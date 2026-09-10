@@ -19,6 +19,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
+from math import ceil
 from typing import Literal, NamedTuple, Protocol, TypeVar, cast
 
 # The store's own bounds on one primitive read. Imported rather than restated so a plan can never
@@ -76,6 +77,17 @@ _MAX_NEIGHBOURS = 10
 _MAX_NEIGHBOR_ANCHORS = 20
 DEFAULT_SIMILAR_K = 12
 DEFAULT_MAX_ROWS = 200
+# When a predicate selects more than this share of the active corpus, enumerating it is not
+# evidence. Measured on LoCoMo dev (525 questions): the planner chose `entity` on 229 of them,
+# no identity registry existed, so the step degraded to matching the name as text -- and on a
+# corpus where every turn reads "[date] Caroline said: ...", that name selected ~300 of ~600
+# records. Those rows flooded the reader: accuracy 0.721 -> 0.528 on exactly those questions and
+# abstention 18 -> 57. Completeness over a predicate that matches most of the corpus carries no
+# information about the question and only dilutes the window.
+_RECALL_NON_SELECTIVE_SHARE = 0.2
+# The floor under that share, in multiples of the ask's own grounding limit: on a small corpus
+# one fifth of it is a handful of rows, and a read of that size is not what flooded anything.
+_RECALL_NON_SELECTIVE_MIN_ROWS = 4
 
 _EnumT = TypeVar("_EnumT", Modality, MemoryType)
 
@@ -137,6 +149,11 @@ class RecallStepResult:
     # truncated read below its own bound, and reading that as "everything" is what licenses a
     # total over a set the caller does not hold.
     bounded: bool
+    # How many records the predicate selected, when it selected too many of the corpus to be
+    # worth enumerating; `0` when the step was selective. Such a step contributes no rows at all,
+    # so the count lives here rather than in `rows`: it is what the reader is told the predicate
+    # matched, and what says the step's own set is not the evidence.
+    non_selective: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +166,8 @@ class RecallResult:
     exhaustive: tuple[SearchHit, ...] = ()
     # By rank, from `similar`, with anything already exhaustive removed.
     ranked: tuple[SearchHit, ...] = ()
+    # Active records in the corpus these reads ran over, for the note's "N of M".
+    active_records: int = 0
 
     @property
     def hits(self) -> tuple[SearchHit, ...]:
@@ -158,7 +177,16 @@ class RecallResult:
     @property
     def complete(self) -> bool:
         """Whether every exhaustive read returned everything its predicate matched."""
-        return not any(step.bounded for step in self.executed if step.op in _EXHAUSTIVE_OPS)
+        return not any(
+            step.bounded or step.non_selective
+            for step in self.executed
+            if step.op in _EXHAUSTIVE_OPS
+        )
+
+    @property
+    def non_selective_steps(self) -> int:
+        """How many reads matched too much of the corpus to enumerate, and so contributed none."""
+        return sum(1 for step in self.executed if step.non_selective)
 
 
 class RecallReader(Protocol):
@@ -246,13 +274,27 @@ def parse_recall_plan(payload: str, *, reference_at: datetime) -> RecallPlan | N
     return RecallPlan(shape=cast(RecallShape, shape), steps=tuple(steps))
 
 
-def execute(plan: RecallPlan, reader: RecallReader) -> RecallResult:
+def execute(
+    plan: RecallPlan,
+    reader: RecallReader,
+    *,
+    limit: int,
+    active_records: int,
+) -> RecallResult:
     """Run every step and merge the rows into one evidence set.
 
     Exhaustive rows come first in chronological order, then the similarity rows by rank with
     anything already present removed. IDs are the only thing deduplicated and no score decides
     the order, so the set a caller reports as complete is the set the predicate defined.
+
+    A predicate that selected too much of the corpus contributes nothing. `limit` is the ask's
+    own grounding limit and `active_records` the corpus the reads ran over, and together they
+    fix the point past which a read is not a question's answer but the corpus itself.
     """
+    ceiling = max(
+        _RECALL_NON_SELECTIVE_MIN_ROWS * limit,
+        ceil(_RECALL_NON_SELECTIVE_SHARE * active_records),
+    )
     executed: list[RecallStepResult] = []
     exhaustive: dict[str, SearchHit] = {}
     ranked: dict[str, SearchHit] = {}
@@ -268,8 +310,18 @@ def execute(plan: RecallPlan, reader: RecallReader) -> RecallResult:
             # its bound says the truth instead, which is that records this predicate matches were
             # never read.
             rows, selected = (), bound
+        non_selective = selected if step.op in _EXHAUSTIVE_OPS and selected > ceiling else 0
+        if non_selective:
+            rows = ()
         by_step.append(rows)
-        executed.append(RecallStepResult(op=step.op, rows=len(rows), bounded=selected >= bound))
+        executed.append(
+            RecallStepResult(
+                op=step.op,
+                rows=len(rows),
+                bounded=selected >= bound,
+                non_selective=non_selective,
+            )
+        )
         target = ranked if step.op == "similar" else exhaustive
         for hit in rows:
             target.setdefault(hit.id, hit)
@@ -278,6 +330,7 @@ def execute(plan: RecallPlan, reader: RecallReader) -> RecallResult:
         executed=tuple(executed),
         exhaustive=tuple(sorted(exhaustive.values(), key=_chronological)),
         ranked=tuple(hit for hit in ranked.values() if hit.id not in exhaustive),
+        active_records=active_records,
     )
 
 
@@ -290,13 +343,21 @@ def recall_note(result: RecallResult, *, omitted: int = 0) -> str:
     total for it anyway.
     """
     reads = "; ".join(
-        _step_note(step, outcome)
+        _step_note(step, outcome, result.active_records)
         for step, outcome in zip(result.plan.steps, result.executed, strict=True)
     )
     if result.complete and not omitted:
         completeness = (
             "The evidence below is every record those reads matched, in time order, so a count "
             "or a list over those records is complete."
+        )
+    elif not result.exhaustive and any(step.non_selective for step in result.executed):
+        # Every predicate matched too much of the corpus to enumerate, so there is no matched set
+        # at all: the reader holds the ranking, and the closing sentence below -- which says the
+        # top-ranked records follow the matched ones -- would be describing nothing.
+        return (
+            f"Recall program ({result.plan.shape}): {reads}. Answer from the records below and "
+            "do not state a total."
         )
     else:
         shortfall = (
@@ -317,7 +378,7 @@ def recall_note(result: RecallResult, *, omitted: int = 0) -> str:
     )
 
 
-def _step_note(step: RecallStep, outcome: RecallStepResult) -> str:
+def _step_note(step: RecallStep, outcome: RecallStepResult, active_records: int) -> str:
     if step.op == "match":
         detail = f"records containing {', '.join(step.terms)}"
     elif step.op == "window":
@@ -328,6 +389,14 @@ def _step_note(step: RecallStep, outcome: RecallStepResult) -> str:
         detail = f"records about {step.name}"
     else:
         detail = "the top-ranked records for the question"
+    if outcome.non_selective:
+        # No count of rows: there are none, and the reader has to be told why rather than shown a
+        # zero it would read as "nothing matched". What it holds instead is the ranking.
+        return (
+            f"{detail}{_span_note(step)} matched too many records to enumerate "
+            f"({outcome.non_selective} of {active_records}); only the top-ranked records for "
+            "the question are shown"
+        )
     return f"{detail}{_span_note(step)} ({outcome.rows})"
 
 

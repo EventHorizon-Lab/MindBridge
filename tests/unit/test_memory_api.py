@@ -34,6 +34,7 @@ from mindbridge._telemetry import (
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
     OPERATION_TTFT,
+    RECALL_NON_SELECTIVE_STEPS,
     TOKEN_COMPLETE,
     TOKEN_EXPECTED_REQUEST_COUNT,
     TOKEN_REPORTED_REQUEST_COUNT,
@@ -531,7 +532,9 @@ def _memory(
     reinforce_on_answer: bool = True,
     recall_planning: bool = MemoryConfig().recall_planning,
     recall_set_budget_chars: int = MemoryConfig().recall_set_budget_chars,
+    recall_set_max_rows: int = MemoryConfig().recall_set_max_rows,
     recall_rounds: int = MemoryConfig().recall_rounds,
+    tracer: Tracer | None = None,
 ) -> Memory:
     models = models or _FakeModels()
     return Memory(
@@ -547,7 +550,9 @@ def _memory(
         reinforce_on_answer=reinforce_on_answer,
         recall_planning=recall_planning,
         recall_set_budget_chars=recall_set_budget_chars,
+        recall_set_max_rows=recall_set_max_rows,
         recall_rounds=recall_rounds,
+        tracer=tracer,
     )
 
 
@@ -7516,6 +7521,11 @@ def test_a_set_plan_grounds_a_bounded_number_of_media_rows(tmp_path: Path) -> No
                 occurred_at=DAY + timedelta(days=index),
             )
         memory.add("frame notes, in text", occurred_at=DAY + timedelta(days=9))
+        # Records the predicate does not match and the question does not rank, so that the five
+        # rows it does match are a selective read rather than the whole corpus -- which would be
+        # the other guard, and would contribute no rows for this cap to bound.
+        for index in range(30):
+            memory.add(f"red bolt {index}", occurred_at=DAY + timedelta(days=100 + index))
 
         memory.ask("how many frames?", limit=1)
 
@@ -7526,6 +7536,115 @@ def test_a_set_plan_grounds_a_bounded_number_of_media_rows(tmp_path: Path) -> No
         "frame notes, in text",
     ]
     assert "2 further matched records are not shown" in question.text
+
+
+def _flooding_corpus(memory: Memory) -> None:
+    """Five dated records every one of which the word "wrench" selects.
+
+    The shape LoCoMo has: every record carries the term the plan matches on, so the predicate is
+    the corpus and completeness over it says nothing about the question.
+    """
+    for index in range(5):
+        memory.add(f"a wrench, mention {index}", occurred_at=DAY + timedelta(days=index))
+
+
+def test_a_predicate_that_matched_most_of_the_corpus_grounds_like_no_plan_at_all(
+    tmp_path: Path,
+) -> None:
+    """A non-selective read is the corpus, not evidence, so it contributes nothing.
+
+    Measured on LoCoMo dev (525 questions): the planner chose `entity` on 229 of them, no
+    identity registry existed so the step degraded to matching the name as text, and on a corpus
+    whose every turn reads "[date] Caroline said: ..." that name selected ~300 of ~600 records.
+    Handing those to the reader cost accuracy 0.721 -> 0.528 on exactly those questions and
+    raised abstention from 18 to 57. The reader is told what the predicate matched and that what
+    it holds is the ranking instead -- never that the rows are a complete set.
+    """
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    unplanned = _FakeModels()
+    with _memory(tmp_path / "unplanned", unplanned) as memory:
+        _flooding_corpus(memory)
+        memory.ask("what was said about the wrench?", limit=1)
+
+    planned = _FakeModels()
+    planned.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(
+        tmp_path / "planned",
+        planned,
+        recall_planning=True,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        _flooding_corpus(memory)
+        memory.ask("what was said about the wrench?", limit=1)
+    provider.shutdown()
+
+    question, grounded = planned.answer_calls[-1]
+    _unplanned_question, unplanned_hits = unplanned.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [hit.content for hit in unplanned_hits]
+    assert "matched too many records to enumerate (5 of 5)" in question.text
+    assert "only the top-ranked records for the question are shown" in question.text
+    assert "every record those reads matched" not in question.text
+    assert "do not state a total" in question.text
+    recall = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.recall"
+    )
+    assert recall.attributes is not None
+    assert recall.attributes[RECALL_NON_SELECTIVE_STEPS] == 1
+
+
+def test_a_selective_predicate_on_the_same_corpus_still_grounds_its_whole_set(
+    tmp_path: Path,
+) -> None:
+    """The guard is a selectivity threshold, not a ceiling on set reads.
+
+    Same corpus and same predicate as above; only the ask's own grounding limit moved, which is
+    what the floor under the corpus share is expressed in. The set is grounded and declared
+    complete, so a count over it is still licensed.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _flooding_corpus(memory)
+
+        memory.ask("how many wrenches were mentioned?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [f"a wrench, mention {index}" for index in range(5)]
+    assert "records containing wrench (5)" in question.text
+    assert "every record those reads matched, in time order" in question.text
+    assert "too many records to enumerate" not in question.text
+
+
+def test_a_matched_set_is_capped_in_rows_as_well_as_characters(tmp_path: Path) -> None:
+    """A short-record corpus fits hundreds of matched rows inside the character budget.
+
+    `recall_set_max_rows` is the other axis of the same bound: the rows arrive chronological, the
+    cap keeps the earliest of them -- the read's own order, not a second ranking -- and the rest
+    are reported as matched records not shown, which is what makes the set incomplete. The ranked
+    window is outside the cap, so this can never cost a question the evidence it already had.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True, recall_set_max_rows=60) as memory:
+        for index in range(70):
+            memory.add(f"wrench {index}", occurred_at=DAY + timedelta(days=index))
+        # Twenty records the predicate does not match and the ranking does: the fake embedder's
+        # only axis is the word "red", so these are the window and the wrenches are the set.
+        for index in range(20):
+            memory.add(f"red thing {index}", occurred_at=DAY + timedelta(days=100 + index))
+
+        memory.ask("what red things did I mention?", limit=18)
+
+    question, grounded = models.answer_calls[-1]
+    matched = [hit.content for hit in grounded if hit.content.startswith("wrench ")]
+    window = [hit.content for hit in grounded if hit.content.startswith("red thing ")]
+    # The earliest sixty of the seventy matched rows, in the order the read returned them.
+    assert matched == [f"wrench {index}" for index in range(60)]
+    assert len(window) == 18
+    assert "10 further matched records are not shown" in question.text
+    assert "do not state a total" in question.text
 
 
 def test_a_read_that_filled_its_own_bound_is_reported_as_incomplete(tmp_path: Path) -> None:

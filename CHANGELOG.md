@@ -42,8 +42,24 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   replan, and whether the plan was the fallback -- because every failure resolves to that same
   fallback, so nothing else distinguishes a planner that ran from one that was never reached.
   `mindbridge-bench eval` aggregates those into a `recall` block per task under `performance`
-  (plan count, plans by shape, fallback count, replan count, incomplete count, exhaustive-row
-  distribution) and stamps each sample's own plan shape into `samples.jsonl` as `recall_shape`.
+  (plan count, plans by shape, fallback count, replan count, incomplete count, non-selective step
+  count, exhaustive-row distribution) and stamps each sample's own plan shape into `samples.jsonl`
+  as `recall_shape`. Two bounds keep a matched set from being the corpus. A read whose predicate
+  selected more than a fifth of the active records -- or more than four times `limit` rows, where
+  that fifth is smaller -- contributes nothing, because completeness over most of a corpus carries
+  no information about the question: measured on LoCoMo dev, the planner chose `entity` on 229 of
+  525 questions, no identity registry existed so the step degraded to matching the name as text,
+  and on a corpus whose every turn reads "[date] Caroline said: ..." that name selected about 300
+  of 600 records; grounding them cost accuracy 0.721 -> 0.528 on exactly those questions and
+  raised abstention from 18 to 57. Such a step is reported on the stage span as
+  `mindbridge.recall.non_selective_steps`, and the note tells the reader what the predicate matched
+  and that it holds the question's top-ranked records instead of a complete set, so a plan whose
+  every step is non-selective grounds precisely what no plan would have. The rows a selective read
+  did return are additionally capped by the new `recall_set_max_rows` (default 60), which is the
+  character budget's bound on the other axis -- a corpus of short records fits hundreds of matched
+  rows inside 30 000 characters -- keeping the earliest rows in the read's own chronological order
+  and counting the rest into the same "not shown" shortfall that declares the set incomplete. The
+  ranked window is outside both bounds.
 - `answer_policy` on `Memory.ask()`, `Memory.ask_stream()`, their `AsyncMemory` twins, REST
   `AnswerRequest`, and the MCP `ask_memory` tool, with the new `AnswerPolicy` alias exported from
   `mindbridge`. Abstaining is a policy the caller owns, not a fixed product behaviour: an

@@ -231,7 +231,12 @@ completeness is what licenses a count or a list. The ranked window is the one th
 would have grounded, `limit` hits and their modality floor, and a plan can only add to it: the
 budget trims exhaustive rows beyond that window and never the window itself, so no plan grounds
 less evidence than no plan. Completeness stays a statement about the exhaustive reads alone, and
-the note says so, because a top-ranked record is not a record the predicate matched. Any missing
+the note says so, because a top-ranked record is not a record the predicate matched. Two bounds
+decide when a predicate's set is worth holding at all: a read whose predicate selected more than
+a fifth of the active corpus (or more than four times `limit` rows, whichever is larger)
+contributes nothing and says so, because completeness over most of a corpus carries no
+information about the question; and the rows a selective read did return stop at
+`recall_set_max_rows`, chronologically, with the remainder reported as not shown. Any missing
 capability, planner failure, or plan the kernel will not run falls back to the single ranked
 search, which is the default.
 

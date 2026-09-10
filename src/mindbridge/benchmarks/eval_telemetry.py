@@ -36,6 +36,7 @@ from mindbridge._telemetry import (
     RECALL_COMPLETE,
     RECALL_EXHAUSTIVE_ROWS,
     RECALL_FALLBACK,
+    RECALL_NON_SELECTIVE_STEPS,
     RECALL_REPLAN,
     RECALL_SHAPE,
     SPAN_KIND,
@@ -610,6 +611,7 @@ class _TaskTelemetry:
     recall_fallback_count: int = 0
     recall_replan_count: int = 0
     recall_incomplete_count: int = 0
+    recall_non_selective_steps: int = 0
     recall_exhaustive_rows: _Samples = field(default_factory=_Samples)
 
     def add(self, span: ReadableSpan) -> None:  # noqa: C901 - one pass classifies every dimension
@@ -710,6 +712,9 @@ class _TaskTelemetry:
         self.recall_fallback_count += attributes.get(RECALL_FALLBACK) is True
         self.recall_replan_count += attributes.get(RECALL_REPLAN) is True
         self.recall_incomplete_count += attributes.get(RECALL_COMPLETE) is not True
+        self.recall_non_selective_steps += (
+            _int_attribute(attributes, RECALL_NON_SELECTIVE_STEPS) or 0
+        )
         rows = _int_attribute(attributes, RECALL_EXHAUSTIVE_ROWS)
         if rows is not None:
             self.recall_exhaustive_rows.add(rows)
@@ -942,14 +947,16 @@ class _TaskTelemetry:
             "measures": (
                 "recall-planning activation: how many plans ran, in what shape, how many were "
                 "the fallback plan every planning failure resolves to, how many were a replan "
-                "round, and how many claimed a set no read completed; empty unless the run sets "
-                "recall_planning"
+                "round, how many claimed a set no read completed, and how many reads matched too "
+                "much of the corpus to enumerate and so contributed nothing; empty unless the "
+                "run sets recall_planning"
             ),
             "plan_count": self.recall_plan_count,
             "shapes": dict(sorted(self.recall_shapes.items())),
             "fallback_count": self.recall_fallback_count,
             "replan_count": self.recall_replan_count,
             "incomplete_count": self.recall_incomplete_count,
+            "non_selective_steps": self.recall_non_selective_steps,
             "exhaustive_rows": self.recall_exhaustive_rows.json(),
         }
 

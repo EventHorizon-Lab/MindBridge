@@ -88,6 +88,15 @@ prompt states the plan and its completeness ("the evidence is every record match
 "N further matches were omitted"), so counting and list answers are licensed only when the set is complete.
 Media attachment and elision rules are unchanged.
 
+Two bounds keep a set read from being the corpus. A step whose predicate selected more than
+`_RECALL_NON_SELECTIVE_SHARE` (0.2) of the active records, or more than four times the ask's own
+`limit` where that fifth is smaller, is non-selective: it contributes no rows, is counted on the stage span as
+`mindbridge.recall.non_selective_steps`, and the note tells the reader what the predicate matched and that
+it holds the ranking instead (measured on LoCoMo, an `entity` step that degraded to matching a name as text
+selected ~300 of ~600 records and cost 0.721 -> 0.528 accuracy on those questions). The rows a selective
+read did return are additionally capped at `MemoryConfig.recall_set_max_rows` (default 60), chronologically,
+with the remainder counted into the same "not shown" shortfall that declares the set incomplete.
+
 ### 3.4 Answer policy and answer shaping (reader)
 
 Port `answer_policy` (`strict` | `best_effort`) from branch `claude/mindbridge-memory-research-3f4fd0`
