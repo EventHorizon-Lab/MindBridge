@@ -3446,9 +3446,9 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 (),
             )
         result: AnswerResult | None = None
-        # Protocol alignment, not a scorer change: two tasks' official evaluations give no credit
+        # Protocol alignment, not a scorer change: one task's official evaluation gives no credit
         # for "unknown", so the request asks for a committed answer there. `task_answer_policy`
-        # owns the mapping and its rationale.
+        # owns the mapping -- `{m3-bench-robot}` -- and its rationale.
         requested_policy = task_answer_policy(task_name, answer_policy)
         with _observe_retrieval_results(observe_retrieval):
             ask_stream = getattr(memory, "ask_stream", None)
@@ -7041,6 +7041,15 @@ def _cache_namespace(
         "gen_kwargs": arguments.gen_kwargs,
         "generation_min_video_seconds": config.generation_min_video_seconds,
         "recall_limit": arguments.recall_limit,
+        # The override and the resolved per-task policy, because either one changes what the
+        # request asked for. Without them a `best_effort` arm replayed a cached `strict` refusal
+        # and labelled it `best_effort`, and widening `BEST_EFFORT_TASKS` replayed a task's older
+        # strict answers under its new default.
+        "answer_policy_override": arguments.answer_policy,
+        "answer_policy": {
+            task: task_answer_policy(task, arguments.answer_policy)
+            for task in sorted(arguments.tasks)
+        },
         "blind": arguments.blind,
         "batch_sizes": dict(sorted(batch_sizes.items())),
         "ingest": arguments.ingest,

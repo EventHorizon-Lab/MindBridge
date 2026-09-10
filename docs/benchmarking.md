@@ -1172,6 +1172,11 @@ is rejected if either artifact's TTFT distribution is incomplete.
 Use `--use-cache .benchmarks/response-cache` to persist deterministic generation responses across
 isolated reruns. The cache is an optimization, not a substitute for the result artifacts.
 
+Everything that decides what a request asked for is part of the cache namespace, so a cached
+answer is only ever reused for the same question. That includes `--answer-policy` and the policy
+each task resolves to, because an arm that asks for a committed answer must not be handed the
+refusal a strict run already cached and report it as its own.
+
 ## Resume an interrupted run
 
 A long run that is killed - by an out-of-memory reaper, a lost session, or a Ctrl-C - keeps both

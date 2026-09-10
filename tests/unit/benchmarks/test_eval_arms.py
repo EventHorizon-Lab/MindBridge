@@ -1385,7 +1385,9 @@ def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path
 
     The harness lends one answerer to every per-unit memory, so the borrowed wrapper is the last
     hop before the provider. It once declared the keyword and dropped it, which made the whole
-    arm a silent no-op that no fake-`ask` test could see.
+    arm a silent no-op that no fake-`ask` test could see. The same wrapper forwards `exhaustive`,
+    which is why this answerer accepts it: a wrapper that dropped an argument the protocol
+    declares would fail the call instead of the arm.
     """
     recorded: list[str] = []
 
@@ -1399,6 +1401,7 @@ def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path
             hits: Sequence[SearchHit],
             *,
             answer_policy: str = "strict",
+            exhaustive: bool = False,
         ) -> AnswerResult:
             del question
             recorded.append(answer_policy)
@@ -1410,6 +1413,7 @@ def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path
             hits: Sequence[SearchHit],
             *,
             answer_policy: str = "strict",
+            exhaustive: bool = False,
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             del question
             recorded.append(answer_policy)
