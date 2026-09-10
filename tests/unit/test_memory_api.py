@@ -7530,11 +7530,14 @@ def test_one_round_is_a_configured_ceiling_on_replanning(tmp_path: Path) -> None
     assert len(models.answer_calls) == 1
 
 
-def test_a_streaming_caller_sees_both_rounds_and_one_terminal_result(tmp_path: Path) -> None:
-    """A second round is a second answer on the wire, and the caller has to be able to tell.
+def test_a_streaming_caller_sees_only_the_round_that_stands(tmp_path: Path) -> None:
+    """A replanned round is not on the wire at all, so the stream is one answer.
 
-    The deltas are the provider's own, so a replanned question streams the thin attempt and
-    then the committed one; the single terminal chunk carries the round that stands.
+    Two complete answers with no boundary between them is not something a caller can render, and
+    a caller who concatenated the deltas would hold text the terminal result contradicts. So a
+    round a later one may replace is held until it is known to stand, and the answer streamed is
+    the answer returned. The last round -- and every round under `strict`, where no replan is
+    possible -- streams as the provider produces it.
     """
     models = _FakeModels()
     models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
@@ -7546,10 +7549,26 @@ def test_a_streaming_caller_sees_both_rounds_and_one_terminal_result(tmp_path: P
 
     deltas = [chunk.text for chunk in chunks if chunk.result is None]
     finals = [chunk.result for chunk in chunks if chunk.result is not None]
-    assert len(deltas) == 2
+    assert len(models.answer_calls) == 2
     assert len(finals) == 1
-    assert finals[0].answer == deltas[1]
+    assert "".join(deltas) == finals[0].answer
     assert finals[0].abstained is False
+
+
+def test_a_streaming_round_nothing_can_replace_is_not_held_back(tmp_path: Path) -> None:
+    """Holding a round costs the caller its time to first token, so only a replannable one is."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    streamed: list[str] = []
+    with _memory(tmp_path, models, recall_planning=True, recall_rounds=1) as memory:
+        _dated_corpus(memory)
+
+        for chunk in memory.ask_stream("how many wrenches?", answer_policy="best_effort"):
+            if chunk.result is None:
+                streamed.append(chunk.text)
+            else:
+                # The deltas arrived before the terminal chunk, not with it.
+                assert streamed and chunk.result.answer == "".join(streamed)
 
 
 def test_planning_and_the_reads_it_names_happen_inside_a_span(tmp_path: Path) -> None:

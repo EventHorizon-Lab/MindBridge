@@ -23,8 +23,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   over it -- then similarity rows by rank. The prompt states
   what the reads were and whether the set is complete, so a count is licensed by completeness
   instead of guessed. Under `answer_policy="best_effort"`, an answer the answerer flagged as
-  thin buys one replan round (`recall_rounds`, default 2) that is told what the first round
-  read. A backend without the new optional `RecallPlanningBackend.plan_recall` capability, a
+  thin buys one replan round (`recall_rounds`, default 2) that is told how much the first round
+  read, over what dates, and why it was not enough; `ask_stream()` still yields one answer,
+  because a round a replan may replace is held back and reaches the caller only if it is the
+  round that stands. A backend without the new optional `RecallPlanningBackend.plan_recall`
+  capability, a
   planner error, and any plan the kernel will not run all fall back to the single search `ask`
   has always made, so the default path is unchanged.
 - Every grounded answer prompt now asks for the whole question to be answered, in the shortest

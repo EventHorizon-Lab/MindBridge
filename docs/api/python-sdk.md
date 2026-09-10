@@ -394,6 +394,12 @@ guess, and is still reported as `abstained` with `AbstentionReason.NO_EVIDENCE`.
 the provider's own deltas, marker included; the terminal `AnswerResult` carries the cleaned
 answer, so render a stream on `abstained` rather than on the text.
 
+`ask_stream()` yields the deltas of one answer, never of two. With `recall_planning` on, a
+`"best_effort"` answer the answerer flagged as thin buys a second round, and a round another
+round may replace is held rather than streamed: the concatenated deltas are always the answer the
+terminal `AnswerResult` carries. The cost is that round's time to first token, paid only where a
+replan is possible -- never under `strict`, and never on the last round.
+
 `ask` may run face recognition on a retrieved photo or video to identify who appears in it before
 answering. With the default `link_identities=True`, a voice-and-face pair corroborated across
 enough assets is fused into one identity the same way `analyze_faces` fuses it: a `MERGE` row in

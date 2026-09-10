@@ -1909,30 +1909,25 @@ class Memory:
                 link_identities=link_identities,
                 answer_policy=answer_policy,
             )
-            attempted = ""
-            for attempt in range(self._recall_rounds if self._recall_planning else 1):
-                # `closing` rather than plain iteration: an abandoned stream throws
-                # `GeneratorExit` at the yield below, and without this the inner generator would
-                # only be closed when the cleared frame drops its last reference. That defers
-                # closing the provider's response and ends `mindbridge.model.generation` after
-                # its own parent, which loses the call's model usage and emits a malformed trace.
-                with closing(self._recall_round(round_context, attempted=attempted)) as deltas:
-                    while True:
-                        try:
-                            delta = next(deltas)
-                        except StopIteration as complete:
-                            result, hits = complete.value
-                            break
-                        if delta.strip() and not operation_ttft_recorded:
-                            operation_ttft_ms = (perf_counter() - started) * 1_000.0
-                            if queue_time_ms is not None:
-                                operation_ttft_ms += queue_time_ms
-                            span.set_attribute(OPERATION_TTFT, operation_ttft_ms)
-                            operation_ttft_recorded = True
-                        yield AnswerChunk(text=delta)
-                if not self._replan_wanted(result, round_context, attempt=attempt):
-                    break
-                attempted = _attempt_note(hits, result)
+            # `closing` rather than plain iteration: an abandoned stream throws `GeneratorExit`
+            # at the yield below, and without this the inner generator would only be closed when
+            # the cleared frame drops its last reference. That defers closing the provider's
+            # response and ends `mindbridge.model.generation` after its own parent, which loses
+            # the call's model usage and emits a malformed trace.
+            with closing(self._answer_rounds(round_context)) as deltas:
+                while True:
+                    try:
+                        delta = next(deltas)
+                    except StopIteration as complete:
+                        result, hits = complete.value
+                        break
+                    if delta.strip() and not operation_ttft_recorded:
+                        operation_ttft_ms = (perf_counter() - started) * 1_000.0
+                        if queue_time_ms is not None:
+                            operation_ttft_ms += queue_time_ms
+                        span.set_attribute(OPERATION_TTFT, operation_ttft_ms)
+                        operation_ttft_recorded = True
+                    yield AnswerChunk(text=delta)
             used_ids = {hit.id for hit in result.hits}
             grounding = tuple(hit for hit in hits if hit.id in used_ids)
             # Reinforcement is part of answering, so it stays inside the operation and runs
@@ -7480,6 +7475,39 @@ class Memory:
                 _normalized_vector(vector, self._embedding_dimension) for vector in vectors
             )
 
+    def _answer_rounds(
+        self,
+        context: _RecallContext,
+    ) -> Generator[str, None, tuple[AnswerResult, tuple[SearchHit, ...]]]:
+        """Answer this question, replanning once when the first round's own answer asked for it.
+
+        A round another round may replace is held rather than streamed. Two complete answers on
+        one wire with no boundary between them is not something a caller can render, and the
+        terminal result has to be the text that was streamed -- so the deltas of a replannable
+        round are buffered and yielded only if that round is the one that stands. Every other
+        round, the common case and always the last one, streams as the provider produces it.
+        """
+        attempted = ""
+        for attempt in range(self._recall_rounds if self._recall_planning else 1):
+            held: builtins.list[str] = []
+            replannable = self._replan_possible(context, attempt=attempt)
+            with closing(self._recall_round(context, attempted=attempted)) as deltas:
+                while True:
+                    try:
+                        delta = next(deltas)
+                    except StopIteration as complete:
+                        result, hits = complete.value
+                        break
+                    if replannable:
+                        held.append(delta)
+                    else:
+                        yield delta
+            if not (result.abstained and replannable):
+                yield from held
+                break
+            attempted = _attempt_note(hits, result)
+        return result, hits
+
     def _recall_round(
         self,
         context: _RecallContext,
@@ -7563,24 +7591,18 @@ class Memory:
         )
         return hits, recall_note(program, omitted=omitted)
 
-    def _replan_wanted(
-        self,
-        result: AnswerResult,
-        context: _RecallContext,
-        *,
-        attempt: int,
-    ) -> bool:
-        """Spend another round only on the failure the first round's own answer reported.
+    def _replan_possible(self, context: _RecallContext, *, attempt: int) -> bool:
+        """Whether a later round could replace this one, which is what makes it unstreamable.
 
-        A committed answer the answerer flagged as thin is the one case where reading again is
-        known to be worth a call: under `strict` the same signal is already the caller's
-        reported refusal, and re-reading behind their back would answer a question they were
-        told could not be answered.
+        Another round is spent only on the failure a round's own answer reports, and only when
+        the caller asked for a committed answer: under `strict` that same signal is already the
+        refusal they were given, and re-reading behind their back would answer a question they
+        were told could not be answered. This is everything but the failure, which is what a
+        round has to know before it starts.
         """
         return (
             self._recall_planning
             and context.answer_policy == "best_effort"
-            and result.abstained
             and attempt + 1 < self._recall_rounds
         )
 
