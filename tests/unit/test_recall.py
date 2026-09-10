@@ -18,6 +18,7 @@ from mindbridge.recall import (
     execute,
     fallback_plan,
     parse_recall_plan,
+    recall_note,
 )
 from mindbridge.types import MemoryType, Modality, SearchHit
 
@@ -313,7 +314,7 @@ def test_execute_unions_the_ops_with_exhaustive_rows_in_time_order_first() -> No
     )
 
     assert plan is not None
-    result = execute(plan, reader)
+    result = execute(plan, reader, limit=12, active_records=1_000)
 
     assert [hit.id for hit in result.exhaustive] == ["m-early", "w-mid", "m-late"]
     assert [hit.id for hit in result.ranked] == ["s-top"]
@@ -335,7 +336,7 @@ def test_a_read_that_returned_its_whole_bound_is_not_complete() -> None:
     )
 
     assert plan is not None
-    result = execute(plan, reader)
+    result = execute(plan, reader, limit=12, active_records=1_000)
 
     assert result.executed[0].bounded is True
     assert result.complete is False
@@ -344,7 +345,7 @@ def test_a_read_that_returned_its_whole_bound_is_not_complete() -> None:
 def test_a_bounded_similarity_read_does_not_make_a_ranking_incomplete() -> None:
     reader = _Reader(similar=tuple(_hit(f"s-{index}") for index in range(4)))
 
-    result = execute(fallback_plan("q", k=4), reader)
+    result = execute(fallback_plan("q", k=4), reader, limit=4, active_records=1_000)
 
     assert result.executed[0].bounded is True
     assert result.complete is True
@@ -370,7 +371,7 @@ def test_neighbors_anchor_on_the_rows_the_named_step_returned() -> None:
     )
 
     assert plan is not None
-    result = execute(plan, reader)
+    result = execute(plan, reader, limit=12, active_records=1_000)
 
     assert reader.calls[1] == ("neighbors", (("m-1", "m-2"), 2, 0, DEFAULT_MAX_ROWS))
     assert [hit.id for hit in result.hits] == ["n-1", "m-1", "m-2"]
@@ -392,7 +393,7 @@ def test_a_step_whose_anchor_read_nothing_reads_nothing_itself() -> None:
     )
 
     assert plan is not None
-    result = execute(plan, reader)
+    result = execute(plan, reader, limit=12, active_records=1_000)
 
     assert [name for name, _arguments in reader.calls] == ["match"]
     assert result.hits == ()
@@ -437,11 +438,69 @@ def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen() 
     )
 
     assert plan is not None
-    result = execute(plan, reader)
+    result = execute(plan, reader, limit=12, active_records=1_000)
 
     assert result.executed[0] == RecallStepResult(op="match", rows=0, bounded=True)
     assert result.complete is False
     assert [hit.id for hit in result.hits] == ["s-1"]
+
+
+@pytest.mark.parametrize(
+    ("selected", "active", "flooded"),
+    [(300, 600, True), (120, 600, False), (13, 10, True), (12, 10, False)],
+    ids=(
+        "over-the-corpus-share",
+        "at-the-corpus-share",
+        "over-the-limit-floor-on-a-small-corpus",
+        "at-the-limit-floor-on-a-small-corpus",
+    ),
+)
+def test_a_predicate_that_selected_most_of_the_corpus_contributes_no_rows(
+    selected: int, active: int, flooded: bool
+) -> None:
+    """Completeness over a non-selective predicate is not evidence, it is the corpus.
+
+    Measured on LoCoMo dev: the planner chose `entity` on 229 of 525 questions, the step
+    degraded to matching the name as text with no identity registry behind it, and the name
+    selected roughly half a corpus whose every turn reads "[date] Caroline said: ...". Those
+    rows flooded the reader -- accuracy 0.721 -> 0.528 on exactly those questions, abstention
+    18 -> 57 -- so the read contributes nothing and says so instead.
+    """
+    reader = _Reader(
+        match=tuple(_hit(f"m-{index}", minutes=index) for index in range(30)),
+        selected={"match": selected},
+    )
+    plan = parse_recall_plan(
+        json.dumps({"shape": "set", "steps": [{"op": "match", "terms": ["caroline"]}]}),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    result = execute(plan, reader, limit=3, active_records=active)
+
+    assert len(result.hits) == (0 if flooded else 30)
+    assert result.executed[0].non_selective == (selected if flooded else 0)
+    assert result.non_selective_steps == int(flooded)
+    assert result.complete is not flooded
+
+
+def test_a_non_selective_step_tells_the_reader_what_it_holds_instead() -> None:
+    """The note may not read as "nothing matched": what the reader holds is the ranking."""
+    reader = _Reader(
+        entity=tuple(_hit(f"m-{index}", minutes=index) for index in range(30)),
+        selected={"entity": 300},
+    )
+    plan = parse_recall_plan(
+        json.dumps({"shape": "entity", "steps": [{"op": "entity", "name": "Caroline"}]}),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    note = recall_note(execute(plan, reader, limit=3, active_records=600))
+
+    assert "records about Caroline matched too many records to enumerate (300 of 600)" in note
+    assert "only the top-ranked records for the question are shown" in note
+    assert "every record those reads matched" not in note
 
 
 def test_a_neighbors_step_anchors_on_a_bounded_head_of_what_it_follows() -> None:
@@ -469,7 +528,7 @@ def test_a_neighbors_step_anchors_on_a_bounded_head_of_what_it_follows() -> None
     )
 
     assert plan is not None
-    execute(plan, reader)
+    execute(plan, reader, limit=12, active_records=1_000)
 
     anchors = cast(tuple[tuple[str, ...], int, int, int], reader.calls[1][1])[0]
     assert anchors == tuple(f"m-{index}" for index in range(_MAX_NEIGHBOR_ANCHORS))
@@ -493,7 +552,7 @@ def test_a_read_the_bound_truncated_stays_bounded_when_a_scope_drops_a_row() -> 
     )
 
     assert plan is not None
-    result = execute(plan, reader)
+    result = execute(plan, reader, limit=12, active_records=1_000)
 
     assert result.executed[0] == RecallStepResult(op="match", rows=1, bounded=True)
     assert result.complete is False

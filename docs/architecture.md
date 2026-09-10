@@ -225,10 +225,20 @@ every other hit, and are bounded by an explicit row count. Because that bound is
 IDs are selected and bitemporal, spatial and metric scope is applied while they are hydrated,
 each read reports how many records it selected as well as the rows it returned: only the
 selection count can say whether the bound truncated anything. The evidence set is a union with ID
-dedup and no recomputed score -- exhaustive rows in time order, then similarity rows by rank --
+dedup and no recomputed score -- exhaustive rows in time order, then the ranked window by rank --
 and the answer prompt states which reads produced it and whether the set is complete, because
-completeness is what licenses a count or a list. Any missing capability, planner failure, or
-plan the kernel will not run falls back to the single ranked search, which is the default.
+completeness is what licenses a count or a list. The ranked window is the one the unplanned path
+would have grounded, `limit` hits and their modality floor, and a plan can only add to it: the
+budget trims exhaustive rows beyond that window and never the window itself, so no plan grounds
+less evidence than no plan. Completeness stays a statement about the exhaustive reads alone, and
+the note says so, because a top-ranked record is not a record the predicate matched. Two bounds
+decide when a predicate's set is worth holding at all: a read whose predicate selected more than
+a fifth of the active corpus (or more than four times `limit` rows, whichever is larger)
+contributes nothing and says so, because completeness over most of a corpus carries no
+information about the question; and the rows a selective read did return stop at
+`recall_set_max_rows`, chronologically, with the remainder reported as not shown. Any missing
+capability, planner failure, or plan the kernel will not run falls back to the single ranked
+search, which is the default.
 
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without
 copying memory content or metadata into the trace. `ask()` uses the same retrieval path, applies

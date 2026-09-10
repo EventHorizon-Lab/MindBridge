@@ -772,7 +772,7 @@ gaps do not inflate the denominator. TTFT and token-per-call distributions also 
 | `time_to_searchable_ms` | Elapsed time from capture commit to the `settle()` call that made the record searchable; empty unless `--ingest capture` runs. |
 | `formation` | `settle()` latency for model-dependent enrichment; empty unless `--ingest capture` runs. |
 | `compile` | `Memory.compile` latency and the compiled bundle's character, item, and media-item distributions; empty unless the `compile` arm runs. |
-| `recall` | Recall-planning activation: `plan_count`, `shapes` (plans counted by shape), `fallback_count`, `replan_count`, `incomplete_count`, and the `exhaustive_rows` distribution, plus the stage's own latency; `plan_count` is `0` unless the run sets `recall_planning`. |
+| `recall` | Recall-planning activation: `plan_count`, `shapes` (plans counted by shape), `fallback_count`, `replan_count`, `incomplete_count`, `non_selective_steps`, and the `exhaustive_rows` distribution, plus the stage's own latency; `plan_count` is `0` unless the run sets `recall_planning`. |
 | `nodes` | Count, compute time, active time, throughput, average, p50/p95/p99, status, parent operation, purpose, model identity, response identity, fingerprint, embedding task, batch size, and modalities for every operation, stage, and model span. |
 | `token_usage` | Total and per-module request counts, exactness, input/output/cached/reasoning tokens, modality totals, per-call distribution, and observed output tokens per model-compute second. |
 
@@ -812,7 +812,10 @@ scores alone cannot separate "planning is off" from "planning ran and decided no
 `plan_count` equal to the question count with a `fallback_count` of `0` is an active planner; a
 `plan_count` of `0` under `recall_planning` means the answerer never declared
 `RecallPlanningBackend`. `incomplete_count` counts the plans whose exhaustive reads filled their
-row bound, which is when a set answer may not state a total. Each sample additionally carries
+row bound, which is when a set answer may not state a total. `non_selective_steps` counts the
+reads that matched too much of the corpus to enumerate and so contributed no rows, which is the
+other way a plan fails to add anything -- and the one that looks like an active planner in every
+other counter. Each sample additionally carries
 `recall_shape`, the shape of the plan its own answer was grounded on.
 
 `compile`'s bundle-size attributes are harness-owned (`compile()` itself carries no such attribute)

@@ -792,7 +792,9 @@ def test_backend_pool_forwards_every_memory_setting(
     monkeypatch.setattr(eval_module, "Memory", Recorder)
     monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = object.__new__(eval_module._BackendPool)
-    settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
+    settings = MemoryConfig(
+        evidence_budget_chars=4_242, minimum_relevance=0.11, recall_set_max_rows=17
+    )
     pool._settings = settings
     pool._tracer = trace.get_tracer(__name__)
     for entry in fields(MemoryPlugins):
