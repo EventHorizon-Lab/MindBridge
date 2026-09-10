@@ -75,6 +75,9 @@ class _Embedder:
     embedding_model = "fake-real-index"
     embedding_space = "fake-real-index:2:test"
     embedding_dimension = 2
+    # Optional, duck-typed by `Memory` (`getattr(..., "_legacy_embedding_spaces", frozenset())`);
+    # declared here only so a test assigning it type-checks.
+    _legacy_embedding_spaces: frozenset[str] = frozenset()
 
     def __init__(self) -> None:
         self.embedding_capabilities = _ALL_INPUT_MODALITIES
