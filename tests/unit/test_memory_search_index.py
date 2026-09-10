@@ -56,7 +56,15 @@ from mindbridge.models.base import (
     SpeechAnalysis,
     SpeechTurn,
 )
-from mindbridge.types import AssetRef, Blob, MemoryIntent, Modality, SpeakerSegment
+from mindbridge.types import (
+    AnswerResult,
+    AssetRef,
+    Blob,
+    MemoryIntent,
+    Modality,
+    SearchHit,
+    SpeakerSegment,
+)
 
 _ALL_INPUT_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 
@@ -1717,3 +1725,40 @@ def test_a_caption_that_is_only_facts_is_not_described_or_appended_twice(tmp_pat
 
         assert describer.calls == 1, "the same bytes were described again"
         assert reopened.get(again.id).content.count("[facts:") == 1
+
+
+class _TextOnlyAnswerer:
+    """A generation backend that can read text and nothing else, the way a text LLM does."""
+
+    generation_capabilities = frozenset({Modality.TEXT})
+
+    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        return AnswerResult(answer="; ".join(hit.content for hit in hits) or "nothing found")
+
+    def close(self) -> None:
+        return None
+
+
+def test_a_facts_only_caption_still_lets_a_text_only_answerer_read_the_image(
+    tmp_path: Path,
+) -> None:
+    """`_has_stream_description` has to count a facts-only caption, or `ask` refuses the image.
+
+    A caption with no visible half sets no `[visual description:]` marker, only `[facts:]`.
+    `_route_generation` falls an image its answerer cannot take back to derived text only when
+    `_has_stream_description` says the image was described. The write-path test above covers the
+    asset cache, a different mechanism, and would pass unchanged even with the `[facts:]` clause
+    missing from `_has_stream_description`; a text-only answerer here would instead raise
+    `unsupported_modality` on exactly that gap.
+    """
+    describer = _StructuredDescriber("Fact: the yoga mat lives in the storage room")
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        vision_describer=describer,
+        answerer=_TextOnlyAnswerer(),
+    ) as memory:
+        memory.add(Blob(b"storage-room", "image/png", "storage.png"))
+        result = memory.ask("where does the yoga mat live")
+
+    assert "storage room" in result.answer
