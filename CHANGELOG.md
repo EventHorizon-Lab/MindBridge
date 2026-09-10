@@ -10,6 +10,46 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `ask()` can plan how to retrieve before it retrieves, behind `recall_planning` (default
+  `False`). Similarity answers "what is most like this"; it has no way to express what a count, a
+  list of "all", an adjacency, or "everything about this person" asks for, and measured on the
+  round's artifacts those question classes sit at the blind rate while the median gold rank on
+  point questions is already 1. With the setting on, the answerer returns a JSON recall plan --
+  a shape and up to six bounded reads over `similar`, `match`, `match` in a time window,
+  `neighbors` in corpus order, and `entity` -- which MindBridge validates and executes against
+  SQLite. The evidence set is a union with ID dedup and no recomputed score: exhaustive rows in
+  time order up to `recall_set_budget_chars`, then similarity rows by rank. The prompt states
+  what the reads were and whether the set is complete, so a count is licensed by completeness
+  instead of guessed. Under `answer_policy="best_effort"`, an answer the answerer flagged as
+  thin buys one replan round (`recall_rounds`, default 2) that is told what the first round
+  read. A backend without the new optional `RecallPlanningBackend.plan_recall` capability, a
+  planner error, and any plan the kernel will not run all fall back to the single search `ask`
+  has always made, so the default path is unchanged.
+- Every grounded answer prompt now asks for the whole question to be answered, in the shortest
+  complete form, with a list holding exactly the items the hits support. Measured on questions
+  the reader did answer rather than refuse: a question asking for two things came back with one,
+  a phrase-sized answer arrived as prose, and a list arrived padded with plausible items no hit
+  supported. The instruction is one sentence in the shared epilogue, so both answer policies
+  carry it.
+- `answer_policy` on `Memory.ask()`, `Memory.ask_stream()`, their `AsyncMemory` twins, REST
+  `AnswerRequest`, and the MCP `ask_memory` tool, with the new `AnswerPolicy` alias exported from
+  `mindbridge`. Abstaining is a policy the caller owns, not a fixed product behaviour: an
+  unanswerable question deserves a refusal, while a multiple-choice caller, or one whose protocol
+  gives no credit for "unknown", loses the whole answer to one. The default `"strict"` is
+  unchanged in behaviour and sends a byte-identical prompt. `"best_effort"` instructs the answerer
+  to commit to the single most likely answer the evidence supports -- for a multiple-choice
+  question, always one of the offered options -- and to flag low confidence with the structured
+  marker on its own line before the answer, which MindBridge reads and removes. The result then
+  carries the same `abstained` and `abstention_reason` alongside a usable `answer`, so the
+  confidence signal survives. A `"best_effort"` question that retrieved nothing at all now reaches
+  the model as a guess instead of returning early, and is still reported as abstained with
+  `AbstentionReason.NO_EVIDENCE`. `GenerationBackend.answer` and
+  `StreamingGenerationBackend.stream_answer` take the same keyword-only argument, defaulted, so a
+  custom backend only needs it once a caller opts in. The benchmark harness sets `"best_effort"`
+  for exactly `m3-bench-robot`, whose official evaluation credits no abstention and whose
+  question set holds no unanswerable item; every other task keeps `"strict"`. `--answer-policy`
+  and `benchmark.run.answer_policy` override that table for one run, and both the task and the
+  sample rows record the policy the request carried.
 - Local storage advances to schema v18. Evidence is stored as clauses: a `CONSOLIDATE` operation's
   cited set is one conjunction, separate operations are alternatives, and withdrawing a source
   retires only the clauses it belonged to, so `(A AND B) OR C` keeps `C` when `A` goes. Derived
@@ -417,6 +457,19 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   the kernel held no logger at all: silent degradation is how a capability dies unnoticed.
 
 ### Changed
+
+- **Breaking:** `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` declare
+  a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
+  `isinstance` checks the method name rather than its signature, so a custom backend written
+  against the two-argument signature keeps answering: MindBridge sends the keyword only when a
+  caller asks for something other than the default `"strict"`, and passing `"best_effort"` to a
+  backend that does not accept it raises `ModelError` with `reason="model_failed"`. Accept the
+  argument to support the policy.
+- The benchmark runner records the `answer_policy` each task's product arm requested, next to the
+  `arm` and `task` fields of every `results.jsonl` task row and every `samples.jsonl` sample row,
+  so a run that asked for a committed answer is distinguishable from every earlier run of the same
+  task. The baseline arms do not call `ask`, so their rows carry `null`. Purely additive: the
+  evaluation schema version is unchanged, and older result documents still load.
 
 - `AsyncMemory(memory)` now wraps an already-open `Memory` instead of repeating its constructor;
   open one with `AsyncMemory.from_plugins()`, `AsyncMemory.from_config()`, or

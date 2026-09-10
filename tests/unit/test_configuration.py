@@ -25,6 +25,7 @@ import mindbridge.configuration as configuration
 import mindbridge.models.openai_sdk as openai_sdk
 import mindbridge.recipes as recipes_module
 from mindbridge import (
+    AnswerPolicy,
     AnswerResult,
     Blob,
     EvidenceBasis,
@@ -223,7 +224,13 @@ def test_a_former_is_declaratively_reachable_but_never_implicit(
         formation_model = "gpt-5-mini"
         formation_space = "gpt-5-mini:mindbridge-formation-v1:test"
 
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+        ) -> AnswerResult:
             raise AssertionError("composition must not call the model")
 
         def form(
@@ -620,7 +627,13 @@ class _FormingEmbedder(TinyEmbedder):
     formation_space = "tiny-former:v1"
     generation_capabilities = frozenset({Modality.TEXT})
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+    ) -> AnswerResult:
         raise AssertionError("not called")
 
     def __init__(self) -> None:
@@ -796,7 +809,13 @@ class _ConsolidatingEmbedder(TinyEmbedder):
     def __init__(self) -> None:
         self.shown: list[tuple[str, ...]] = []
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+    ) -> AnswerResult:
         raise AssertionError("not called")
 
     def consolidate(

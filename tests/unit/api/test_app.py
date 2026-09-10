@@ -40,6 +40,7 @@ from mindbridge.exceptions import (
 from mindbridge.types import (
     AffectCue,
     AnswerChunk,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     Blob,
@@ -359,9 +360,12 @@ class FakeMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         self._fail()
-        self.calls.append(("ask", question, limit, memory_type, reference_at, link_identities))
+        self.calls.append(
+            ("ask", question, limit, memory_type, reference_at, link_identities, answer_policy)
+        )
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def ask_stream(
@@ -373,10 +377,19 @@ class FakeMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "strict",
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         self._fail()
         self.calls.append(
-            ("ask_stream", question, limit, memory_type, reference_at, link_identities)
+            (
+                "ask_stream",
+                question,
+                limit,
+                memory_type,
+                reference_at,
+                link_identities,
+                answer_policy,
+            )
         )
         result = AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
         yield AnswerChunk(text="The toolbox ")
@@ -621,7 +634,7 @@ def test_resource_routes_map_the_public_memory_values() -> None:
             OCCURRED_FROM,
             OCCURRED_UNTIL,
         ),
-        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW, False),
+        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW, False, "strict"),
         ("delete", "memory_1"),
     ]
     assert memory.close_count == 0
@@ -648,7 +661,7 @@ def test_answer_stream_sends_deltas_then_one_grounded_result_with_transport_timi
     assert 'data: {"text":"is blue."}' in response.text
     assert response.text.count("event: result\n") == 1
     assert '"answer":"The toolbox is blue."' in response.text
-    assert memory.calls == [("ask_stream", "What color is it?", 4, None, None, False)]
+    assert memory.calls == [("ask_stream", "What color is it?", 4, None, None, False, "strict")]
 
     span = next(
         span for span in exporter.get_finished_spans() if span.name == "mindbridge.http.request"
@@ -698,8 +711,9 @@ def test_answer_stream_failure_after_a_delta_ends_with_an_error_event() -> None:
             reference_at: datetime | None = None,
             scope: RetrievalScope | None = None,
             link_identities: bool = True,
+            answer_policy: AnswerPolicy = "strict",
         ) -> Generator[AnswerChunk, None, AnswerResult]:
-            del question, limit, memory_type, reference_at, scope, link_identities
+            del question, limit, memory_type, reference_at, scope, link_identities, answer_policy
             yield AnswerChunk(text="partial answer")
             failure = ModelError(
                 "generation request failed", reason="rate_limited", stage="generate"
@@ -746,8 +760,9 @@ async def test_answer_stream_closes_after_the_transport_send_fails(
             reference_at: datetime | None = None,
             scope: RetrievalScope | None = None,
             link_identities: bool = True,
+            answer_policy: AnswerPolicy = "strict",
         ) -> Generator[AnswerChunk, None, AnswerResult]:
-            del question, limit, memory_type, reference_at, scope, link_identities
+            del question, limit, memory_type, reference_at, scope, link_identities, answer_policy
             result = AnswerResult(answer="answer")
             try:
                 yield AnswerChunk(text="answer")
@@ -1762,15 +1777,15 @@ def test_answers_only_link_identities_when_embodied_operations_is_enabled() -> N
     with TestClient(create_app(memory=memory)) as client:
         client.post("/v1/answers", json={"question": "What color is it?"})
         client.post("/v1/answers/stream", json={"question": "What color is it?"})
-    assert memory.calls[-1][-1] is False
-    assert memory.calls[-2][-1] is False
+    assert memory.calls[-1][-2] is False
+    assert memory.calls[-2][-2] is False
 
     memory = FakeMemory()
     with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
         client.post("/v1/answers", json={"question": "What color is it?"})
         client.post("/v1/answers/stream", json={"question": "What color is it?"})
-    assert memory.calls[-1][-1] is True
-    assert memory.calls[-2][-1] is True
+    assert memory.calls[-1][-2] is True
+    assert memory.calls[-2][-2] is True
 
 
 def test_embodied_routes_map_memory_not_found() -> None:
@@ -2023,3 +2038,22 @@ def _hit() -> SearchHit:
         modality=Modality.TEXT,
         created_at=NOW,
     )
+
+
+def test_answer_requests_carry_the_caller_chosen_answer_policy() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        default = client.post("/v1/answers", json={"question": "What color is it?"})
+        chosen = client.post(
+            "/v1/answers",
+            json={"question": "What color is it?", "answer_policy": "best_effort"},
+        )
+        rejected = client.post(
+            "/v1/answers",
+            json={"question": "What color is it?", "answer_policy": "guess"},
+        )
+
+    assert default.status_code == 200
+    assert chosen.status_code == 200
+    assert rejected.status_code == 422
+    assert [call[-1] for call in memory.calls if call[0] == "ask"] == ["strict", "best_effort"]

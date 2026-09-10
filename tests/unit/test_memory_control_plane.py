@@ -20,6 +20,7 @@ from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
 
 from mindbridge import (
     AbstentionReason,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -3068,7 +3069,13 @@ class Abstainer:
 
     generation_capabilities = frozenset({Modality.TEXT})
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+    ) -> AnswerResult:
         return AnswerResult(
             answer="I do not know",
             hits=(),

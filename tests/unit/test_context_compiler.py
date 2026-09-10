@@ -18,6 +18,7 @@ from test_memory_control_plane import ScriptedConsolidator
 
 from mindbridge import (
     AffectCue,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -1971,7 +1972,13 @@ class _Answerer:
     generation_capabilities = frozenset({Modality.TEXT})
     generation_model = "compiler-test-answerer"
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+    ) -> AnswerResult:
         raise AssertionError("compile never generates text")
 
     def close(self) -> None:

@@ -4473,3 +4473,239 @@ def test_one_malformed_formation_reply_is_retried_once() -> None:
     assert [proposal.kind for proposal in proposals] == [MemoryKind.STATE]
     assert len(sent) == 2
     assert sent[0] == sent[1]
+
+
+def _answer_policy_transport(
+    requests: list[dict[str, object]],
+    reply: str,
+) -> httpx.MockTransport:
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(cast(dict[str, object], json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"index": 0, "message": {"content": reply}, "finish_reason": "stop"}]
+            },
+        )
+
+    return httpx.MockTransport(respond)
+
+
+def test_the_recall_planner_asks_for_json_at_temperature_zero() -> None:
+    """A plan decides which reads happen, so sampling it would read a different corpus twice.
+
+    The answer temperature is deliberately overridden: it is a prose control, and a composition
+    that wants varied answers must not get a varied retrieval program with them.
+    """
+    requests: list[dict[str, object]] = []
+    plan = '{"shape": "set", "steps": [{"op": "match", "terms": ["Cairo"]}]}'
+    with httpx.Client(transport=_answer_policy_transport(requests, plan)) as client:
+        returned = _model(_sdk_client(client), generation_temperature=0.8).plan_recall(
+            "how many times did I fly to Cairo?",
+            reference_at=NOW,
+            corpus_digest="30 records; modalities text",
+        )
+
+    assert returned == plan
+    payload = requests[0]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["temperature"] == 0.0
+    messages = cast(list[dict[str, str]], payload["messages"])
+    assert messages[0]["content"] == openai_backend._RECALL_PLAN_SYSTEM_PROMPT
+    assert messages[1]["content"] == (
+        f"Reference time: {NOW.isoformat()}\n"
+        "Corpus: 30 records; modalities text\n"
+        "Question: how many times did I fly to Cairo?"
+    )
+
+
+def test_the_recall_planner_prompt_describes_every_op_and_shape() -> None:
+    """The kernel rejects an op it does not know, so the prompt is the whole vocabulary."""
+    prompt = openai_backend._RECALL_PLAN_SYSTEM_PROMPT
+
+    for op in ("similar", "match", "window", "neighbors", "entity"):
+        assert f'"op": "{op}"' in prompt
+    for shape in ("point", "set", "sequence", "entity", "composite"):
+        assert f"- {shape}:" in prompt
+
+
+def test_a_planner_that_replied_with_nothing_reports_an_invalid_response() -> None:
+    """It is reported, not smoothed over: the kernel's own fallback is what keeps `ask` running.
+
+    A backend may also decline by returning None, which the protocol allows; this one answers
+    through the shared JSON path, and an empty completion there is a provider fault like any
+    other -- retried once, then raised.
+    """
+    requests: list[dict[str, object]] = []
+    with (
+        httpx.Client(transport=_answer_policy_transport(requests, "   ")) as client,
+        pytest.raises(ModelError, match="recall plan response was invalid") as failure,
+    ):
+        _model(_sdk_client(client)).plan_recall(
+            "how many?",
+            reference_at=NOW,
+            corpus_digest="empty",
+        )
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "plan"
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ({"question": "  "}, "question must be non-empty text"),
+        ({"reference_at": NOW.replace(tzinfo=None)}, "reference_at must be a timezone-aware"),
+        ({"corpus_digest": 3}, "corpus_digest must be text"),
+    ],
+    ids=("blank-question", "naive-clock", "digest-not-text"),
+)
+def test_the_recall_planner_rejects_an_unusable_request(
+    arguments: dict[str, object],
+    error: str,
+) -> None:
+    requests: list[dict[str, object]] = []
+    call: dict[str, object] = {
+        "question": "how many?",
+        "reference_at": NOW,
+        "corpus_digest": "empty",
+        **arguments,
+    }
+    with (
+        httpx.Client(transport=_answer_policy_transport(requests, "{}")) as client,
+        pytest.raises(ValidationError, match=error),
+    ):
+        _model(_sdk_client(client)).plan_recall(**call)  # type: ignore[arg-type]
+
+    assert requests == []
+
+
+def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstention() -> None:
+    """`answer_policy` is opt-in: the default path must be byte-identical to what it was."""
+    requests: list[dict[str, object]] = []
+    hit = SearchHit(id="memory_1", content="the toolbox is blue", score=0.9, created_at=NOW)
+    with httpx.Client(transport=_answer_policy_transport(requests, "Blue.")) as client:
+        model = _model(_sdk_client(client))
+        model.answer("What colour?", (hit,))
+        model.answer("What colour?", (hit,), answer_policy="strict")
+
+    assert requests[0] == requests[1]
+    assert requests[0]["messages"] == [
+        {"role": "system", "content": openai_backend._GROUNDED_SYSTEM_PROMPT},
+        cast(list[dict[str, object]], requests[0]["messages"])[1],
+    ]
+    assert (
+        f"If the hits do not contain enough evidence, reply with exactly "
+        f"{openai_backend._ABSTENTION_MARKER} and nothing else, whatever language the question "
+        "uses."
+    ) in openai_backend._GROUNDED_SYSTEM_PROMPT
+
+
+def test_both_policies_ask_for_a_whole_answer_in_the_shortest_complete_form() -> None:
+    """Answer shaping is not a policy: a refusal-capable reader shapes its answers the same way.
+
+    Three losses measured on questions the reader did answer -- half of a two-part question, a
+    phrase padded into prose, a list padded past the evidence -- so the instruction lives in the
+    shared epilogue and every grounded system prompt carries it.
+    """
+    for prompt in (
+        openai_backend._GROUNDED_SYSTEM_PROMPT,
+        openai_backend._BEST_EFFORT_SYSTEM_PROMPT,
+    ):
+        assert "Answer every part of the question that was asked" in prompt
+        assert "shortest complete answer" in prompt
+        assert "include exactly the items the hits support" in prompt
+
+
+def test_best_effort_asks_for_a_committed_answer_and_reports_the_marker_separately() -> None:
+    requests: list[dict[str, object]] = []
+    hit = SearchHit(
+        id="memory_1", content="a blue crate stood by the door", score=0.4, created_at=NOW
+    )
+    reply = f"{openai_backend._ABSTENTION_MARKER}\nThe toolbox is probably blue."
+    with httpx.Client(transport=_answer_policy_transport(requests, reply)) as client:
+        result = _model(_sdk_client(client)).answer(
+            "What colour is the toolbox?", (hit,), answer_policy="best_effort"
+        )
+
+    system = cast(list[dict[str, str]], requests[0]["messages"])[0]["content"]
+    assert system == openai_backend._BEST_EFFORT_SYSTEM_PROMPT
+    assert "do not decline" in system and "multiple-choice" in system
+    # The marker is a confidence flag here, not the answer: it is reported, then cut out.
+    assert result.answer == "The toolbox is probably blue."
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    assert result.hits == (hit,)
+
+
+def test_best_effort_still_guesses_when_nothing_was_retrieved() -> None:
+    """The early no-evidence return is what `best_effort` exists to skip."""
+    requests: list[dict[str, object]] = []
+    with httpx.Client(transport=_answer_policy_transport(requests, "Probably blue.")) as client:
+        result = _model(_sdk_client(client)).answer(
+            "What colour is the toolbox?", (), answer_policy="best_effort"
+        )
+
+    assert len(requests) == 1
+    assert result.answer == "Probably blue."
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.NO_EVIDENCE
+
+
+def test_best_effort_falls_back_to_the_refusal_sentence_when_the_model_only_marks() -> None:
+    requests: list[dict[str, object]] = []
+    hit = SearchHit(id="memory_1", content="unrelated", score=0.2, created_at=NOW)
+    with httpx.Client(
+        transport=_answer_policy_transport(requests, openai_backend._ABSTENTION_MARKER)
+    ) as client:
+        result = _model(_sdk_client(client)).answer(
+            "What colour?", (hit,), answer_policy="best_effort"
+        )
+
+    assert result.answer == UNKNOWN_ANSWER
+    assert result.abstained is True
+
+
+def test_streaming_best_effort_yields_the_marker_but_completes_with_the_clean_answer() -> None:
+    """The deltas are the provider's; the completion is what a buffering caller reports."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        deltas = (f"{openai_backend._ABSTENTION_MARKER}\n", "Probably blue.")
+        chunks = [
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": delta},
+                        "finish_reason": "stop" if delta is deltas[-1] else None,
+                    }
+                ],
+            }
+            for delta in deltas
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    hit = SearchHit(id="memory_1", content="a blue crate", score=0.4, created_at=NOW)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        stream = _model(_sdk_client(client)).stream_answer(
+            ModelInput(text="What colour?"), (hit,), answer_policy="best_effort"
+        )
+        deltas = []
+        while True:
+            try:
+                deltas.append(next(stream))
+            except StopIteration as completed:
+                grounded = completed.value
+                break
+
+    assert "".join(deltas) == f"{openai_backend._ABSTENTION_MARKER}\nProbably blue."
+    assert grounded.answer == "Probably blue."
+    assert grounded.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    assert tuple(grounded) == (hit,)

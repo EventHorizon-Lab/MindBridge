@@ -5,11 +5,13 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.types import (
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     FormationProposal,
@@ -329,7 +331,13 @@ class GenerationBackend(Protocol):
     @property
     def generation_capabilities(self) -> frozenset[Modality]: ...
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult: ...
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+    ) -> AnswerResult: ...
 
     def close(self) -> None: ...
 
@@ -342,7 +350,32 @@ class StreamingGenerationBackend(Protocol):
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
     ) -> Iterator[str]: ...
+
+
+@runtime_checkable
+class RecallPlanningBackend(Protocol):
+    """Optional generation capability that plans how to retrieve for one question.
+
+    The return value is the model's own JSON text, which the kernel validates: a backend that
+    cannot plan, or one whose plan is unusable, costs the caller a fallback to plain similarity
+    search and nothing else. `corpus_digest` is one line describing what is in the store, so a
+    plan cannot ask for a time span or a modality that does not exist. `attempted` describes what
+    an earlier round of the same question already read and why it was not enough; it is empty on
+    the first round and sent only when it is not, so a backend written against the shorter
+    signature keeps planning.
+    """
+
+    def plan_recall(
+        self,
+        question: str,
+        *,
+        reference_at: datetime,
+        corpus_digest: str,
+        attempted: str = "",
+    ) -> str | None: ...
 
 
 @runtime_checkable
