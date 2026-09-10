@@ -116,6 +116,17 @@ _FUNCTIONAL_CLAIM_PARAMETERS = (
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
 _MEMORY_MODALITIES = frozenset({"text", "image", "video", "audio", "omni"})
+# The event time the recall primitives order and window by. A record with no stated `occurred_at`
+# is placed at the time it was stored, which is the same substitution the answer prompt tells the
+# reader about, so one timeline covers a corpus that dates some records and not others.
+_RECALL_EVENT_TIME = "COALESCE(occurred_at, created_at)"
+# NFKC casefold as a SQL function, so a substring predicate folds both sides the same way.
+# SQLite's own `lower()` is ASCII-only, and a term that differs from the content only by an
+# accent or a full-width digit would silently match nothing.
+_RECALL_FOLD_FUNCTION = "mindbridge_fold"
+# One primitive call reads at most this many rows whatever the caller asks for. It bounds the
+# hydration behind it, not the scan: a substring predicate reads the table either way.
+_RECALL_MAX_ROWS = 500
 _MEMORY_TYPES = frozenset({"semantic", "episodic", "procedural"})
 _ASSET_MODALITIES = frozenset({"image", "video", "audio"})
 _SHA256_HEX_LENGTH = 64
@@ -2489,6 +2500,269 @@ class LocalStore:
                 context=contexts.get(_row_text(row, "memory_id")),
             )
             for row in rows
+        )
+
+    def match_memories(
+        self,
+        terms: Sequence[str] = (),
+        *,
+        any_of: bool = True,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+        modality: str | None = None,
+        memory_type: str | None = None,
+        max_rows: int = 200,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
+    ) -> tuple[StoredMemory, ...]:
+        """Return every active memory whose content contains the terms, oldest first.
+
+        This is the exhaustive counterpart to search: the answer is defined by the predicate and
+        not by a relevance order, so a caller can say "these are all of them" up to `max_rows`.
+        Matching is an NFKC case-folded substring over `content`, which already carries
+        transcripts, visual descriptions and speech prose, so a media memory is reachable by the
+        words its own record holds. No terms means the predicate is the time window alone.
+
+        The scope arguments are `read_memories`'s, and hydration goes through it, so bitemporal,
+        place, identity and metric scope have exactly one implementation.
+        """
+        folded = _recall_terms(terms)
+        _require_recall_window(occurred_from, occurred_until, require_both=False)
+        _require_recall_filters(modality, memory_type, max_rows)
+        selected = self._recall_memory_ids(
+            folded,
+            any_of=any_of,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+            modality=modality,
+            memory_type=memory_type,
+            max_rows=max_rows,
+            place_id=place_id,
+            identity_id=identity_id,
+        )
+        return self._hydrate_recall(
+            selected,
+            valid_at=valid_at,
+            known_at=known_at,
+            near=near,
+            radius_m=radius_m,
+            place_id=place_id,
+            identity_id=identity_id,
+        )
+
+    def memories_in_window(
+        self,
+        *,
+        occurred_from: datetime,
+        occurred_until: datetime,
+        modality: str | None = None,
+        memory_type: str | None = None,
+        max_rows: int = 200,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
+    ) -> tuple[StoredMemory, ...]:
+        """Return every active memory whose event time overlaps the window, oldest first.
+
+        The window is half-open, start inclusive, and it is required: a window primitive with no
+        bounds is the whole store, which is `list_memories`. A memory with no `occurred_at` is
+        placed by its `created_at`, the same substitution the answer prompt describes, so a
+        corpus that never states event times still has a timeline.
+        """
+        _require_recall_window(occurred_from, occurred_until, require_both=True)
+        return self.match_memories(
+            (),
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+            modality=modality,
+            memory_type=memory_type,
+            max_rows=max_rows,
+            valid_at=valid_at,
+            known_at=known_at,
+            near=near,
+            radius_m=radius_m,
+            place_id=place_id,
+            identity_id=identity_id,
+        )
+
+    def neighbor_memories(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        before: int = 1,
+        after: int = 1,
+        max_rows: int = 200,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
+    ) -> tuple[StoredMemory, ...]:
+        """Return the active memories adjacent to the anchors in corpus order, oldest first.
+
+        Corpus order is `(effective event time, rowid)`. `memory_records` is a rowid table and
+        every adapter writes one turn per `add`, in turn order, so the rowid breaks ties between
+        records that share a timestamp by the order they arrived -- which is what "what did I say
+        just before that" asks for. The anchors themselves are not returned: the step that found
+        them already holds them.
+        """
+        anchors = tuple(dict.fromkeys(memory_ids))
+        for memory_id in anchors:
+            _require_identifier(memory_id, "memory_id")
+        _require_recall_neighbors(before, after, max_rows)
+        if not anchors:
+            return ()
+        # ponytail: two statements per anchor, each an index-less ordered scan bounded by
+        # `before`/`after`. Anchors are bounded by the caller's plan; if a plan ever wants
+        # hundreds, a single window-function query over the whole ordered set is the upgrade.
+        found: list[tuple[str, int, str]] = []
+        with self._read_transaction() as connection:
+            identity_clause, identity_parameters = _identity_scope(connection, identity_id)
+            if identity_clause is None:
+                return ()
+            for memory_id in anchors:
+                position = connection.execute(
+                    f"""
+                    SELECT {_RECALL_EVENT_TIME} AS event_time, rowid AS row_position
+                    FROM memory_records
+                    WHERE memory_id = ? AND forgotten_at IS NULL
+                    """,
+                    (memory_id,),
+                ).fetchone()
+                if position is None:
+                    continue
+                found.extend(
+                    _neighbor_ids(
+                        connection,
+                        position,
+                        before=before,
+                        after=after,
+                        place_id=place_id,
+                        identity_clause=identity_clause,
+                        identity_parameters=identity_parameters,
+                    )
+                )
+        anchor_ids = set(anchors)
+        ordered = tuple(
+            dict.fromkeys(
+                memory_id
+                for _event_time, _row_position, memory_id in sorted(found)
+                if memory_id not in anchor_ids
+            )
+        )
+        return self._hydrate_recall(
+            ordered[:max_rows],
+            valid_at=valid_at,
+            known_at=known_at,
+            near=near,
+            radius_m=radius_m,
+            place_id=place_id,
+            identity_id=identity_id,
+        )
+
+    def identity_id_for_name(self, name: str) -> str | None:
+        """Resolve a display name to the canonical identity ID that carries it.
+
+        The comparison is the NFKC casefold the rest of the kernel uses, and the lowest matching
+        ID wins so two identities registered under one name resolve deterministically. A name no
+        identity was registered under returns None, which leaves the caller to fall back on
+        matching the name as text.
+        """
+        wanted = _canonical_subject(name)
+        if wanted is None:
+            return None
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT identity_id, name
+                FROM identities
+                WHERE name IS NOT NULL
+                ORDER BY identity_id
+                """
+            ).fetchall()
+            for row in rows:
+                if _canonical_subject(_row_text(row, "name")) == wanted:
+                    return _resolve_identity_id(connection, _row_text(row, "identity_id"))
+        return None
+
+    def _recall_memory_ids(
+        self,
+        terms: tuple[str, ...],
+        *,
+        any_of: bool,
+        occurred_from: datetime | None,
+        occurred_until: datetime | None,
+        modality: str | None,
+        memory_type: str | None,
+        max_rows: int,
+        place_id: str | None,
+        identity_id: str | None,
+    ) -> tuple[str, ...]:
+        """Select the bounded, chronologically ordered ID set one recall predicate defines."""
+        clauses: list[str] = []
+        parameters: list[object] = []
+        time_clause, time_parameters = _recall_time_clause(occurred_from, occurred_until)
+        clauses.append(time_clause)
+        parameters.extend(time_parameters)
+        for column, value in (("modality", modality), ("memory_type", memory_type)):
+            if value is not None:
+                clauses.append(f"AND {column} = ?")
+                parameters.append(value)
+        if place_id is not None:
+            clauses.append("AND place_id = ?")
+            parameters.append(place_id)
+        term_clause, term_parameters = _recall_term_clause(terms, any_of=any_of)
+        clauses.append(term_clause)
+        parameters.extend(term_parameters)
+        with self._read_transaction() as connection:
+            identity_clause, identity_parameters = _identity_scope(connection, identity_id)
+            if identity_clause is None:
+                return ()
+            rows = connection.execute(
+                f"""
+                SELECT memory_id
+                FROM memory_records
+                WHERE forgotten_at IS NULL
+                {" ".join(clauses)}
+                {identity_clause}
+                ORDER BY {_RECALL_EVENT_TIME}, rowid
+                LIMIT ?
+                """,
+                (*parameters, *identity_parameters, max_rows),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
+
+    def _hydrate_recall(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        valid_at: datetime | None,
+        known_at: datetime | None,
+        near: SpatialContext | None,
+        radius_m: float | None,
+        place_id: str | None,
+        identity_id: str | None,
+    ) -> tuple[StoredMemory, ...]:
+        """Hydrate a selected ID set through the one authoritative scoped read."""
+        if not memory_ids:
+            return ()
+        return self.read_memories(
+            memory_ids,
+            valid_at=valid_at,
+            known_at=known_at,
+            near=near,
+            radius_m=radius_m,
+            place_id=place_id,
+            identity_id=identity_id,
+            active_only=True,
         )
 
     def reinforce_memories(self, memory_ids: Sequence[str], *, accessed_at: datetime) -> int:
@@ -4985,6 +5259,7 @@ class LocalStore:
                 connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
             connection.execute("PRAGMA busy_timeout = 30000")
+            connection.create_function(_RECALL_FOLD_FUNCTION, 1, _recall_fold, deterministic=True)
             if secure_delete:
                 # Zero-fill freed cells instead of leaving them legible in free pages. Scoped
                 # to erasure: it costs extra page writes on every DELETE, and the outbox
@@ -9091,6 +9366,140 @@ def _index_document_from_row(
         place_id=_optional_row_text(row, "place_id"),
         identity_ids=identity_ids.get(_row_text(row, "memory_id"), ()),
     )
+
+
+def _recall_fold(value: str) -> str:
+    """Fold text the one way the recall primitives compare it: NFKC, case-folded."""
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _recall_terms(terms: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(terms, (str, bytes)):
+        raise ValueError("terms must be a sequence of strings")
+    folded: list[str] = []
+    for term in terms:
+        if not isinstance(term, str) or not term.strip():
+            raise ValueError("every term must be non-empty text")
+        if len(term) > 200:
+            raise ValueError("a term must be at most 200 characters")
+        folded.append(_recall_fold(term.strip()))
+    return tuple(dict.fromkeys(folded))
+
+
+def _require_recall_window(
+    occurred_from: datetime | None,
+    occurred_until: datetime | None,
+    *,
+    require_both: bool,
+) -> None:
+    if require_both and (occurred_from is None or occurred_until is None):
+        raise ValueError("occurred_from and occurred_until are required")
+    if occurred_from is not None:
+        _require_aware(occurred_from, "occurred_from")
+    if occurred_until is not None:
+        _require_aware(occurred_until, "occurred_until")
+    if occurred_from is not None and occurred_until is not None and occurred_until <= occurred_from:
+        raise ValueError("occurred_until must be later than occurred_from")
+
+
+def _require_recall_filters(modality: str | None, memory_type: str | None, max_rows: int) -> None:
+    if modality is not None and modality not in _MEMORY_MODALITIES:
+        raise ValueError("modality is invalid")
+    if memory_type is not None and memory_type not in _MEMORY_TYPES:
+        raise ValueError("memory_type is invalid")
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int):
+        raise ValueError(f"max_rows must be between 1 and {_RECALL_MAX_ROWS}")
+    if not 1 <= max_rows <= _RECALL_MAX_ROWS:
+        raise ValueError(f"max_rows must be between 1 and {_RECALL_MAX_ROWS}")
+
+
+def _require_recall_neighbors(before: int, after: int, max_rows: int) -> None:
+    for name, value in (("before", before), ("after", after)):
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 50:
+            raise ValueError(f"{name} must be between 0 and 50")
+    if before == 0 and after == 0:
+        raise ValueError("before and after must not both be zero")
+    _require_recall_filters(None, None, max_rows)
+
+
+def _recall_time_clause(
+    occurred_from: datetime | None,
+    occurred_until: datetime | None,
+) -> tuple[str, tuple[object, ...]]:
+    """Bound the effective event interval, start inclusive and end exclusive.
+
+    `embedding_ids_in_range` bounds the same interval but drops rows with no `occurred_at`,
+    because an index pass has an unfiltered fallback behind it. These primitives are the answer
+    themselves, so a record with no stated event time is placed at its `created_at` rather than
+    left out of every window.
+    """
+    clauses: list[str] = []
+    parameters: list[object] = []
+    if occurred_from is not None:
+        start = _datetime_text(occurred_from)
+        clauses.append(
+            f"""AND (
+                (occurred_end IS NOT NULL AND occurred_end > ?)
+                OR (occurred_end IS NULL AND {_RECALL_EVENT_TIME} >= ?)
+            )"""
+        )
+        parameters.extend((start, start))
+    if occurred_until is not None:
+        clauses.append(f"AND {_RECALL_EVENT_TIME} < ?")
+        parameters.append(_datetime_text(occurred_until))
+    return " ".join(clauses), tuple(parameters)
+
+
+def _recall_term_clause(terms: Sequence[str], *, any_of: bool) -> tuple[str, tuple[object, ...]]:
+    if not terms:
+        return "", ()
+    if not isinstance(any_of, bool):
+        raise ValueError("any_of must be a boolean")
+    joiner = " OR " if any_of else " AND "
+    tests = joiner.join(f"instr({_RECALL_FOLD_FUNCTION}(content), ?) > 0" for _term in terms)
+    return f"AND ({tests})", tuple(terms)
+
+
+def _neighbor_ids(
+    connection: sqlite3.Connection,
+    position: sqlite3.Row,
+    *,
+    before: int,
+    after: int,
+    place_id: str | None,
+    identity_clause: str,
+    identity_parameters: tuple[object, ...],
+) -> tuple[tuple[str, int, str], ...]:
+    """Read the rows immediately around one anchor, each with its own order key."""
+    event_time = position["event_time"]
+    row_position = position["row_position"]
+    place_clause = "" if place_id is None else "AND place_id = ?"
+    place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
+    found: list[tuple[str, int, str]] = []
+    for comparison, order, count in (("<", "DESC", before), (">", "ASC", after)):
+        if count == 0:
+            continue
+        rows = connection.execute(
+            f"""
+            SELECT memory_id, {_RECALL_EVENT_TIME} AS event_time, rowid AS row_position
+            FROM memory_records
+            WHERE forgotten_at IS NULL
+              AND (
+                  {_RECALL_EVENT_TIME} {comparison} ?
+                  OR ({_RECALL_EVENT_TIME} = ? AND rowid {comparison} ?)
+              )
+              {place_clause}
+              {identity_clause}
+            ORDER BY {_RECALL_EVENT_TIME} {order}, rowid {order}
+            LIMIT ?
+            """,
+            (event_time, event_time, row_position, *place_parameters, *identity_parameters, count),
+        ).fetchall()
+        found.extend(
+            (_row_text(row, "event_time"), int(row["row_position"]), _row_text(row, "memory_id"))
+            for row in rows
+        )
+    return tuple(found)
 
 
 def _identity_scope(
