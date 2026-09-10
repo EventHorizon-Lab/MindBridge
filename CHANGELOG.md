@@ -18,7 +18,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   a shape and up to six bounded reads over `similar`, `match`, `match` in a time window,
   `neighbors` in corpus order, and `entity` -- which MindBridge validates and executes against
   SQLite. The evidence set is a union with ID dedup and no recomputed score: exhaustive rows in
-  time order up to `recall_set_budget_chars`, then similarity rows by rank. The prompt states
+  time order up to `recall_set_budget_chars` -- never past `evidence_budget_chars` when a caller
+  set one, and never more than twice `limit` media rows, since grounding media runs recognition
+  over it -- then similarity rows by rank. The prompt states
   what the reads were and whether the set is complete, so a count is licensed by completeness
   instead of guessed. Under `answer_policy="best_effort"`, an answer the answerer flagged as
   thin buys one replan round (`recall_rounds`, default 2) that is told what the first round

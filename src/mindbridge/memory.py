@@ -310,6 +310,11 @@ _STREAM_GROUP_SECONDS = 0.25
 _REINDEX_PAGE_SIZE = 256
 _REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 100
+# How many media rows an exhaustive plan may ground on, as a multiple of the window the caller
+# asked for. Media is the one kind of evidence whose grounding costs writes -- face and speech
+# recognition run on each row before the answer call, and again on a replan -- so a set read that
+# matched every clip in the corpus is bounded here rather than by the character budget alone.
+_RECALL_MEDIA_FACTOR = 2
 # One empty recall is a question nobody had asked before; two near-equal ones inside the
 # configured window is a gap. Not configurable: below two there is no repetition to speak of, and
 # a host that wants a stricter threshold narrows the window instead.
@@ -7527,7 +7532,16 @@ class Memory:
         if program is None or not program.plan.exhaustive:
             budget = self._evidence_budget
             return _grounding_hits(context.ranked, context.limit, budget_chars=budget), None
-        hits, omitted = _budgeted_recall(program, self._recall_set_budget)
+        hits, omitted = _budgeted_recall(
+            program,
+            # `evidence_budget_chars` is what a caller who cares about prompt size sets, and a
+            # set plan used to walk straight past it. The set budget may narrow that ceiling and
+            # never widen it; with no ceiling set, the set budget is the only bound.
+            self._recall_set_budget
+            if self._evidence_budget is None
+            else min(self._recall_set_budget, self._evidence_budget),
+            media_limit=_RECALL_MEDIA_FACTOR * context.limit,
+        )
         return hits, recall_note(program, omitted=omitted)
 
     def _replan_wanted(
@@ -11223,23 +11237,34 @@ def _batch_values(
 def _budgeted_recall(
     program: RecallResult,
     budget_chars: int,
+    *,
+    media_limit: int,
 ) -> tuple[tuple[SearchHit, ...], int]:
     """Ground on the set the program produced, chronologically, up to the character budget.
 
-    Exhaustive rows come first because they are the answer's shape; similarity rows spend what
-    is left. The returned count is how many rows the budget left out, which is what turns a
-    complete set into an incomplete one for the reader.
+    Exhaustive rows come first because they are the answer's shape; similarity rows spend what is
+    left. The returned count is how many of the *exhaustive* rows were left out, which is what
+    turns a complete set into an incomplete one for the reader -- a ranking cut short is still a
+    ranking, and counting one of its rows as a missing "matched record" told a reader holding
+    every record its predicate matched that it did not have them.
+
+    Media rows are capped separately. An exhaustive read can name every clip in a corpus, and
+    each media row reaching the answer call carries face and speech recognition -- writes, paid
+    again on every replan round -- so a set's media rows stop at `media_limit` while its text
+    rows do not.
     """
     selected: builtins.list[SearchHit] = []
     spent = 0
+    media = 0
     omitted = 0
-    for hit in program.hits:
-        cost = len(hit.content)
-        if selected and spent + cost > budget_chars:
-            omitted += 1
+    for index, hit in enumerate(program.hits):
+        cost = evidence_cost(hit)
+        if (selected and spent + cost > budget_chars) or (hit.assets and media >= media_limit):
+            omitted += 1 if index < len(program.exhaustive) else 0
             continue
         selected.append(hit)
         spent += cost
+        media += 1 if hit.assets else 0
     return tuple(selected), omitted
 
 

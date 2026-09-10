@@ -7284,6 +7284,78 @@ def test_a_truncated_set_tells_the_reader_it_is_not_a_set(tmp_path: Path) -> Non
     assert "do not state a total" in question.text
 
 
+def test_a_cut_similarity_row_does_not_make_the_matched_set_incomplete(tmp_path: Path) -> None:
+    """Completeness is a property of the predicate, not of how deep the ranking got to go.
+
+    Counting a dropped `similar` row as a missing "matched record" told a reader holding every
+    record the predicate matched that it held an incomplete set, which withdraws exactly the
+    licence -- to state a total -- that running the set read bought.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "set",
+        {"op": "match", "terms": ["wrench"]},
+        {"op": "similar", "query": "wrenches", "k": 3},
+    )
+    with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=30) as memory:
+        _dated_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=3)
+
+    question, grounded = models.answer_calls[-1]
+    # Both matched records are grounded; the crate is a ranking row the budget had no room for.
+    assert [hit.content for hit in grounded] == ["a red wrench", "a blue wrench"]
+    assert "every record those reads matched, in time order" in question.text
+    assert "do not state a total" not in question.text
+
+
+def test_a_set_plan_grounds_within_the_callers_own_evidence_budget(tmp_path: Path) -> None:
+    """A caller who bounded the prompt bounded it for every question shape, not just ranked ones."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        evidence_budget_chars=20,
+    ) as memory:
+        _dated_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?")
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == ["a red wrench"]
+    assert "1 further matched records are not shown" in question.text
+
+
+def test_a_set_plan_grounds_a_bounded_number_of_media_rows(tmp_path: Path) -> None:
+    """Every grounded media row is recognition work, so a set read may not hand over the corpus.
+
+    Face and speech recognition run over the media that reaches the answer call -- writes, and
+    paid again on a replan -- so the cap is twice the window the caller asked for. Text rows in
+    the same set are unaffected, and the rows the cap dropped are reported as not shown.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["frame"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        for index in range(4):
+            memory.add(
+                (f"frame {index}", Blob(str(index).encode(), "image/png")),
+                occurred_at=DAY + timedelta(days=index),
+            )
+        memory.add("frame notes, in text", occurred_at=DAY + timedelta(days=9))
+
+        memory.ask("how many frames?", limit=1)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        "frame 0",
+        "frame 1",
+        "frame notes, in text",
+    ]
+    assert "2 further matched records are not shown" in question.text
+
+
 def test_a_read_that_filled_its_own_bound_is_reported_as_incomplete(tmp_path: Path) -> None:
     models = _FakeModels()
     models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"], "max_rows": 1})
