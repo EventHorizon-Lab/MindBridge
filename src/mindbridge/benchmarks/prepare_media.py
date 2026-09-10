@@ -243,9 +243,12 @@ def _acquire_selected(
         acquire_media(
             spec,
             root,
+            # MEMLENS answers hide in its images, but the release ships them in a
+            # separate archive and the published captions alone are the protocol
+            # this task shipped with, so an image-less checkout still runs.
             patterns=patterns,
             download=download,
-            allow_missing=spec.name == "supermemory-vqa",
+            allow_missing=spec.name == "supermemory-vqa" or spec.name.startswith("memlens-"),
             announce=announce,
         )
     return {}

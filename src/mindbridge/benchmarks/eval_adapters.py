@@ -834,7 +834,7 @@ def _openeqa(
 def _memlens(
     spec: TaskSpec,
     dataset: Path,
-    _media: MediaResolver,
+    media: MediaResolver,
     root: Path,
     limit: Limit,
     offset: int,
@@ -847,6 +847,7 @@ def _memlens(
     if subset_path.exists():
         wanted = set(load_memlens_agent_subset(subset_path))
         questions = tuple(question for question in questions if question.question_id in wanted)
+    images = None if media.root is None else media.root.expanduser().resolve()
     units = []
     for question in _selected(questions, limit, offset):
         memories = tuple(
@@ -859,6 +860,7 @@ def _memlens(
                         for image in turn.images
                         if image.caption
                     ),
+                    *_present_images(images, tuple(image.source_file for image in turn.images)),
                 ),
                 occurred_at=session.occurred_at,
             )
@@ -888,6 +890,24 @@ def _memlens(
             )
         )
     return tuple(units)
+
+
+def _present_images(root: Path | None, names: Sequence[str]) -> tuple[Path, ...]:
+    """Return the published image files that are present, ignoring the absent ones.
+
+    MEMLENS hides most of its answers inside the images, but the release ships them
+    as a separate archive, so a checkout without them keeps the published captions
+    as its only visual evidence instead of failing.
+    """
+    if root is None:
+        return ()
+    return tuple(
+        path
+        for name in names
+        if (path := (root / name).resolve()).suffix.casefold() in _MEDIA_SUFFIXES
+        and path.is_file()
+        and path.is_relative_to(root)
+    )
 
 
 def _mm_lifelong(
