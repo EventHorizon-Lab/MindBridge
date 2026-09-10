@@ -54,6 +54,12 @@ GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
 FORMATION_PROPOSALS_DROPPED = "mindbridge.formation.dropped_proposals"
 FORMATION_PROPOSALS_REFUSED = "mindbridge.formation.refused_proposals"
 VISION_BATCHES_FAILED = "mindbridge.vision.failed_batches"
+# A batch that failed but was still inside its retry budget when it did: it did not lose
+# its caption, only pay another attempt for it. Counted apart from `VISION_BATCHES_FAILED`,
+# which answers "how many memories lost their caption" -- an attempt on the way to success
+# is not one, and summing both into one counter could not tell a provider that throttled an
+# ingest from one that ate it.
+VISION_BATCHES_RETRIED = "mindbridge.vision.retried_batches"
 IDENTITY_OBSERVATIONS = "mindbridge.identity.observations"
 IDENTITY_MATCHED = "mindbridge.identity.matched_existing"
 IDENTITY_IDENTITIES = "mindbridge.identity.identities"

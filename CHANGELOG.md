@@ -455,6 +455,33 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   caption, and a configured model that cannot accept a modality so derived text is used instead.
   Observability rode entirely on OpenTelemetry spans, which are no-ops when the SDK is absent, and
   the kernel held no logger at all: silent degradation is how a capability dies unnoticed.
+- A `[facts:<asset>]` document section, split from `[visual description:<asset>]`. A describer's
+  reserved `Fact:` lines -- short declarative statements that stay true after the clip ends -- are
+  cut out of the visible caption and indexed under their own marker, both reachable through the
+  ordinary lexical and dense routes; the visible half never carries a `Fact:` line and the facts
+  half never carries the visible prose.
+- Automatic `IDENTIFY` from a caption's own stated name. A fact reading `speaker_N is called
+  <name>`, where `speaker_N` resolves to a label this same asset's own diarisation produced, binds
+  the name through the same `IDENTIFY` assertion `register_identity` writes -- auditable through
+  `operations()`, reversible through `rollback()` -- reachable from both `add()` and `settle()`
+  with no extra model call, since the name is already in the caption. A standing name a host
+  registered is never overwritten by one a model read off a transcript, and a label no recognizer
+  in the clip produced binds nobody; both drop into `mindbridge.identity.names_refused` rather
+  than only a log line, alongside `mindbridge.identity.names_bound`.
+- Vision description retries a throttled or overloaded endpoint before falling open to an
+  uncaptioned write. A batch refused as `rate_limited`, on a timeout, a dropped connection, or a
+  5xx is described again after three bounded waits (1s, 4s, 16s; configurable only by patching the
+  module constant) rather than losing its caption on the first refusal a burst produces. An attempt
+  that still has a wait left is counted on `mindbridge.vision.retried_batches`, apart from
+  `mindbridge.vision.failed_batches`, which now counts only the attempt that actually lost the
+  caption -- summing every attempt into one counter could not tell a provider that throttled an
+  ingest from one that ate it. Also retried: a 400 whose provider message says it aborted
+  `response_format` JSON generation mid-reply ("Model output became abnormal ... The generation
+  was aborted ... Please retry the request"), measured live on an inner-prism gateway where an
+  identical retry 5s later succeeds. `request_rejected` otherwise stays a permanent 400 and out of
+  the closed `RETRYABLE_REASONS` vocabulary -- this is a narrow message match scoped to describe's
+  own retry loop, not a reclassification, and an ordinary rejected request (an unsupported image)
+  still fails open on the first attempt.
 
 ### Changed
 
@@ -547,6 +574,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   caption prompt, so editing the prompt invalidates captions written under the old one. Serving a
   stale caption is the one failure nothing downstream can detect, since it is indistinguishable
   from a fresh one once it is inside a searchable document.
+- `OpenAIModels.vision_space`'s digested recipe bumps to `mindbridge-vision-v2`, folding in the
+  labelled-line prompt and the `Fact:`/`IDENTIFY` contract described above. A caption cached under
+  the old recipe is invisible to the new one, not wrong: the next write that cites the asset pays
+  one fresh describe call and the store then holds both, keyed by their own space. A store already
+  on v1 keeps serving v1 captions to any composition still pointed at v1; there is no in-place
+  migration, so a corpus that wants every asset re-described under the new prompt needs a fresh
+  `data_dir`.
 - `search_with_trace` orders its candidate list without going through a `set`, so two runs of one
   query on one library print it in one order whatever the interpreter's string hash seed. The
   ranking never depended on this and does not change: it sorts on `(-final_score, memory_id)`, and

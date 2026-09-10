@@ -22,15 +22,26 @@ import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import ClassVar, cast
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from mindbridge import Memory, RetrievalScope
+from mindbridge._telemetry import (
+    IDENTITY_NAMES_BOUND,
+    IDENTITY_NAMES_REFUSED,
+    VISION_BATCHES_FAILED,
+    VISION_BATCHES_RETRIED,
+)
 from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local.store import LocalStore
 from mindbridge.memory import (
     _LEXICAL_FULL_COVERAGE,
     _LEXICAL_FULL_COVERAGE_RELEVANCE,
+    _MAX_DESCRIBE_CONTEXT_CHARACTERS,
     _MAX_TEXT_CHARACTERS,
     _lexical_query_terms,
     _lexical_relevance,
@@ -45,7 +56,15 @@ from mindbridge.models.base import (
     SpeechAnalysis,
     SpeechTurn,
 )
-from mindbridge.types import AssetRef, Blob, MemoryIntent, Modality, SpeakerSegment
+from mindbridge.types import (
+    AnswerResult,
+    AssetRef,
+    Blob,
+    MemoryIntent,
+    Modality,
+    SearchHit,
+    SpeakerSegment,
+)
 
 _ALL_INPUT_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 
@@ -56,11 +75,18 @@ class _Embedder:
     embedding_model = "fake-real-index"
     embedding_space = "fake-real-index:2:test"
     embedding_dimension = 2
+    # Optional, duck-typed by `Memory` (`getattr(..., "_legacy_embedding_spaces", frozenset())`);
+    # declared here only so a test assigning it type-checks.
+    _legacy_embedding_spaces: frozenset[str] = frozenset()
 
     def __init__(self) -> None:
         self.embedding_capabilities = _ALL_INPUT_MODALITIES
         self.oversized_assets: frozenset[str] = frozenset()
         self.document_inputs: list[ModelInput] = []
+        # Per call, not only accumulated: an assertion over every input ever embedded passes on
+        # the strength of the first write, while what a later rebuild of the same document keys
+        # is exactly what a reindex can break.
+        self.document_batches: list[tuple[ModelInput, ...]] = []
 
     def embed(
         self,
@@ -75,6 +101,7 @@ class _Embedder:
             )
         if task is EmbedTask.DOCUMENT:
             self.document_inputs.extend(batch)
+            self.document_batches.append(batch)
         # One vector for everything: dense relevance is deliberately uninformative so that a
         # lexical assertion cannot pass on the strength of the dense route.
         return tuple((1.0, 0.0) for _ in batch)
@@ -1159,6 +1186,29 @@ class _Diarised:
         return None
 
 
+_LONG_TURN_TEXT = "the quick brown fox jumps over the lazy dog by the riverbank at dawn today"
+
+
+class _VerboseDiarised:
+    """A speech backend whose one speaker talks long enough to exceed the describe-context cap."""
+
+    transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+    transcription_model = "fake-funasr-verbose"
+    transcription_space = "fake-funasr-verbose:speech:test"
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+        turns = tuple(
+            SpeechTurn(index * 900, (index + 1) * 900, _LONG_TURN_TEXT, "0") for index in range(150)
+        )
+        return tuple(
+            SpeechAnalysis(turns=turns, speakers=(SpeakerEmbedding("0", (1.0, 0.0)),))
+            for _asset in assets
+        )
+
+    def close(self) -> None:
+        return None
+
+
 def _section(content: str, marker: str) -> str:
     """Read back one derived section of a stored document by its marker line."""
     for section in content.split("\n\n"):
@@ -1192,8 +1242,13 @@ def test_a_described_clip_carries_its_durable_facts_as_their_own_section(tmp_pat
         assert described.startswith("Shown: two people at a kitchen table")
         assert "Hongqiao" in described
         assert "Fact:" not in described, "a fact must not stay inside the description"
+        # The label is projected to the name this same write's own facts just staged, the same
+        # projection transcript prose gets -- see `_project_fact_labels`. The binding line reads
+        # a little redundant rendered that way ("Lily is called Lily"), which is the accepted
+        # cost of one write-time pass rather than a second special case for the line that is the
+        # assertion itself.
         assert _section(stored, f"[facts:{asset_id}]") == (
-            "speaker_1 is called Lily\nLily is allergic to peanuts"
+            "Lily is called Lily\nLily is allergic to peanuts"
         )
         # The verbatim asset stays attached: the sections are additional keys, not a replacement.
         assert record.assets[0].sha256 is not None
@@ -1201,8 +1256,36 @@ def test_a_described_clip_carries_its_durable_facts_as_their_own_section(tmp_pat
         # Both halves reach the lexical route. "peanuts" is only ever said in the facts.
         assert record.id in _lexical_matches(memory, "peanuts")
         assert record.id in _lexical_matches(memory, "Hongqiao")
-        # And both reach the embedder as their own retrieval key.
-        keys = [value.text for value in embedder.document_inputs]
+        # And both reach the embedder as their own retrieval key -- in the *last* batch, which
+        # is the reindex the stated name triggered, not the original write. Rebuilding a
+        # document from its stored text has to recover the same atomic parts `add()` embedded;
+        # rebuilding it as one merged string keys 2048-character windows of the whole document
+        # instead, and the per-section keys are lost on exactly the clips that name somebody.
+        keys = [value.text for value in embedder.document_batches[-1]]
+        assert any(text.startswith(f"[facts:{asset_id}]") for text in keys)
+        assert any(text.startswith(f"[visual description:{asset_id}]") for text in keys)
+
+
+def test_a_re_embedding_migration_keeps_each_derived_section_as_its_own_key(
+    tmp_path: Path,
+) -> None:
+    """An embedder swap re-keys every stored row, and must key them the way `add()` did.
+
+    The migration reads `content` back as one string. Handing that string over as a single
+    canonical part throws away the section boundaries the write path embedded separately, so a
+    corpus that migrates loses the atomic facts key it had before the swap.
+    """
+    describer = _StructuredDescriber("Shown: a red bicycle", "Fact: the bicycle lives in the shed")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(Blob(b"bicycle-frame", "image/png"))
+        asset_id = record.assets[0].id
+
+    upgraded = _Embedder()
+    upgraded.embedding_space = "fake-real-index:2:test-v2"
+    upgraded._legacy_embedding_spaces = frozenset({_Embedder.embedding_space})
+    with Memory(tmp_path, embedder=upgraded, vision_describer=describer):
+        keys = [value.text for value in upgraded.document_batches[-1]]
+
         assert any(text.startswith(f"[facts:{asset_id}]") for text in keys)
         assert any(text.startswith(f"[visual description:{asset_id}]") for text in keys)
 
@@ -1233,6 +1316,30 @@ def test_a_described_clip_is_shown_the_transcript_under_the_indexed_labels(tmp_p
         "speaker_1: my name is Lily\nspeaker_1: and I cannot eat peanuts\nspeaker_2: noted"
     ]
     assert describer.context[0] == projected, "the describer saw labels the document does not use"
+
+
+def test_a_long_transcript_shown_to_the_describer_is_capped_at_a_line_boundary(
+    tmp_path: Path,
+) -> None:
+    """One long clip's own words must not dominate the token budget every visual in it pays.
+
+    Cut at `_MAX_DESCRIBE_CONTEXT_CHARACTERS`, and at a line boundary -- each line is one
+    speaker turn -- so the cut context still ends on a whole turn.
+    """
+    describer = _StructuredDescriber("Shown: a long conversation")
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_VerboseDiarised(),
+        vision_describer=describer,
+    ) as memory:
+        memory.add(Blob(b"long-clip", "video/mp4", "long.mp4"))
+
+    assert len(describer.context) == 1
+    shown = describer.context[0]
+    assert len(shown) <= _MAX_DESCRIBE_CONTEXT_CHARACTERS
+    assert shown, "some context should still survive the cap"
+    assert all(line == f"speaker_1: {_LONG_TURN_TEXT}" for line in shown.split("\n"))
 
 
 def test_a_described_image_is_shown_no_transcript_and_still_yields_a_description(
@@ -1368,6 +1475,87 @@ def test_a_stated_name_never_replaces_the_one_a_host_registered(tmp_path: Path) 
         ]
 
 
+def test_a_stated_name_with_a_few_words_is_bound_in_full(tmp_path: Path) -> None:
+    """A short multi-word name is not truncated to its first word.
+
+    The binding is bounded by length, not by word count: up to four words is still one name.
+    """
+    describer = _StructuredDescriber(
+        "Shown: two people at a kitchen table",
+        "Fact: speaker_1 is called Mary Jane",
+    )
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+    ) as memory:
+        named = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        identity_id = _speaker_identity(memory, named.id, "speaker_1")
+
+        assert memory.identity(identity_id).name == "Mary Jane"  # type: ignore[union-attr]
+
+
+def test_a_stated_name_does_not_swallow_the_clause_that_follows_it(tmp_path: Path) -> None:
+    """A name is a handful of words, not everything up to the next period.
+
+    The old pattern captured every character up to a period or semicolon, so a fact that kept
+    talking past the name in the same sentence ("...and works in marketing") bound the whole
+    clause as the name. Bounded to a few words, that sentence fails to match at all, and nothing
+    is bound rather than something wrong.
+    """
+    describer = _StructuredDescriber(
+        "Shown: two people at a kitchen table",
+        "Fact: speaker_1 is called Lily and works in marketing",
+    )
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+    ) as memory:
+        named = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        identity_id = _speaker_identity(memory, named.id, "speaker_1")
+
+        assert memory.identity(identity_id).name is None  # type: ignore[union-attr]
+        assert memory.operations() == ()
+
+
+def test_a_fact_naming_a_label_nobody_produced_is_counted_not_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    """A fact naming `speaker_5` when the clip only produced two speakers names nobody.
+
+    That drop used to vanish with no trace once the label failed to resolve to an identity.
+    It is the same kind of event as the "already named" refusal `_bind_speaker_names` already
+    counted, so both land on `IDENTITY_NAMES_REFUSED`.
+    """
+    describer = _StructuredDescriber(
+        "Shown: two people at a kitchen table",
+        "Fact: speaker_5 is called Nobody",
+    )
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+    provider.shutdown()
+
+    spans = [
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.identity.names"
+    ]
+    assert len(spans) == 1
+    attributes = spans[0].attributes or {}
+    assert attributes.get(IDENTITY_NAMES_BOUND) == 0
+    assert attributes.get(IDENTITY_NAMES_REFUSED) == 1
+
+
 def test_a_stated_name_binds_nothing_without_a_speech_backend(tmp_path: Path) -> None:
     """No recognizer, no labels, nobody to name: the fact stays indexed text and nothing else.
 
@@ -1413,6 +1601,10 @@ def _rate_limited() -> ModelError:
     return ModelError("slow down", reason="rate_limited", stage="describe")
 
 
+def _out_of_quota() -> ModelError:
+    return ModelError("no quota", reason="quota_exhausted", stage="describe")
+
+
 class _UpstreamFailure(Exception):
     """Stands in for the provider SDK's own 5xx exception, which carries a status code."""
 
@@ -1426,7 +1618,57 @@ def _server_error() -> ModelError:
     return error
 
 
-@pytest.mark.parametrize("failure", [_rate_limited, _server_error])
+class _AbortedJsonGeneration(Exception):
+    """Stands in for the provider SDK's `BadRequestError` when it aborts mid-response.
+
+    The message is the inner-prism gateway's own, verbatim, from a live ATM raw-arm run: a 400
+    that an identical retry 5s later clears, unlike an ordinary rejected request.
+    """
+
+    status_code = 400
+    body: ClassVar[dict[str, object]] = {
+        "message": (
+            "<400> InternalError.Algo.InvalidParameter: Model output became abnormal while "
+            "generating a JSON response for response_format. The generation was aborted because "
+            "the partial output may be incomplete or invalid JSON. Please retry the request or "
+            "adjust your prompt or JSON schema."
+        ),
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "invalid_parameter_error",
+    }
+
+
+def _aborted_json_generation() -> ModelError:
+    error = ModelError(
+        "vision description request failed", reason="request_rejected", stage="describe"
+    )
+    error.__cause__ = _AbortedJsonGeneration()
+    return error
+
+
+class _RejectedImage(Exception):
+    """An ordinary 400: the same status code, a permanent cause, no aborted-generation wording."""
+
+    status_code = 400
+    body: ClassVar[dict[str, object]] = {
+        "message": "invalid image",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "invalid_parameter_error",
+    }
+
+
+def _rejected_image() -> ModelError:
+    """A 400 that really is permanent, to prove the narrow message match does not over-retry."""
+    error = ModelError(
+        "vision description request failed", reason="request_rejected", stage="describe"
+    )
+    error.__cause__ = _RejectedImage()
+    return error
+
+
+@pytest.mark.parametrize("failure", [_rate_limited, _server_error, _aborted_json_generation])
 def test_a_throttled_describe_is_retried_before_the_caption_is_given_up(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1466,6 +1708,24 @@ def test_a_permanent_describe_refusal_is_not_retried_and_still_fails_open(
         assert memory.get(record.id).content == ""
 
 
+def test_an_ordinary_400_is_still_not_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The narrow message match for the aborted-JSON-generation quirk must not swallow every 400.
+
+    Same status code as the transient case, a permanent cause: an unsupported or rejected image
+    is not going to describe successfully on a second try, so this must still fail open on
+    attempt one, the way it did before the aborted-generation case was recognized.
+    """
+    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
+    describer = _ThrottledDescriber(4, _rejected_image())
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(Blob(b"bicycle-frame", "image/png"))
+
+        assert describer.calls == 1
+        assert memory.get(record.id).content == ""
+
+
 def test_a_sustained_refusal_gives_up_after_a_bounded_number_of_waits(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1476,6 +1736,44 @@ def test_a_sustained_refusal_gives_up_after_a_bounded_number_of_waits(
 
         assert describer.calls == 3, "one attempt per wait, plus the last one"
         assert memory.get(record.id).content == ""
+
+
+def test_waiting_out_a_throttled_describe_is_counted_apart_from_losing_the_caption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`failed_batches` answers "how many memories lost their caption", so an attempt is not one.
+
+    Retrying inside the fail-open turned one lost batch into three of them, and a counter that
+    sums attempts cannot tell a provider that throttled an ingest from one that ate it. The
+    attempts are still worth counting -- they are what a long ingest pays -- under their own name.
+    """
+    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0))
+    cases = (
+        (_ThrottledDescriber(2, _rate_limited()), 0, 2),
+        (_ThrottledDescriber(99, _rate_limited()), 1, 2),
+        (_ThrottledDescriber(99, _out_of_quota()), 1, 0),
+        (_ThrottledDescriber(1, _aborted_json_generation()), 0, 1),
+    )
+    for index, (describer, failed, retried) in enumerate(cases):
+        provider = TracerProvider()
+        exporter = InMemorySpanExporter()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        with Memory(
+            tmp_path / f"case-{index}",
+            embedder=_Embedder(),
+            vision_describer=describer,
+            tracer=provider.get_tracer("test"),
+        ) as memory:
+            memory.add(Blob(b"bicycle-frame", "image/png"))
+        provider.shutdown()
+
+        counted = {VISION_BATCHES_FAILED: 0, VISION_BATCHES_RETRIED: 0}
+        for span in exporter.get_finished_spans():
+            for name in counted:
+                counted[name] += cast(int, (span.attributes or {}).get(name, 0))
+
+        assert counted[VISION_BATCHES_FAILED] == failed, describer.error.reason
+        assert counted[VISION_BATCHES_RETRIED] == retried, describer.error.reason
 
 
 def test_a_caption_that_is_only_facts_is_not_described_or_appended_twice(tmp_path: Path) -> None:
@@ -1499,3 +1797,40 @@ def test_a_caption_that_is_only_facts_is_not_described_or_appended_twice(tmp_pat
 
         assert describer.calls == 1, "the same bytes were described again"
         assert reopened.get(again.id).content.count("[facts:") == 1
+
+
+class _TextOnlyAnswerer:
+    """A generation backend that can read text and nothing else, the way a text LLM does."""
+
+    generation_capabilities = frozenset({Modality.TEXT})
+
+    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        return AnswerResult(answer="; ".join(hit.content for hit in hits) or "nothing found")
+
+    def close(self) -> None:
+        return None
+
+
+def test_a_facts_only_caption_still_lets_a_text_only_answerer_read_the_image(
+    tmp_path: Path,
+) -> None:
+    """`_has_stream_description` has to count a facts-only caption, or `ask` refuses the image.
+
+    A caption with no visible half sets no `[visual description:]` marker, only `[facts:]`.
+    `_route_generation` falls an image its answerer cannot take back to derived text only when
+    `_has_stream_description` says the image was described. The write-path test above covers the
+    asset cache, a different mechanism, and would pass unchanged even with the `[facts:]` clause
+    missing from `_has_stream_description`; a text-only answerer here would instead raise
+    `unsupported_modality` on exactly that gap.
+    """
+    describer = _StructuredDescriber("Fact: the yoga mat lives in the storage room")
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        vision_describer=describer,
+        answerer=_TextOnlyAnswerer(),
+    ) as memory:
+        memory.add(Blob(b"storage-room", "image/png", "storage.png"))
+        result = memory.ask("where does the yoga mat live")
+
+    assert "storage room" in result.answer

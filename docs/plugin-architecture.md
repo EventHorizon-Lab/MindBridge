@@ -72,6 +72,18 @@ output from the same model and must return a different space. Declaring a stable
 changed recipe is the one failure the kernel cannot detect, because a stale derived value is
 indistinguishable from a fresh one once it is inside a searchable document.
 
+`VisionDescriptionBackend.describe` has one further reserved contract, because its output is
+parsed by the kernel rather than only stored. A line beginning with the literal prefix `Fact:` is
+split out of the visible caption into its own indexed `[facts:<asset>]` section rather than left
+inside the description; a plugin's prompt must produce that prefix deliberately; free prose must
+never start a line with it by coincidence. One fact shape reads as more than indexed text: a line
+that says exactly `speaker_N is called <name>` binds the diarised label the plugin was shown to a
+stated name and performs an automatic `IDENTIFY` write, auditable through `operations()` and
+reversible through `rollback()`, never overwriting a name the identity already carries. `inputs[i]`
+may also carry non-empty `text` — derived transcript context the write already knows under the same
+`speaker_N` labels the index prints — which a plugin reads as context for the caption and must
+never echo back into it.
+
 The optional `server` and `mcp` dependencies are packaging boundaries, not plugins. REST, MCP, and
 the product CLI remain thin transports over the application-composed `Memory`.
 

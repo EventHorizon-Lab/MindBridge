@@ -68,6 +68,7 @@ from mindbridge._telemetry import (
     SPAN_KIND,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
+    VISION_BATCHES_RETRIED,
     _record_retrieval_results,
     current_model_request_count,
     mark_model_requests,
@@ -470,9 +471,13 @@ _FACT_LINE_PREFIX = "Fact:"
 # The one fact shape that is not just indexed text but an assertion about a person: it binds a
 # diarised speaker label to a name the dialogue itself stated. Tolerant of how the label is
 # spelled, because the label is the model's echo of a prompt, and strict about the sentence,
-# because anything looser would rename people out of ordinary description.
+# because anything looser would rename people out of ordinary description. The name itself is
+# bounded to a handful of words rather than "everything up to a period": an unbounded run
+# swallows whatever clause follows ("speaker_1 is called Lily and works in marketing" named the
+# whole clause), and a name that long fails to match at all rather than binding the wrong text.
 _NAME_BINDING = re.compile(
-    r"speakers?[ _-]?(?P<index>\d{1,3})\s+is\s+called\s+(?P<name>[^.;]+?)\s*[.;]?",
+    r"speakers?[ _-]?(?P<index>\d{1,3})\s+is\s+called\s+"
+    r"(?P<name>[^\s.;,]+(?: [^\s.;,]+){0,3})\s*[.;]?",
     re.IGNORECASE,
 )
 # Seconds to wait before describing a throttled or overloaded batch again. Coarse and short: the
@@ -480,6 +485,11 @@ _NAME_BINDING = re.compile(
 # these failures reaches us, and what is left to wait out is a provider throttling a whole ingest
 # rather than one request. Module-level so a test can shorten it.
 _VISION_RETRY_BACKOFF = (1.0, 4.0, 16.0)
+# A describer is shown this write's own transcript as context, under the same labels the index
+# prints (`_speaker_prose`), so a fact naming a speaker resolves to the same person. Uncapped,
+# one long clip's words would dominate the token budget every visual in it pays; cut at a line
+# boundary so a turn is never split mid-sentence.
+_MAX_DESCRIBE_CONTEXT_CHARACTERS = 12_000
 _MAX_METADATA_BYTES = 262_144
 _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
@@ -698,6 +708,11 @@ class _OperationAssets:
     # than applied on the spot: the naming assertion reindexes every memory that mentions the
     # person, and this write's own memory does not exist until it commits.
     speaker_names: dict[str, str]
+    # A naming fact that named nobody: a label no recognizer in this clip produced, an identity
+    # that no longer exists by binding time, or a name that failed validation. Counted rather
+    # than only logged, alongside the refusals `_bind_speaker_names` already counts for a name
+    # that conflicts with one a person already carries.
+    speaker_names_refused: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -4901,7 +4916,9 @@ class Memory:
                 missing = [
                     replace(
                         memory,
-                        content=self._with_visual_descriptions(memory.content, described),
+                        content=self._with_visual_descriptions(
+                            memory.content, described, operation
+                        ),
                     )
                     for memory in missing
                 ]
@@ -5132,7 +5149,7 @@ class Memory:
             self._stage_speaker_names(described, operation)
             memory = replace(
                 memory,
-                content=self._with_visual_descriptions(memory.content, described),
+                content=self._with_visual_descriptions(memory.content, described, operation),
             )
             if Modality.AUDIO not in self._embedding_capabilities:
                 # Same rescue set `_add_prepared` allows, so a composition `add()` accepts is not
@@ -5633,18 +5650,22 @@ class Memory:
                     # words, not the pixels: four stills say two people are at a table, and only
                     # the dialogue says which one is called Lily. Empty for an image and for any
                     # composition with no speech backend, which then describes pixels as before.
-                    text=_speaker_prose(
-                        asset.asset_id,
-                        operation.speech_segments.get(asset.asset_id, ()),
-                    )
-                    or "",
+                    # Capped: an unbounded transcript would let one long clip's words dominate the
+                    # token budget every visual in it pays.
+                    text=_truncated_describe_context(
+                        _speaker_prose(
+                            asset.asset_id,
+                            operation.speech_segments.get(asset.asset_id, ()),
+                        )
+                        or ""
+                    ),
                 )
             )
             for asset in pending
         )
         for wait in _VISION_RETRY_BACKOFF:
             try:
-                return self._vision_descriptions(inputs)
+                return self._vision_descriptions(inputs, final=False)
             except ModelError as error:
                 if not _transient_vision_failure(error):
                     raise
@@ -5669,9 +5690,11 @@ class Memory:
         to the same voice, which is what carries an identity across clips at all.
 
         Only a label this asset's own recognizer produced can be resolved, so a fact naming a
-        speaker who is not in this clip is dropped rather than guessed at. Cached descriptions
-        are read too: re-ingesting a corpus must reach the same named store as the first ingest,
-        and re-asserting a standing name is a no-op.
+        speaker who is not in this clip is dropped rather than guessed at -- counted into
+        `operation.speaker_names_refused`, the same drop tally `_bind_speaker_names` adds to and
+        reports, so a fact naming a label nobody produced is not simply invisible. Cached
+        descriptions are read too: re-ingesting a corpus must reach the same named store as the
+        first ingest, and re-asserting a standing name is a no-op.
         """
         for asset_id, description in descriptions.items():
             segments = operation.speech_segments.get(asset_id)
@@ -5683,8 +5706,37 @@ class Memory:
                 if match is None:
                     continue
                 identity_id = identities.get(f"speaker_{int(match['index'])}")
-                if identity_id is not None:
-                    operation.speaker_names.setdefault(identity_id, match["name"].strip())
+                if identity_id is None:
+                    operation.speaker_names_refused += 1
+                    continue
+                operation.speaker_names.setdefault(identity_id, match["name"].strip())
+
+    def _known_speaker_names(self, asset_id: str, operation: _OperationAssets) -> dict[str, str]:
+        """Map this asset's `speaker_N` labels to whatever name is already known for them.
+
+        "Known now" is a name this very batch's own facts just staged (`operation.speaker_names`)
+        or a name an already-registered identity carries on its recognized segments; a name a
+        later write asserts is not, which is the write-time/retrieval-time split documented on
+        `_project_fact_labels`.
+        """
+        segments = operation.speech_segments.get(asset_id)
+        if not segments:
+            return {}
+        names: dict[str, str] = {}
+        for identity_id, label in _speaker_labels(segments).items():
+            name = operation.speaker_names.get(identity_id)
+            if name is None:
+                name = next(
+                    (
+                        segment.speaker_name
+                        for segment in segments
+                        if segment.speaker_id == identity_id and segment.speaker_name
+                    ),
+                    None,
+                )
+            if name:
+                names[label] = name
+        return names
 
     def _bind_speaker_names(self, operation: _OperationAssets) -> None:
         """Register the staged names, now that the memory carrying the voices is readable.
@@ -5712,7 +5764,14 @@ class Memory:
                 proposed = None if profile is None else _identity_name(name)
             except ValidationError:
                 proposed = None
-            if profile is None or proposed is None or profile.name == proposed:
+            if profile is None or proposed is None:
+                # The identity a staged name resolved to has since vanished (merged or deleted),
+                # or the stated name failed validation. Either way the fact named nobody, which
+                # is worth counting apart from a silent `continue` even though there is nobody
+                # left to warn about by name.
+                operation.speaker_names_refused += 1
+                continue
+            if profile.name == proposed:
                 continue
             if profile.name is not None:
                 refused += 1
@@ -5732,6 +5791,8 @@ class Memory:
                     operation=operation,
                 )
             bound += 1
+        refused += operation.speaker_names_refused
+        operation.speaker_names_refused = 0
         if bound or refused:
             with self._trace("mindbridge.identity.names", kind="stage") as span:
                 span.set_attribute(IDENTITY_NAMES_BOUND, bound)
@@ -5761,6 +5822,7 @@ class Memory:
         self,
         prepared: _PreparedContent,
         descriptions: Mapping[str, str],
+        operation: _OperationAssets,
     ) -> _PreparedContent:
         """Union derived visual text into the indexed document, whatever the embedder can take.
 
@@ -5780,7 +5842,11 @@ class Memory:
             for asset in prepared.assets
             if asset.asset_id in descriptions
             and not _has_stream_description(prepared.text, (asset,))
-            for section in _description_sections(asset.asset_id, descriptions[asset.asset_id])
+            for section in _description_sections(
+                asset.asset_id,
+                descriptions[asset.asset_id],
+                self._known_speaker_names(asset.asset_id, operation),
+            )
         )
         if not sections:
             return prepared
@@ -5931,7 +5997,11 @@ class Memory:
                 ),
                 assets=memory.assets,
                 modality=Modality(memory.modality),
-                canonical_parts=(("text", base),) if base else (),
+                # Recovered section by section, not handed over as one string: the derived
+                # sections were embedded as their own atomic keys on the way in, and merging
+                # them here would key 2048-character windows of the whole document instead --
+                # on exactly the memories a stated name reindexes.
+                canonical_parts=_stored_canonical_parts(base, memory.assets),
                 audio_transcript=_has_stream_transcript(base, memory.assets),
                 visual_description=_has_stream_description(base, memory.assets),
             )
@@ -7562,7 +7632,17 @@ class Memory:
                 )
             return tuple(described[asset_id] for asset_id in asset_ids)
 
-    def _vision_descriptions(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+    def _vision_descriptions(
+        self, inputs: Sequence[ModelInput], *, final: bool = True
+    ) -> tuple[str, ...]:
+        """Describe one batch, and account a failure as lost or merely retried.
+
+        A caller still inside its retry budget passes ``final=False``: a transient failure there
+        is going to be attempted again, so it is counted on `VISION_BATCHES_RETRIED` rather than
+        `VISION_BATCHES_FAILED`. Anything else -- the last attempt, or a failure no retry could
+        fix -- is final regardless of what the caller passed, because no further attempt follows
+        it either way.
+        """
         if self._vision_describer is None:
             raise ModelError(
                 "vision description backend is not configured",
@@ -7598,7 +7678,10 @@ class Memory:
             try:
                 return _validated_descriptions(self._vision_describer.describe(inputs), inputs)
             except Exception as error:
-                span.set_attribute(VISION_BATCHES_FAILED, 1)
+                if not final and isinstance(error, ModelError) and _transient_vision_failure(error):
+                    span.set_attribute(VISION_BATCHES_RETRIED, 1)
+                else:
+                    span.set_attribute(VISION_BATCHES_FAILED, 1)
                 if isinstance(error, MindBridgeError):
                     raise
                 raise ModelError(
@@ -8217,7 +8300,12 @@ class Memory:
                             text=memory.content,
                             assets=memory.assets,
                             modality=Modality(memory.modality),
-                            canonical_parts=((("text", memory.content),) if memory.content else ()),
+                            # Same reason as `_refresh_speaker_memories`: an embedder swap has to
+                            # re-key each stored row the way `add()` keyed it, section by section.
+                            canonical_parts=_stored_canonical_parts(
+                                memory.content,
+                                memory.assets,
+                            ),
                             audio_transcript=_has_stream_transcript(
                                 memory.content,
                                 memory.assets,
@@ -10765,17 +10853,43 @@ def _has_stream_description(text: str, assets: Sequence[StoredAsset]) -> bool:
     )
 
 
-def _description_sections(asset_id: str, description: str) -> tuple[str, ...]:
+_NO_NAMES: Mapping[str, str] = {}
+
+
+def _description_sections(
+    asset_id: str, description: str, names: Mapping[str, str] = _NO_NAMES
+) -> tuple[str, ...]:
     """Render one caption as the document sections it becomes, what-is-shown first.
 
     A caption whose visible half is empty still contributes its facts, and one with no facts is
     exactly the single section this produced before facts existed.
+
+    `names` projects the facts half through whatever `speaker_N` -> name binding this write
+    already knows, the same way transcript prose is projected (`_speech_retrieval_text`) -- see
+    `_project_fact_labels` for why this projection runs once, here, and never again.
     """
     visible, facts = _split_description(description)
+    if facts and names:
+        facts = _project_fact_labels(facts, names)
     return (
         *((f"[visual description:{asset_id}]\n{visible}",) if visible else ()),
         *((f"[facts:{asset_id}]\n{facts}",) if facts else ()),
     )
+
+
+def _project_fact_labels(facts: str, names: Mapping[str, str]) -> str:
+    """Replace a speaker label with the name already known for it, at write time only.
+
+    Unlike `[speech identities:]`, which `_retrieval_text` re-projects from the current name on
+    every index rebuild, `[facts:]` is rendered once, when the memory is written, from whatever
+    names this write already knows -- its own newly staged ones and any identity already named
+    before it. A name a *later* clip asserts does not retroactively rewrite an earlier one's
+    stored facts; only the identity's own projected name (`identities()`, `[speech identities:]`)
+    stays current for a person the store keeps renaming.
+    """
+    for label, name in names.items():
+        facts = re.sub(rf"\b{re.escape(label)}\b", name, facts)
+    return facts
 
 
 def _split_description(description: str) -> tuple[str, str]:
@@ -10856,6 +10970,18 @@ def _speech_evidence(asset_id: str, segments: Sequence[SpeakerSegment]) -> dict[
             for segment in segments
         ],
     }
+
+
+def _truncated_describe_context(text: str) -> str:
+    """Cap what a describer is shown of a clip's own words at a bounded character budget.
+
+    Cut at a line boundary -- each line is one speaker's turn (see `_speaker_prose`) -- so a
+    truncated context still ends on a whole turn rather than a sentence sliced in half.
+    """
+    if len(text) <= _MAX_DESCRIBE_CONTEXT_CHARACTERS:
+        return text
+    cut = text.rfind("\n", 0, _MAX_DESCRIBE_CONTEXT_CHARACTERS)
+    return text[:cut] if cut > 0 else text[:_MAX_DESCRIBE_CONTEXT_CHARACTERS]
 
 
 def _speaker_prose(asset_id: str, segments: Sequence[SpeakerSegment]) -> str | None:
@@ -11539,11 +11665,31 @@ def _transient_vision_failure(error: ModelError) -> bool:
     say about every other operation. A 5xx is deliberately not in it and is the other answer a
     loaded endpoint gives a write burst, so it is read off the provider exception's own status
     code: duck-typed, because the SDK that raised it is an optional adapter dependency.
+
+    One inner-prism gateway also answers a 400 -- `request_rejected`, not in `RETRYABLE_REASONS`
+    -- when it aborts JSON generation mid-response rather than rejecting the request itself, and
+    an identical retry 5s later succeeds. Measured live: 'Model output became abnormal while
+    generating a JSON response for response_format. The generation was aborted because the
+    partial output may be incomplete or invalid JSON. Please retry the request or adjust your
+    prompt or JSON schema.' Most 400s (a malformed prompt, an unsupported image) are not
+    transient, so this is a narrow message match rather than a status-code rule, and it is scoped
+    to this function alone -- `answer` and `formation` never call it, so their 400s are unchanged.
     """
     if error.retryable:
         return True
-    status = getattr(error.__cause__, "status_code", None)
-    return isinstance(status, int) and 500 <= status < 600
+    cause = error.__cause__
+    status = getattr(cause, "status_code", None)
+    if isinstance(status, int) and 500 <= status < 600:
+        return True
+    if status != 400:
+        return False
+    body = getattr(cause, "body", None)
+    message = body.get("message") if isinstance(body, Mapping) else None
+    return (
+        isinstance(message, str)
+        and "model output became abnormal" in message.casefold()
+        and "generation was aborted" in message.casefold()
+    )
 
 
 def _validated_descriptions(

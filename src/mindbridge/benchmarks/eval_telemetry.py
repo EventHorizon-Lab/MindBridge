@@ -48,6 +48,7 @@ from mindbridge._telemetry import (
     TOKEN_TOTAL,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
+    VISION_BATCHES_RETRIED,
     token_modality_attribute,
 )
 from mindbridge.benchmarks.eval_environment import nvidia_smi_rows
@@ -580,6 +581,7 @@ class _TaskTelemetry:
     media_elided_hits: int = 0
     dropped_hits: int = 0
     vision_failed_batches: int = 0
+    vision_retried_batches: int = 0
     # Fast-plane and compiler measurements: populated only when the run actually exercises
     # `capture()`/`settle()` (the `--ingest capture` path) or the `compile` answering arm.
     time_to_searchable_ms: _Samples = field(default_factory=_Samples)
@@ -655,6 +657,7 @@ class _TaskTelemetry:
             self.media_elided_hits += _int_attribute(attributes, GROUNDING_MEDIA_ELIDED) or 0
             self.dropped_hits += _int_attribute(attributes, GROUNDING_HITS_DROPPED) or 0
             self.vision_failed_batches += _int_attribute(attributes, VISION_BATCHES_FAILED) or 0
+            self.vision_retried_batches += _int_attribute(attributes, VISION_BATCHES_RETRIED) or 0
             module = _string_attribute(attributes, MODEL_MODULE) or "unknown"
             self.tokens_by_module.setdefault(module, _Tokens()).add(attributes)
             if status == "ok":
@@ -1042,7 +1045,10 @@ class _TaskTelemetry:
                 "media_elided_hits": self.media_elided_hits,
                 "dropped_hits": self.dropped_hits,
             },
-            "vision": {"failed_batches": self.vision_failed_batches},
+            "vision": {
+                "failed_batches": self.vision_failed_batches,
+                "retried_batches": self.vision_retried_batches,
+            },
         }
 
 

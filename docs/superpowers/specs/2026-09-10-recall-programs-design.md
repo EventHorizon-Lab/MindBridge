@@ -155,8 +155,11 @@ changes.
 Planner adds one call per `ask()` (latency and tokens; accepted: stronger before faster). Set ops on
 point questions add noise — guarded by shape. Distillation hallucinations enter the index — kept as
 separate sections so the reader sees provenance, and the verbatim asset remains attached. Name binding
-errors propagate across clips — bounded by `identity_link_min_assets` and reversible via
-`unlink_identity`. 31-question ATM-Hard is noisy — decisions use ATM-main dev and m3 dev.
+errors propagate across clips — not bounded by `identity_link_min_assets`, which gates face↔voice
+linking (a different join) rather than naming; a wrong name is bounded instead by the never-overwrite
+guard (a standing name is never replaced by a later assertion) and is reversible through `rollback()`,
+since binding lands as an ordinary `IDENTIFY` operation. 31-question ATM-Hard is noisy — decisions use
+ATM-main dev and m3 dev.
 
 ## 7. Work packages
 

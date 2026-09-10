@@ -342,7 +342,7 @@ def test_evaluation_telemetry_sums_failed_description_batches_per_task() -> None
     finally:
         telemetry.close()
 
-    assert performance["vision"] == {"failed_batches": 2}
+    assert performance["vision"] == {"failed_batches": 2, "retried_batches": 0}
 
 
 def test_ttft_distribution_marks_missing_observations_incomplete() -> None:
