@@ -57,6 +57,7 @@ from mindbridge.models.base import (
     SpeechTurn,
 )
 from mindbridge.types import (
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     Blob,
@@ -1804,7 +1805,14 @@ class _TextOnlyAnswerer:
 
     generation_capabilities = frozenset({Modality.TEXT})
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
+    ) -> AnswerResult:
         return AnswerResult(answer="; ".join(hit.content for hit in hits) or "nothing found")
 
     def close(self) -> None:
