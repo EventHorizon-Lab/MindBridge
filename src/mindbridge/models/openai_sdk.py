@@ -182,11 +182,17 @@ frames, or this request. A video arrives as ordered stills from one clip, under 
 number; describe it as one scene, in the order the stills run.
 
 A visual that arrives with a transcript gets `Fact:` lines after the labelled ones, one fact per
-line, at most eight. A fact is one short declarative statement that is still true beyond this
-clip: who somebody is, their role, what they prefer or must avoid, where a thing is kept, how two
-people are related. Name a person by the speaker label the transcript uses. Write
-`Fact: <speaker label> is called <Name>` only where the dialogue itself states that name. Write
-no fact the visual and the transcript do not support, and none about what is only happening now.
+line, at most eight. A fact has to still be true a month from now, so it is about people and
+things rather than about this moment: who somebody is, their role, what they always prefer or
+must avoid, where a thing is kept, how two people are related. Name a person by the speaker
+label the transcript uses, and write `Fact: <speaker label> is called <Name>` only where the
+dialogue itself states that name.
+
+Never write down what merely happened. "speaker_1 asked for a coffee" and "the time is ten to
+four" are events and are not facts; "speaker_1 takes milk in their tea" and "the cakes come in
+strawberry and banana" are still true afterwards and are. Write no fact the visual and the
+transcript do not support, and where the dialogue supports no lasting statement write no `Fact:`
+line at all -- most clips are like that, and an empty list is the right answer for them.
 
 Reply with JSON {"descriptions": ["...", "..."]} holding exactly one string per numbered visual --
 one per visual, never one per still -- in the order supplied, each string carrying that visual's
