@@ -4497,7 +4497,14 @@ def test_the_recall_planner_rejects_an_unusable_request(
 
 
 def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstention() -> None:
-    """`answer_policy` is opt-in: the default path must be byte-identical to what it was."""
+    """`answer_policy` is opt-in: the default and an explicit `strict` are one request.
+
+    What `strict` keeps is the abstention instruction, word for word. The prompt around it is
+    not what it was before the policy existed -- the answer-shaping sentence was added to both
+    policies at the same time, taking it from 654 to 1,001 characters -- so both sentences are
+    asserted here as the literals the model is actually sent, rather than by comparing the
+    request against the constant that built it.
+    """
     requests: list[dict[str, object]] = []
     hit = SearchHit(id="memory_1", content="the toolbox is blue", score=0.9, created_at=NOW)
     with httpx.Client(transport=_answer_policy_transport(requests, "Blue.")) as client:
@@ -4506,15 +4513,18 @@ def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstenti
         model.answer("What colour?", (hit,), answer_policy="strict")
 
     assert requests[0] == requests[1]
-    assert requests[0]["messages"] == [
-        {"role": "system", "content": openai_backend._GROUNDED_SYSTEM_PROMPT},
-        cast(list[dict[str, object]], requests[0]["messages"])[1],
-    ]
+    system = cast(list[dict[str, str]], requests[0]["messages"])[0]["content"]
     assert (
-        f"If the hits do not contain enough evidence, reply with exactly "
-        f"{openai_backend._ABSTENTION_MARKER} and nothing else, whatever language the question "
-        "uses."
-    ) in openai_backend._GROUNDED_SYSTEM_PROMPT
+        "If the hits do not contain enough evidence, reply with exactly "
+        "[insufficient_evidence] and nothing else, whatever language the question uses."
+    ) in system
+    assert (
+        "Answer every part of the question that was asked -- one asking for two things, such as "
+        "a date and a time, is not answered by either alone -- give the shortest complete "
+        "answer, a word or a phrase rather than a sentence unless the question asks you to "
+        "explain, and when the answer is a list include exactly the items the hits support and "
+        "no others."
+    ) in system
 
 
 @pytest.mark.parametrize(
