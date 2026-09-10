@@ -288,11 +288,10 @@ _LEGACY_INDEX_RECIPES = frozenset(
 _OUTBOX_BATCH_SIZE = 1_024
 # Applied-but-unflushed outbox rows that trigger the Zvec flush. Zvec answers dense and full-text
 # queries from unflushed writes (and hides unflushed deletes), so a public write only has to
-# *apply* its rows to be visible; the ~50 ms flush is taken once per this many rows or at
-# `close()`, and rows are acknowledged in SQLite only after that flush, exactly as before. A
-# single `add` therefore no longer pays a flush and no longer leaves one segment behind. Must stay
-# below `_OUTBOX_BATCH_SIZE`: a drain reads the oldest rows first and skips the applied ones, so
-# the applied set must fit in one read with room for fresh rows or a backlog could never advance.
+# *apply* its rows to be visible; the ~50 ms flush is taken once per this many rows, when a drain
+# applied a deletion, and at `optimize()`, `reindex()` and `close()`. Rows are acknowledged in
+# SQLite only after that flush, exactly as before, and a single `add` no longer pays a flush or
+# leaves one segment behind.
 # ponytail: 256 caps the replay after a crash at 256 idempotent upserts; raise it if segment count
 # ever matters more than that.
 _INDEX_FLUSH_OPERATIONS = 256
@@ -864,7 +863,7 @@ class Memory:
             ) from error
 
         self._closed = False
-        self._unflushed_operations: dict[int, IndexOperation] = {}
+        self._unflushed_operations: set[IndexOperation] = set()
         try:
             with self._write_lock:
                 self._drain_outbox()
@@ -1349,7 +1348,7 @@ class Memory:
     ) -> Iterator[MemoryRecord]:
         """Add a lazy omni stream one durable, searchable observation at a time.
 
-        Index commits are batched in bounded groups, so a fast source pays one Zvec flush per
+        Index applies are batched in bounded groups, so a fast source pays one outbox drain per
         group instead of one per item; a reader always drains first, so a committed item is
         searchable before the group closes.
 
@@ -1440,7 +1439,7 @@ class Memory:
         return grouped, group_started
 
     def _flush_stream_group(self) -> None:
-        """Index and acknowledge exactly the outbox rows the group's commits left pending."""
+        """Apply to the index exactly the outbox rows the group's commits left pending."""
         with self._write_lock:
             self._drain_outbox(force=True)
 
@@ -4421,8 +4420,12 @@ class Memory:
                     asset_ids=reported_assets,
                     capture_memory_ids=capture_ids,
                 )
-            for memory_id in direct_ids:
-                self.delete(memory_id)
+            # Each deletion forces an index flush when its drain runs, so the page is deleted
+            # under the stream deferral and drained once: one flush, not one per record.
+            with self._deferred_index(defer=True):
+                for memory_id in direct_ids:
+                    self.delete(memory_id)
+            self._drain_outbox(force=True)
             removed: list[str] = []
             with _translate_storage_errors("delete retained media"):
                 # Whatever the deletions above orphaned is already gone; what is left here is
@@ -4455,7 +4458,8 @@ class Memory:
             # Flushed and acknowledged first: the checkpoint below queues every embedding that has
             # no pending row, so an applied-but-unacknowledged row would otherwise keep its
             # embedding out of the rebuild's replay if the rebuild fails.
-            self._drain_outbox(flush=True)
+            self._drain_outbox()
+            self._flush_index()
             with _translate_storage_errors("checkpoint a search-index rebuild"):
                 self._store.queue_all_embeddings()
             memory_count = 0
@@ -4471,7 +4475,8 @@ class Memory:
                 self._index.rebuild(documents(), batch_size=_REINDEX_PAGE_SIZE)
             # Adds may commit SQLite while the rebuild owns the Zvec boundary. Replay instead of
             # blindly acknowledging so records committed after its SQLite scan cannot be lost.
-            self._drain_outbox(flush=True)
+            self._drain_outbox()
+            self._flush_index()
             return memory_count
 
     def optimize(self) -> None:
@@ -4481,7 +4486,8 @@ class Memory:
             self._operation(),
             self._write_lock,
         ):
-            self._drain_outbox(flush=True)
+            self._drain_outbox()
+            self._flush_index()
             with _translate_index_errors("optimize the search index"):
                 self._index.optimize()
                 self._index.flush()
@@ -4507,7 +4513,8 @@ class Memory:
                 # Rows a failed flush leaves pending are durable in SQLite and replay on open.
                 try:
                     if self._unflushed_operations:
-                        self._flush_index()
+                        with self._trace("mindbridge.index.sync", kind="stage"):
+                            self._flush_index()
                 except Exception as error:
                     failures.append(error)
                 failures.extend(self._close_resources())
@@ -4797,7 +4804,7 @@ class Memory:
                 )
             if stored_memories:
                 # SQLite is authoritative and uses one WAL connection per transaction. Commit
-                # before taking the index lock so ordinary concurrent writers can share one flush.
+                # before taking the index lock so ordinary concurrent writers can share one drain.
                 with (
                     self._trace("mindbridge.storage.write", kind="stage"),
                     _translate_storage_errors("write memories"),
@@ -7566,34 +7573,35 @@ class Memory:
             with _translate_storage_errors("delete orphaned media metadata"):
                 self._store.delete_asset_if_unreferenced(asset.asset_id)
 
-    def _drain_outbox(self, *, force: bool = False, flush: bool = False) -> None:
+    def _drain_outbox(self, *, force: bool = False) -> None:
         """Apply current SQLite truth to Zvec; flush and acknowledge once enough has been applied.
 
         Skipped inside an `add_stream` group, whose own bounds force it. Skipping only leaves
-        rows pending: they are still durable in SQLite and the next drain applies them. `flush`
-        makes the applied rows durable and acknowledged now instead of at the batch bound.
+        rows pending: they are still durable in SQLite and the next drain applies them.
         """
         if not force and self._deferring:
             return
         with self._trace("mindbridge.index.sync", kind="stage"):
-            self._apply_outbox(flush=flush)
+            self._apply_outbox()
 
-    def _apply_outbox(self, *, flush: bool) -> None:
+    def _apply_outbox(self) -> None:
         while True:
             with self._trace(
                 "mindbridge.index.sync.sqlite.read",
                 kind="stage",
                 failure_stage="index.sync",
             ):
-                with _translate_storage_errors("read the search-index outbox"):
-                    pending = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
                 # Rows already applied and waiting for the batched flush stay pending in SQLite
-                # until that flush acknowledges them, so they are not re-hydrated here.
-                operations = tuple(
-                    operation
-                    for operation in pending
-                    if operation.operation_id not in self._unflushed_operations
+                # until that flush acknowledges them; they are always the oldest pending rows, so
+                # reading past the newest of them reads exactly what is not applied yet.
+                applied_through = max(
+                    (operation.operation_id for operation in self._unflushed_operations),
+                    default=0,
                 )
+                with _translate_storage_errors("read the search-index outbox"):
+                    operations = self._store.pending_index_operations(
+                        limit=_OUTBOX_BATCH_SIZE, after=applied_through
+                    )
                 if not operations:
                     break
                 last_by_embedding = {operation.embedding_id: operation for operation in operations}
@@ -7645,26 +7653,21 @@ class Memory:
                     self._index.delete(deleted_ids)
                 if documents:
                     self._index.upsert(documents)
-            self._unflushed_operations.update(
-                (operation.operation_id, operation) for operation in operations
-            )
+            self._unflushed_operations.update(operations)
             # A deletion is made durable before its call returns: an erased record must not stay
             # in the index, nor be named by a pending outbox row, for the sake of write latency.
             if deleted_ids or len(self._unflushed_operations) >= _INDEX_FLUSH_OPERATIONS:
                 self._flush_index()
-        if flush and self._unflushed_operations:
+        # A flush that failed in an earlier drain left the set at the bound; retry it here even
+        # when no new row arrived, so a read-only workload also heals the index.
+        if len(self._unflushed_operations) >= _INDEX_FLUSH_OPERATIONS:
             self._flush_index()
 
     def _flush_index(self) -> None:
-        """Make the applied Zvec changes durable, then acknowledge exactly their outbox rows.
-
-        A flush that fails leaves the rows both pending in SQLite and applied in memory, so the
-        next drain retries the flush without re-applying them. After a flush that succeeded the
-        set is cleared before the optimize and acknowledge steps: if either fails the rows are
-        re-applied (an idempotent upsert or delete) and acknowledged by the next drain, and a
-        compaction inside `optimize_if_needed` can never run over unflushed documents.
-        """
-        operations = tuple(self._unflushed_operations.values())
+        """Make the applied Zvec changes durable, then acknowledge exactly their outbox rows."""
+        if not self._unflushed_operations:
+            return
+        operations = tuple(self._unflushed_operations)
         with (
             self._trace(
                 "mindbridge.index.sync.zvec.flush",
@@ -7674,6 +7677,10 @@ class Memory:
             _translate_index_errors("update the search index"),
         ):
             self._index.flush()
+        # A failed flush above keeps the set, so the next drain retries without re-applying. Cleared
+        # here, before optimize and acknowledge: if either fails the rows are re-applied (idempotent
+        # upsert or delete) and acknowledged by the next drain, and a compaction inside
+        # `optimize_if_needed` never runs over unflushed documents.
         self._unflushed_operations.clear()
         with (
             self._trace(
@@ -11497,11 +11504,24 @@ def _lexical_relevance(
 
 
 # Every search re-derives the terms of ~100 hydrated candidates whose content has not changed
-# since the last search that ranked them; the terms are a pure function of the text.
-# ponytail: bounded by entries, not bytes -- a 16 KB record costs 16 KB of cache; shrink or key by
-# (memory_id, updated_at) if resident memory ever matters more than the ~0.4 ms per search.
-@lru_cache(maxsize=4096)
+# since the last search that ranked them; the terms are a pure function of the text. The cache is
+# process-wide and holds the term sets, which run to ~15x the text for unspaced CJK, so only texts
+# under this length are cached: 1024 entries x 2 000 chars bounds it near 32 MiB.
+_LEXICAL_TERMS_CACHE_CHARS = 2_000
+
+
 def _lexical_terms(value: str) -> frozenset[str]:
+    if len(value) > _LEXICAL_TERMS_CACHE_CHARS:
+        return _lexical_terms_uncached(value)
+    return _lexical_terms_cached(value)
+
+
+@lru_cache(maxsize=1024)
+def _lexical_terms_cached(value: str) -> frozenset[str]:
+    return _lexical_terms_uncached(value)
+
+
+def _lexical_terms_uncached(value: str) -> frozenset[str]:
     """Split text into words, plus adjacent-character bigrams for runs `\\w+` cannot split.
 
     `\\w+` matches an entire unspaced run as one token. That token is by construction the rarest

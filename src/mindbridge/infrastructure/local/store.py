@@ -4841,19 +4841,28 @@ class LocalStore:
                         raise RuntimeError("stored embedding vector is not a BLOB")
                     yield _row_text(row, "memory_id"), _unpack_vector(vector, int(row["dimension"]))
 
-    def pending_index_operations(self, *, limit: int = 100) -> tuple[IndexOperation, ...]:
-        """Read queued mutations without acknowledging them."""
+    def pending_index_operations(
+        self, *, limit: int = 100, after: int = 0
+    ) -> tuple[IndexOperation, ...]:
+        """Read queued mutations with an operation id above `after`, without acknowledging them.
+
+        Operation ids are AUTOINCREMENT and rows only ever leave through acknowledgement, so the
+        cursor is exact: a caller that has applied every row up to `after` reads exactly the rest.
+        """
         if not 1 <= limit <= 10_000:
             raise ValueError("limit must be between 1 and 10000")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ValueError("after must be a non-negative integer")
         with self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT operation_id, embedding_id, action
                 FROM search_index_queue
+                WHERE operation_id > ?
                 ORDER BY operation_id
                 LIMIT ?
                 """,
-                (limit,),
+                (after, limit),
             ).fetchall()
         return tuple(
             IndexOperation(
@@ -9540,8 +9549,22 @@ def validate_asset_name(value: str) -> str:
 
 # Hydration re-canonicalizes metadata the store itself wrote, so the round trip is a no-op that a
 # search pays ~140 times; the result is a pure function of the text, and invalid JSON is not cached.
-@lru_cache(maxsize=1024)
+# Process-wide, so only small payloads are cached: 1024 entries x 4 KiB bounds it near 8 MiB.
+_CANONICAL_JSON_CACHE_CHARS = 4_096
+
+
 def _canonical_object_json(value: str) -> str:
+    if len(value) > _CANONICAL_JSON_CACHE_CHARS:
+        return _canonical_object_json_uncached(value)
+    return _canonical_object_json_cached(value)
+
+
+@lru_cache(maxsize=1024)
+def _canonical_object_json_cached(value: str) -> str:
+    return _canonical_object_json_uncached(value)
+
+
+def _canonical_object_json_uncached(value: str) -> str:
     try:
         decoded: object = json.loads(value, parse_constant=_reject_json_constant)
     except (TypeError, ValueError) as error:

@@ -868,9 +868,20 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
         "mindbridge.index.sync.sqlite.read",
         "mindbridge.index.sync.zvec.apply",
     } <= index_sync_children
-    # The flush is batched behind the write; here `close()` took it, outside any operation span.
+    # The flush is batched behind the write; here `close()` took it, under its own sync stage.
     flush = next(span for span in spans if span.name == "mindbridge.index.sync.zvec.flush")
-    assert flush.parent is None
+    assert flush.parent is not None
+    close_sync = next(span for span in spans if span.context.span_id == flush.parent.span_id)
+    assert close_sync.name == "mindbridge.index.sync"
+    assert {
+        span.name
+        for span in spans
+        if span.parent is not None and span.parent.span_id == close_sync.context.span_id
+    } == {
+        "mindbridge.index.sync.zvec.flush",
+        "mindbridge.index.sync.zvec.optimize",
+        "mindbridge.index.sync.sqlite.ack",
+    }
     assert ask.attributes is not None
     operation_ttft = ask.attributes[OPERATION_TTFT]
     assert isinstance(operation_ttft, int | float) and operation_ttft >= 0
@@ -4057,13 +4068,8 @@ def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
 
 
 def test_writes_apply_at_once_and_flush_in_batches(tmp_path: Path) -> None:
-    """A write is searchable when it returns; the flush and acknowledgement wait for the bound.
-
-    The bound must stay below the outbox read bound: a drain reads the oldest rows first and skips
-    the applied ones, so the applied set has to fit in one read with room left for fresh rows.
-    """
+    """A write is searchable when it returns; the flush and acknowledgement wait for the bound."""
     bound = memory_module._INDEX_FLUSH_OPERATIONS
-    assert bound < memory_module._OUTBOX_BATCH_SIZE
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
         record = memory.add("red kettle")
@@ -4098,14 +4104,67 @@ def test_a_failed_batched_flush_is_retried_without_reapplying_its_rows(tmp_path:
         applied = len(index.upsert_calls)
         assert memory._store.pending_index_operations() != ()
         assert len(memory.search("kettle", limit=5)) == 5
+        # The read-only drain retried the flush and acknowledged every row without re-applying.
+        assert index.flush_calls == 2
+        assert len(index.upsert_calls) == applied
+        assert memory._store.pending_index_operations() == ()
         memory.add("red kettle")
-        # Only the new row was applied; the retried flush acknowledged every pending row.
         assert len(index.upsert_calls) == applied + 1
         assert index.flush_calls == 2
+
+
+def test_a_failed_flush_over_a_full_outbox_read_does_not_stall_later_writes(
+    tmp_path: Path,
+) -> None:
+    """The applied set can outgrow one outbox read; the next drain must still see fresh rows.
+
+    Before the read carried a cursor, a drain re-read the oldest rows and skipped the applied
+    ones, so once a failed flush left a full read's worth applied, every later drain saw nothing
+    new, never retried the flush, and never applied the write it was called for.
+    """
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.add_many(
+                tuple(f"window {position}" for position in range(memory_module._OUTBOX_BATCH_SIZE))
+            )
+        assert index.flush_calls == 1
+        record = memory.add("red teapot")
+        assert index.flush_calls == 2
+        assert memory._store.pending_index_operations() == ()
+        assert record.id in {hit.id for hit in memory.search("red teapot")}
+        # A read-only drain retries a still-failed flush too.
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.add_many(
+                tuple(f"second {position}" for position in range(memory_module._OUTBOX_BATCH_SIZE))
+            )
+        memory.search("red teapot")
+        assert index.flush_calls == 4
         assert memory._store.pending_index_operations() == ()
 
 
-def test_concurrent_adds_share_one_durable_index_flush(
+def test_close_reports_a_failed_batched_flush_and_the_next_open_replays_it(
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        record = memory.add("red lantern")
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.close()
+    assert index.closed is True
+    with _memory(tmp_path, _FakeModels()) as memory:
+        # The rows were pending in SQLite, so the open re-applied them; `close()` acknowledges.
+        assert len(memory._store.pending_index_operations()) > 0
+        assert [hit.id for hit in memory.search("red lantern")] == [record.id]
+    assert _FakeIndex.instances[-1].flush_calls == 1
+    with _memory(tmp_path, _FakeModels()) as memory:
+        assert memory._store.pending_index_operations() == ()
+
+
+def test_concurrent_adds_share_one_index_apply(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -4507,12 +4566,7 @@ def test_formation_marker_commits_with_derived_sqlite_before_index_flush(
         assert states[0].context.evidence_ids == (source.id,)
 
 
-def test_delete_recreate_coalesces_outbox_and_stale_hits_are_filtered(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    # Flush in every drain so the failure surfaces in the write that enqueued the row.
-    monkeypatch.setattr(memory_module, "_INDEX_FLUSH_OPERATIONS", 1)
+def test_delete_recreate_coalesces_outbox_and_stale_hits_are_filtered(tmp_path: Path) -> None:
     models = _FakeModels()
     with _memory(tmp_path, models) as memory:
         record = memory.add("red notebook")
@@ -5165,8 +5219,6 @@ def test_delete_gc_recovers_from_index_and_file_failures(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # Flush in every drain so the failure surfaces in the write that enqueued the row.
-    monkeypatch.setattr(memory_module, "_INDEX_FLUSH_OPERATIONS", 1)
     with _memory(tmp_path, _FakeModels()) as memory:
         record = memory.add(Blob(b"first image", "image/png", "first.png"))
         path = record.assets[0].path

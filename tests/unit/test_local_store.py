@@ -354,6 +354,10 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
 
         operations = store.pending_index_operations()
         assert [operation.action for operation in operations] == ["upsert"]
+        assert store.pending_index_operations(after=operations[0].operation_id) == ()
+        assert store.pending_index_operations(after=operations[0].operation_id - 1) == operations
+        with pytest.raises(ValueError, match="after"):
+            store.pending_index_operations(after=-1)
         assert store.acknowledge_index_operations(operations) == 1
 
         changed = replace(

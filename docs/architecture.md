@@ -115,7 +115,7 @@ flowchart LR
     commit --> ack["Acknowledge capture"]
     ack -. later .-> settle["settle(): run the model stages"]
     settle --> derived["Commit derived content and vectors; the queue row survives"]
-    derived --> zvec["Flush Zvec, form, then delete the queue row"]
+    derived --> zvec["Apply to Zvec, form, then delete the queue row"]
     settle -. failure .-> queued["Count the attempt, store the reason, keep the row queued"]
 ```
 
