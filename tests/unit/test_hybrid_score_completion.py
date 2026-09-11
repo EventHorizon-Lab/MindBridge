@@ -296,6 +296,9 @@ def test_corrupt_persisted_vector_uses_the_storage_error_path(
             "lexical_search",
             lambda *_args, **_kwargs: (_lexical_hit(record.id),),
         )
+        # Flush and acknowledge the add's batched outbox row first, so the trigger row the
+        # corruption below enqueues is the only one left to drop.
+        memory.optimize()
         with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
             connection.execute(
                 "UPDATE embeddings SET vector = ? WHERE embedding_id = ?",

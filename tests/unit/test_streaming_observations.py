@@ -739,10 +739,15 @@ def test_a_stream_killed_before_its_flush_is_drained_by_the_next_open(tmp_path: 
     assert indexed == 0
 
     with Memory(data_dir, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
-        assert memory._store.pending_index_operations() == ()
+        # The open replayed the rows into the index; they are acknowledged by the batched flush,
+        # which `close()` takes below.
+        assert len(memory._store.pending_index_operations()) == _KILLED_STREAM_ITEMS
         assert cast(ZvecIndex, memory._index).doc_count == _KILLED_STREAM_ITEMS
         found = memory.search("streamed clip", limit=10)
         assert {hit.id for hit in found} == set(committed)
+    with Memory(data_dir, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+        assert memory._store.pending_index_operations() == ()
+        assert cast(ZvecIndex, memory._index).doc_count == _KILLED_STREAM_ITEMS
         assert [item.id for item in memory.list().items] == list(reversed(committed))
 
 
@@ -903,7 +908,7 @@ def test_a_finished_stream_never_leaves_another_thread_deferring(tmp_path: Path)
         second_open = threading.Event()
         first_done = threading.Event()
         second_done = threading.Event()
-        pending: dict[str, int] = {}
+        indexed: dict[str, int] = {}
 
         def first_stream() -> None:
             stream = memory.add_stream(("the kettle boiled",))
@@ -914,9 +919,11 @@ def test_a_finished_stream_never_leaves_another_thread_deferring(tmp_path: Path)
                 pass
             first_done.set()
             assert second_done.wait(10)
-            # Nothing defers this thread any more, so its own write reaches the index.
+            # Nothing defers this thread any more, so its own write reaches the index before
+            # any search forces a drain. (Its outbox row is acknowledged by the batched flush.)
+            before = cast(ZvecIndex, memory._index).doc_count
             memory.add("the toolbox is blue")
-            pending["first"] = len(memory._store.pending_index_operations(limit=5))
+            indexed["first"] = cast(ZvecIndex, memory._index).doc_count - before
 
         thread = threading.Thread(target=first_stream)
         thread.start()
@@ -932,7 +939,7 @@ def test_a_finished_stream_never_leaves_another_thread_deferring(tmp_path: Path)
         finally:
             thread.join(30)
 
-        assert pending == {"first": 0}
+        assert indexed == {"first": 1}
         assert memory._deferring is False
 
 

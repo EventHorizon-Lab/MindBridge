@@ -49,24 +49,34 @@ flowchart LR
     assets --> models["Run configured model stages"]
     models --> sqlite["Commit record, FP32 vectors, and outbox in SQLite"]
     sqlite --> zvec["Apply current SQLite truth to Zvec"]
-    zvec --> flush["Flush Zvec"]
-    flush --> ack["Acknowledge exact outbox rows in SQLite"]
+    zvec --> flush["Flush Zvec once 256 applied rows accumulate, or at optimize(), reindex(), close()"]
+    flush --> ack["Acknowledge exactly the flushed outbox rows in SQLite"]
     zvec -. failure .-> pending["Keep outbox rows pending"]
     flush -. failure .-> pending
 ```
 
 Media is copied to the content-addressed store before any model receives it. SQLite triggers
 enqueue an upsert or delete for each embedding mutation. MindBridge commits that transaction
-before changing Zvec, flushes Zvec before acknowledging work, and acknowledges the exact rows it
-applied. Startup, add, delete, search, `reindex()`, and `optimize()` drain pending work.
+before changing Zvec, and acknowledges outbox rows only after the Zvec flush that made them
+durable. Zvec answers dense and full-text queries from applied but unflushed writes, so a write is
+searchable as soon as its rows are applied, and the flush itself is batched: it runs once 256
+applied rows accumulate, when a drain applied a deletion, inside `optimize()` and `reindex()`, and
+at `close()`. A single `add` therefore pays an apply rather than a flush and leaves no segment of
+its own, while a deletion is still flushed before its call returns. Startup, add, delete, search,
+`reindex()`, and `optimize()` drain pending work.
 
 The ordering determines failure behavior:
 
 - Validation or model failure before the SQLite transaction creates no record; unreferenced media
   is cleaned after its operation lease is released.
 - A SQLite failure rolls back the record, embeddings, and outbox together.
-- A Zvec mutation or flush failure can fail the public call after SQLite committed. The record is
-  still durable and the unacknowledged projection work is retryable.
+- A Zvec mutation failure can fail the public call after SQLite committed. The record is still
+  durable and the unacknowledged projection work is retryable.
+- A Zvec flush failure surfaces in the call that took the flush -- the write that reached the
+  batch bound, `optimize()`, `reindex()`, or `close()` -- not necessarily in the write that
+  enqueued the row. The rows stay pending and applied, and the next drain retries the flush. A
+  process that dies before the flush loses only the unflushed projection: the rows are still
+  pending and replay on the next open.
 - Stale IDs left in Zvec cannot resurrect deleted data because final hydration uses SQLite.
 
 `delete()` is physical forgetting and runs the same ordering in reverse. One SQLite transaction
@@ -86,9 +96,9 @@ A memory ID is the SHA-256 digest of canonical ordered content, media digests, m
 time, memory type, and optional typed observation context. Repeating the same add is idempotent.
 `add_many()` uses one model batch and one SQLite transaction. `add_stream()` commits each completed
 item through the ordinary add path, so a later source failure preserves the committed prefix. It
-applies and acknowledges those commits to Zvec in bounded groups instead of once per item: the
-group ends after 32 items or 250 ms, and covers exactly the outbox rows the commits behind it left
-pending. Only the projection is grouped, so the order and the failure behavior above are unchanged;
+applies those commits to Zvec in bounded groups instead of once per item: the group ends after 32
+items or 250 ms, and covers exactly the outbox rows the commits behind it left pending. Only the
+projection is grouped, so the order and the failure behavior above are unchanged;
 a group the process never reaches leaves its rows pending for the next drain, and `search` drains
 before it reads, so a committed item is retrievable during the stream either way.
 
@@ -105,7 +115,7 @@ flowchart LR
     commit --> ack["Acknowledge capture"]
     ack -. later .-> settle["settle(): run the model stages"]
     settle --> derived["Commit derived content and vectors; the queue row survives"]
-    derived --> zvec["Flush Zvec, form, then delete the queue row"]
+    derived --> zvec["Apply to Zvec, form, then delete the queue row"]
     settle -. failure .-> queued["Count the attempt, store the reason, keep the row queued"]
 ```
 
@@ -234,8 +244,9 @@ and close wait for active queries.
 
 `reindex()` reads authoritative SQLite pages, replaces the Zvec collection, then replays the
 outbox so writes committed during the scan are retained. `close()` rejects new work, waits for
-active operations, releases asset leases, and closes each unique backend and storage resource
-once. `AsyncMemory` delegates to this same synchronous core with `asyncio.to_thread`; it does not
+active operations, releases asset leases, flushes and acknowledges the applied index work, and
+closes each unique backend and storage resource once. `AsyncMemory` delegates to this same
+synchronous core with `asyncio.to_thread`; it does not
 create a service or a second consistency model.
 
 ## Model boundary

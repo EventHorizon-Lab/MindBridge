@@ -771,8 +771,9 @@ gaps do not inflate the denominator. TTFT and token-per-call distributions also 
 | `nodes` | Count, compute time, active time, throughput, average, p50/p95/p99, status, parent operation, purpose, model identity, response identity, fingerprint, embedding task, batch size, and modalities for every operation, stage, and model span. |
 | `token_usage` | Total and per-module request counts, exactness, input/output/cached/reasoning tokens, modality totals, per-call distribution, and observed output tokens per model-compute second. |
 
-`ingest` ends only after the SQLite commit, Zvec flush, and durable outbox acknowledgement, so an
-accepted item is searchable when its measured call completes. Failed attempts stay in attempt
+`ingest` ends only after the SQLite commit and the Zvec apply, so an accepted item is searchable
+when its measured call completes; the Zvec flush and outbox acknowledgement are batched behind the
+call and are not part of its latency. Failed attempts stay in attempt
 latency and error counts but never enter accepted-item throughput.
 
 The three first-output clocks are intentionally distinct:

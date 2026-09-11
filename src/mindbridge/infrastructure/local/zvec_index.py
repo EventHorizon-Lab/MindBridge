@@ -72,10 +72,11 @@ _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS = 100_000
 # this bound is also the read tax, and 64 is a deliberate choice of the write side of that trade,
 # not an oversight. Lowering it to 8 moved the median search on a 16 000-memory interleaved
 # workload from 53.4 ms to 21.1 ms, and cost 120 single `add` calls on an 8 000-memory store 7.31 s
-# to 13.88 s with p90 latency 74 ms to 452 ms, because one `add` makes one segment however little
-# it carries and `optimize` costs the same ~530 ms whether it merges eight documents or eight
-# thousand. Break-even is around three and a half searches per memory written. Raising
-# `_OUTBOX_BATCH_SIZE` is the part of this that is free, and it is taken.
+# to 13.88 s with p90 latency 74 ms to 452 ms, because at the time one `add` made one segment
+# however little it carried and `optimize` costs the same ~530 ms whether it merges eight documents
+# or eight thousand. Break-even was around three and a half searches per memory written. The
+# kernel now flushes once per batch of applied outbox rows rather than per write, so segments
+# accrue per flush rather than per `add`; the merge cadence below still counts flushes.
 _AUTO_OPTIMIZE_FLUSHES = 64
 _AUTO_COMPACT_FLUSHES = 256
 _FILE_DESCRIPTOR_RESERVE = 128

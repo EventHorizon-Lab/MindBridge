@@ -867,10 +867,21 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
     assert {
         "mindbridge.index.sync.sqlite.read",
         "mindbridge.index.sync.zvec.apply",
+    } <= index_sync_children
+    # The flush is batched behind the write; here `close()` took it, under its own sync stage.
+    flush = next(span for span in spans if span.name == "mindbridge.index.sync.zvec.flush")
+    assert flush.parent is not None
+    close_sync = next(span for span in spans if span.context.span_id == flush.parent.span_id)
+    assert close_sync.name == "mindbridge.index.sync"
+    assert {
+        span.name
+        for span in spans
+        if span.parent is not None and span.parent.span_id == close_sync.context.span_id
+    } == {
         "mindbridge.index.sync.zvec.flush",
         "mindbridge.index.sync.zvec.optimize",
         "mindbridge.index.sync.sqlite.ack",
-    } <= index_sync_children
+    }
     assert ask.attributes is not None
     operation_ttft = ask.attributes[OPERATION_TTFT]
     assert isinstance(operation_ttft, int | float) and operation_ttft >= 0
@@ -4056,7 +4067,104 @@ def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
     ]
 
 
-def test_concurrent_adds_share_one_durable_index_flush(
+def test_writes_apply_at_once_and_flush_in_batches(tmp_path: Path) -> None:
+    """A write is searchable when it returns; the flush and acknowledgement wait for the bound."""
+    bound = memory_module._INDEX_FLUSH_OPERATIONS
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        record = memory.add("red kettle")
+        assert len(index.upsert_calls) == 1
+        assert index.flush_calls == 0
+        assert [hit.id for hit in memory.search("red kettle")] == [record.id]
+        assert memory._store.pending_index_operations() != ()
+        # A later drain does not re-hydrate or re-apply what the index already holds.
+        memory.search("red kettle")
+        assert len(index.upsert_calls) == 1
+        memory.add_many(tuple(f"kettle {position}" for position in range(bound)))
+        assert index.flush_calls == 1
+        assert memory._store.pending_index_operations() == ()
+        memory.add("blue kettle")
+        assert index.flush_calls == 1
+        assert memory._store.pending_index_operations() != ()
+    # `close()` flushes and acknowledges whatever the bound had not reached.
+    assert index.flush_calls == 2
+    with _memory(tmp_path, _FakeModels()) as memory:
+        assert memory._store.pending_index_operations() == ()
+
+
+def test_a_failed_batched_flush_is_retried_without_reapplying_its_rows(tmp_path: Path) -> None:
+    """The write that takes the flush reports its failure; the rows stay pending and applied."""
+    bound = memory_module._INDEX_FLUSH_OPERATIONS
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.add_many(tuple(f"kettle {position}" for position in range(bound)))
+        assert index.flush_calls == 1
+        applied = len(index.upsert_calls)
+        assert memory._store.pending_index_operations() != ()
+        assert len(memory.search("kettle", limit=5)) == 5
+        # The read-only drain retried the flush and acknowledged every row without re-applying.
+        assert index.flush_calls == 2
+        assert len(index.upsert_calls) == applied
+        assert memory._store.pending_index_operations() == ()
+        memory.add("red kettle")
+        assert len(index.upsert_calls) == applied + 1
+        assert index.flush_calls == 2
+
+
+def test_a_failed_flush_over_a_full_outbox_read_does_not_stall_later_writes(
+    tmp_path: Path,
+) -> None:
+    """The applied set can outgrow one outbox read; the next drain must still see fresh rows.
+
+    Before the read carried a cursor, a drain re-read the oldest rows and skipped the applied
+    ones, so once a failed flush left a full read's worth applied, every later drain saw nothing
+    new, never retried the flush, and never applied the write it was called for.
+    """
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.add_many(
+                tuple(f"window {position}" for position in range(memory_module._OUTBOX_BATCH_SIZE))
+            )
+        assert index.flush_calls == 1
+        record = memory.add("red teapot")
+        assert index.flush_calls == 2
+        assert memory._store.pending_index_operations() == ()
+        assert record.id in {hit.id for hit in memory.search("red teapot")}
+        # A read-only drain retries a still-failed flush too.
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.add_many(
+                tuple(f"second {position}" for position in range(memory_module._OUTBOX_BATCH_SIZE))
+            )
+        memory.search("red teapot")
+        assert index.flush_calls == 4
+        assert memory._store.pending_index_operations() == ()
+
+
+def test_close_reports_a_failed_batched_flush_and_the_next_open_replays_it(
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        record = memory.add("red lantern")
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.close()
+    assert index.closed is True
+    with _memory(tmp_path, _FakeModels()) as memory:
+        # The rows were pending in SQLite, so the open re-applied them; `close()` acknowledges.
+        assert len(memory._store.pending_index_operations()) > 0
+        assert [hit.id for hit in memory.search("red lantern")] == [record.id]
+    assert _FakeIndex.instances[-1].flush_calls == 1
+    with _memory(tmp_path, _FakeModels()) as memory:
+        assert memory._store.pending_index_operations() == ()
+
+
+def test_concurrent_adds_share_one_index_apply(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -4396,7 +4504,13 @@ def test_index_fd_exhaustion_keeps_the_actionable_cause() -> None:
         )
 
 
-def test_formation_marker_commits_with_derived_sqlite_before_index_flush(tmp_path: Path) -> None:
+def test_formation_marker_commits_with_derived_sqlite_before_index_flush(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Flush in every drain so the failure surfaces in the write that enqueued the row.
+    monkeypatch.setattr(memory_module, "_INDEX_FLUSH_OPERATIONS", 1)
+
     class FlushFailingFormer:
         formation_capabilities = frozenset({Modality.TEXT})
         formation_model = "formation-test"
@@ -6380,14 +6494,18 @@ def test_add_stream_indexes_committed_items_in_bounded_groups(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """One flush per group of 32, and every Zvec change follows its own SQLite commit."""
+    """One index apply per group of 32, every one after its own SQLite commit; the flush waits.
+
+    The stream groups the *apply*; the flush that acknowledges the rows is batched behind every
+    write and here runs once, at `close()`.
+    """
     monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
 
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
         log = _stream_log(memory, index)
         records = tuple(memory.add_stream(f"streamed clip {position}" for position in range(70)))
-        stream_flushes = index.flush_calls
+        stream_groups = len(index.upsert_calls)
         found = memory.search("streamed clip", limit=100)
 
     committed: set[str] = set()
@@ -6399,14 +6517,15 @@ def test_add_stream_indexes_committed_items_in_bounded_groups(
             assert set(memory_ids) <= committed
     assert [action for action, _ids in log].count("commit") == 70
     # 32, 64, and the six left over when the source ends.
-    assert stream_flushes == 3
+    assert stream_groups == 3
     assert [action for action, _ids in log if action in {"upsert", "flush"}] == [
-        value for _group in range(3) for value in ["upsert", "flush"]
+        *(["upsert"] * 3),
+        "flush",
     ]
     assert {hit.id for hit in found} == {record.id for record in records}
 
 
-def test_add_stream_flushes_a_slow_source_on_the_time_bound(
+def test_add_stream_applies_a_slow_source_on_the_time_bound(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -6416,7 +6535,7 @@ def test_add_stream_flushes_a_slow_source_on_the_time_bound(
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
         tuple(memory.add_stream(f"slow clip {position}" for position in range(4)))
-        assert index.flush_calls == 4
+        assert len(index.upsert_calls) == 4
 
 
 def test_a_stream_that_ended_stops_deferring_even_if_another_outlives_it(
@@ -6444,9 +6563,9 @@ def test_a_stream_that_ended_stops_deferring_even_if_another_outlives_it(
                 both_open.wait()
             first_closed.set()
             assert second_closed.wait(timeout=30)
-            before = index.flush_calls
+            before = len(index.upsert_calls)
             memory.add("a note added once both streams had ended")
-            after_both.append(index.flush_calls - before)
+            after_both.append(len(index.upsert_calls) - before)
 
         def second() -> None:
             # Opens inside the first stream's group and closes after it, which is the order that
@@ -6486,9 +6605,9 @@ def test_a_stream_pumped_across_threads_stops_deferring_on_the_thread_that_opene
         stream = memory.add_stream(("clip the opener pumps", "clip the finisher pumps"))
 
         def add_and_count_flushes() -> int:
-            before = index.flush_calls
+            before = len(index.upsert_calls)
             memory.add("a note added on the thread that opened the stream")
-            return index.flush_calls - before
+            return len(index.upsert_calls) - before
 
         with (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="opener") as opener,
@@ -6519,7 +6638,7 @@ def test_search_during_a_stream_sees_the_committed_items(
             seen.append(record)
             if len(seen) == 2:
                 break
-        assert index.flush_calls == 0
+        assert index.upsert_calls == []
         during = memory.search("midstream clip", limit=10)
 
     assert {hit.id for hit in during} == {record.id for record in seen}
@@ -6542,12 +6661,12 @@ def test_search_inside_a_live_stream_loop_sees_the_item_just_yielded(
         for record in memory.add_stream(f"live clip {position}" for position in range(3)):
             hits = memory.search("live clip", limit=10)
             visible.append((record.id, {hit.id for hit in hits}))
-        flushes = index.flush_calls
+        applies = len(index.upsert_calls)
 
     for record_id, ids in visible:
         assert record_id in ids
     # Each in-loop search closed the group that held the item just yielded.
-    assert flushes >= 3
+    assert applies >= 3
 
 
 def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
@@ -6568,7 +6687,7 @@ def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
         with pytest.raises(ModelError):
             next(stream)
         # The group never closed, so the projection work is still pending and durable.
-        assert index.flush_calls == 0
+        assert index.upsert_calls == []
         assert memory._store.pending_index_operations() != ()
         assert [item.id for item in memory.list().items] == [prefix[1].id, prefix[0].id]
         recovered = memory.search("failing-stream clip", limit=10)

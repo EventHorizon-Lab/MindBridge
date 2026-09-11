@@ -288,7 +288,7 @@ derive to `content` and never rewrites what the caller supplied; see
 [public values](#public-values) for how derived sections are marked.
 
 `settle` runs the deferred stages — speech identity, transcription, embedding, the SQLite embedding
-commit, the index flush, and formation — over up to `limit` captured records in enqueue order, and
+commit, the index apply, and formation — over up to `limit` captured records in enqueue order, and
 returns how many it settled. Every record it read is attempted: a model or storage failure on one
 leaves it queued with its attempt count and reason while the rest still settle, and the first
 failure is raised once the batch is done with `subject` set to that memory ID. A record whose
