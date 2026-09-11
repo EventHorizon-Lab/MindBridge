@@ -1366,11 +1366,11 @@ def test_baseline_generator_uses_the_configured_generation_model(
     assert requests[3] == requests[2]
 
 
-def test_a_failed_answer_keeps_retrieval_but_drops_the_joint_metrics() -> None:
-    """`joint_*` is accuracy times recall, so it scores the answer the run never got.
+def test_a_failed_answer_keeps_retrieval_and_scores_the_joint_metrics_zero() -> None:
+    """A question the run never answered is a question it got wrong.
 
-    Leaving it behind put the empty prediction back into the mean under another name, and
-    because the arms fail at different rates the deflation was asymmetric.
+    `joint_*` is accuracy times recall, so it follows the answer to zero while the separately
+    measured recall stays; the failure is still counted in `error_count`.
     """
     ranked = (_hit("gold-1", 0.9),)
     memory = _RankedMemory(ranked, ranked)
@@ -1391,9 +1391,10 @@ def test_a_failed_answer_keeps_retrieval_but_drops_the_joint_metrics() -> None:
     )
 
     assert sample.error_code is not None
-    assert sample.score is None
+    assert sample.score == 0.0
     assert sample.metrics["retrieval_recall@5"] == 1.0
-    assert not [name for name in sample.metrics if name.startswith("joint_")]
+    joint = {name: value for name, value in sample.metrics.items() if name.startswith("joint_")}
+    assert joint and set(joint.values()) == {0.0}
 
 
 def test_a_sample_with_no_ranked_list_carries_no_retrieval_metrics() -> None:

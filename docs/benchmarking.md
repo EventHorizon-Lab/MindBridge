@@ -1102,7 +1102,7 @@ Before reporting a number, check these task fields:
 | --- | --- |
 | `primary_metric` and `score.mean` | Name and value of the headline result |
 | `official_metric` | Must be true for an official-protocol claim |
-| `score_valid` | Must be true; answer or ingest failures make it false |
+| `score_valid` | Must be true; ingest failures, failed retrieval diagnostics, and unavailable units make it false. An answer or judge failure scores zero, stays in the mean, and is counted in `error_count` |
 | `question_count` and `score.cluster_count` | Report both sample size and independent memory units |
 | `score.confidence_interval_95` | Present as `null` with fewer than two independent clusters |
 | `dataset_sha256`, `evaluation_sha256`, `scorer_protocol`, and `judge_model` | Establish whether two runs are comparable |

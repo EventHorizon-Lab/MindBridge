@@ -3736,10 +3736,8 @@ def _sample(
         retrieval_available=(
             arm.retrieves and ranked_source_ids_complete and retrieval_diagnostic_error is None
         ),
-        # A provider failure produced no answer. Scoring the empty prediction turned every 500
-        # into a confident zero, and because the arms fail at different rates the deflation was
-        # asymmetric: on one run the blind arm errored 3.4x more often than the product arm,
-        # so the naive "memory is worth +X" gap was inflated by the error-rate difference.
+        # A provider failure produced no answer; `_score` counts it as a wrong one. Transient
+        # failures are waited out before they get here, so what remains is the system's loss.
         answer_failed=error_code is not None,
     )
     if (
@@ -3830,14 +3828,22 @@ def _score(
     )
     metrics = _arm_metrics(metrics, arm, retrieval_available=retrieval_available)
     if answer_failed:
-        # Keep the separately measured retrieval diagnostic and leave the failed answer unscored
-        # so it lands in `error_count`, not in the mean. The `joint_*` metrics go with it: they
-        # are accuracy times recall, so scoring the empty prediction would put a confident zero
-        # back in under another name.
-        diagnostic = {
-            name: value for name, value in metrics.items() if name.startswith("retrieval_")
-        }
-        return diagnostic, None, None
+        # A question the system did not answer is a question it got wrong: it scores zero under
+        # the task's primary metric, and the separately measured retrieval diagnostic stays.
+        # Judge-scored families carry no local answer metric, so the zero is written explicitly
+        # rather than read off the empty prediction, and the derived `joint_*` metrics follow.
+        # The earlier rule left it unscored so one failure did not deflate the arms unevenly,
+        # at the price of a single residual failure invalidating a task's whole score; the
+        # failure is still counted and its provider message kept for diagnosis.
+        failed = finalize_scores(
+            task_name,
+            {
+                **metrics,
+                sample_primary_metric(task_name): 0.0,
+                **({"exact_match": 0.0} if "exact_match" in metrics else {}),
+            },
+        )
+        return failed, 0.0, failed.get("exact_match")
     score = metrics.get(sample_primary_metric(task_name), metrics.get("token_f1"))
     return metrics, score, metrics.get("exact_match")
 
@@ -3999,9 +4005,15 @@ async def _judge_sample(
         )
     except Exception as error:
         message = " ".join(str(error).split())[:500]
+        # The judge's outage was waited out already; an answer that still has no verdict is
+        # scored as wrong, the same as an answer that was never produced.
+        metrics = finalize_scores(
+            sample.task, {**sample.metrics, sample_primary_metric(sample.task): 0.0}
+        )
         return replace(
             sample,
-            score=sample.metrics.get(sample_primary_metric(sample.task)),
+            score=0.0,
+            metrics=metrics,
             error_code=sample.error_code or "JudgeError",
             scorer_error=f"{type(error).__name__}: {message}",
             scorer_details={**sample.scorer_details, **plan.details},
@@ -4891,9 +4903,11 @@ def _metrics(
             else len(judge_models) == 1 and judge_model_is_official(task.spec.name, judge_models[0])
         ),
         "score": primary,
+        # An answer or judge failure scores zero and stays in the mean; only a store that
+        # lost writes, a retrieval diagnostic that failed, or a unit the dataset could not
+        # supply makes the score something other than the system's result on the task.
         "score_valid": (
-            error_count == 0
-            and ingest_failure_count == 0
+            ingest_failure_count == 0
             and retrieval_diagnostic_error_count == 0
             and not unavailable_units
         ),
