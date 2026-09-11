@@ -2911,9 +2911,21 @@ def test_answer_converts_only_videos_below_the_configured_provider_minimum(
     assert video.path is not None and video.path.read_bytes() == original
 
 
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        "The video file is too short.",
+        # A content-inspection refusal names the modality, not the clip; measured live on one
+        # gateway for two of thirteen questions over the same clips, so it is a fact about this
+        # request and the memories' text still answers.
+        "<400> InternalError.Algo.DataInspectionFailed: Input video data may contain "
+        "inappropriate content.",
+    ],
+)
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("image_capable", [False, True])
-def test_answer_retries_provider_rejected_short_hit_video_as_text(
+def test_answer_retries_provider_rejected_hit_video_as_text(
+    rejection: str,
     streaming: bool,
     image_capable: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -2937,10 +2949,7 @@ def test_answer_retries_provider_rejected_short_hit_video_as_text(
         if len(requests) == 1:
             assert isinstance(content, list)
             assert any(part["type"] == "video_url" for part in content)
-            return httpx.Response(
-                400,
-                json={"error": {"message": "The video file is too short."}},
-            )
+            return httpx.Response(400, json={"error": {"message": rejection}})
         assert isinstance(content, str)
         assert "The blue toolbox is beside the door." in content
         messages = cast(list[dict[str, object]], payload["messages"])

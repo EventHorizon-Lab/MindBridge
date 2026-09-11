@@ -105,8 +105,12 @@ from 0 through 2; seed is from 0 through `2**63 - 1`; face thresholds are from 0
 
 `generation.video_limit` caps retrieved evidence videos in one answer request; question media has
 priority, and `None` disables that count. `generation.min_video_seconds` sends a shorter video as
-four ordered stills and requires image support. Formation and consolidation have neither field
-because they shape answer evidence, not proposals.
+four ordered stills and requires image support. When the provider rejects an answer request by
+declaring a constraint on its media -- a video "too short", or input data that "may contain
+inappropriate content" -- the same request is sent once more with that modality's evidence
+media omitted and the omission declared in the prompt, because the memories' text still answers
+and the provider names the modality, never the clip. Formation and consolidation have neither
+field because they shape answer evidence, not proposals.
 
 `vision` takes the same completion fields as `formation`, but its `modalities` accepts only `image`
 and `video`, because it is the visual capability set rather than a generation one. `generation`,

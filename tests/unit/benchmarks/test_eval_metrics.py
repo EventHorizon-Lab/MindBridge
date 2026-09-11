@@ -278,6 +278,35 @@ def test_answer_latency_names_the_quantity_it_measures() -> None:
     assert cast(float, latency["p99"]) == pytest.approx(39.7)
 
 
+def test_a_failed_answer_counts_as_wrong_without_invalidating_the_task_score() -> None:
+    # Two of thirteen answers failed on a fourteen-hour run and the whole task read INVALID.
+    # A failure is waited out while it is transient; what remains is scored as a wrong answer,
+    # stays in the mean, and is still counted so the report shows it happened.
+    answered = _sample("q1", sources=(), gold=(), candidate_count=0, score=1.0)
+    failed = replace(
+        _sample("q2", sources=(), gold=(), candidate_count=0, score=0.0),
+        error_code="model_error",
+        error_reason="request_rejected",
+        error_message="Input video data may contain inappropriate content.",
+    )
+    task = cast(
+        Any,
+        SimpleNamespace(
+            spec=SimpleNamespace(name="fixture"),
+            units=(SimpleNamespace(unit_id="unit"),),
+            unavailable_units={},
+        ),
+    )
+
+    metrics = eval_module._metrics(task, (answered, failed), _arguments())
+    score = cast(Mapping[str, object], metrics["score"])
+
+    assert metrics["score_valid"] is True
+    assert metrics["error_count"] == 1
+    assert metrics["scored_question_count"] == 2
+    assert score["mean"] == pytest.approx(0.5)
+
+
 def test_metrics_mark_an_unavailable_dataset_unit_as_incomplete() -> None:
     sample = _sample("q1", sources=(), gold=(), candidate_count=0)
     task = cast(

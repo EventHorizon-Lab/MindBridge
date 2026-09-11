@@ -7449,12 +7449,15 @@ def test_a_point_plan_grounds_exactly_as_the_unplanned_path_does(tmp_path: Path)
     planned = _FakeModels()
     planned.recall_plan = _plan("point", {"op": "similar", "query": "the red wrench", "k": 3})
     plain = _FakeModels()
+    # The reader is handed the answering clock; two calls straddling a second boundary would
+    # differ in that line alone, so both are asked at one pinned instant.
+    asked_at = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
     with _memory(tmp_path / "planned", planned, recall_planning=True) as memory:
         _dated_corpus(memory)
-        memory.ask("which wrench is red?", limit=2)
+        memory.ask("which wrench is red?", limit=2, reference_at=asked_at)
     with _memory(tmp_path / "plain", plain) as memory:
         _dated_corpus(memory)
-        memory.ask("which wrench is red?", limit=2)
+        memory.ask("which wrench is red?", limit=2, reference_at=asked_at)
 
     planned_question, planned_hits = planned.answer_calls[-1]
     plain_question, plain_hits = plain.answer_calls[-1]

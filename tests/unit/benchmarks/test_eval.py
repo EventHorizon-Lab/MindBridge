@@ -1486,12 +1486,13 @@ async def test_answer_failure_preserves_the_product_retrieval_ranking(tmp_path: 
     assert sample.ranked_source_ids_complete is True
 
 
-def test_a_provider_error_leaves_the_answer_unscored_but_keeps_retrieval(tmp_path: Path) -> None:
-    """A 500 is a missing answer, not a wrong one.
+def test_a_provider_error_scores_the_answer_zero_and_keeps_retrieval(tmp_path: Path) -> None:
+    """A question the system did not answer is a question it got wrong.
 
-    Scoring the empty prediction gave every provider failure an f1 of 0.0 and deflated the
-    arms unevenly (one run: blind errored 3.4x more than the product arm). The retriever
-    did rank before the generator failed, so its diagnostics stay.
+    Transient provider failures are waited out before a sample records an error, so what
+    remains is the system's loss: it scores zero, stays in the mean, and is still counted in
+    `error_count` with its provider message. The retriever did rank before the generator
+    failed, so its diagnostics stay.
     """
     question = EvalQuestion(
         "q1",
@@ -1524,9 +1525,10 @@ def test_a_provider_error_leaves_the_answer_unscored_but_keeps_retrieval(tmp_pat
     )
 
     assert sample.error_code == "model_error"
-    assert sample.score is None
-    assert sample.metrics and all(name.startswith("retrieval_") for name in sample.metrics)
-    assert "f1" not in sample.metrics
+    assert sample.error_message == "upstream 500"
+    assert sample.score == 0.0
+    assert sample.metrics["f1"] == 0.0
+    assert any(name.startswith("retrieval_") for name in sample.metrics)
 
 
 def test_run_identifier_cannot_escape_the_default_output_root() -> None:
@@ -2014,6 +2016,51 @@ def test_progress_drives_a_bar_on_a_terminal(
     assert activities == ["ingesting unit 1/1"]
     assert closed == [True]
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_a_judge_that_still_fails_after_the_wait_scores_the_answer_wrong(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The judge's outage is waited out inside `_judge_call`; an answer that still has no verdict
+    # is scored zero like an answer that was never produced, so one dead judge call is a wrong
+    # answer in the mean, not an INVALID task.
+    from mindbridge.benchmarks.official_scorers import judge_plan
+
+    sample = replace(
+        _sample_fixture(1, answer="yes"),
+        task="m3-bench-robot",
+        metrics={"retrieval_recall@5": 1.0},
+    )
+    plan = judge_plan(
+        "m3-bench-robot",
+        question="Is the door open?",
+        references=("yes",),
+        prediction="yes",
+        metadata={},
+    )
+    assert plan is not None
+
+    async def dead_judge(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("judge down")
+
+    monkeypatch.setattr(eval_module, "_traced_judge_call", dead_judge)
+    judged = await eval_module._judge_sample(
+        sample,
+        plan,
+        client=cast(Any, object()),
+        cache=None,
+        semaphore=asyncio.Semaphore(1),
+        config=eval_module._JudgeConfig("judge", "https://judge.example/v1"),
+        log_samples=False,
+        tracer=trace.get_tracer("test"),
+    )
+
+    assert judged.error_code == "JudgeError"
+    assert judged.scorer_error == "RuntimeError: judge down"
+    assert judged.score == 0.0
+    assert judged.metrics["accuracy"] == 0.0
+    assert judged.metrics["retrieval_recall@5"] == 1.0
 
 
 @pytest.mark.asyncio
