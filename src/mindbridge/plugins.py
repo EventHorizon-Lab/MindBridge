@@ -116,6 +116,29 @@ class MemoryConfig:
     # the window to the same 56.3 memories, Jaccard 0.986. Bound a prompt by lowering `limit`
     # with this left at `None`.
     evidence_budget_chars: _PositiveInt | None = None
+    # Whether `ask` asks the answerer how to retrieve before retrieving. Off by default: it costs
+    # one extra generation call per question, and it only pays where similarity has no way to
+    # express the question -- a count, a list of "all", an adjacency, everything about a person.
+    # With it off, `ask` runs exactly the one search it always has.
+    recall_planning: _StrictBool = False
+    # How many characters of evidence a set, sequence or entity plan may add to the ranked
+    # window. A point question keeps `limit` (and `evidence_budget_chars`); a question that asks
+    # for every matching record needs more than a window of that width, and this is what bounds
+    # what it adds. It never trims the window itself -- that is what the question would have been
+    # answered from with no plan at all. Only read when `recall_planning` is on.
+    recall_set_budget_chars: _PositiveInt = 30_000
+    # How many matched rows a set, sequence or entity plan may add at all, whatever the character
+    # budget leaves room for. A short-record corpus fits hundreds of rows inside 30 000
+    # characters, and a reader handed hundreds of rows answers worse than one handed twenty: the
+    # rows past this cap are dropped and reported as not shown, so the set is declared incomplete
+    # rather than silently thinned. It bounds the matched set only; the ranked window is outside
+    # it. Only read when `recall_planning` is on.
+    recall_set_max_rows: _PositiveInt = 60
+    # How many plan-and-answer rounds one `ask` may spend. The second round exists for the case
+    # the first round's own answer diagnoses -- a low-confidence guess under
+    # `answer_policy="best_effort"` -- and it replans against what the first round read. `1`
+    # disables it. Only read when `recall_planning` is on.
+    recall_rounds: _PositiveInt = 2
     decay_half_life_days: _PositiveFloat | None = None
     # `ask` counts the evidence it cited, which is what keeps the reinforcement factor in
     # `_ranking_signals` from being pinned at 1.0 for a caller that never calls `reinforce`.

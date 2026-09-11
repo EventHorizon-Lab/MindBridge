@@ -155,7 +155,9 @@ zvec/               disposable dense and lexical search projection
 ```
 
 A durable write commits SQLite before applying Zvec changes. Zvec work is acknowledged only after
-the index flush succeeds; startup, add, delete, search, `reindex`, and `optimize` drain pending work.
+the index flush succeeds, and that flush is batched behind the writes it covers, which are
+searchable as soon as they are applied; startup, add, delete, search, `reindex`, and `optimize`
+drain pending work.
 A missing Zvec collection or an index-recipe change can be rebuilt from stored embeddings without
 re-embedding content; an embedding-space change is a separate migration and can require
 re-embedding. Search always hydrates candidates from SQLite, so a stale index ID cannot resurrect a

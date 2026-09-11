@@ -127,6 +127,14 @@ class AbstentionReason(str, Enum):
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 
 
+# Whether declining is the caller's preferred failure. Abstaining is right for a caller whose
+# questions can be genuinely unanswerable and wrong for one whose protocol gives no credit for
+# "unknown" -- a multiple-choice caller, or a benchmark scored only on a committed answer. The
+# product default stays `strict`; `best_effort` still reports the insufficiency through
+# `AnswerResult.abstained`, it just also commits to the most likely answer.
+AnswerPolicy: TypeAlias = Literal["strict", "best_effort"]
+
+
 class IndexQuantization(str, Enum):
     """Explicit compression applied only to the rebuildable vector index."""
 
@@ -1505,7 +1513,7 @@ class MemoryRecord:
     `content` is the caller's text followed by any text the configured models derived from the
     media. Derived sections are appended, never substituted: what the caller supplied stays
     byte-identical at the front, and each derived section is introduced by its own marker line --
-    `[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or
+    `[transcript:<asset_id>]`, `[visual description:<asset_id>]`, `[facts:<asset_id>]`, or
     `[speech identities:<asset_id>]` -- so a reader can tell interpretation from evidence and
     which asset it came from. `add` derives before its first write and `settle` derives after
     `capture` already committed, so the same record shape results either way; the raw media is

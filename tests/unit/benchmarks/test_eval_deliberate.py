@@ -14,7 +14,7 @@ from typing import cast
 
 import pytest
 
-from mindbridge import AnswerResult, AsyncMemory, DeliberationReport
+from mindbridge import AnswerPolicy, AnswerResult, AsyncMemory, DeliberationReport
 from mindbridge.benchmarks import eval as eval_module
 from mindbridge.benchmarks.eval import MemoryFactory, run_loaded_task
 from mindbridge.benchmarks.eval_adapters import (
@@ -62,8 +62,9 @@ class _Memory:
         *,
         limit: int,
         reference_at: datetime | None = None,
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
-        del reference_at, limit
+        del reference_at, limit, answer_policy
         self.events.append(f"ask:{question}")
         return AnswerResult("A")
 

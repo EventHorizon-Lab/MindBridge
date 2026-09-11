@@ -354,6 +354,10 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
 
         operations = store.pending_index_operations()
         assert [operation.action for operation in operations] == ["upsert"]
+        assert store.pending_index_operations(after=operations[0].operation_id) == ()
+        assert store.pending_index_operations(after=operations[0].operation_id - 1) == operations
+        with pytest.raises(ValueError, match="after"):
+            store.pending_index_operations(after=-1)
         assert store.acknowledge_index_operations(operations) == 1
 
         changed = replace(
@@ -3260,3 +3264,326 @@ def test_current_schema_rejects_corrupt_evidence_clause_tables(
 
     with closing(sqlite3.connect(database_path)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
+
+
+def _turn(
+    memory_id: str,
+    content: str,
+    *,
+    occurred_at: datetime,
+    modality: str = "text",
+    memory_type: str = "episodic",
+    assets: tuple[StoredAsset, ...] = (),
+) -> StoredMemory:
+    """One dated conversational turn, which is what a recall program reads."""
+    return replace(
+        _memory(memory_id, content, created_at=occurred_at),
+        modality=modality,
+        memory_type=memory_type,
+        occurred_at=occurred_at,
+        occurred_end=None,
+        assets=assets,
+    )
+
+
+def _recall_corpus(store: LocalStore) -> datetime:
+    """Write six turns in turn order, two of them sharing one timestamp."""
+    start = datetime(2024, 9, 10, 9, 0, tzinfo=timezone.utc)
+    store.write_memories(
+        (
+            _turn("turn-1", "booked a flight to Cairo", occurred_at=start),
+            _turn("turn-2", "the Café was closed", occurred_at=start + timedelta(hours=1)),
+            _turn("turn-3", "mentioned the Cairo hotel", occurred_at=start + timedelta(hours=2)),
+            _turn("turn-4", "packed a bag", occurred_at=start + timedelta(hours=2)),
+            _turn("turn-5", "flew home from CAIRO", occurred_at=start + timedelta(days=40)),
+            _turn("turn-6", "bought a lamp", occurred_at=start + timedelta(days=41)),
+        )
+    )
+    return start
+
+
+def test_match_memories_returns_every_folded_substring_hit_in_time_order(tmp_path: Path) -> None:
+    """The exhaustive counterpart to search: a predicate, an order, and a bound.
+
+    Folding is NFKC casefold on both sides, so `CAIRO` and a full-width spelling reach the same
+    rows SQLite's ASCII-only `lower()` would have split.
+    """
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+
+        matched = store.match_memories(("cairo",))
+        accented = store.match_memories(("café",))
+        # Written as a codepoint shift so the fullwidth spelling survives an editor that
+        # normalizes source, which is exactly the fold this predicate has to do itself.
+        widened = store.match_memories(("".join(chr(ord(letter) + 0xFEE0) for letter in "CAIRO"),))
+
+        assert [memory.memory_id for memory in matched] == ["turn-1", "turn-3", "turn-5"]
+        assert [memory.memory_id for memory in accented] == ["turn-2"]
+        assert widened == matched
+
+
+def test_match_memories_intersects_terms_and_bounds_the_row_count(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+
+        any_of = store.match_memories(("cairo", "lamp"))
+        all_of = store.match_memories(("cairo", "hotel"), any_of=False)
+        bounded = store.match_memories(("cairo",), max_rows=2)
+
+        assert [memory.memory_id for memory in any_of] == [
+            "turn-1",
+            "turn-3",
+            "turn-5",
+            "turn-6",
+        ]
+        assert [memory.memory_id for memory in all_of] == ["turn-3"]
+        assert [memory.memory_id for memory in bounded] == ["turn-1", "turn-3"]
+
+
+def test_match_memories_filters_by_window_modality_and_type(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        start = _recall_corpus(store)
+        store.write_memories(
+            (
+                _turn(
+                    "clip-1",
+                    "[visual description:asset] the Cairo skyline",
+                    occurred_at=start + timedelta(hours=3),
+                    modality="video",
+                    memory_type="semantic",
+                    assets=(
+                        _asset(
+                            b"clip frames",
+                            modality="video",
+                            mime_type="video/mp4",
+                            name="clip.mp4",
+                        ),
+                    ),
+                ),
+            )
+        )
+
+        in_window = store.match_memories(
+            ("cairo",),
+            occurred_from=start,
+            occurred_until=start + timedelta(days=1),
+        )
+        video_only = store.match_memories(("cairo",), modality="video")
+        semantic_only = store.match_memories(("cairo",), memory_type="semantic")
+
+        assert [memory.memory_id for memory in in_window] == ["turn-1", "turn-3", "clip-1"]
+        assert [memory.memory_id for memory in video_only] == ["clip-1"]
+        assert [memory.memory_id for memory in semantic_only] == ["clip-1"]
+
+
+def test_match_memories_never_returns_a_forgotten_record(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+        store.set_forgotten(("turn-3",), forgotten_at=datetime(2026, 9, 10, tzinfo=timezone.utc))
+
+        assert [memory.memory_id for memory in store.match_memories(("cairo",))] == [
+            "turn-1",
+            "turn-5",
+        ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ({"terms": ("",)}, "every term must be non-empty text"),
+        ({"terms": "cairo"}, "terms must be a sequence of strings"),
+        ({"max_rows": 0}, "max_rows must be between 1 and 500"),
+        ({"max_rows": 501}, "max_rows must be between 1 and 500"),
+        ({"max_rows": True}, "max_rows must be between 1 and 500"),
+        ({"modality": "hologram"}, "modality is invalid"),
+        ({"memory_type": "reflexive"}, "memory_type is invalid"),
+        (
+            {
+                "occurred_from": datetime(2024, 9, 10, 9, tzinfo=timezone.utc),
+                "occurred_until": datetime(2024, 9, 10, 8, tzinfo=timezone.utc),
+            },
+            "occurred_until must be later than occurred_from",
+        ),
+        (
+            {"occurred_from": datetime(2024, 9, 10, 9, tzinfo=timezone.utc).replace(tzinfo=None)},
+            "occurred_from must be timezone-aware",
+        ),
+    ],
+)
+def test_match_memories_rejects_an_unusable_predicate(
+    tmp_path: Path,
+    arguments: dict[str, object],
+    error: str,
+) -> None:
+    with LocalStore(tmp_path) as store, pytest.raises(ValueError, match=error):
+        store.match_memories(**arguments)  # type: ignore[arg-type]
+
+
+def test_memories_in_window_requires_both_bounds_and_places_undated_records(
+    tmp_path: Path,
+) -> None:
+    """An undated record still has a place on the timeline: when it was stored.
+
+    A window that dropped it would make "everything that happened in September" wrong for a
+    corpus that dates some records and not others, and the answer prompt already tells the
+    reader that `created_at` stands in for a missing event time.
+    """
+    with LocalStore(tmp_path) as store:
+        start = _recall_corpus(store)
+        undated = replace(
+            _memory("undated-1", "no event time", created_at=start + timedelta(minutes=30)),
+            occurred_at=None,
+            occurred_end=None,
+        )
+        store.write_memories((undated,))
+
+        windowed = store.memories_in_window(
+            occurred_from=start,
+            occurred_until=start + timedelta(hours=2),
+        )
+
+        assert [memory.memory_id for memory in windowed] == ["turn-1", "undated-1", "turn-2"]
+        with pytest.raises(ValueError, match="occurred_from and occurred_until are required"):
+            store.memories_in_window(
+                occurred_from=start,
+                occurred_until=None,  # type: ignore[arg-type]
+            )
+
+
+def test_neighbor_memories_reads_corpus_order_and_breaks_ties_by_insertion(
+    tmp_path: Path,
+) -> None:
+    """Two turns share a timestamp, so the rowid is what "just before that" means.
+
+    `memory_records` is a rowid table and every adapter writes one turn per `add` in turn order,
+    which is the assumption this pins: without the tie-break the pair would come back in an
+    order SQLite is free to change.
+    """
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+
+        around = store.neighbor_memories(("turn-4",), before=2, after=1)
+        forward_only = store.neighbor_memories(("turn-1",), before=0, after=2)
+        first_row = store.neighbor_memories(("turn-1",), before=3, after=0)
+
+        assert [memory.memory_id for memory in around] == ["turn-2", "turn-3", "turn-5"]
+        assert [memory.memory_id for memory in forward_only] == ["turn-2", "turn-3"]
+        assert first_row == ()
+
+
+def test_neighbor_memories_merges_anchors_without_repeating_them(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+
+        merged = store.neighbor_memories(("turn-3", "turn-4", "turn-3"), before=1, after=1)
+        bounded = store.neighbor_memories(("turn-3", "turn-4"), before=1, after=1, max_rows=1)
+
+        assert [memory.memory_id for memory in merged] == ["turn-2", "turn-5"]
+        assert [memory.memory_id for memory in bounded] == ["turn-2"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ({"before": 0, "after": 0}, "before and after must not both be zero"),
+        ({"before": 51}, "before must be between 0 and 50"),
+        ({"after": -1}, "after must be between 0 and 50"),
+        ({"max_rows": 0}, "max_rows must be between 1 and 500"),
+    ],
+)
+def test_neighbor_memories_rejects_an_unusable_span(
+    tmp_path: Path,
+    arguments: dict[str, object],
+    error: str,
+) -> None:
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+        with pytest.raises(ValueError, match=error):
+            store.neighbor_memories(("turn-3",), **arguments)  # type: ignore[arg-type]
+
+
+def test_a_missing_anchor_contributes_nothing_and_an_empty_anchor_set_reads_nothing(
+    tmp_path: Path,
+) -> None:
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+
+        assert store.neighbor_memories(()) == ()
+        assert [
+            memory.memory_id for memory in store.neighbor_memories(("gone", "turn-1"), after=1)
+        ] == ["turn-2"]
+
+
+def test_recall_primitives_scope_to_one_identity(tmp_path: Path) -> None:
+    """The identity scope is `read_memories`'s, so `entity` is one clause, not a second rule."""
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        # In the past, so the claim is valid now: `active_only` hydration is the authority on
+        # what is current, and a claim that starts in an hour is correctly not in the answer.
+        recorded_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        store.write_memories(
+            (
+                _turn("turn-a", "Cairo came up again", occurred_at=recorded_at),
+                _bound_claim(
+                    "claim-1",
+                    voice_id,
+                    evidence_ids=("turn-a",),
+                    recorded_at=recorded_at + timedelta(minutes=1),
+                ),
+            )
+        )
+
+        scoped = store.match_memories((), identity_id=voice_id)
+        unknown = store.match_memories((), identity_id="identity-that-never-existed")
+
+        # The clip is in scope too: its own asset carries the speech segment that identity was
+        # bound from, which is the same membership rule the search index filters on.
+        assert [memory.memory_id for memory in scoped] == ["clip", "claim-1"]
+        assert unknown == ()
+
+
+def test_a_recall_primitive_reports_what_it_selected_not_what_hydration_kept(
+    tmp_path: Path,
+) -> None:
+    """`max_rows` is applied while IDs are selected; scope is applied while they are hydrated.
+
+    A caller cannot tell a truncated set from a complete one out of the row count alone, because
+    a scope filter shrinks a read that did fill its bound to fewer rows than the bound. The
+    selection count is the only thing that carries the difference, so the primitives report it.
+    """
+    elsewhere = SpatialContext(
+        frame_id="workshop",
+        anchor=SpatialAnchor.OBSERVER,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+    )
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+
+        bounded = store.match_memories(("cairo",), max_rows=2)
+        nowhere = store.match_memories(("cairo",), max_rows=2, near=elsewhere, radius_m=1.0)
+        neighbors = store.neighbor_memories(("turn-3", "turn-4"), before=1, after=1, max_rows=1)
+
+    assert [memory.memory_id for memory in bounded] == ["turn-1", "turn-3"]
+    assert bounded.selected == 2
+    # Every selected row has no pose, so `near` drops all of them -- while the predicate still
+    # matched more rows than the bound allowed.
+    assert nowhere.selected == 2
+    assert tuple(nowhere) == ()
+    assert neighbors.selected == 1
+
+
+def test_identity_id_for_name_resolves_through_a_merge_and_declines_a_stranger(
+    tmp_path: Path,
+) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        full_id = _full_identity(store, clip, (1.0, 0.0))
+        assert store.register_identity(full_id, "Li Hua") is True
+
+        assert store.identity_id_for_name("li hua") == full_id
+        assert store.identity_id_for_name("LI  HUA") is None
+        assert store.identity_id_for_name("Someone Else") is None
+        assert store.identity_id_for_name("   ") is None

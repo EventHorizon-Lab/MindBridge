@@ -69,6 +69,7 @@ _EGOTEMPO = (
     "7022ba77b4d89f51cf34e499767995ccd5c90c7a",
 )
 _MEMLENS = ("xiyuRenBill/MEMLENS", "afa101a1907cc37db40b50d649547964387b96b7")
+_MEMLENS_MEDIA = MediaSource("memlens", *_MEMLENS, ("release_images/*",))
 _LIFELONG = ("MM-Lifelong/MM-Lifelong", "248aa82039a574e63a2e524746a7cd8f32330443")
 _SUPERMEMORY = (
     "OSU-AIoT-MLSys-Lab/SuperMemory-VQA",
@@ -225,6 +226,8 @@ TASKS: dict[str, TaskSpec] = {
                 ),
                 variant=window,
                 auxiliary=("memlens/agent_subset_195.json",),
+                media="memlens/release_images",
+                media_source=_MEMLENS_MEDIA,
             )
             for window in ("32k", "64k", "128k", "256k")
         ),

@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from mindbridge.benchmarks.eval_regression import PERFORMANCE_BUDGET_NAMES
 from mindbridge.configuration import _absolute_http_url
-from mindbridge.types import Modality
+from mindbridge.types import AnswerPolicy, Modality
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_GENERATION_MODEL = "gpt-5-mini"
@@ -175,6 +175,8 @@ class RunOverrides(_HarnessModel):
     request_concurrency: Annotated[int, Field(strict=True, gt=0)] | None = None
     judge_concurrency: Annotated[int, Field(strict=True, gt=0)] | None = None
     recall_limit: Annotated[int, Field(strict=True, gt=0, le=100)] | None = None
+    # Unset keeps each task's official protocol; a value overrides the whole table for the run.
+    answer_policy: AnswerPolicy | None = None
     # One integer, or three, or four -- the shorter forms expand exactly as the flag expands them.
     seed: int | Sequence[int] | None = None
     bootstrap_samples: Annotated[int, Field(strict=True, gt=0)] | None = None

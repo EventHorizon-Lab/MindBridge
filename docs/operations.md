@@ -74,8 +74,11 @@ re-embed records.
 
 ## Index maintenance and repair
 
-Normal startup, add, delete, and search operations drain the SQLite outbox. Zvec also performs
-bounded automatic optimization after enough pending vectors or durable segments accumulate.
+Normal startup, add, delete, and search operations drain the SQLite outbox. Drained rows are
+searchable at once; the Zvec flush that acknowledges them runs once 256 applied rows accumulate,
+when a drain applied a deletion, inside `optimize()` and `reindex()`, and at `close()`. Zvec also
+performs bounded automatic optimization after enough pending vectors or durable segments
+accumulate.
 
 From the live owner, rebuild or optimize explicitly when measurement or diagnosis justifies it:
 
@@ -86,8 +89,9 @@ print(f"reindexed {count} memories")
 ```
 
 `reindex()` replaces the derived collection from SQLite FP32 embeddings and then replays writes
-committed during its scan. `optimize()` drains pending work, merges staged vectors, and flushes the
-collection. Neither operation repairs missing media or converts an incompatible embedding space.
+committed during its scan. `optimize()` drains and acknowledges pending work, merges staged
+vectors, and flushes the collection. Neither operation repairs missing media or converts an
+incompatible embedding space.
 
 If Zvec cannot open or appears corrupt:
 
@@ -206,9 +210,9 @@ the SQLite-before-Zvec-before-ack order:
 | --- | --- |
 | `mindbridge.index.sync.sqlite.read` | Read and hydrate the durable SQLite outbox batch. |
 | `mindbridge.index.sync.zvec.apply` | Delete or upsert the derived Zvec documents. |
-| `mindbridge.index.sync.zvec.flush` | Flush the applied Zvec changes. |
-| `mindbridge.index.sync.zvec.optimize` | Run the conditional Zvec optimization check. |
-| `mindbridge.index.sync.sqlite.ack` | Acknowledge the flushed outbox batch in SQLite. |
+| `mindbridge.index.sync.zvec.flush` | Flush the applied Zvec changes; present only in the drain that reaches the flush bound, in `optimize()` and `reindex()`, and at `close()`. |
+| `mindbridge.index.sync.zvec.optimize` | Run the conditional Zvec optimization check after a flush. |
+| `mindbridge.index.sync.sqlite.ack` | Acknowledge the flushed outbox rows in SQLite. |
 
 Capture acknowledgement, settle duration, and time to settled are three different numbers and
 are measured separately. `mindbridge.capture` and `mindbridge.settle` are distinct operation
@@ -282,6 +286,11 @@ Watch these degradation and recognition attributes:
   because the model's prompt exceeded its context.
 - `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` count evidence
   removed from OpenAI grounding requests.
+- `mindbridge.recall.shape`, `mindbridge.recall.ops`, `mindbridge.recall.exhaustive_rows`,
+  `mindbridge.recall.complete`, `mindbridge.recall.replan`, and `mindbridge.recall.fallback`
+  describe one `mindbridge.recall` stage, present only when `recall_planning` is on. Every
+  planning failure resolves to the same fallback plan, so `fallback` is the only signal that the
+  planner did not decide that question, and `complete` is what licenses a count over the set.
 - `mindbridge.formation.refused_proposals` counts the proposals the kernel refused to ground,
   totalled over the whole operation span and present only when formation ran; the model adapter's
   `mindbridge.formation.dropped_proposals` counts the ones it could not read at all.

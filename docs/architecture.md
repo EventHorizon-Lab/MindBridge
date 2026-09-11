@@ -49,24 +49,34 @@ flowchart LR
     assets --> models["Run configured model stages"]
     models --> sqlite["Commit record, FP32 vectors, and outbox in SQLite"]
     sqlite --> zvec["Apply current SQLite truth to Zvec"]
-    zvec --> flush["Flush Zvec"]
-    flush --> ack["Acknowledge exact outbox rows in SQLite"]
+    zvec --> flush["Flush Zvec once 256 applied rows accumulate, or at optimize(), reindex(), close()"]
+    flush --> ack["Acknowledge exactly the flushed outbox rows in SQLite"]
     zvec -. failure .-> pending["Keep outbox rows pending"]
     flush -. failure .-> pending
 ```
 
 Media is copied to the content-addressed store before any model receives it. SQLite triggers
 enqueue an upsert or delete for each embedding mutation. MindBridge commits that transaction
-before changing Zvec, flushes Zvec before acknowledging work, and acknowledges the exact rows it
-applied. Startup, add, delete, search, `reindex()`, and `optimize()` drain pending work.
+before changing Zvec, and acknowledges outbox rows only after the Zvec flush that made them
+durable. Zvec answers dense and full-text queries from applied but unflushed writes, so a write is
+searchable as soon as its rows are applied, and the flush itself is batched: it runs once 256
+applied rows accumulate, when a drain applied a deletion, inside `optimize()` and `reindex()`, and
+at `close()`. A single `add` therefore pays an apply rather than a flush and leaves no segment of
+its own, while a deletion is still flushed before its call returns. Startup, add, delete, search,
+`reindex()`, and `optimize()` drain pending work.
 
 The ordering determines failure behavior:
 
 - Validation or model failure before the SQLite transaction creates no record; unreferenced media
   is cleaned after its operation lease is released.
 - A SQLite failure rolls back the record, embeddings, and outbox together.
-- A Zvec mutation or flush failure can fail the public call after SQLite committed. The record is
-  still durable and the unacknowledged projection work is retryable.
+- A Zvec mutation failure can fail the public call after SQLite committed. The record is still
+  durable and the unacknowledged projection work is retryable.
+- A Zvec flush failure surfaces in the call that took the flush -- the write that reached the
+  batch bound, `optimize()`, `reindex()`, or `close()` -- not necessarily in the write that
+  enqueued the row. The rows stay pending and applied, and the next drain retries the flush. A
+  process that dies before the flush loses only the unflushed projection: the rows are still
+  pending and replay on the next open.
 - Stale IDs left in Zvec cannot resurrect deleted data because final hydration uses SQLite.
 
 `delete()` is physical forgetting and runs the same ordering in reverse. One SQLite transaction
@@ -86,9 +96,9 @@ A memory ID is the SHA-256 digest of canonical ordered content, media digests, m
 time, memory type, and optional typed observation context. Repeating the same add is idempotent.
 `add_many()` uses one model batch and one SQLite transaction. `add_stream()` commits each completed
 item through the ordinary add path, so a later source failure preserves the committed prefix. It
-applies and acknowledges those commits to Zvec in bounded groups instead of once per item: the
-group ends after 32 items or 250 ms, and covers exactly the outbox rows the commits behind it left
-pending. Only the projection is grouped, so the order and the failure behavior above are unchanged;
+applies those commits to Zvec in bounded groups instead of once per item: the group ends after 32
+items or 250 ms, and covers exactly the outbox rows the commits behind it left pending. Only the
+projection is grouped, so the order and the failure behavior above are unchanged;
 a group the process never reaches leaves its rows pending for the next drain, and `search` drains
 before it reads, so a committed item is retrievable during the stream either way.
 
@@ -105,7 +115,7 @@ flowchart LR
     commit --> ack["Acknowledge capture"]
     ack -. later .-> settle["settle(): run the model stages"]
     settle --> derived["Commit derived content and vectors; the queue row survives"]
-    derived --> zvec["Flush Zvec, form, then delete the queue row"]
+    derived --> zvec["Apply to Zvec, form, then delete the queue row"]
     settle -. failure .-> queued["Count the attempt, store the reason, keep the row queued"]
 ```
 
@@ -117,10 +127,13 @@ runs under one process-wide settlement lock, so a concurrent `settle()` or an `a
 captured content waits instead of running the model stages twice.
 
 Enrichment appends. Derived text is added to `memory_records.content` behind a per-asset marker —
-`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or `[speech identities:<asset_id>]`
-— so the caller's own text stays byte-identical at the front of the record and model
-interpretation stays separable from evidence. Media bytes are never rewritten: they stay in
-`assets/` under their digest, and a transcript is also cached on the asset row.
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, `[facts:<asset_id>]`, or
+`[speech identities:<asset_id>]` — so the caller's own text stays byte-identical at the front of
+the record and model interpretation stays separable from evidence. Media bytes are never
+rewritten: they stay in `assets/` under their digest, and a transcript is also cached on the asset
+row. A described visual yields two of those sections: the labelled description of what is
+visible, and the durable facts distilled from it and from the clip's own transcript, kept apart
+because one is observation and the other a distillation that outlives the clip.
 
 `settle()` attempts every record it read: a failing one keeps its queue row, its attempt count,
 and its reason while the records behind it still settle, and the first failure is raised once the
@@ -213,6 +226,30 @@ merging, splitting, or erasing an identity re-enqueues the affected memories thr
 durable outbox, and a stale field can only cost recall: SQLite reapplies both predicates during
 hydration and decides.
 
+With `recall_planning` enabled, `ask()` adds a second retrieval semantics beside that ranking.
+The answerer is asked for a recall plan -- a question shape and bounded reads -- and the reads
+that are not `similar` are answered by predicate rather than by rank: substring matching over
+`content`, an event-time window, the records adjacent in corpus order, or the records one
+identity is in. They read SQLite only, hydrate through the same authoritative scoped read as
+every other hit, and are bounded by an explicit row count. Because that bound is applied while
+IDs are selected and bitemporal, spatial and metric scope is applied while they are hydrated,
+each read reports how many records it selected as well as the rows it returned: only the
+selection count can say whether the bound truncated anything. The evidence set is a union with ID
+dedup and no recomputed score -- exhaustive rows in time order, then the ranked window by rank --
+and the answer prompt states which reads produced it and whether the set is complete, because
+completeness is what licenses a count or a list. The ranked window is the one the unplanned path
+would have grounded, `limit` hits and their modality floor, and a plan can only add to it: the
+budget trims exhaustive rows beyond that window and never the window itself, so no plan grounds
+less evidence than no plan. Completeness stays a statement about the exhaustive reads alone, and
+the note says so, because a top-ranked record is not a record the predicate matched. Two bounds
+decide when a predicate's set is worth holding at all: a read whose predicate selected more than
+a fifth of the active corpus (or more than four times `limit` rows, whichever is larger)
+contributes nothing and says so, because completeness over most of a corpus carries no
+information about the question; and the rows a selective read did return stop at
+`recall_set_max_rows`, chronologically, with the remainder reported as not shown. Any missing
+capability, planner failure, or plan the kernel will not run falls back to the single ranked
+search, which is the default.
+
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without
 copying memory content or metadata into the trace. `ask()` uses the same retrieval path, applies
 the evidence budget, routes the question and hits through the generation backend's declared
@@ -236,8 +273,9 @@ concurrent flush is freeing (alibaba/zvec#714), which surfaced as a bus error in
 
 `reindex()` reads authoritative SQLite pages, replaces the Zvec collection, then replays the
 outbox so writes committed during the scan are retained. `close()` rejects new work, waits for
-active operations, releases asset leases, and closes each unique backend and storage resource
-once. `AsyncMemory` delegates to this same synchronous core with `asyncio.to_thread`; it does not
+active operations, releases asset leases, flushes and acknowledges the applied index work, and
+closes each unique backend and storage resource once. `AsyncMemory` delegates to this same
+synchronous core with `asyncio.to_thread`; it does not
 create a service or a second consistency model.
 
 ## Model boundary

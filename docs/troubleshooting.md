@@ -76,9 +76,11 @@ until a known search succeeds. Never move `state.sqlite3` or `assets/`; they are
 
 ## A write returned an index error
 
-MindBridge commits SQLite before applying and flushing Zvec. An `index_unavailable` response can
-therefore mean the record or deletion is durable even though the call failed. The corresponding
-outbox rows stay pending until startup or another draining operation succeeds.
+MindBridge commits SQLite before applying Zvec changes, and flushes Zvec in batches behind them.
+An `index_unavailable` response can therefore mean the record or deletion is durable even though
+the call failed, and a flush failure surfaces in the call that took the flush -- a later write,
+`optimize()`, `reindex()`, or `close()` -- rather than in the write that enqueued the row. The
+corresponding outbox rows stay pending until startup or another draining operation succeeds.
 
 1. Preserve the error envelope and `trace_id`.
 2. Check authoritative state with `get()` or `list()` if the ID is known.

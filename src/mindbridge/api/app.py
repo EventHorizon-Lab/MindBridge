@@ -48,6 +48,7 @@ from mindbridge.control import dump_operation
 from mindbridge.types import (
     AbstentionReason,
     AnswerChunk,
+    AnswerPolicy,
     AnswerResult,
     ConsentState,
     ContentInput,
@@ -143,6 +144,9 @@ class AnswerRequest(StrictModel):
     memory_type: MemoryType | None = None
     reference_at: AwareDatetime | None = None
     scope: RetrievalScope | None = None
+    # Abstention is the caller's policy, not the server's: `best_effort` commits to the most
+    # likely answer and still reports `abstained`. The default keeps the refusal behaviour.
+    answer_policy: AnswerPolicy = "strict"
 
 
 # The shared bounds under the name FastAPI publishes as the OpenAPI component; no fields and no
@@ -607,6 +611,7 @@ class _Memory(Protocol):
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult: ...
 
     def ask_stream(
@@ -618,6 +623,7 @@ class _Memory(Protocol):
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "strict",
     ) -> Generator[AnswerChunk, None, AnswerResult]: ...
 
     def compile(
@@ -1017,6 +1023,7 @@ def _v1_router(  # noqa: C901 - one literal public route registry
                 memory_type=request.memory_type,
                 reference_at=request.reference_at,
                 scope=request.scope,
+                answer_policy=request.answer_policy,
                 # Mirrors MCP's own `embodied_operations` switch (`docs/context-os.md`): a
                 # caller with recall access alone must not acquire cross-modal merge authority
                 # through `ask`, so REST only lets an answer commit that bind when the host has
@@ -1039,6 +1046,7 @@ def _v1_router(  # noqa: C901 - one literal public route registry
                 memory_type=request.memory_type,
                 reference_at=request.reference_at,
                 scope=request.scope,
+                answer_policy=request.answer_policy,
                 link_identities=embodied_operations,
             )
         )
