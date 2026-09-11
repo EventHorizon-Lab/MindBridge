@@ -288,7 +288,7 @@ derive to `content` and never rewrites what the caller supplied; see
 [public values](#public-values) for how derived sections are marked.
 
 `settle` runs the deferred stages — speech identity, transcription, embedding, the SQLite embedding
-commit, the index flush, and formation — over up to `limit` captured records in enqueue order, and
+commit, the index apply, and formation — over up to `limit` captured records in enqueue order, and
 returns how many it settled. Every record it read is attempted: a model or storage failure on one
 leaves it queued with its attempt count and reason while the rest still settle, and the first
 failure is raised once the batch is done with `subject` set to that memory ID. A record whose
@@ -1054,7 +1054,7 @@ These are the 126 supported names exported by `mindbridge`:
 `MemoryRecord.content` is the caller's text followed by any text the configured models derived
 from the media. Derived sections are appended, never substituted: what the caller supplied stays
 byte-identical at the front, and each derived section is introduced by its own marker line --
-`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, `[facts:<asset_id>]`, or
 `[speech identities:<asset_id>]` -- so a reader can separate interpretation from evidence and see
 which asset it came from. `add` derives before its first write and `settle` derives after
 `capture` already committed, so both paths leave the same record; the raw media is never rewritten

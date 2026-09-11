@@ -647,6 +647,30 @@ def test_retention_handles_more_than_one_sql_parameter_batch(tmp_path: Path) -> 
                 memory.get(memory_id)
 
 
+def test_retention_flushes_the_index_once_for_a_page_of_deletions(tmp_path: Path) -> None:
+    """A deletion flushes the index before returning; a retention page pays that once, not per row."""
+    policy = RetentionPolicy(forgotten_days=_AGED)
+    with _memory(tmp_path, retention=policy) as memory:
+        records = tuple(
+            memory.add(f"aged note {index}", occurred_at=OCCURRED) for index in range(3)
+        )
+        assert memory.forget(tuple(record.id for record in records)) is not None
+        flushes = 0
+        original_flush = memory._index.flush
+
+        def counted_flush() -> None:
+            nonlocal flushes
+            flushes += 1
+            original_flush()
+
+        memory._index.flush = counted_flush  # type: ignore[method-assign]
+        report = memory.apply_retention()
+        assert report.deleted == 3
+        assert flushes == 1
+        assert memory._store.pending_index_operations() == ()
+        assert memory.search("aged note", limit=10) == ()
+
+
 def test_an_undeclared_policy_deletes_nothing(tmp_path: Path) -> None:
     """`None` is "no policy", not "keep for zero days"; nothing ages out because a clock ticked."""
     with _memory(tmp_path) as memory:

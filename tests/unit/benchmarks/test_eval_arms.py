@@ -40,6 +40,7 @@ from mindbridge._telemetry import (
     RECALL_COMPLETE,
     RECALL_EXHAUSTIVE_ROWS,
     RECALL_FALLBACK,
+    RECALL_NON_SELECTIVE_STEPS,
     RECALL_REPLAN,
     RECALL_SHAPE,
     SPAN_KIND,
@@ -1091,7 +1092,12 @@ def test_recall_planning_activation_is_aggregated_per_task_and_stamped_per_sampl
     plans: tuple[tuple[str, dict[str, AttributeValue]], ...] = (
         (
             "atm-bench/unit/q1",
-            {RECALL_SHAPE: "set", RECALL_EXHAUSTIVE_ROWS: 12, RECALL_COMPLETE: False},
+            {
+                RECALL_SHAPE: "set",
+                RECALL_EXHAUSTIVE_ROWS: 12,
+                RECALL_COMPLETE: False,
+                RECALL_NON_SELECTIVE_STEPS: 1,
+            },
         ),
         (
             "atm-bench/unit/q2",
@@ -1132,6 +1138,9 @@ def test_recall_planning_activation_is_aggregated_per_task_and_stamped_per_sampl
         assert recall["fallback_count"] == 1
         assert recall["replan_count"] == 1
         assert recall["incomplete_count"] == 2
+        # A predicate that matched most of the corpus contributed no rows, which is a
+        # different failure from a read that filled its bound and has to be visible as one.
+        assert recall["non_selective_steps"] == 1
         rows = cast(dict[str, object], recall["exhaustive_rows"])
         assert rows["average"] == pytest.approx(6.0)
 

@@ -36,6 +36,7 @@ from mindbridge._telemetry import (
     RECALL_COMPLETE,
     RECALL_EXHAUSTIVE_ROWS,
     RECALL_FALLBACK,
+    RECALL_NON_SELECTIVE_STEPS,
     RECALL_REPLAN,
     RECALL_SHAPE,
     SPAN_KIND,
@@ -53,6 +54,7 @@ from mindbridge._telemetry import (
     TOKEN_TOTAL,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
+    VISION_BATCHES_RETRIED,
     token_modality_attribute,
 )
 from mindbridge.benchmarks.eval_environment import nvidia_smi_rows
@@ -591,6 +593,7 @@ class _TaskTelemetry:
     media_elided_hits: int = 0
     dropped_hits: int = 0
     vision_failed_batches: int = 0
+    vision_retried_batches: int = 0
     # Fast-plane and compiler measurements: populated only when the run actually exercises
     # `capture()`/`settle()` (the `--ingest capture` path) or the `compile` answering arm.
     time_to_searchable_ms: _Samples = field(default_factory=_Samples)
@@ -608,6 +611,7 @@ class _TaskTelemetry:
     recall_fallback_count: int = 0
     recall_replan_count: int = 0
     recall_incomplete_count: int = 0
+    recall_non_selective_steps: int = 0
     recall_exhaustive_rows: _Samples = field(default_factory=_Samples)
 
     def add(self, span: ReadableSpan) -> None:  # noqa: C901 - one pass classifies every dimension
@@ -677,6 +681,7 @@ class _TaskTelemetry:
             self.media_elided_hits += _int_attribute(attributes, GROUNDING_MEDIA_ELIDED) or 0
             self.dropped_hits += _int_attribute(attributes, GROUNDING_HITS_DROPPED) or 0
             self.vision_failed_batches += _int_attribute(attributes, VISION_BATCHES_FAILED) or 0
+            self.vision_retried_batches += _int_attribute(attributes, VISION_BATCHES_RETRIED) or 0
             module = _string_attribute(attributes, MODEL_MODULE) or "unknown"
             self.tokens_by_module.setdefault(module, _Tokens()).add(attributes)
             if status == "ok":
@@ -707,6 +712,9 @@ class _TaskTelemetry:
         self.recall_fallback_count += attributes.get(RECALL_FALLBACK) is True
         self.recall_replan_count += attributes.get(RECALL_REPLAN) is True
         self.recall_incomplete_count += attributes.get(RECALL_COMPLETE) is not True
+        self.recall_non_selective_steps += (
+            _int_attribute(attributes, RECALL_NON_SELECTIVE_STEPS) or 0
+        )
         rows = _int_attribute(attributes, RECALL_EXHAUSTIVE_ROWS)
         if rows is not None:
             self.recall_exhaustive_rows.add(rows)
@@ -939,14 +947,16 @@ class _TaskTelemetry:
             "measures": (
                 "recall-planning activation: how many plans ran, in what shape, how many were "
                 "the fallback plan every planning failure resolves to, how many were a replan "
-                "round, and how many claimed a set no read completed; empty unless the run sets "
-                "recall_planning"
+                "round, how many claimed a set no read completed, and how many reads matched too "
+                "much of the corpus to enumerate and so contributed nothing; empty unless the "
+                "run sets recall_planning"
             ),
             "plan_count": self.recall_plan_count,
             "shapes": dict(sorted(self.recall_shapes.items())),
             "fallback_count": self.recall_fallback_count,
             "replan_count": self.recall_replan_count,
             "incomplete_count": self.recall_incomplete_count,
+            "non_selective_steps": self.recall_non_selective_steps,
             "exhaustive_rows": self.recall_exhaustive_rows.json(),
         }
 
@@ -1095,7 +1105,10 @@ class _TaskTelemetry:
                 "media_elided_hits": self.media_elided_hits,
                 "dropped_hits": self.dropped_hits,
             },
-            "vision": {"failed_batches": self.vision_failed_batches},
+            "vision": {
+                "failed_batches": self.vision_failed_batches,
+                "retried_batches": self.vision_retried_batches,
+            },
         }
 
 

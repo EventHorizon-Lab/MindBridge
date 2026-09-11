@@ -88,6 +88,15 @@ prompt states the plan and its completeness ("the evidence is every record match
 "N further matches were omitted"), so counting and list answers are licensed only when the set is complete.
 Media attachment and elision rules are unchanged.
 
+Two bounds keep a set read from being the corpus. A step whose predicate selected more than
+`_RECALL_NON_SELECTIVE_SHARE` (0.2) of the active records, or more than four times the ask's own
+`limit` where that fifth is smaller, is non-selective: it contributes no rows, is counted on the stage span as
+`mindbridge.recall.non_selective_steps`, and the note tells the reader what the predicate matched and that
+it holds the ranking instead (measured on LoCoMo, an `entity` step that degraded to matching a name as text
+selected ~300 of ~600 records and cost 0.721 -> 0.528 accuracy on those questions). The rows a selective
+read did return are additionally capped at `MemoryConfig.recall_set_max_rows` (default 60), chronologically,
+with the remainder counted into the same "not shown" shortfall that declares the set incomplete.
+
 ### 3.4 Answer policy and answer shaping (reader)
 
 Port `answer_policy` (`strict` | `best_effort`) from branch `claude/mindbridge-memory-research-3f4fd0`
@@ -162,8 +171,11 @@ changes.
 Planner adds one call per `ask()` (latency and tokens; accepted: stronger before faster). Set ops on
 point questions add noise — guarded by shape. Distillation hallucinations enter the index — kept as
 separate sections so the reader sees provenance, and the verbatim asset remains attached. Name binding
-errors propagate across clips — bounded by `identity_link_min_assets` and reversible via
-`unlink_identity`. 31-question ATM-Hard is noisy — decisions use ATM-main dev and m3 dev.
+errors propagate across clips — not bounded by `identity_link_min_assets`, which gates face↔voice
+linking (a different join) rather than naming; a wrong name is bounded instead by the never-overwrite
+guard (a standing name is never replaced by a later assertion) and is reversible through `rollback()`,
+since binding lands as an ordinary `IDENTIFY` operation. 31-question ATM-Hard is noisy — decisions use
+ATM-main dev and m3 dev.
 
 ## 7. Work packages
 

@@ -52,6 +52,7 @@ RECALL_EXHAUSTIVE_ROWS = "mindbridge.recall.exhaustive_rows"
 RECALL_COMPLETE = "mindbridge.recall.complete"
 RECALL_REPLAN = "mindbridge.recall.replan"
 RECALL_FALLBACK = "mindbridge.recall.fallback"
+RECALL_NON_SELECTIVE_STEPS = "mindbridge.recall.non_selective_steps"
 EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
@@ -63,6 +64,12 @@ GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
 FORMATION_PROPOSALS_DROPPED = "mindbridge.formation.dropped_proposals"
 FORMATION_PROPOSALS_REFUSED = "mindbridge.formation.refused_proposals"
 VISION_BATCHES_FAILED = "mindbridge.vision.failed_batches"
+# A batch that failed but was still inside its retry budget when it did: it did not lose
+# its caption, only pay another attempt for it. Counted apart from `VISION_BATCHES_FAILED`,
+# which answers "how many memories lost their caption" -- an attempt on the way to success
+# is not one, and summing both into one counter could not tell a provider that throttled an
+# ingest from one that ate it.
+VISION_BATCHES_RETRIED = "mindbridge.vision.retried_batches"
 IDENTITY_OBSERVATIONS = "mindbridge.identity.observations"
 IDENTITY_MATCHED = "mindbridge.identity.matched_existing"
 IDENTITY_IDENTITIES = "mindbridge.identity.identities"
@@ -71,6 +78,12 @@ IDENTITY_CACHED = "mindbridge.identity.cached"
 IDENTITY_EVIDENCE_ASSETS = "mindbridge.identity.evidence_assets"
 IDENTITY_EVIDENCE_REQUIRED = "mindbridge.identity.evidence_required"
 IDENTITY_LINKED = "mindbridge.identity.linked"
+# Names a distillation read out of a clip's dialogue: how many were registered against a person
+# who had none, and how many were refused because that person already had a different one. The
+# refusals are the interesting half -- a name is what the index keys a person under, so a wrong
+# one propagates to every clip they appear in and has to be countable rather than only logged.
+IDENTITY_NAMES_BOUND = "mindbridge.identity.names_bound"
+IDENTITY_NAMES_REFUSED = "mindbridge.identity.names_refused"
 
 TOKEN_MODALITIES = ("text", "image", "video", "audio", "unattributed")
 

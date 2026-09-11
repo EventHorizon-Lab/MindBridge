@@ -427,7 +427,7 @@ from `mindbridge.benchmarks.task_catalog`; `--list-tasks` remains authoritative.
 | Benchmark and selector | What it measures and when to use it | Primary result and scoring requirement | Data requirement |
 | --- | --- | --- | --- |
 | LoCoMo-Refined (`locomo-refined`) | Multi-session dialogue QA, temporal questions, captioned-image turns, and exact source-ID retrieval; use for conversational long-term memory | `llm_judge`; judge `qwen3-14b` | Pinned GitHub JSON; automatic |
-| MemLens (`memlens`: 32K/64K/128K/256K) | Information extraction, multi-session and temporal reasoning, knowledge updates, and refusal over dated conversations; use for scaling context length | `accuracy`; judge `qwen3-235b-judge` | Pinned Hugging Face JSON and 195-question subset; automatic; published captions need no runtime media |
+| MemLens (`memlens`: 32K/64K/128K/256K) | Information extraction, multi-session and temporal reasoning, knowledge updates, and refusal over dated conversations; use for scaling context length | `accuracy`; judge `qwen3-235b-judge` | Pinned Hugging Face JSON, 195-question subset, and the release's 229 MB `release_images/` tree; automatic. A turn's image is ingested as media when its file is present, so a run needs a model that declares the image capability; without the images the published captions are ingested alone |
 | LongMemEval (`longmemeval-s`) | User, assistant, and preference recall plus multi-session reasoning, updates, abstention, and exact turn-level retrieval; use for established long-term dialogue behaviors | `accuracy`; judge `gpt-4o-2024-08-06` | Pinned Hugging Face JSON; automatic |
 | ES-MemEval (`es-memeval`, task `es-memeval-qa`) | Personalized long-term emotional-support dialogue QA across information extraction, temporal reasoning, conflict detection, abstention, and user modeling | `llm_judge` (the 0--2 rubric normalized to 0--1); judge `gpt-4o`; published `f1` is also reported; the semantically transcribed judge is marked non-official | Pinned GitHub EvoEmo JSON; automatic; upstream declares no license at the pinned revision |
 | BEAM (`beam`: 100K/500K/1M/10M) | Very-long dialogue with contradiction resolution, ordering, extraction, updates, summarization, and temporal reasoning; use for length scaling | `llm_judge_score`; judge `gpt-4.1-mini` | Pinned GitHub tier directories; automatic |
@@ -564,7 +564,11 @@ Protocol boundaries that affect interpretation are explicit rather than approxim
 
 - `locomo-refined`, `memlens`, `longmemeval-s`, `es-memeval-qa`, `clbench`, `beam`, and
   `personamem-v3` need no
-  runtime media preparation; LoCoMo-Refined and MemLens ingest the releases' published captions.
+  runtime media preparation; LoCoMo-Refined ingests the release's published captions, and
+  MemLens ingests its captions plus the release's own image files where they are present.
+  MEMLENS hides 65.7% of its answers inside those images, so a caption-only run is a
+  different protocol and must be reported as one; `--media-root` pointed at an empty
+  directory selects it deliberately.
 - CL-Bench has no separate question field. The adapter splits the final user turn at its last
   blank-line paragraph break and marks oversized residual questions with `question_unsliced`.
 - BEAM reports its per-rubric `llm_judge_score`; `event_ordering` additionally runs the official
@@ -686,13 +690,13 @@ Four choices decide whether a number here is comparable with the leaderboard:
 
 ## Benchmarks without runtime media preparation
 
-Seven benchmark families read text, structured annotations, or published captions without opening
-runtime media, so they need neither `ffmpeg` nor a preparation pass:
+Seven benchmark families read text, structured annotations, published captions, or single
+images without opening timed media, so they need neither `ffmpeg` nor a preparation pass:
 
 | Task | Unit | Corpus | Official headline |
 | --- | --- | --- | --- |
 | `locomo-refined` | one conversation | multi-session dialogue plus published image captions | `llm_judge`, the official correctness judge |
-| `memlens-32k` … `memlens-256k` | one question | dated conversation sessions plus published image captions | `accuracy`, the official question-type judge |
+| `memlens-32k` … `memlens-256k` | one question | dated conversation sessions, published image captions, and the release's image files | `accuracy`, the official question-type judge |
 | `longmemeval-s` | one question | its own 50-session haystack | `accuracy`, the yes/no answer-check judge |
 | `es-memeval-qa` | one seeker | every dated seeker/supporter session and all of that seeker's QA items | non-official adapted `llm_judge`, the GPT-4o 0--2 rubric normalized to 0--1 |
 | `clbench` | one task | the reference document behind its question | `solving_rate`, the binary rubric judge |
@@ -768,12 +772,13 @@ gaps do not inflate the denominator. TTFT and token-per-call distributions also 
 | `time_to_searchable_ms` | Elapsed time from capture commit to the `settle()` call that made the record searchable; empty unless `--ingest capture` runs. |
 | `formation` | `settle()` latency for model-dependent enrichment; empty unless `--ingest capture` runs. |
 | `compile` | `Memory.compile` latency and the compiled bundle's character, item, and media-item distributions; empty unless the `compile` arm runs. |
-| `recall` | Recall-planning activation: `plan_count`, `shapes` (plans counted by shape), `fallback_count`, `replan_count`, `incomplete_count`, and the `exhaustive_rows` distribution, plus the stage's own latency; `plan_count` is `0` unless the run sets `recall_planning`. |
+| `recall` | Recall-planning activation: `plan_count`, `shapes` (plans counted by shape), `fallback_count`, `replan_count`, `incomplete_count`, `non_selective_steps`, and the `exhaustive_rows` distribution, plus the stage's own latency; `plan_count` is `0` unless the run sets `recall_planning`. |
 | `nodes` | Count, compute time, active time, throughput, average, p50/p95/p99, status, parent operation, purpose, model identity, response identity, fingerprint, embedding task, batch size, and modalities for every operation, stage, and model span. |
 | `token_usage` | Total and per-module request counts, exactness, input/output/cached/reasoning tokens, modality totals, per-call distribution, and observed output tokens per model-compute second. |
 
-`ingest` ends only after the SQLite commit, Zvec flush, and durable outbox acknowledgement, so an
-accepted item is searchable when its measured call completes. Failed attempts stay in attempt
+`ingest` ends only after the SQLite commit and the Zvec apply, so an accepted item is searchable
+when its measured call completes; the Zvec flush and outbox acknowledgement are batched behind the
+call and are not part of its latency. Failed attempts stay in attempt
 latency and error counts but never enter accepted-item throughput.
 
 The three first-output clocks are intentionally distinct:
@@ -808,7 +813,10 @@ scores alone cannot separate "planning is off" from "planning ran and decided no
 `plan_count` equal to the question count with a `fallback_count` of `0` is an active planner; a
 `plan_count` of `0` under `recall_planning` means the answerer never declared
 `RecallPlanningBackend`. `incomplete_count` counts the plans whose exhaustive reads filled their
-row bound, which is when a set answer may not state a total. Each sample additionally carries
+row bound, which is when a set answer may not state a total. `non_selective_steps` counts the
+reads that matched too much of the corpus to enumerate and so contributed no rows, which is the
+other way a plan fails to add anything -- and the one that looks like an active planner in every
+other counter. Each sample additionally carries
 `recall_shape`, the shape of the plan its own answer was grounded on.
 
 `compile`'s bundle-size attributes are harness-owned (`compile()` itself carries no such attribute)

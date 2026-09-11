@@ -35,6 +35,7 @@ from mindbridge._telemetry import (
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
     OPERATION_TTFT,
+    RECALL_NON_SELECTIVE_STEPS,
     TOKEN_COMPLETE,
     TOKEN_EXPECTED_REQUEST_COUNT,
     TOKEN_REPORTED_REQUEST_COUNT,
@@ -532,7 +533,9 @@ def _memory(
     reinforce_on_answer: bool = True,
     recall_planning: bool = MemoryConfig().recall_planning,
     recall_set_budget_chars: int = MemoryConfig().recall_set_budget_chars,
+    recall_set_max_rows: int = MemoryConfig().recall_set_max_rows,
     recall_rounds: int = MemoryConfig().recall_rounds,
+    tracer: Tracer | None = None,
 ) -> Memory:
     models = models or _FakeModels()
     return Memory(
@@ -548,7 +551,9 @@ def _memory(
         reinforce_on_answer=reinforce_on_answer,
         recall_planning=recall_planning,
         recall_set_budget_chars=recall_set_budget_chars,
+        recall_set_max_rows=recall_set_max_rows,
         recall_rounds=recall_rounds,
+        tracer=tracer,
     )
 
 
@@ -918,10 +923,21 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
     assert {
         "mindbridge.index.sync.sqlite.read",
         "mindbridge.index.sync.zvec.apply",
+    } <= index_sync_children
+    # The flush is batched behind the write; here `close()` took it, under its own sync stage.
+    flush = next(span for span in spans if span.name == "mindbridge.index.sync.zvec.flush")
+    assert flush.parent is not None
+    close_sync = next(span for span in spans if span.context.span_id == flush.parent.span_id)
+    assert close_sync.name == "mindbridge.index.sync"
+    assert {
+        span.name
+        for span in spans
+        if span.parent is not None and span.parent.span_id == close_sync.context.span_id
+    } == {
         "mindbridge.index.sync.zvec.flush",
         "mindbridge.index.sync.zvec.optimize",
         "mindbridge.index.sync.sqlite.ack",
-    } <= index_sync_children
+    }
     assert ask.attributes is not None
     operation_ttft = ask.attributes[OPERATION_TTFT]
     assert isinstance(operation_ttft, int | float) and operation_ttft >= 0
@@ -4119,7 +4135,104 @@ def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
     ]
 
 
-def test_concurrent_adds_share_one_durable_index_flush(
+def test_writes_apply_at_once_and_flush_in_batches(tmp_path: Path) -> None:
+    """A write is searchable when it returns; the flush and acknowledgement wait for the bound."""
+    bound = memory_module._INDEX_FLUSH_OPERATIONS
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        record = memory.add("red kettle")
+        assert len(index.upsert_calls) == 1
+        assert index.flush_calls == 0
+        assert [hit.id for hit in memory.search("red kettle")] == [record.id]
+        assert memory._store.pending_index_operations() != ()
+        # A later drain does not re-hydrate or re-apply what the index already holds.
+        memory.search("red kettle")
+        assert len(index.upsert_calls) == 1
+        memory.add_many(tuple(f"kettle {position}" for position in range(bound)))
+        assert index.flush_calls == 1
+        assert memory._store.pending_index_operations() == ()
+        memory.add("blue kettle")
+        assert index.flush_calls == 1
+        assert memory._store.pending_index_operations() != ()
+    # `close()` flushes and acknowledges whatever the bound had not reached.
+    assert index.flush_calls == 2
+    with _memory(tmp_path, _FakeModels()) as memory:
+        assert memory._store.pending_index_operations() == ()
+
+
+def test_a_failed_batched_flush_is_retried_without_reapplying_its_rows(tmp_path: Path) -> None:
+    """The write that takes the flush reports its failure; the rows stay pending and applied."""
+    bound = memory_module._INDEX_FLUSH_OPERATIONS
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.add_many(tuple(f"kettle {position}" for position in range(bound)))
+        assert index.flush_calls == 1
+        applied = len(index.upsert_calls)
+        assert memory._store.pending_index_operations() != ()
+        assert len(memory.search("kettle", limit=5)) == 5
+        # The read-only drain retried the flush and acknowledged every row without re-applying.
+        assert index.flush_calls == 2
+        assert len(index.upsert_calls) == applied
+        assert memory._store.pending_index_operations() == ()
+        memory.add("red kettle")
+        assert len(index.upsert_calls) == applied + 1
+        assert index.flush_calls == 2
+
+
+def test_a_failed_flush_over_a_full_outbox_read_does_not_stall_later_writes(
+    tmp_path: Path,
+) -> None:
+    """The applied set can outgrow one outbox read; the next drain must still see fresh rows.
+
+    Before the read carried a cursor, a drain re-read the oldest rows and skipped the applied
+    ones, so once a failed flush left a full read's worth applied, every later drain saw nothing
+    new, never retried the flush, and never applied the write it was called for.
+    """
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.add_many(
+                tuple(f"window {position}" for position in range(memory_module._OUTBOX_BATCH_SIZE))
+            )
+        assert index.flush_calls == 1
+        record = memory.add("red teapot")
+        assert index.flush_calls == 2
+        assert memory._store.pending_index_operations() == ()
+        assert record.id in {hit.id for hit in memory.search("red teapot")}
+        # A read-only drain retries a still-failed flush too.
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.add_many(
+                tuple(f"second {position}" for position in range(memory_module._OUTBOX_BATCH_SIZE))
+            )
+        memory.search("red teapot")
+        assert index.flush_calls == 4
+        assert memory._store.pending_index_operations() == ()
+
+
+def test_close_reports_a_failed_batched_flush_and_the_next_open_replays_it(
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        record = memory.add("red lantern")
+        index.fail_next_flush = True
+        with pytest.raises(IndexUnavailableError):
+            memory.close()
+    assert index.closed is True
+    with _memory(tmp_path, _FakeModels()) as memory:
+        # The rows were pending in SQLite, so the open re-applied them; `close()` acknowledges.
+        assert len(memory._store.pending_index_operations()) > 0
+        assert [hit.id for hit in memory.search("red lantern")] == [record.id]
+    assert _FakeIndex.instances[-1].flush_calls == 1
+    with _memory(tmp_path, _FakeModels()) as memory:
+        assert memory._store.pending_index_operations() == ()
+
+
+def test_concurrent_adds_share_one_index_apply(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -4459,7 +4572,13 @@ def test_index_fd_exhaustion_keeps_the_actionable_cause() -> None:
         )
 
 
-def test_formation_marker_commits_with_derived_sqlite_before_index_flush(tmp_path: Path) -> None:
+def test_formation_marker_commits_with_derived_sqlite_before_index_flush(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Flush in every drain so the failure surfaces in the write that enqueued the row.
+    monkeypatch.setattr(memory_module, "_INDEX_FLUSH_OPERATIONS", 1)
+
     class FlushFailingFormer:
         formation_capabilities = frozenset({Modality.TEXT})
         formation_model = "formation-test"
@@ -6477,14 +6596,18 @@ def test_add_stream_indexes_committed_items_in_bounded_groups(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """One flush per group of 32, and every Zvec change follows its own SQLite commit."""
+    """One index apply per group of 32, every one after its own SQLite commit; the flush waits.
+
+    The stream groups the *apply*; the flush that acknowledges the rows is batched behind every
+    write and here runs once, at `close()`.
+    """
     monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
 
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
         log = _stream_log(memory, index)
         records = tuple(memory.add_stream(f"streamed clip {position}" for position in range(70)))
-        stream_flushes = index.flush_calls
+        stream_groups = len(index.upsert_calls)
         found = memory.search("streamed clip", limit=100)
 
     committed: set[str] = set()
@@ -6496,14 +6619,15 @@ def test_add_stream_indexes_committed_items_in_bounded_groups(
             assert set(memory_ids) <= committed
     assert [action for action, _ids in log].count("commit") == 70
     # 32, 64, and the six left over when the source ends.
-    assert stream_flushes == 3
+    assert stream_groups == 3
     assert [action for action, _ids in log if action in {"upsert", "flush"}] == [
-        value for _group in range(3) for value in ["upsert", "flush"]
+        *(["upsert"] * 3),
+        "flush",
     ]
     assert {hit.id for hit in found} == {record.id for record in records}
 
 
-def test_add_stream_flushes_a_slow_source_on_the_time_bound(
+def test_add_stream_applies_a_slow_source_on_the_time_bound(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -6513,7 +6637,7 @@ def test_add_stream_flushes_a_slow_source_on_the_time_bound(
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
         tuple(memory.add_stream(f"slow clip {position}" for position in range(4)))
-        assert index.flush_calls == 4
+        assert len(index.upsert_calls) == 4
 
 
 def test_a_stream_that_ended_stops_deferring_even_if_another_outlives_it(
@@ -6541,9 +6665,9 @@ def test_a_stream_that_ended_stops_deferring_even_if_another_outlives_it(
                 both_open.wait()
             first_closed.set()
             assert second_closed.wait(timeout=30)
-            before = index.flush_calls
+            before = len(index.upsert_calls)
             memory.add("a note added once both streams had ended")
-            after_both.append(index.flush_calls - before)
+            after_both.append(len(index.upsert_calls) - before)
 
         def second() -> None:
             # Opens inside the first stream's group and closes after it, which is the order that
@@ -6583,9 +6707,9 @@ def test_a_stream_pumped_across_threads_stops_deferring_on_the_thread_that_opene
         stream = memory.add_stream(("clip the opener pumps", "clip the finisher pumps"))
 
         def add_and_count_flushes() -> int:
-            before = index.flush_calls
+            before = len(index.upsert_calls)
             memory.add("a note added on the thread that opened the stream")
-            return index.flush_calls - before
+            return len(index.upsert_calls) - before
 
         with (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="opener") as opener,
@@ -6616,7 +6740,7 @@ def test_search_during_a_stream_sees_the_committed_items(
             seen.append(record)
             if len(seen) == 2:
                 break
-        assert index.flush_calls == 0
+        assert index.upsert_calls == []
         during = memory.search("midstream clip", limit=10)
 
     assert {hit.id for hit in during} == {record.id for record in seen}
@@ -6639,12 +6763,12 @@ def test_search_inside_a_live_stream_loop_sees_the_item_just_yielded(
         for record in memory.add_stream(f"live clip {position}" for position in range(3)):
             hits = memory.search("live clip", limit=10)
             visible.append((record.id, {hit.id for hit in hits}))
-        flushes = index.flush_calls
+        applies = len(index.upsert_calls)
 
     for record_id, ids in visible:
         assert record_id in ids
     # Each in-loop search closed the group that held the item just yielded.
-    assert flushes >= 3
+    assert applies >= 3
 
 
 def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
@@ -6665,7 +6789,7 @@ def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
         with pytest.raises(ModelError):
             next(stream)
         # The group never closed, so the projection work is still pending and durable.
-        assert index.flush_calls == 0
+        assert index.upsert_calls == []
         assert memory._store.pending_index_operations() != ()
         assert [item.id for item in memory.list().items] == [prefix[1].id, prefix[0].id]
         recovered = memory.search("failing-stream clip", limit=10)
@@ -7223,6 +7347,21 @@ def _dated_corpus(memory: Memory) -> None:
     memory.add("a green crate", occurred_at=DAY + timedelta(days=2))
 
 
+def _partly_matched_corpus(memory: Memory) -> None:
+    """Five dated records whose matched set and ranked window overlap only partly.
+
+    The fake embedder's only axis is the word "red", so nothing containing it ranks for a
+    question that does not: the two red wrenches are reachable by predicate and never by rank,
+    and the crate and the pallet the other way round. That is the shape the union rule is about,
+    and the shape a single corpus of interchangeable records cannot show.
+    """
+    memory.add("a red wrench", occurred_at=DAY)
+    memory.add("a red wrench, spare", occurred_at=DAY + timedelta(days=1))
+    memory.add("a blue wrench", occurred_at=DAY + timedelta(days=2))
+    memory.add("a green crate", occurred_at=DAY + timedelta(days=3))
+    memory.add("a green pallet", occurred_at=DAY + timedelta(days=4))
+
+
 def _plan(shape: str, *steps: dict[str, object]) -> str:
     return json.dumps({"shape": shape, "steps": list(steps)})
 
@@ -7340,6 +7479,96 @@ def test_a_set_plan_grounds_the_whole_matched_set_in_time_order(tmp_path: Path) 
     assert "every record those reads matched, in time order" in question.text
 
 
+def test_a_set_plan_adds_its_matched_rows_to_the_window_the_ranking_earned(
+    tmp_path: Path,
+) -> None:
+    """A predicate that matched one record must not cost the question its other evidence.
+
+    Measured on ATM-Hard: a plan whose exhaustive reads returned a few rows used to ground on
+    only those rows, and the questions whose ranked window held the gold lost it -- 12 grounded
+    records down to 1, 2, 4 and 5. The set is what the predicate adds; the window is what the
+    question already had.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["blue"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("how many wrenches did I mention?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        # The one record the predicate matched, then the two the ranking earned.
+        "a blue wrench",
+        "a red wrench",
+        "a green crate",
+    ]
+    assert [hit.content for hit in answered.hits] == [hit.content for hit in grounded]
+    # The reader is holding both, so the note has to separate them: counting a top-ranked record
+    # as one the predicate matched is the same wrong total the completeness line exists to stop.
+    assert "records containing blue (1)" in question.text
+    assert "The top-ranked records for the question follow them" in question.text
+
+
+def test_a_set_plan_that_matched_nothing_grounds_exactly_as_the_unplanned_path_does(
+    tmp_path: Path,
+) -> None:
+    """A predicate that matched nothing has said nothing, least of all that there is no evidence.
+
+    This is the worst case of grounding on the exhaustive rows alone: on ATM-Hard it turned a
+    question the unplanned path answered into a refusal, because the evidence set the reader was
+    given was empty while the ranking held twelve records.
+    """
+    planned = _FakeModels()
+    planned.recall_plan = _plan("set", {"op": "match", "terms": ["zebra"]})
+    plain = _FakeModels()
+    with _memory(tmp_path / "planned", planned, recall_planning=True) as memory:
+        _dated_corpus(memory)
+        answered = memory.ask("how many wrenches did I mention?", limit=2)
+    with _memory(tmp_path / "plain", plain) as memory:
+        _dated_corpus(memory)
+        memory.ask("how many wrenches did I mention?", limit=2)
+
+    _planned_question, planned_hits = planned.answer_calls[-1]
+    _plain_question, plain_hits = plain.answer_calls[-1]
+    assert [hit.content for hit in planned_hits] == [hit.content for hit in plain_hits]
+    assert answered.answer.startswith("Grounded in: ")
+
+
+def test_the_grounded_set_is_the_matched_rows_in_time_order_then_the_ranking(
+    tmp_path: Path,
+) -> None:
+    """One order, whatever produced a row: the predicate's set in time, then rank, then nothing.
+
+    A record both reads found is in the set once, and it keeps the earlier seat -- the note calls
+    the leading rows a complete set, so a matched record listed among the ranked tail instead
+    would contradict it.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "set",
+        {"op": "match", "terms": ["wrench"]},
+        {"op": "similar", "query": "wrenches", "k": 3},
+    )
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _partly_matched_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=5)
+
+    _question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        # Matched, in time order. The blue wrench keeps its seat here although it ranked fourth,
+        # and the two red wrenches were also the top of the ranking.
+        "a red wrench",
+        "a red wrench, spare",
+        "a blue wrench",
+        # Ranked, by rank: the pallet ranked third, the crate fifth.
+        "a green pallet",
+        "a green crate",
+    ]
+    assert len({hit.id for hit in grounded}) == len(grounded)
+
+
 @pytest.mark.parametrize(
     ("shape", "step", "exhaustive"),
     [
@@ -7370,16 +7599,27 @@ def test_the_answerer_is_told_whether_its_evidence_is_a_set_or_a_ranking(
 
 
 def test_a_truncated_set_tells_the_reader_it_is_not_a_set(tmp_path: Path) -> None:
-    """The count the budget dropped is the difference between an answer and a wrong total."""
+    """The count the budget dropped is the difference between an answer and a wrong total.
+
+    What the budget may drop is a matched record beyond the ranked window. The window itself is
+    what the question would have been answered from with no plan at all, so a budget that
+    trimmed it would make planning a way to lose evidence.
+    """
     models = _FakeModels()
     models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
     with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=20) as memory:
-        _dated_corpus(memory)
+        _partly_matched_corpus(memory)
 
-        memory.ask("how many wrenches did I mention?")
+        memory.ask("how many wrenches did I mention?", limit=3)
 
     question, grounded = models.answer_calls[-1]
-    assert [hit.content for hit in grounded] == ["a red wrench"]
+    assert [hit.content for hit in grounded] == [
+        # Two matched records, and the pallet the ranking found: the blue wrench is the matched
+        # record the budget had no room for, and it is outside the three-record window.
+        "a red wrench",
+        "a red wrench, spare",
+        "a green pallet",
+    ]
     assert "1 further matched records are not shown" in question.text
     assert "do not state a total" in question.text
 
@@ -7395,16 +7635,22 @@ def test_a_cut_similarity_row_does_not_make_the_matched_set_incomplete(tmp_path:
     models.recall_plan = _plan(
         "set",
         {"op": "match", "terms": ["wrench"]},
-        {"op": "similar", "query": "wrenches", "k": 3},
+        {"op": "similar", "query": "wrenches", "k": 5},
     )
-    with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=30) as memory:
-        _dated_corpus(memory)
+    with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=60) as memory:
+        _partly_matched_corpus(memory)
 
-        memory.ask("how many wrenches did I mention?", limit=3)
+        memory.ask("how many wrenches did I mention?", limit=2)
 
     question, grounded = models.answer_calls[-1]
-    # Both matched records are grounded; the crate is a ranking row the budget had no room for.
-    assert [hit.content for hit in grounded] == ["a red wrench", "a blue wrench"]
+    # Every matched record is grounded, and so is the two-record window; the crate ranked fifth,
+    # outside the window, and is what the budget had no room for.
+    assert [hit.content for hit in grounded] == [
+        "a red wrench",
+        "a red wrench, spare",
+        "a blue wrench",
+        "a green pallet",
+    ]
     assert "every record those reads matched, in time order" in question.text
     assert "do not state a total" not in question.text
 
@@ -7419,12 +7665,16 @@ def test_a_set_plan_grounds_within_the_callers_own_evidence_budget(tmp_path: Pat
         recall_planning=True,
         evidence_budget_chars=20,
     ) as memory:
-        _dated_corpus(memory)
+        _partly_matched_corpus(memory)
 
-        memory.ask("how many wrenches did I mention?")
+        memory.ask("how many wrenches did I mention?", limit=3)
 
     question, grounded = models.answer_calls[-1]
-    assert [hit.content for hit in grounded] == ["a red wrench"]
+    assert [hit.content for hit in grounded] == [
+        "a red wrench",
+        "a red wrench, spare",
+        "a green pallet",
+    ]
     assert "1 further matched records are not shown" in question.text
 
 
@@ -7444,6 +7694,11 @@ def test_a_set_plan_grounds_a_bounded_number_of_media_rows(tmp_path: Path) -> No
                 occurred_at=DAY + timedelta(days=index),
             )
         memory.add("frame notes, in text", occurred_at=DAY + timedelta(days=9))
+        # Records the predicate does not match and the question does not rank, so that the five
+        # rows it does match are a selective read rather than the whole corpus -- which would be
+        # the other guard, and would contribute no rows for this cap to bound.
+        for index in range(30):
+            memory.add(f"red bolt {index}", occurred_at=DAY + timedelta(days=100 + index))
 
         memory.ask("how many frames?", limit=1)
 
@@ -7454,6 +7709,115 @@ def test_a_set_plan_grounds_a_bounded_number_of_media_rows(tmp_path: Path) -> No
         "frame notes, in text",
     ]
     assert "2 further matched records are not shown" in question.text
+
+
+def _flooding_corpus(memory: Memory) -> None:
+    """Five dated records every one of which the word "wrench" selects.
+
+    The shape LoCoMo has: every record carries the term the plan matches on, so the predicate is
+    the corpus and completeness over it says nothing about the question.
+    """
+    for index in range(5):
+        memory.add(f"a wrench, mention {index}", occurred_at=DAY + timedelta(days=index))
+
+
+def test_a_predicate_that_matched_most_of_the_corpus_grounds_like_no_plan_at_all(
+    tmp_path: Path,
+) -> None:
+    """A non-selective read is the corpus, not evidence, so it contributes nothing.
+
+    Measured on LoCoMo dev (525 questions): the planner chose `entity` on 229 of them, no
+    identity registry existed so the step degraded to matching the name as text, and on a corpus
+    whose every turn reads "[date] Caroline said: ..." that name selected ~300 of ~600 records.
+    Handing those to the reader cost accuracy 0.721 -> 0.528 on exactly those questions and
+    raised abstention from 18 to 57. The reader is told what the predicate matched and that what
+    it holds is the ranking instead -- never that the rows are a complete set.
+    """
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    unplanned = _FakeModels()
+    with _memory(tmp_path / "unplanned", unplanned) as memory:
+        _flooding_corpus(memory)
+        memory.ask("what was said about the wrench?", limit=1)
+
+    planned = _FakeModels()
+    planned.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(
+        tmp_path / "planned",
+        planned,
+        recall_planning=True,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        _flooding_corpus(memory)
+        memory.ask("what was said about the wrench?", limit=1)
+    provider.shutdown()
+
+    question, grounded = planned.answer_calls[-1]
+    _unplanned_question, unplanned_hits = unplanned.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [hit.content for hit in unplanned_hits]
+    assert "matched too many records to enumerate (5 of 5)" in question.text
+    assert "only the top-ranked records for the question are shown" in question.text
+    assert "every record those reads matched" not in question.text
+    assert "do not state a total" in question.text
+    recall = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.recall"
+    )
+    assert recall.attributes is not None
+    assert recall.attributes[RECALL_NON_SELECTIVE_STEPS] == 1
+
+
+def test_a_selective_predicate_on_the_same_corpus_still_grounds_its_whole_set(
+    tmp_path: Path,
+) -> None:
+    """The guard is a selectivity threshold, not a ceiling on set reads.
+
+    Same corpus and same predicate as above; only the ask's own grounding limit moved, which is
+    what the floor under the corpus share is expressed in. The set is grounded and declared
+    complete, so a count over it is still licensed.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _flooding_corpus(memory)
+
+        memory.ask("how many wrenches were mentioned?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [f"a wrench, mention {index}" for index in range(5)]
+    assert "records containing wrench (5)" in question.text
+    assert "every record those reads matched, in time order" in question.text
+    assert "too many records to enumerate" not in question.text
+
+
+def test_a_matched_set_is_capped_in_rows_as_well_as_characters(tmp_path: Path) -> None:
+    """A short-record corpus fits hundreds of matched rows inside the character budget.
+
+    `recall_set_max_rows` is the other axis of the same bound: the rows arrive chronological, the
+    cap keeps the earliest of them -- the read's own order, not a second ranking -- and the rest
+    are reported as matched records not shown, which is what makes the set incomplete. The ranked
+    window is outside the cap, so this can never cost a question the evidence it already had.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True, recall_set_max_rows=60) as memory:
+        for index in range(70):
+            memory.add(f"wrench {index}", occurred_at=DAY + timedelta(days=index))
+        # Twenty records the predicate does not match and the ranking does: the fake embedder's
+        # only axis is the word "red", so these are the window and the wrenches are the set.
+        for index in range(20):
+            memory.add(f"red thing {index}", occurred_at=DAY + timedelta(days=100 + index))
+
+        memory.ask("what red things did I mention?", limit=18)
+
+    question, grounded = models.answer_calls[-1]
+    matched = [hit.content for hit in grounded if hit.content.startswith("wrench ")]
+    window = [hit.content for hit in grounded if hit.content.startswith("red thing ")]
+    # The earliest sixty of the seventy matched rows, in the order the read returned them.
+    assert matched == [f"wrench {index}" for index in range(60)]
+    assert len(window) == 18
+    assert "10 further matched records are not shown" in question.text
+    assert "do not state a total" in question.text
 
 
 def test_a_read_that_filled_its_own_bound_is_reported_as_incomplete(tmp_path: Path) -> None:
@@ -7513,7 +7877,12 @@ def test_a_sequence_plan_grounds_the_records_around_what_it_found(tmp_path: Path
         memory.ask("what did I say just before the crate?")
 
     question, grounded = models.answer_calls[-1]
-    assert [hit.content for hit in grounded] == ["a blue wrench", "a green crate"]
+    # The adjacent pair in corpus order, then the one ranked record neither read had already.
+    assert [hit.content for hit in grounded] == [
+        "a blue wrench",
+        "a green crate",
+        "a red wrench",
+    ]
     assert "the 1 before and 0 after each of them (1)" in question.text
 
 
@@ -7530,7 +7899,12 @@ def test_an_entity_plan_falls_back_to_the_name_as_text_when_no_identity_carries_
         memory.ask("what do I know about Lily?")
 
     question, grounded = models.answer_calls[-1]
-    assert [hit.content for hit in grounded] == ["Lily brought the red wrench"]
+    # The record about Lily leads; the crate is the ranked window, which the entity read adds to
+    # rather than replaces.
+    assert [hit.content for hit in grounded] == [
+        "Lily brought the red wrench",
+        "a green crate arrived",
+    ]
     assert "records about Lily (1)" in question.text
 
 
@@ -7594,7 +7968,7 @@ def test_a_thin_best_effort_answer_buys_one_replan_round(tmp_path: Path) -> None
     assert "reported insufficient_evidence" in models.plan_calls[1][3]
     # A count and a date span, not labels: `E`-numbers here would not be the reader's, which are
     # assigned to the qualified subset of the evidence and to nothing when none of it qualifies.
-    assert "read 2 records dated 2024-09-01 to 2024-09-02" in models.plan_calls[1][3]
+    assert "read 3 records dated 2024-09-01 to 2024-09-03" in models.plan_calls[1][3]
     assert "E1" not in models.plan_calls[1][3]
     assert len(models.answer_calls) == 2
     assert answered.abstained is False

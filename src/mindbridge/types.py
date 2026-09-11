@@ -1513,7 +1513,7 @@ class MemoryRecord:
     `content` is the caller's text followed by any text the configured models derived from the
     media. Derived sections are appended, never substituted: what the caller supplied stays
     byte-identical at the front, and each derived section is introduced by its own marker line --
-    `[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or
+    `[transcript:<asset_id>]`, `[visual description:<asset_id>]`, `[facts:<asset_id>]`, or
     `[speech identities:<asset_id>]` -- so a reader can tell interpretation from evidence and
     which asset it came from. `add` derives before its first write and `settle` derives after
     `capture` already committed, so the same record shape results either way; the raw media is

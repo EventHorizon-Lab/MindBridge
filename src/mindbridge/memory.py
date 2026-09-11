@@ -34,11 +34,11 @@ from contextlib import AbstractContextManager, closing, contextmanager, suppress
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, time, timedelta, timezone
-from functools import partial
+from functools import lru_cache, partial
 from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock, local
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Literal, Protocol, TypeVar, cast, get_args
 
 from opentelemetry import trace
@@ -59,6 +59,8 @@ from mindbridge._telemetry import (
     IDENTITY_IDENTITIES,
     IDENTITY_LINKED,
     IDENTITY_MATCHED,
+    IDENTITY_NAMES_BOUND,
+    IDENTITY_NAMES_REFUSED,
     IDENTITY_OBSERVATIONS,
     MODEL_MODULE,
     MODEL_TTFT,
@@ -66,12 +68,14 @@ from mindbridge._telemetry import (
     RECALL_COMPLETE,
     RECALL_EXHAUSTIVE_ROWS,
     RECALL_FALLBACK,
+    RECALL_NON_SELECTIVE_STEPS,
     RECALL_OPS,
     RECALL_REPLAN,
     RECALL_SHAPE,
     SPAN_KIND,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
+    VISION_BATCHES_RETRIED,
     _record_retrieval_results,
     current_model_request_count,
     mark_model_requests,
@@ -111,6 +115,7 @@ from mindbridge.infrastructure.local.store import (
     IdentityLink,
     IndexCandidate,
     IndexDocument,
+    IndexOperation,
     LocalStore,
     RecallRead,
     SpeechRollback,
@@ -293,18 +298,28 @@ _LEGACY_INDEX_RECIPES = frozenset(
         ),
     }
 )
-# One drain applies this many outbox rows before flushing Zvec. A flush is a fixed ~45 ms
+# One drain hydrates and applies this many outbox rows per read. A flush is a fixed ~50 ms
 # fsync-class operation whatever it carries -- one document costs the same as a thousand -- and it
 # also creates one durable segment, which every later search pays for until an optimize merges it
-# away. Both costs are therefore per *flush*, so the batch is the largest one the index writes in
-# a single call: 1024 documents. `ZvecIndex.upsert` chunks anything larger, so this is a
-# memory-for-flushes choice and not a safety bound. Raising it from 256 quartered both the flush
-# count and the segment count of a bulk `add_many` (8 000 memories: 32 flushes and 32 segments
-# became 8 and 8) for about 32 MiB of transient hydration at 1024 dimensions.
+# away. Both costs are therefore per *flush*, so a bulk write applies rows in the largest batch
+# the index writes in a single call, 1024 documents, and flushes once per batch. `ZvecIndex.upsert`
+# chunks anything larger, so this is a memory-for-flushes choice and not a safety bound. Raising
+# it from 256 quartered both the flush count and the segment count of a bulk `add_many` (8 000
+# memories: 32 flushes and 32 segments became 8 and 8) for about 32 MiB of transient hydration at
+# 1024 dimensions.
 _OUTBOX_BATCH_SIZE = 1_024
+# Applied-but-unflushed outbox rows that trigger the Zvec flush. Zvec answers dense and full-text
+# queries from unflushed writes (and hides unflushed deletes), so a public write only has to
+# *apply* its rows to be visible; the ~50 ms flush is taken once per this many rows, when a drain
+# applied a deletion, and at `optimize()`, `reindex()` and `close()`. Rows are acknowledged in
+# SQLite only after that flush, exactly as before, and a single `add` no longer pays a flush or
+# leaves one segment behind.
+# ponytail: 256 caps the replay after a crash at 256 idempotent upserts; raise it if segment count
+# ever matters more than that.
+_INDEX_FLUSH_OPERATIONS = 256
 # `add_stream` group commit bounds. Every item still commits to SQLite on its own, and the Zvec
-# flush that follows it is deferred until one of these two bounds is reached, so a stream pays one
-# fsync-class operation per group instead of one per observation. Both bounds are fixed rather
+# apply that follows it is deferred until one of these two bounds is reached, so a stream pays one
+# outbox drain per group instead of one per observation. Both bounds are fixed rather
 # than configurable: a caller cannot choose better values without knowing what a Zvec flush costs,
 # and the visible behaviour they trade against - when a committed item enters the index - is
 # already forced by `search`, which drains before it reads.
@@ -475,6 +490,31 @@ _MODEL_STAGES = {
     "vision": "describe",
 }
 _MAX_TEXT_CHARACTERS = 65_536
+# The one line prefix the describer's durable statements arrive under, inside the same string as
+# the visible description. See `_split_description`.
+_FACT_LINE_PREFIX = "Fact:"
+# The one fact shape that is not just indexed text but an assertion about a person: it binds a
+# diarised speaker label to a name the dialogue itself stated. Tolerant of how the label is
+# spelled, because the label is the model's echo of a prompt, and strict about the sentence,
+# because anything looser would rename people out of ordinary description. The name itself is
+# bounded to a handful of words rather than "everything up to a period": an unbounded run
+# swallows whatever clause follows ("speaker_1 is called Lily and works in marketing" named the
+# whole clause), and a name that long fails to match at all rather than binding the wrong text.
+_NAME_BINDING = re.compile(
+    r"speakers?[ _-]?(?P<index>\d{1,3})\s+is\s+called\s+"
+    r"(?P<name>[^\s.;,]+(?: [^\s.;,]+){0,3})\s*[.;]?",
+    re.IGNORECASE,
+)
+# Seconds to wait before describing a throttled or overloaded batch again. Coarse and short: the
+# SDK client has already spent its own `max_retries` budget on this batch by the time one of
+# these failures reaches us, and what is left to wait out is a provider throttling a whole ingest
+# rather than one request. Module-level so a test can shorten it.
+_VISION_RETRY_BACKOFF = (1.0, 4.0, 16.0)
+# A describer is shown this write's own transcript as context, under the same labels the index
+# prints (`_speaker_prose`), so a fact naming a speaker resolves to the same person. Uncapped,
+# one long clip's words would dominate the token budget every visual in it pays; cut at a line
+# boundary so a turn is never split mid-sentence.
+_MAX_DESCRIBE_CONTEXT_CHARACTERS = 12_000
 _MAX_METADATA_BYTES = 262_144
 _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
@@ -689,6 +729,15 @@ class _OperationAssets:
     speech_rollbacks: builtins.list[SpeechRollback]
     face_observations: dict[str, tuple[FaceObservation, ...]]
     descriptions: dict[str, str]
+    # Identity ID -> the name a caption's facts stated for that diarised speaker. Staged rather
+    # than applied on the spot: the naming assertion reindexes every memory that mentions the
+    # person, and this write's own memory does not exist until it commits.
+    speaker_names: dict[str, str]
+    # A naming fact that named nobody: a label no recognizer in this clip produced, an identity
+    # that no longer exists by binding time, or a name that failed validation. Counted rather
+    # than only logged, alongside the refusals `_bind_speaker_names` already counts for a name
+    # that conflicts with one a person already carries.
+    speaker_names_refused: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -881,6 +930,7 @@ class Memory:
         evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         recall_planning: bool = _DEFAULT_CONFIG.recall_planning,
         recall_set_budget_chars: int = _DEFAULT_CONFIG.recall_set_budget_chars,
+        recall_set_max_rows: int = _DEFAULT_CONFIG.recall_set_max_rows,
         recall_rounds: int = _DEFAULT_CONFIG.recall_rounds,
         decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
         reinforce_on_answer: bool = _DEFAULT_CONFIG.reinforce_on_answer,
@@ -932,6 +982,7 @@ class Memory:
         self._evidence_budget = _evidence_budget(evidence_budget_chars)
         self._recall_planning = _strict_bool(recall_planning, "recall_planning")
         self._recall_set_budget = _positive_int(recall_set_budget_chars, "recall_set_budget_chars")
+        self._recall_set_max_rows = _positive_int(recall_set_max_rows, "recall_set_max_rows")
         self._recall_rounds = _positive_int(recall_rounds, "recall_rounds")
         self._decay_half_life = _decay_half_life(decay_half_life_days)
         self._reinforce_on_answer = _strict_bool(reinforce_on_answer, "reinforce_on_answer")
@@ -1043,6 +1094,7 @@ class Memory:
             ) from error
 
         self._closed = False
+        self._unflushed_operations: set[IndexOperation] = set()
         try:
             with self._write_lock:
                 self._drain_outbox()
@@ -1527,7 +1579,7 @@ class Memory:
     ) -> Iterator[MemoryRecord]:
         """Add a lazy omni stream one durable, searchable observation at a time.
 
-        Index commits are batched in bounded groups, so a fast source pays one Zvec flush per
+        Index applies are batched in bounded groups, so a fast source pays one outbox drain per
         group instead of one per item; a reader always drains first, so a committed item is
         searchable before the group closes.
 
@@ -1618,7 +1670,7 @@ class Memory:
         return grouped, group_started
 
     def _flush_stream_group(self) -> None:
-        """Index and acknowledge exactly the outbox rows the group's commits left pending."""
+        """Apply to the index exactly the outbox rows the group's commits left pending."""
         with self._write_lock:
             self._drain_outbox(force=True)
 
@@ -4619,8 +4671,12 @@ class Memory:
                     asset_ids=reported_assets,
                     capture_memory_ids=capture_ids,
                 )
-            for memory_id in direct_ids:
-                self.delete(memory_id)
+            # Each deletion forces an index flush when its drain runs, so the page is deleted
+            # under the stream deferral and drained once: one flush, not one per record.
+            with self._deferred_index(defer=True):
+                for memory_id in direct_ids:
+                    self.delete(memory_id)
+            self._drain_outbox(force=True)
             removed: list[str] = []
             with _translate_storage_errors("delete retained media"):
                 # Whatever the deletions above orphaned is already gone; what is left here is
@@ -4650,7 +4706,11 @@ class Memory:
             self._operation(),
             self._write_lock,
         ):
+            # Flushed and acknowledged first: the checkpoint below queues every embedding that has
+            # no pending row, so an applied-but-unacknowledged row would otherwise keep its
+            # embedding out of the rebuild's replay if the rebuild fails.
             self._drain_outbox()
+            self._flush_index()
             with _translate_storage_errors("checkpoint a search-index rebuild"):
                 self._store.queue_all_embeddings()
             memory_count = 0
@@ -4667,6 +4727,7 @@ class Memory:
             # Adds may commit SQLite while the rebuild owns the Zvec boundary. Replay instead of
             # blindly acknowledging so records committed after its SQLite scan cannot be lost.
             self._drain_outbox()
+            self._flush_index()
             return memory_count
 
     def optimize(self) -> None:
@@ -4677,6 +4738,7 @@ class Memory:
             self._write_lock,
         ):
             self._drain_outbox()
+            self._flush_index()
             with _translate_index_errors("optimize the search index"):
                 self._index.optimize()
                 self._index.flush()
@@ -4697,6 +4759,13 @@ class Memory:
                 failures = []
                 try:
                     self._cleanup_pending_assets()
+                except Exception as error:
+                    failures.append(error)
+                # Rows a failed flush leaves pending are durable in SQLite and replay on open.
+                try:
+                    if self._unflushed_operations:
+                        with self._trace("mindbridge.index.sync", kind="stage"):
+                            self._flush_index()
                 except Exception as error:
                     failures.append(error)
                 failures.extend(self._close_resources())
@@ -4905,10 +4974,13 @@ class Memory:
                     tuple(memory.content for memory in missing),
                     operation,
                 )
+                self._stage_speaker_names(described, operation)
                 missing = [
                     replace(
                         memory,
-                        content=self._with_visual_descriptions(memory.content, described),
+                        content=self._with_visual_descriptions(
+                            memory.content, described, operation
+                        ),
                     )
                     for memory in missing
                 ]
@@ -4986,7 +5058,7 @@ class Memory:
                 )
             if stored_memories:
                 # SQLite is authoritative and uses one WAL connection per transaction. Commit
-                # before taking the index lock so ordinary concurrent writers can share one flush.
+                # before taking the index lock so ordinary concurrent writers can share one drain.
                 with (
                     self._trace("mindbridge.storage.write", kind="stage"),
                     _translate_storage_errors("write memories"),
@@ -5018,6 +5090,10 @@ class Memory:
         rows_by_id = {memory.memory_id: memory for memory in authoritative}
         if rows_by_id.keys() != unique.keys():
             raise StorageError("written memories could not be read from SQLite", reason="io_failed")
+        # After the commit, and outside the speech-index guard: the naming assertion reindexes
+        # every memory that mentions the person, and this write's own memory has to be one of
+        # them -- `speaker_memory_ids` joins through `memory_assets`, which exists only now.
+        self._bind_speaker_names(operation)
         return tuple(self._memory_record(rows_by_id[memory.memory_id]) for memory in prepared)
 
     def _complete_formation(self, records: Sequence[MemoryRecord]) -> None:
@@ -5132,9 +5208,10 @@ class Memory:
             # Same order as `_add_prepared`: derived visual text has to exist before the fallback
             # guard decides whether this embedder can take the media at all.
             described = self._pending_visual_descriptions((memory.content,), operation)
+            self._stage_speaker_names(described, operation)
             memory = replace(
                 memory,
-                content=self._with_visual_descriptions(memory.content, described),
+                content=self._with_visual_descriptions(memory.content, described, operation),
             )
             if Modality.AUDIO not in self._embedding_capabilities:
                 # Same rescue set `_add_prepared` allows, so a composition `add()` accepts is not
@@ -5198,6 +5275,9 @@ class Memory:
                 if operation.speech_updates:
                     self._persist_transcripts(operation)
                 self._persist_descriptions(operation)
+        # Same order as `_add_prepared`: after the commit, so the row this write just settled is
+        # one of the memories the naming assertion reindexes.
+        self._bind_speaker_names(operation)
         return enriched if committed else None
 
     def _form_sources(
@@ -5568,7 +5648,10 @@ class Memory:
                 for content in contents
                 for asset in content.assets
                 if Modality(asset.modality) in self._vision_capabilities
-                and f"[visual description:{asset.asset_id}]\n" not in content.text
+                # Either derived section standing in the document means this asset is described:
+                # a caption that was all facts leaves no description marker behind, and asking
+                # for it again would buy the same text twice and append a duplicate section.
+                and not _has_stream_description(content.text, (asset,))
             }.values()
         )
         if not assets:
@@ -5584,9 +5667,7 @@ class Memory:
             # re-ingests a described corpus reports zero vision cost because it paid none.
             return dict(cached)
         try:
-            descriptions = self._vision_descriptions(
-                tuple(self._resolved_model_input(_asset_content(asset)) for asset in pending)
-            )
+            descriptions = self._described_batch(pending, operation)
         except ModelError as error:
             _LOGGER.warning(
                 "vision description failed for %d asset(s); storing them without a caption: %s",
@@ -5604,6 +5685,180 @@ class Memory:
         fresh = dict(zip((asset.asset_id for asset in pending), descriptions, strict=True))
         operation.descriptions.update(fresh)
         return {**cached, **fresh}
+
+    def _described_batch(
+        self,
+        pending: Sequence[StoredAsset],
+        operation: _OperationAssets,
+    ) -> tuple[str, ...]:
+        """Describe one batch of visuals, waiting out a throttled or overloaded endpoint first.
+
+        The SDK client retries a 429 or a 5xx on its own `max_retries` budget, which is seconds.
+        A provider throttling a whole ingest throttles it for minutes, and the caller's fail-open
+        then stores every asset in the burst without a caption, behind one log line -- a round of
+        write-path measurement lost an entire arm to exactly that. Three bounded waits, then the
+        batch fails open as it did before, uncached, so a later ingest retries it.
+
+        ponytail: the wait is taken under the write lock when speech is indexed, the same lock
+        the describe call itself already holds for seconds. Move it outside `_speech_index_guard`
+        if concurrent writers ever matter more than the caption does.
+        """
+        inputs = tuple(
+            self._resolved_model_input(
+                replace(
+                    _asset_content(asset),
+                    # Whatever this write already knows the clip says, under the same `speaker_N`
+                    # labels the index projection prints. A durable fact about a person is in the
+                    # words, not the pixels: four stills say two people are at a table, and only
+                    # the dialogue says which one is called Lily. Empty for an image and for any
+                    # composition with no speech backend, which then describes pixels as before.
+                    # Capped: an unbounded transcript would let one long clip's words dominate the
+                    # token budget every visual in it pays.
+                    text=_truncated_describe_context(
+                        _speaker_prose(
+                            asset.asset_id,
+                            operation.speech_segments.get(asset.asset_id, ()),
+                        )
+                        or ""
+                    ),
+                )
+            )
+            for asset in pending
+        )
+        for wait in _VISION_RETRY_BACKOFF:
+            try:
+                return self._vision_descriptions(inputs, final=False)
+            except ModelError as error:
+                if not _transient_vision_failure(error):
+                    raise
+                _LOGGER.warning(
+                    "describing %d visual(s) was refused as %s; retrying in %.0fs",
+                    len(inputs),
+                    error.reason or "a provider failure",
+                    wait,
+                )
+                sleep(wait)
+        return self._vision_descriptions(inputs)
+
+    def _stage_speaker_names(
+        self,
+        descriptions: Mapping[str, str],
+        operation: _OperationAssets,
+    ) -> None:
+        """Collect the names a caption's facts stated for this write's own diarised speakers.
+
+        A stated name is the one distillation that is more than indexed text: it re-keys the
+        person in every document that mentions them, now and for every later clip that resolves
+        to the same voice, which is what carries an identity across clips at all.
+
+        Only a label this asset's own recognizer produced can be resolved, so a fact naming a
+        speaker who is not in this clip is dropped rather than guessed at -- counted into
+        `operation.speaker_names_refused`, the same drop tally `_bind_speaker_names` adds to and
+        reports, so a fact naming a label nobody produced is not simply invisible. Cached
+        descriptions are read too: re-ingesting a corpus must reach the same named store as the
+        first ingest, and re-asserting a standing name is a no-op.
+        """
+        for asset_id, description in descriptions.items():
+            segments = operation.speech_segments.get(asset_id)
+            if not segments:
+                continue
+            identities = {label: identity for identity, label in _speaker_labels(segments).items()}
+            for fact in _split_description(description)[1].splitlines():
+                match = _NAME_BINDING.fullmatch(fact.strip())
+                if match is None:
+                    continue
+                identity_id = identities.get(f"speaker_{int(match['index'])}")
+                if identity_id is None:
+                    operation.speaker_names_refused += 1
+                    continue
+                operation.speaker_names.setdefault(identity_id, match["name"].strip())
+
+    def _known_speaker_names(self, asset_id: str, operation: _OperationAssets) -> dict[str, str]:
+        """Map this asset's `speaker_N` labels to whatever name is already known for them.
+
+        "Known now" is a name this very batch's own facts just staged (`operation.speaker_names`)
+        or a name an already-registered identity carries on its recognized segments; a name a
+        later write asserts is not, which is the write-time/retrieval-time split documented on
+        `_project_fact_labels`.
+        """
+        segments = operation.speech_segments.get(asset_id)
+        if not segments:
+            return {}
+        names: dict[str, str] = {}
+        for identity_id, label in _speaker_labels(segments).items():
+            name = operation.speaker_names.get(identity_id)
+            if name is None:
+                name = next(
+                    (
+                        segment.speaker_name
+                        for segment in segments
+                        if segment.speaker_id == identity_id and segment.speaker_name
+                    ),
+                    None,
+                )
+            if name:
+                names[label] = name
+        return names
+
+    def _bind_speaker_names(self, operation: _OperationAssets) -> None:
+        """Register the staged names, now that the memory carrying the voices is readable.
+
+        `register_identity` in all but name -- it lands the same `IDENTIFY` assertion through the
+        same commit, so it is auditable through `operations()` and reversible through
+        `rollback()` -- but it resolves and checks the person itself rather than raising on one
+        who has since been merged away, and it holds the existing operation instead of nesting a
+        second one inside this write.
+
+        A different standing name is never overwritten. The name came from a model reading a
+        transcript, and one mishearing would rewrite every document that person appears in; the
+        host's own `register_identity` stays the only thing that can replace a name. Nothing here
+        links identities either: `identity_link_min_assets` governs who is the same person, and a
+        name is not evidence about that.
+        """
+        bindings = dict(operation.speaker_names)
+        operation.speaker_names.clear()
+        bound = 0
+        refused = 0
+        for identity_id, name in bindings.items():
+            with _translate_storage_errors("read identity profile"):
+                profile = self._store.identity_profile(identity_id)
+            try:
+                proposed = None if profile is None else _identity_name(name)
+            except ValidationError:
+                proposed = None
+            if profile is None or proposed is None:
+                # The identity a staged name resolved to has since vanished (merged or deleted),
+                # or the stated name failed validation. Either way the fact named nobody, which
+                # is worth counting apart from a silent `continue` even though there is nobody
+                # left to warn about by name.
+                operation.speaker_names_refused += 1
+                continue
+            if profile.name == proposed:
+                continue
+            if profile.name is not None:
+                refused += 1
+                _LOGGER.warning(
+                    "a distilled fact called identity %s %r, which is already called %r; "
+                    "keeping the registered name",
+                    profile.identity_id,
+                    proposed,
+                    profile.name,
+                )
+                continue
+            with self._formation_lock, self._write_lock:
+                self._assert_identity_name(
+                    profile.identity_id,
+                    proposed,
+                    relationship=profile.relationship,
+                    operation=operation,
+                )
+            bound += 1
+        refused += operation.speaker_names_refused
+        operation.speaker_names_refused = 0
+        if bound or refused:
+            with self._trace("mindbridge.identity.names", kind="stage") as span:
+                span.set_attribute(IDENTITY_NAMES_BOUND, bound)
+                span.set_attribute(IDENTITY_NAMES_REFUSED, refused)
 
     def _stage_stream_description(
         self,
@@ -5629,6 +5884,7 @@ class Memory:
         self,
         prepared: _PreparedContent,
         descriptions: Mapping[str, str],
+        operation: _OperationAssets,
     ) -> _PreparedContent:
         """Union derived visual text into the indexed document, whatever the embedder can take.
 
@@ -5637,12 +5893,22 @@ class Memory:
         recommended omni composition the one that stored the empty string as its whole BM25
         document, so a stronger embedder deleted the lexical half of the dense+lexical union.
         Union does not lose here; replacement does.
+
+        One caption becomes up to two sections: what the pixels show, and the durable facts
+        distilled from them and from the clip's words. They are separate because they are
+        different claims -- one is observation, the other a distillation that outlives the clip --
+        and a reader that cannot tell them apart cannot correct the wrong one.
         """
         sections = tuple(
-            f"[visual description:{asset.asset_id}]\n{descriptions[asset.asset_id]}"
+            section
             for asset in prepared.assets
             if asset.asset_id in descriptions
-            and f"[visual description:{asset.asset_id}]\n" not in prepared.text
+            and not _has_stream_description(prepared.text, (asset,))
+            for section in _description_sections(
+                asset.asset_id,
+                descriptions[asset.asset_id],
+                self._known_speaker_names(asset.asset_id, operation),
+            )
         )
         if not sections:
             return prepared
@@ -5793,7 +6059,11 @@ class Memory:
                 ),
                 assets=memory.assets,
                 modality=Modality(memory.modality),
-                canonical_parts=(("text", base),) if base else (),
+                # Recovered section by section, not handed over as one string: the derived
+                # sections were embedded as their own atomic keys on the way in, and merging
+                # them here would key 2048-character windows of the whole document instead --
+                # on exactly the memories a stated name reindexes.
+                canonical_parts=_stored_canonical_parts(base, memory.assets),
                 audio_transcript=_has_stream_transcript(base, memory.assets),
                 visual_description=_has_stream_description(base, memory.assets),
             )
@@ -7424,17 +7694,31 @@ class Memory:
                 )
             return tuple(described[asset_id] for asset_id in asset_ids)
 
-    def _vision_descriptions(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+    def _vision_descriptions(
+        self, inputs: Sequence[ModelInput], *, final: bool = True
+    ) -> tuple[str, ...]:
+        """Describe one batch, and account a failure as lost or merely retried.
+
+        A caller still inside its retry budget passes ``final=False``: a transient failure there
+        is going to be attempted again, so it is counted on `VISION_BATCHES_RETRIED` rather than
+        `VISION_BATCHES_FAILED`. Anything else -- the last attempt, or a failure no retry could
+        fix -- is final regardless of what the caller passed, because no further attempt follows
+        it either way.
+        """
         if self._vision_describer is None:
             raise ModelError(
                 "vision description backend is not configured",
                 reason="backend_not_configured",
             )
         inputs = tuple(inputs)
+        # Media only: an input's text is the context this write derived for the visual, and a
+        # describer's capability set is narrowed to image and video at construction, so counting
+        # text as required would refuse every described clip that arrived with a transcript.
         unsupported = frozenset(
-            modality
+            asset.modality
             for value in inputs
-            for modality in value.modalities - self._vision_capabilities
+            for asset in value.assets
+            if asset.modality is not None and asset.modality not in self._vision_capabilities
         )
         if unsupported:
             names = ", ".join(sorted(modality.value for modality in unsupported))
@@ -7456,7 +7740,10 @@ class Memory:
             try:
                 return _validated_descriptions(self._vision_describer.describe(inputs), inputs)
             except Exception as error:
-                span.set_attribute(VISION_BATCHES_FAILED, 1)
+                if not final and isinstance(error, ModelError) and _transient_vision_failure(error):
+                    span.set_attribute(VISION_BATCHES_RETRIED, 1)
+                else:
+                    span.set_attribute(VISION_BATCHES_FAILED, 1)
                 if isinstance(error, MindBridgeError):
                     raise
                 raise ModelError(
@@ -7588,13 +7875,22 @@ class Memory:
                 k=k,
                 attempted=attempted,
             )
-            program = execute(plan, _RecallReads(self, context))
+            program = execute(
+                plan,
+                _RecallReads(self, context),
+                limit=k,
+                # The digest the planner was already handed, recomputed only after a commit, so
+                # the selectivity of every step is decided against one cached read per question
+                # rather than a count per step.
+                active_records=self._store.recall_digest().records,
+            )
             span.set_attributes(
                 {
                     RECALL_SHAPE: plan.shape,
                     RECALL_OPS: tuple(step.op for step in plan.steps),
                     RECALL_EXHAUSTIVE_ROWS: len(program.exhaustive),
                     RECALL_COMPLETE: program.complete,
+                    RECALL_NON_SELECTIVE_STEPS: program.non_selective_steps,
                     RECALL_REPLAN: bool(attempted),
                     # Every way planning can fail resolves to this same plan, so equality with it
                     # is the only signal that says the planner did not decide this question --
@@ -7609,13 +7905,18 @@ class Memory:
         program: RecallResult | None,
         context: _RecallContext,
     ) -> tuple[tuple[SearchHit, ...], str | None]:
-        """Choose the grounding window the question's shape asks for.
+        """Widen the grounding window by whatever the question's shape asks for beyond it.
 
         A ranking question keeps the window the ranking earned. A question that asked for every
-        matching record grounds on the set instead, up to `recall_set_budget_chars`, and carries
-        a line saying what the set is -- because a reader cannot see the predicate that produced
-        its evidence, and a count over a silently truncated set is a wrong answer stated
-        confidently.
+        matching record adds that set to it, up to `recall_set_budget_chars`, and carries a line
+        saying what the set is -- because a reader cannot see the predicate that produced its
+        evidence, and a count over a silently truncated set is a wrong answer stated confidently.
+
+        The set is added to the ranked window, never substituted for it. Grounding a plan on its
+        exhaustive rows alone cost every question whose reads returned few rows the window it
+        already had: measured on ATM-Hard, 12 grounded records down to 1, 2, 4 and 5, and one
+        down to a refusal the unplanned path had answered. A plan says what else is relevant; it
+        never says the ranking was wrong.
         """
         if program is None or not program.plan.exhaustive:
             budget = self._evidence_budget
@@ -7629,6 +7930,10 @@ class Memory:
             if self._evidence_budget is None
             else min(self._recall_set_budget, self._evidence_budget),
             media_limit=_RECALL_MEDIA_FACTOR * context.limit,
+            max_rows=self._recall_set_max_rows,
+            # Exactly what the unplanned path grounds, this question's modality floor included,
+            # so no plan can cost a question the evidence it already had.
+            required=_grounding_hits(context.ranked, context.limit),
         )
         return hits, recall_note(program, omitted=omitted)
 
@@ -8002,7 +8307,7 @@ class Memory:
                 self._store.delete_asset_if_unreferenced(asset.asset_id)
 
     def _drain_outbox(self, *, force: bool = False) -> None:
-        """Apply current SQLite truth, then acknowledge the exact durable operation batch.
+        """Apply current SQLite truth to Zvec; flush and acknowledge once enough has been applied.
 
         Skipped inside an `add_stream` group, whose own bounds force it. Skipping only leaves
         rows pending: they are still durable in SQLite and the next drain applies them.
@@ -8019,10 +8324,19 @@ class Memory:
                 kind="stage",
                 failure_stage="index.sync",
             ):
+                # Rows already applied and waiting for the batched flush stay pending in SQLite
+                # until that flush acknowledges them; they are always the oldest pending rows, so
+                # reading past the newest of them reads exactly what is not applied yet.
+                applied_through = max(
+                    (operation.operation_id for operation in self._unflushed_operations),
+                    default=0,
+                )
                 with _translate_storage_errors("read the search-index outbox"):
-                    operations = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
+                    operations = self._store.pending_index_operations(
+                        limit=_OUTBOX_BATCH_SIZE, after=applied_through
+                    )
                 if not operations:
-                    return
+                    break
                 last_by_embedding = {operation.embedding_id: operation for operation in operations}
                 current = sorted(
                     last_by_embedding.values(), key=lambda operation: operation.operation_id
@@ -8072,38 +8386,58 @@ class Memory:
                     self._index.delete(deleted_ids)
                 if documents:
                     self._index.upsert(documents)
-            with (
-                self._trace(
-                    "mindbridge.index.sync.zvec.flush",
-                    kind="stage",
-                    failure_stage="index.sync",
-                ),
-                _translate_index_errors("update the search index"),
-            ):
-                self._index.flush()
-            with (
-                self._trace(
-                    "mindbridge.index.sync.zvec.optimize",
-                    kind="stage",
-                    failure_stage="index.sync",
-                ),
-                _translate_index_errors("update the search index"),
-            ):
-                self._index.optimize_if_needed()
-            with (
-                self._trace(
-                    "mindbridge.index.sync.sqlite.ack",
-                    kind="stage",
-                    failure_stage="index.sync",
-                ),
-                _translate_storage_errors("acknowledge the search-index outbox"),
-            ):
-                acknowledged = self._store.acknowledge_index_operations(operations)
-            if acknowledged != len(operations):
-                raise StorageError(
-                    "search-index outbox changed while it was being acknowledged",
-                    reason="flush_failed",
-                )
+            self._unflushed_operations.update(operations)
+            # A deletion is made durable before its call returns: an erased record must not stay
+            # in the index, nor be named by a pending outbox row, for the sake of write latency.
+            if deleted_ids or len(self._unflushed_operations) >= _INDEX_FLUSH_OPERATIONS:
+                self._flush_index()
+        # A flush that failed in an earlier drain left the set at the bound; retry it here even
+        # when no new row arrived, so a read-only workload also heals the index.
+        if len(self._unflushed_operations) >= _INDEX_FLUSH_OPERATIONS:
+            self._flush_index()
+
+    def _flush_index(self) -> None:
+        """Make the applied Zvec changes durable, then acknowledge exactly their outbox rows."""
+        if not self._unflushed_operations:
+            return
+        operations = tuple(self._unflushed_operations)
+        with (
+            self._trace(
+                "mindbridge.index.sync.zvec.flush",
+                kind="stage",
+                failure_stage="index.sync",
+            ),
+            _translate_index_errors("update the search index"),
+        ):
+            self._index.flush()
+        # A failed flush above keeps the set, so the next drain retries without re-applying. Cleared
+        # here, before optimize and acknowledge: if either fails the rows are re-applied (idempotent
+        # upsert or delete) and acknowledged by the next drain, and a compaction inside
+        # `optimize_if_needed` never runs over unflushed documents.
+        self._unflushed_operations.clear()
+        with (
+            self._trace(
+                "mindbridge.index.sync.zvec.optimize",
+                kind="stage",
+                failure_stage="index.sync",
+            ),
+            _translate_index_errors("update the search index"),
+        ):
+            self._index.optimize_if_needed()
+        with (
+            self._trace(
+                "mindbridge.index.sync.sqlite.ack",
+                kind="stage",
+                failure_stage="index.sync",
+            ),
+            _translate_storage_errors("acknowledge the search-index outbox"),
+        ):
+            acknowledged = self._store.acknowledge_index_operations(operations)
+        if acknowledged != len(operations):
+            raise StorageError(
+                "search-index outbox changed while it was being acknowledged",
+                reason="flush_failed",
+            )
 
     def _index_documents(self) -> Iterator[IndexDocument]:
         after: tuple[datetime, str] | None = None
@@ -8145,7 +8479,12 @@ class Memory:
                             text=memory.content,
                             assets=memory.assets,
                             modality=Modality(memory.modality),
-                            canonical_parts=((("text", memory.content),) if memory.content else ()),
+                            # Same reason as `_refresh_speaker_memories`: an embedder swap has to
+                            # re-key each stored row the way `add()` keyed it, section by section.
+                            canonical_parts=_stored_canonical_parts(
+                                memory.content,
+                                memory.assets,
+                            ),
                             audio_transcript=_has_stream_transcript(
                                 memory.content,
                                 memory.assets,
@@ -8294,6 +8633,7 @@ class Memory:
             speech_rollbacks=[],
             face_observations={},
             descriptions={},
+            speaker_names={},
         )
         try:
             yield assets
@@ -10644,16 +10984,24 @@ def _stored_canonical_parts(
     """
     cuts: dict[int, str] = {}
     for asset in assets:
+        markers: tuple[tuple[str, str], ...]
         if asset.modality == Modality.AUDIO.value:
-            kind, marker = "audio_transcript", f"[transcript:{asset.asset_id}]\n"
+            markers = (("audio_transcript", f"[transcript:{asset.asset_id}]\n"),)
         elif asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}:
-            kind, marker = "visual_description", f"[visual description:{asset.asset_id}]\n"
+            # Both derived visual sections cut, and both under the kind that reaches the text
+            # keys: a facts section folded into the description part would key differently on
+            # the settle path than the same content did on the add path.
+            markers = (
+                ("visual_description", f"[visual description:{asset.asset_id}]\n"),
+                ("visual_description", f"[facts:{asset.asset_id}]\n"),
+            )
         else:
             continue
-        found = text.find(f"\n\n{marker}")
-        start = found + 2 if found >= 0 else (0 if text.startswith(marker) else -1)
-        if start >= 0:
-            cuts[start] = kind
+        for kind, marker in markers:
+            found = text.find(f"\n\n{marker}")
+            start = found + 2 if found >= 0 else (0 if text.startswith(marker) else -1)
+            if start >= 0:
+                cuts[start] = kind
     if not cuts:
         return (("text", text),) if text else ()
     ordered = sorted(cuts.items())
@@ -10676,9 +11024,71 @@ def _has_stream_transcript(text: str, assets: Sequence[StoredAsset]) -> bool:
 def _has_stream_description(text: str, assets: Sequence[StoredAsset]) -> bool:
     return any(
         asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}
-        and f"[visual description:{asset.asset_id}]\n" in text
+        and (
+            f"[visual description:{asset.asset_id}]\n" in text
+            or f"[facts:{asset.asset_id}]\n" in text
+        )
         for asset in assets
     )
+
+
+_NO_NAMES: Mapping[str, str] = {}
+
+
+def _description_sections(
+    asset_id: str, description: str, names: Mapping[str, str] = _NO_NAMES
+) -> tuple[str, ...]:
+    """Render one caption as the document sections it becomes, what-is-shown first.
+
+    A caption whose visible half is empty still contributes its facts, and one with no facts is
+    exactly the single section this produced before facts existed.
+
+    `names` projects the facts half through whatever `speaker_N` -> name binding this write
+    already knows, the same way transcript prose is projected (`_speech_retrieval_text`) -- see
+    `_project_fact_labels` for why this projection runs once, here, and never again.
+    """
+    visible, facts = _split_description(description)
+    if facts and names:
+        facts = _project_fact_labels(facts, names)
+    return (
+        *((f"[visual description:{asset_id}]\n{visible}",) if visible else ()),
+        *((f"[facts:{asset_id}]\n{facts}",) if facts else ()),
+    )
+
+
+def _project_fact_labels(facts: str, names: Mapping[str, str]) -> str:
+    """Replace a speaker label with the name already known for it, at write time only.
+
+    Unlike `[speech identities:]`, which `_retrieval_text` re-projects from the current name on
+    every index rebuild, `[facts:]` is rendered once, when the memory is written, from whatever
+    names this write already knows -- its own newly staged ones and any identity already named
+    before it. A name a *later* clip asserts does not retroactively rewrite an earlier one's
+    stored facts; only the identity's own projected name (`identities()`, `[speech identities:]`)
+    stays current for a person the store keeps renaming.
+    """
+    for label, name in names.items():
+        facts = re.sub(rf"\b{re.escape(label)}\b", name, facts)
+    return facts
+
+
+def _split_description(description: str) -> tuple[str, str]:
+    """Separate a caption's visible description from its `Fact:` lines.
+
+    The describer answers with one string per visual because that is the contract that survives
+    a video arriving as several stills -- asked for a per-still or per-section reply, a measured
+    endpoint returned one item per still and the whole batch was rejected. So the two halves
+    travel as labelled lines in one string and are cut apart here, on the write path, which is
+    also where the cache stores them as one row per asset.
+    """
+    lines = description.splitlines()
+    facts = "\n".join(
+        stripped
+        for line in lines
+        if line.startswith(_FACT_LINE_PREFIX)
+        and (stripped := line[len(_FACT_LINE_PREFIX) :].strip())
+    )
+    visible = "\n".join(line for line in lines if not line.startswith(_FACT_LINE_PREFIX))
+    return visible.strip(), facts
 
 
 def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
@@ -10714,25 +11124,73 @@ def _speech_identity_text(
         segments = segments_by_asset[asset]
         if not segments:
             continue
-        evidence = {
-            "asset_id": asset,
-            "segments": [
-                {
-                    "start_ms": segment.start_ms,
-                    "end_ms": segment.end_ms,
-                    "text": segment.text,
-                    "speaker_id": segment.speaker_id,
-                    "speaker_name": segment.speaker_name,
-                    "identity_score": segment.identity_score,
-                }
-                for segment in segments
-            ],
-        }
         sections.append(
             f"[speech identities:{asset}]\n"
-            + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(
+                _speech_evidence(asset, segments), ensure_ascii=False, separators=(",", ":")
+            )
         )
     return "\n\n".join(sections)
+
+
+def _speech_evidence(asset_id: str, segments: Sequence[SpeakerSegment]) -> dict[str, object]:
+    """Shape one asset's speaker evidence: the form the document holds and the projection reads."""
+    return {
+        "asset_id": asset_id,
+        "segments": [
+            {
+                "start_ms": segment.start_ms,
+                "end_ms": segment.end_ms,
+                "text": segment.text,
+                "speaker_id": segment.speaker_id,
+                "speaker_name": segment.speaker_name,
+                "identity_score": segment.identity_score,
+            }
+            for segment in segments
+        ],
+    }
+
+
+def _truncated_describe_context(text: str) -> str:
+    """Cap what a describer is shown of a clip's own words at a bounded character budget.
+
+    Cut at a line boundary -- each line is one speaker's turn (see `_speaker_prose`) -- so a
+    truncated context still ends on a whole turn rather than a sentence sliced in half.
+    """
+    if len(text) <= _MAX_DESCRIBE_CONTEXT_CHARACTERS:
+        return text
+    cut = text.rfind("\n", 0, _MAX_DESCRIBE_CONTEXT_CHARACTERS)
+    return text[:cut] if cut > 0 else text[:_MAX_DESCRIBE_CONTEXT_CHARACTERS]
+
+
+def _speaker_prose(asset_id: str, segments: Sequence[SpeakerSegment]) -> str | None:
+    """Render one asset's turns as the prose the index carries, or None when nothing was said.
+
+    Routed through the stored evidence shape and `_speech_retrieval_text` rather than formatted
+    here, so the labels a describer is shown are byte-for-byte the labels the searchable document
+    prints. Anything else and a fact naming `speaker_2` would name a different person than the
+    transcript the reader sees.
+    """
+    if not segments:
+        return None
+    return _speech_retrieval_text(
+        json.dumps(_speech_evidence(asset_id, segments), ensure_ascii=False), asset_id
+    )
+
+
+def _speaker_labels(segments: Sequence[SpeakerSegment]) -> dict[str, str]:
+    """Map each per-run identity ID to the stable `speaker_N` label the projection prints.
+
+    Mirrors the aliasing rule inside `_speech_retrieval_text`, which is what writes those labels
+    into the document; a distilled fact naming `speaker_2` can only be resolved back to a person
+    by the same rule, so a test pins the two against each other.
+    """
+    labels: dict[str, str] = {}
+    for segment in segments:
+        speaker_id = segment.speaker_id
+        if speaker_id is not None and speaker_id.startswith("identity_"):
+            labels.setdefault(speaker_id, f"speaker_{len(labels) + 1}")
+    return labels
 
 
 def _face_identity_text(
@@ -11325,32 +11783,54 @@ def _budgeted_recall(
     budget_chars: int,
     *,
     media_limit: int,
+    max_rows: int,
+    required: Sequence[SearchHit],
 ) -> tuple[tuple[SearchHit, ...], int]:
-    """Ground on the set the program produced, chronologically, up to the character budget.
+    """Union the program's set with the window the ranking earned, inside one budget.
 
-    Exhaustive rows come first because they are the answer's shape; similarity rows spend what is
-    left. The returned count is how many of the *exhaustive* rows were left out, which is what
-    turns a complete set into an incomplete one for the reader -- a ranking cut short is still a
-    ranking, and counting one of its rows as a missing "matched record" told a reader holding
-    every record its predicate matched that it did not have them.
+    Exhaustive rows come first because they are the answer's shape; ranked rows follow by rank,
+    deduplicated by ID. `required` is the window the unplanned path would have grounded, and it
+    is admitted whatever either bound says: it is evidence the question already had, so the
+    budget may only trim exhaustive rows beyond it and a plan can never ground less than no plan.
+
+    The returned count is how many of the *exhaustive* rows were left out, which is what turns a
+    complete set into an incomplete one for the reader -- a ranking cut short is still a ranking,
+    and counting one of its rows as a missing "matched record" told a reader holding every record
+    its predicate matched that it did not have them.
 
     Media rows are capped separately. An exhaustive read can name every clip in a corpus, and
     each media row reaching the answer call carries face and speech recognition -- writes, paid
     again on every replan round -- so a set's media rows stop at `media_limit` while its text
-    rows do not.
+    rows do not. The cap bounds what the predicate added, never the ranked window, whose size is
+    `limit` and which the unplanned path hands over regardless.
+
+    `max_rows` caps the matched rows the same way for the same reason on the other axis: a
+    corpus of short records fits hundreds of rows inside the character budget, and a reader
+    handed hundreds answers worse than one handed a window. The rows are already chronological
+    when they arrive, so the cap keeps the earliest ones -- the read's own order, not a second
+    ranking -- and the rows past it are counted in the returned shortfall, which is what tells
+    the reader the set is not complete. Like the other bounds, it may not drop a `required` row.
     """
+    exhaustive_ids = {hit.id for hit in program.exhaustive}
+    ranked = {hit.id: hit for hit in (*program.ranked, *required) if hit.id not in exhaustive_ids}
+    required_ids = {hit.id for hit in required}
     selected: builtins.list[SearchHit] = []
     spent = 0
     media = 0
     omitted = 0
-    for index, hit in enumerate(program.hits):
+    for index, hit in enumerate((*program.exhaustive, *ranked.values())):
+        exhaustive_row = index < len(program.exhaustive)
         cost = evidence_cost(hit)
-        if (selected and spent + cost > budget_chars) or (hit.assets and media >= media_limit):
-            omitted += 1 if index < len(program.exhaustive) else 0
+        if hit.id not in required_ids and (
+            (selected and spent + cost > budget_chars)
+            or (exhaustive_row and hit.assets and media >= media_limit)
+            or (exhaustive_row and index >= max_rows)
+        ):
+            omitted += 1 if exhaustive_row else 0
             continue
         selected.append(hit)
         spent += cost
-        media += 1 if hit.assets else 0
+        media += 1 if exhaustive_row and hit.assets and hit.id not in required_ids else 0
     return tuple(selected), omitted
 
 
@@ -11390,6 +11870,41 @@ def _with_reference_time(question: ModelInput, reference_at: datetime) -> ModelI
     """Append the answering clock as the final line of what the reader is handed."""
     note = f"Reference time for relative dates: {reference_at.isoformat(timespec='seconds')}"
     return replace(question, text=f"{question.text}\n\n{note}" if question.text else note)
+
+
+def _transient_vision_failure(error: ModelError) -> bool:
+    """Whether describing the same batch again could plausibly work.
+
+    `retryable` is the closed public vocabulary -- a 429, a timeout, a dropped connection -- and
+    REST, MCP, and the CLI all publish it, so widening it here would change what those surfaces
+    say about every other operation. A 5xx is deliberately not in it and is the other answer a
+    loaded endpoint gives a write burst, so it is read off the provider exception's own status
+    code: duck-typed, because the SDK that raised it is an optional adapter dependency.
+
+    One inner-prism gateway also answers a 400 -- `request_rejected`, not in `RETRYABLE_REASONS`
+    -- when it aborts JSON generation mid-response rather than rejecting the request itself, and
+    an identical retry 5s later succeeds. Measured live: 'Model output became abnormal while
+    generating a JSON response for response_format. The generation was aborted because the
+    partial output may be incomplete or invalid JSON. Please retry the request or adjust your
+    prompt or JSON schema.' Most 400s (a malformed prompt, an unsupported image) are not
+    transient, so this is a narrow message match rather than a status-code rule, and it is scoped
+    to this function alone -- `answer` and `formation` never call it, so their 400s are unchanged.
+    """
+    if error.retryable:
+        return True
+    cause = error.__cause__
+    status = getattr(cause, "status_code", None)
+    if isinstance(status, int) and 500 <= status < 600:
+        return True
+    if status != 400:
+        return False
+    body = getattr(cause, "body", None)
+    message = body.get("message") if isinstance(body, Mapping) else None
+    return (
+        isinstance(message, str)
+        and "model output became abnormal" in message.casefold()
+        and "generation was aborted" in message.casefold()
+    )
 
 
 def _validated_descriptions(
@@ -11972,7 +12487,25 @@ def _lexical_relevance(
     }
 
 
+# Every search re-derives the terms of ~100 hydrated candidates whose content has not changed
+# since the last search that ranked them; the terms are a pure function of the text. The cache is
+# process-wide and holds the term sets, which run to ~15x the text for unspaced CJK, so only texts
+# under this length are cached: 1024 entries x 2 000 chars bounds it near 32 MiB.
+_LEXICAL_TERMS_CACHE_CHARS = 2_000
+
+
 def _lexical_terms(value: str) -> frozenset[str]:
+    if len(value) > _LEXICAL_TERMS_CACHE_CHARS:
+        return _lexical_terms_uncached(value)
+    return _lexical_terms_cached(value)
+
+
+@lru_cache(maxsize=1024)
+def _lexical_terms_cached(value: str) -> frozenset[str]:
+    return _lexical_terms_uncached(value)
+
+
+def _lexical_terms_uncached(value: str) -> frozenset[str]:
     """Split text into words, plus adjacent-character bigrams for runs `\\w+` cannot split.
 
     `\\w+` matches an entire unspaced run as one token. That token is by construction the rarest

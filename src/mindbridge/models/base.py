@@ -425,6 +425,25 @@ class VisionDescriptionBackend(Protocol):
     @property
     def vision_space(self) -> str: ...
 
-    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]: ...
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        """Return one caption per input, in order -- never more, never fewer, never empty.
+
+        `inputs[i].text`, when set, is derived transcript context this write already knows about
+        the visual -- the clip's own words under the `speaker_N` labels the index prints, not
+        anything the caller wrote. It is context to read, not content to echo back: repeating it
+        verbatim in the caption duplicates text the document already carries under its own
+        section.
+
+        A line starting with the literal prefix ``Fact:`` is reserved syntax, not prose. The
+        kernel splits it out of the visible caption into its own indexed `[facts:<asset>]`
+        section (`_split_description`), so a fact must never depend on surrounding sentences to
+        be read correctly. One fact shape is more than indexed text: a line reading exactly
+        ``speaker_N is called <name>`` (case-insensitive, tolerant of `speaker N`/`speaker-N`)
+        binds the diarised label `speaker_N` to a stated name and performs an automatic
+        `IDENTIFY` write the caller can see through `operations()` and reverse through
+        `rollback()` -- never a label this clip's own recognizer did not produce, and never over
+        a name the identity already carries.
+        """
+        ...
 
     def close(self) -> None: ...

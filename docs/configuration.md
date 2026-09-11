@@ -215,6 +215,17 @@ whatever the caller wrote, each section carrying a `[visual description:<asset_i
 `get` shows which assets were described, and the asset is still embedded natively: the derived
 text is added to the record, never substituted for it.
 
+A caption is labelled lines rather than prose -- what is shown, readable text transcribed exactly,
+counts, place cues, a visible date or clock, and index tags -- because a question days later asks
+for the sign or the count, and free prose names whichever of those the model found interesting. A
+visual described while a speech backend is configured is also shown that clip's diarised
+transcript, and answers with `Fact:` lines: short declarative statements that stay true after the
+clip ends ("Lily is allergic to peanuts", "the yoga mat lives in the storage room"). Those land in
+their own `[facts:<asset_id>]` section, so the distillation is correctable separately from the
+observation, and where the dialogue itself states a diarised speaker's name that fact also
+registers the name against the recognized identity, so every later clip resolving to the same
+person is indexed under it.
+
 Three things bound what it costs and what it can do:
 
 - `modalities` is the visual capability set and accepts only `image` and `video`. An asset outside
@@ -240,11 +251,29 @@ Three things bound what it costs and what it can do:
   caption text back or accepts a wrong-length list. A second failure, or any other failure, leaves
   the memory
   stored **without** a caption rather than failing the write. Losing derived text must never lose
-  an observation the caller handed over. Those batches are counted on the vision span as
-  `mindbridge.vision.failed_batches`, so the loss is measurable rather than silent. The failure is
+  an observation the caller handed over. The batch that finally gives up -- the one that actually
+  cost a memory its caption -- is counted on the vision span as `mindbridge.vision.failed_batches`,
+  so the loss is measurable rather than silent. The failure is
   not negatively cached, but re-adding the same already-embedded memory is idempotent and does not
   revisit its caption. Repairing an existing captionless record therefore requires rebuilding it;
   the retry improves new writes and does not backfill old ones.
+- A throttled or overloaded endpoint is waited out before that fail-open, not straight through it.
+  A batch refused as `rate_limited`, with a timeout, on a dropped connection, or with a 5xx is
+  described again after 1 s, 4 s, and 16 s; a refusal that an identical request cannot clear --
+  `quota_exhausted`, `auth_failed`, `request_rejected` -- is not retried at all, with one narrow
+  exception: a `request_rejected` whose provider message says generation itself was aborted
+  while producing the JSON reply ("Model output became abnormal ... generation was aborted ...
+  Please retry") is retried the same way, because an identical request there routinely succeeds
+  seconds later; every other `request_rejected` -- a rejected image, an unsupported request --
+  still fails open on the first attempt. The SDK client's
+  own `max_retries` budget is spent inside each of those attempts, so `max_retries` on this slot
+  raises the per-attempt budget and is worth setting above the SDK default for a long ingest. A
+  provider that throttles a corpus throttles it for minutes, which is long enough for a
+  fail-open to store an entire ingest with no captions behind one log line. An attempt that fails
+  but still has a wait left is not a lost caption, only a paid retry, so it is counted apart on
+  `mindbridge.vision.retried_batches` rather than summed into `failed_batches` -- the two answer
+  different questions, "how many memories lost their caption" against "what did a long ingest pay
+  waiting one out".
 - Captions are not reproducible. The request pins `temperature` 0 and a fixed `seed` unless the
   slot sets its own, but a measured endpoint returned four different completions for four
   identical requests at those values. A caption becomes indexed text, so anything that needs two
@@ -333,7 +362,8 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
 | `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
 | `recall_planning` | `False` | Ask the answerer for a recall plan before retrieving, and ground on the set, sequence or entity it names; off means `ask` runs the one search it always has. An answerer without `plan_recall` cannot plan: the store logs one warning when it opens and every question runs that same search |
-| `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may ground on, never more than `evidence_budget_chars` when that is set; a point plan keeps `limit`. Read only when `recall_planning` is on |
+| `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may add to the ranked window, never more than `evidence_budget_chars` when that is set; a point plan keeps `limit`. Read only when `recall_planning` is on |
+| `recall_set_max_rows` | `60` | Matched rows a set, sequence or entity plan may add at all, whatever the character budget leaves room for; the rows past it are reported as not shown, so the set is declared incomplete. Bounds the matched set only. Read only when `recall_planning` is on |
 | `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; the second runs only when the first answer was a low-confidence guess under `answer_policy="best_effort"`. `1` disables it. Read only when `recall_planning` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
@@ -388,14 +418,29 @@ hits are never dropped, this setting can only enlarge a prompt: to bound one, lo
 leave the budget at `None`. Setting it also removes `limit`'s effect on prompt size, since the
 budget refills the window to the same width whatever `limit` was.
 
-A set, sequence or entity recall plan grounds on its own matched set instead of the ranked window,
-and `recall_set_budget_chars` bounds that set with the same text-equivalent cost. It is a ceiling
-rather than a floor: when `evidence_budget_chars` is also set, the lower of the two applies, so a
-caller who bounded the prompt bounded it for every question shape. Media rows carry one further
-bound. Grounding a media row runs face and speech recognition over it, which are writes and are
-paid again on a replan round, so a set keeps at most twice `limit` media rows however many its
-predicate matched; its text rows are unaffected, and the rows either bound dropped are reported to
-the reader as matched records not shown.
+A set, sequence or entity recall plan grounds on its own matched set *in addition to* the ranked
+window -- the same `limit` hits and modality floor the unplanned path grounds -- and
+`recall_set_budget_chars` bounds what the plan added with the same text-equivalent cost. It is a
+ceiling rather than a floor: when `evidence_budget_chars` is also set, the lower of the two
+applies, so a caller who bounded the prompt bounded it for every question shape. Neither bound may
+trim the ranked window, which is evidence the question already had, so planning can never ground
+less than not planning. Media rows carry one further bound. Grounding a media row runs face and
+speech recognition over it, which are writes and are paid again on a replan round, so the matched
+set keeps at most twice `limit` media rows however many its predicate matched -- the ranked window,
+whose width is `limit`, is outside that cap. Text rows are unaffected, and the matched rows either
+bound dropped are reported to the reader as matched records not shown. `recall_set_max_rows`
+is the same bound on the other axis: a corpus of short records fits hundreds of matched rows
+inside 30 000 characters, and the rows past the cap are dropped in favour of the earliest ones --
+the read's own chronological order, not a second ranking -- and counted as not shown.
+
+A read is only allowed to be complete while its predicate is selective. A step whose predicate
+selected more than a fifth of the active corpus, or more than four times `limit` rows on a corpus
+too small for that fifth to mean anything, contributes no rows at all: the reader is told what the
+predicate matched and that what it holds is the question's top-ranked records instead. Measured on
+LoCoMo, where every record reads "[date] Caroline said: ...", an entity step that degraded to
+matching the name as text selected about half the corpus and cost 19 points of accuracy on exactly
+the questions it ran on. A plan whose every step is non-selective grounds precisely what no plan
+would have grounded.
 
 Pass an OpenTelemetry tracer through the separate `tracer=` argument of `Memory.from_config()` or
 `Memory(...)`; it is not a setting. See [operations](operations.md#telemetry) for exporter setup
