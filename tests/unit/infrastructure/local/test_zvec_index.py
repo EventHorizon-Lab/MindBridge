@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Barrier, Event, Lock
+from types import SimpleNamespace
 from typing import Any, NoReturn, cast
 
 import pytest
@@ -55,6 +56,7 @@ def test_rabitq_rejects_unsupported_dimensions_before_open(tmp_path: Path) -> No
 
 def test_every_batch_status_is_checked() -> None:
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index.dimension = 2
     index._zvec = _FakeZvec
     index._collection = _FailingCollection()
@@ -65,6 +67,7 @@ def test_every_batch_status_is_checked() -> None:
 
 def test_native_fd_status_becomes_safe_emfile() -> None:
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index.dimension = 2
     index._zvec = _FakeZvec
     index._collection = _FileDescriptorFailingCollection()
@@ -100,6 +103,7 @@ def test_native_writes_are_serialized_across_collections() -> None:
     indexes = []
     for _number in range(2):
         index = object.__new__(ZvecIndex)
+        index._gate = _CollectionGate()
         index.dimension = 2
         index._zvec = _FakeZvec
         index._collection = BlockingCollection()
@@ -127,6 +131,7 @@ def test_native_writes_are_serialized_across_collections() -> None:
 
 def test_only_aggregate_vector_carries_full_text() -> None:
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index.dimension = 2
     index._zvec = _FakeZvec
     collection = _CapturingCollection()
@@ -153,6 +158,7 @@ def test_only_aggregate_vector_carries_full_text() -> None:
 
 def test_delete_accepts_only_not_found_failures() -> None:
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index._zvec = _FakeZvec
     index._collection = _DeletingCollection()
 
@@ -240,6 +246,7 @@ def test_group_by_falls_back_until_it_has_distinct_parent_memories() -> None:
         ),
     )
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index.dimension = 2
     index.ef_search = 300
     index.quantization = IndexQuantization.NONE
@@ -575,6 +582,7 @@ def test_write_refuses_to_consume_the_fd_safety_reserve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index.dimension = 2
     index._zvec = _FakeZvec
     collection = _CapturingCollection()
@@ -623,6 +631,7 @@ def test_fd_pressure_optimizes_while_recovery_headroom_remains(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index._flushes_since_optimization = 8
     index._flushes_since_compaction = 8
     optimized = 0
@@ -645,6 +654,7 @@ def test_fd_pressure_compacts_when_optimization_cannot_restore_headroom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index._flushes_since_optimization = 8
     index._flushes_since_compaction = 8
     optimized = 0
@@ -677,6 +687,7 @@ def test_fd_pressure_compacts_a_young_collection_without_optimizing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
     index._flushes_since_optimization = 1
     index._flushes_since_compaction = 1
     optimized = 0
@@ -1006,3 +1017,41 @@ class _QueryZvec:
 class _DenseZvec:
     Query = dict
     HnswQueryParam = dict
+
+
+def test_native_writes_wait_for_in_flight_queries_and_reenter_their_own_gate() -> None:
+    # Zvec 0.7 frees a segment's in-memory store during flush while a query may still read it
+    # (alibaba/zvec#714); the gate must therefore hold a flush back until the query has left,
+    # and the flush thread must still be able to run maintenance that re-reads the collection.
+    reentered = Event()
+
+    class FlushingCollection:
+        stats = SimpleNamespace(doc_count=0)
+
+        def flush(self) -> None:
+            with index._gate.read():
+                reentered.set()
+
+    index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
+    index._zvec = _FakeZvec
+    index._collection = FlushingCollection()
+    index._flushes_since_optimization = 0
+    index._flushes_since_compaction = 0
+
+    waiting = Event()
+    entered = Event()
+
+    def flush() -> None:
+        waiting.set()
+        index.flush()
+        entered.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with index._gate.read():
+            future = executor.submit(flush)
+            assert waiting.wait(timeout=2)
+            assert not entered.wait(timeout=0.1)
+        future.result(timeout=2)
+    assert entered.is_set()
+    assert reentered.is_set()

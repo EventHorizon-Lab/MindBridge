@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Condition, RLock
+from threading import Condition, RLock, get_ident
 from types import ModuleType
 from typing import Any, NoReturn, cast
 
@@ -154,18 +154,32 @@ def validate_index_configuration(
 
 
 class _CollectionGate:
-    """Let queries overlap while collection replacement remains exclusive."""
+    """Let queries overlap while every native write remains exclusive.
+
+    Zvec 0.7 lets a query snapshot the segment list without a lock while an insert or flush on
+    the same collection reassigns the writing segment and frees the old in-memory store
+    (alibaba/zvec#714). A query that lands in that window reads freed memory: sometimes a
+    ``fetch table failed`` error, sometimes SIGBUS with no Python traceback. Writers therefore
+    take the exclusive side of this gate, and a thread that already holds it may re-enter either
+    side, because flush runs maintenance and maintenance re-reads the collection it replaces.
+    """
+
+    # ponytail: writes exclude reads; drop back to replacement-only exclusion once the pinned
+    # zvec carries the fix for alibaba/zvec#714.
 
     def __init__(self) -> None:
         self._condition = Condition()
         self._readers = 0
-        self._writer = False
+        self._writer: int | None = None
         self._waiting_writers = 0
 
     @contextmanager
     def read(self) -> Iterator[None]:
+        if self._writer == get_ident():
+            yield
+            return
         with self._condition:
-            while self._writer or self._waiting_writers:
+            while self._writer is not None or self._waiting_writers:
                 self._condition.wait()
             self._readers += 1
         try:
@@ -178,19 +192,23 @@ class _CollectionGate:
 
     @contextmanager
     def write(self) -> Iterator[None]:
+        me = get_ident()
+        if self._writer == me:
+            yield
+            return
         with self._condition:
             self._waiting_writers += 1
             try:
-                while self._writer or self._readers:
+                while self._writer is not None or self._readers:
                     self._condition.wait()
-                self._writer = True
+                self._writer = me
             finally:
                 self._waiting_writers -= 1
         try:
             yield
         finally:
             with self._condition:
-                self._writer = False
+                self._writer = None
                 self._condition.notify_all()
 
 
@@ -322,7 +340,7 @@ class ZvecIndex:
         # write as far as the maintenance lock is concerned: another writer's segments must not
         # land between two chunks of one drain.
         written = []
-        with _INDEX_MAINTENANCE_LOCK:
+        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
             _require_file_descriptor_headroom()
             collection = cast(Any, self._require_collection())
             for start in range(0, len(docs), _MAX_WRITE_BATCH):
@@ -341,7 +359,7 @@ class ZvecIndex:
             if not document_id or document_id != document_id.strip():
                 raise ValueError("index document IDs must be non-empty and trimmed")
         deleted = []
-        with _INDEX_MAINTENANCE_LOCK:
+        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
             _require_file_descriptor_headroom()
             collection = cast(Any, self._require_collection())
             for start in range(0, len(ids), _MAX_WRITE_BATCH):
@@ -444,7 +462,7 @@ class ZvecIndex:
 
     def flush(self) -> None:
         """Make prior Zvec writes durable before SQLite acknowledges its outbox."""
-        with _INDEX_MAINTENANCE_LOCK:
+        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
             _require_file_descriptor_headroom()
             collection = cast(Any, self._require_collection())
             collection.flush()
@@ -456,10 +474,10 @@ class ZvecIndex:
             self._maintain_under_pressure()
 
     def optimize(self, *, concurrency: int = 0) -> None:
-        """Merge pending vectors into HNSW without blocking normal queries."""
+        """Merge pending vectors into HNSW; queries wait, see `_CollectionGate`."""
         if isinstance(concurrency, bool) or concurrency < 0:
             raise ValueError("concurrency must be a non-negative integer")
-        with _INDEX_MAINTENANCE_LOCK:
+        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
             collection = cast(Any, self._require_collection())
             collection.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
             self._optimization_watermark = self.doc_count
@@ -474,8 +492,8 @@ class ZvecIndex:
         _require_positive(minimum_unindexed, "minimum_unindexed")
         # Every collection shares one process FD table. Serializing maintenance prevents several
         # otherwise-isolated stores from all opening replacement segments at the same pressure
-        # boundary. Normal reads and writes remain independent.
-        with _INDEX_MAINTENANCE_LOCK:
+        # boundary. Reads of other collections remain independent.
+        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
             # Zvec optimize compacts search segments but leaves one idmap SST per durable flush.
             if self._flushes_since_compaction >= _AUTO_COMPACT_FLUSHES:
                 self._compact()

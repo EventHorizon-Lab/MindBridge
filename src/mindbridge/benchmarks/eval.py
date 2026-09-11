@@ -438,6 +438,57 @@ def _systemic_embedding_stage_failure(error: Exception) -> bool:
     )
 
 
+_TRANSIENT_RETRY_SECONDS = 600.0
+_TRANSIENT_RETRY_CAP_SECONDS = 30.0
+_TRANSIENT_REASONS = frozenset({"connection_failed", "timeout", "rate_limited"})
+_Retried = TypeVar("_Retried")
+
+
+def _transient_provider_failure(error: BaseException) -> bool:
+    """Recognize a provider failure that time, not a different request, resolves."""
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - every provider path imports the SDK first
+        transient: tuple[type[BaseException], ...] = ()
+        rate_limited: type[BaseException] | None = None
+    else:
+        transient = (openai.APIConnectionError, openai.InternalServerError)
+        rate_limited = openai.RateLimitError
+    for current in _exception_chain(error):
+        if isinstance(current, MindBridgeError) and current.reason in _TRANSIENT_REASONS:
+            return True
+        if rate_limited is not None and isinstance(current, rate_limited):
+            # Exhausted billing is a 429 too, and waiting never refills it.
+            return getattr(current, "code", None) != "insufficient_quota"
+        if isinstance(current, transient):
+            return True
+    return False
+
+
+async def _retry_transient(operation: Callable[[], Awaitable[_Retried]]) -> _Retried:
+    """Wait out a provider outage with exponential backoff instead of recording an error.
+
+    A connection reset is a fact about the network at that second, not about the answer, the
+    memory write, or the judge verdict it interrupted; one fourteen-hour run lost its longmemeval
+    score to eight of them. An outage longer than the budget still surfaces as the structured
+    error the caller already records, so nothing here hides a dead endpoint.
+    """
+    deadline = time.monotonic() + _TRANSIENT_RETRY_SECONDS
+    attempt = 0
+    while True:
+        try:
+            return await operation()
+        except Exception as error:
+            delay = min(2.0**attempt, _TRANSIENT_RETRY_CAP_SECONDS)
+            if not _transient_provider_failure(error) or time.monotonic() + delay > deadline:
+                raise
+            attempt += 1
+            logging.getLogger(__name__).warning(
+                "provider failure (%s); retrying in %.0fs", type(error).__name__, delay
+            )
+            await asyncio.sleep(delay)
+
+
 @dataclass(frozen=True, slots=True)
 class SampleResult:
     """One answered question plus diagnostics needed for replay and comparison."""
@@ -3000,7 +3051,7 @@ async def _deliberate_after_ingest(memory: AsyncMemory) -> None:
     _deliberation_applied += report.applied
 
 
-async def _ingest(
+async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transient retry share one chunk path
     memory: AsyncMemory,
     items: Sequence[MemoryItem],
     *,
@@ -3018,7 +3069,8 @@ async def _ingest(
 
     async def add_chunk(chunk: Sequence[MemoryItem]) -> int:
         contents = tuple(_memory_content(item) for item in chunk)
-        try:
+
+        async def add_all() -> None:
             with _durable_write(tracer, len(chunk), arm=arm):
                 await memory.add_many(
                     contents,
@@ -3027,6 +3079,19 @@ async def _ingest(
                     metadata=tuple(_memory_metadata(item) for item in chunk),
                     memory_type=MemoryType.EPISODIC,
                 )
+
+        async def add_first() -> None:
+            with _durable_write(tracer, 1, arm=arm):
+                await memory.add(
+                    contents[0],
+                    occurred_at=chunk[0].occurred_at,
+                    occurred_end=chunk[0].occurred_end,
+                    metadata=_memory_metadata(chunk[0]),
+                    memory_type=MemoryType.EPISODIC,
+                )
+
+        try:
+            await _retry_transient(add_all)
             return 0
         except IndexUnavailableError:
             raise
@@ -3038,14 +3103,7 @@ async def _ingest(
                 middle = len(chunk) // 2
                 return await add_chunk(chunk[:middle]) + await add_chunk(chunk[middle:])
         try:
-            with _durable_write(tracer, 1, arm=arm):
-                await memory.add(
-                    contents[0],
-                    occurred_at=chunk[0].occurred_at,
-                    occurred_end=chunk[0].occurred_end,
-                    metadata=_memory_metadata(chunk[0]),
-                    memory_type=MemoryType.EPISODIC,
-                )
+            await _retry_transient(add_first)
         except IndexUnavailableError:
             raise
         except Exception as error:
@@ -3329,6 +3387,15 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
     ranked: tuple[SearchHit, ...] = ()
     ranked_complete = False
 
+    async def attempt(operation: Callable[[], Awaitable[_Retried]]) -> _Retried:
+        # Only the attempt that answered is timed: a retry's backoff is outage time, not latency.
+        async def timed() -> _Retried:
+            nonlocal latency_started
+            latency_started = time.perf_counter()
+            return await operation()
+
+        return await _retry_transient(timed)
+
     def observe_retrieval(value: object) -> None:
         nonlocal ranked, ranked_complete
         if isinstance(value, tuple) and all(isinstance(hit, SearchHit) for hit in value):
@@ -3337,14 +3404,16 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
 
     try:
         if arm.name == "random":
-            ranked = await memory.search(
-                content,
-                limit=(
-                    RETRIEVAL_CANDIDATE_LIMIT
-                    if retrieval_gold_ids(task_name, question.metadata)
-                    else recall_limit
-                ),
-                reference_at=question.reference_at,
+            ranked = await attempt(
+                lambda: memory.search(
+                    content,
+                    limit=(
+                        RETRIEVAL_CANDIDATE_LIMIT
+                        if retrieval_gold_ids(task_name, question.metadata)
+                        else recall_limit
+                    ),
+                    reference_at=question.reference_at,
+                )
             )
             order = list(ranked)
             random.Random(f"{arm.seed}:{sample_id}").shuffle(order)
@@ -3358,21 +3427,28 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 ranked_source_ids_complete=True,
             )
         if arm.name == "compile":
-            bundle = await memory.compile(
-                content,
-                budget=compile_budget,
-                reference_at=question.reference_at,
-                allow_partial_sources=arm.allow_partial_sources,
+            bundle = await attempt(
+                lambda: memory.compile(
+                    content,
+                    budget=compile_budget,
+                    reference_at=question.reference_at,
+                    allow_partial_sources=arm.allow_partial_sources,
+                )
             )
             with _compile_span(tracer, bundle):
                 rendered = bundle.render()
-            if arm.generator is None:
+            compile_generator = arm.generator
+            if compile_generator is None:
                 raise RuntimeError("the compile arm requires a generator")
-            prediction = await arm.generator.answer(
-                _question_text(question),
-                rendered,
-                question_assets=tuple(atom for atom in question.content if isinstance(atom, Path)),
-                evidence_hits=bundle.hits,
+            prediction = await attempt(
+                lambda: compile_generator.answer(
+                    _question_text(question),
+                    rendered,
+                    question_assets=tuple(
+                        atom for atom in question.content if isinstance(atom, Path)
+                    ),
+                    evidence_hits=bundle.hits,
+                )
             )
             return _AnswerOutcome(
                 prediction,
@@ -3386,11 +3462,16 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 excerpt_source_ids=tuple(excerpt.source_memory_id for excerpt in bundle.excerpts),
                 excerpt_evidence=tuple(_excerpt_evidence(excerpt) for excerpt in bundle.excerpts),
             )
-        if arm.generator is not None:
-            prediction = await arm.generator.answer(
-                _question_text(question),
-                context if arm.name == "full-context" else None,
-                question_assets=tuple(atom for atom in question.content if isinstance(atom, Path)),
+        generator = arm.generator
+        if generator is not None:
+            prediction = await attempt(
+                lambda: generator.answer(
+                    _question_text(question),
+                    context if arm.name == "full-context" else None,
+                    question_assets=tuple(
+                        atom for atom in question.content if isinstance(atom, Path)
+                    ),
+                )
             )
             return _AnswerOutcome(
                 prediction,
@@ -3399,33 +3480,38 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 (),
                 (),
             )
-        result: AnswerResult | None = None
-        with _observe_retrieval_results(observe_retrieval):
-            ask_stream = getattr(memory, "ask_stream", None)
+        ask_stream = getattr(memory, "ask_stream", None)
+
+        async def answered() -> AnswerResult:
             if ask_stream is None:
-                result = await memory.ask(
+                answer: AnswerResult = await memory.ask(
                     content,
                     limit=recall_limit,
                     reference_at=question.reference_at,
                 )
-            else:
-                first_token_seen = False
-                async for chunk in ask_stream(
-                    content,
-                    limit=recall_limit,
-                    reference_at=question.reference_at,
-                ):
-                    if chunk.text.strip() and not first_token_seen:
-                        first_token_seen = True
-                        if answer_span is not None:
-                            answer_span.set_attribute(
-                                OPERATION_TTFT,
-                                (time.perf_counter() - started) * 1_000,
-                            )
-                    if chunk.result is not None:
-                        result = chunk.result
-                if result is None:
-                    raise RuntimeError("answer stream ended without a terminal result")
+                return answer
+            first_token_seen = False
+            streamed: AnswerResult | None = None
+            async for chunk in ask_stream(
+                content,
+                limit=recall_limit,
+                reference_at=question.reference_at,
+            ):
+                if chunk.text.strip() and not first_token_seen:
+                    first_token_seen = True
+                    if answer_span is not None:
+                        answer_span.set_attribute(
+                            OPERATION_TTFT,
+                            (time.perf_counter() - started) * 1_000,
+                        )
+                if chunk.result is not None:
+                    streamed = chunk.result
+            if streamed is None:
+                raise RuntimeError("answer stream ended without a terminal result")
+            return streamed
+
+        with _observe_retrieval_results(observe_retrieval):
+            result = await attempt(answered)
     except Exception as error:
         if _systemic_embedding_stage_failure(error):
             raise _SystemicEmbeddingFailure(
@@ -3441,7 +3527,6 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
             ranked_source_ids=_source_ids(ranked),
             ranked_source_ids_complete=ranked_complete,
         )
-    assert result is not None
     # `_declined` stays on this path: the product cannot recognise a refusal a task worded
     # itself, so the harness counts it. It is deliberately not extended to the baseline arms
     # here, which would be new behaviour rather than a merge of the two intents.
@@ -3925,48 +4010,47 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
     if extra_body:
         request["extra_body"] = extra_body
     use_responses_api = plan.parser == "atm" and judge_model_is_official(sample.task, config.model)
-    last_error: Exception | None = None
     usages = []
     attempted = 0
-    try:
-        for attempt in range(3):
-            try:
-                async with semaphore:
-                    attempted = attempt + 1
-                    mark_model_requests(attempted)
-                    if use_responses_api:
-                        response = await client.responses.create(
-                            model=config.model,
-                            input="\n".join(message.content for message in messages),
-                            max_output_tokens=plan.max_tokens,
-                            reasoning={"effort": "minimal"},
-                        )
-                        text = str(response.output_text or "").strip()
-                    else:
-                        response = await client.chat.completions.create(**request)
-                        text = str(response.choices[0].message.content or "").strip()
-                _record_openai_provenance(response)
-                usages.append(
-                    _model_usage(
-                        response,
-                        input_modalities=frozenset({Modality.TEXT}),
-                        output_modalities=frozenset({Modality.TEXT}),
-                    )
+
+    async def call() -> tuple[Mapping[str, float], str, bool]:
+        nonlocal attempted
+        async with semaphore:
+            attempted += 1
+            mark_model_requests(attempted)
+            if use_responses_api:
+                response = await client.responses.create(
+                    model=config.model,
+                    input="\n".join(message.content for message in messages),
+                    max_output_tokens=plan.max_tokens,
+                    reasoning={"effort": "minimal"},
                 )
-                scores = parse_judge_response(plan, text)
-                if cache is not None:
-                    cache.put(cache_task, sample.unit_id, key, CachedAnswer(text, 0.0, ()))
-                return scores, text, False
+                text = str(response.output_text or "").strip()
+            else:
+                response = await client.chat.completions.create(**request)
+                text = str(response.choices[0].message.content or "").strip()
+        _record_openai_provenance(response)
+        usages.append(
+            _model_usage(
+                response,
+                input_modalities=frozenset({Modality.TEXT}),
+                output_modalities=frozenset({Modality.TEXT}),
+            )
+        )
+        scores = parse_judge_response(plan, text)
+        if cache is not None:
+            cache.put(cache_task, sample.unit_id, key, CachedAnswer(text, 0.0, ()))
+        return scores, text, False
+
+    try:
+        while True:
+            try:
+                return await _retry_transient(call)
             except Exception as error:
-                last_error = error
                 if "extra_body" in request and _unsupported_extra_body(error):
                     request.pop("extra_body")
                     continue
-                if attempt < 2:
-                    await asyncio.sleep(2**attempt)
-        if last_error is None:
-            raise RuntimeError("judge call failed without an exception")
-        raise last_error
+                raise
     finally:
         _record_usage_batch(usages, request_count=attempted)
 
