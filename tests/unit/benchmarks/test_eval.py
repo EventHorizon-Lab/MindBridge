@@ -19,7 +19,7 @@ from inspect import getattr_static, signature
 from pathlib import Path
 from threading import Event as ThreadEvent
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 import yaml
@@ -1863,6 +1863,7 @@ async def test_ingest_records_the_failed_source_and_stable_error_detail() -> Non
             reason="unsupported_backend",
             stage="analyze",
             cause_type="TypeError",
+            message="speech failed",
         )
     ]
 
@@ -5364,3 +5365,58 @@ async def test_retry_transient_waits_out_provider_outages_only(
     with pytest.raises(ModelError, match="still down"):
         await eval_module._retry_transient(outage)
     assert time.monotonic() - started < 2
+
+    # The answer path streams `response_format` replies, and one gateway reports aborting its
+    # own JSON generation as a 400. That is `request_rejected` by status, yet an identical
+    # request seconds later succeeds; it is recognized by the provider's words and waited out.
+    calls = 0
+
+    async def aborted_generation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 2:
+            raise _aborted_json_generation()
+        return "answered"
+
+    assert await eval_module._retry_transient(aborted_generation) == "answered"
+    assert calls == 2
+
+
+class _AbortedJsonGeneration(Exception):
+    """The SDK's 400 as the eval sees it: a status code and the provider's parsed body."""
+
+    status_code = 400
+    body: ClassVar[dict[str, object]] = {
+        "message": (
+            "<400> InternalError.Algo.InvalidParameter: Model output became abnormal while "
+            "generating a JSON response for response_format. The generation was aborted because "
+            "the partial output may be incomplete or invalid JSON. Please retry the request or "
+            "adjust your prompt or JSON schema."
+        ),
+        "type": "invalid_request_error",
+    }
+
+
+def _aborted_json_generation() -> ModelError:
+    error = ModelError("generation request failed", reason="request_rejected", stage="generate")
+    error.__cause__ = _AbortedJsonGeneration()
+    return error
+
+
+def test_failure_detail_keeps_the_provider_message_for_the_next_diagnosis() -> None:
+    # The stable fields say "request rejected"; only the provider's words say whether the prompt
+    # was malformed or the gateway aborted its own generation, and a one-in-two-hundred failure
+    # cannot be reproduced on demand afterwards.
+    detail = eval_module._failure_detail(_aborted_json_generation())
+    assert detail.reason == "request_rejected"
+    assert detail.message is not None
+    assert detail.message.startswith("<400> InternalError.Algo.InvalidParameter")
+    assert detail.json()["message"] == detail.message
+
+    # Without a parsed provider body the failure's own text is kept, bounded and one-line.
+    plain = eval_module._failure_detail(RuntimeError("boom\n" + "x" * 900))
+    assert plain.message is not None
+    assert plain.message.startswith("boom x")
+    assert len(plain.message) == eval_module._FAILURE_MESSAGE_CHARS
+    assert eval_module._restored_failure({**detail.json(), "message": None}).message is None
+    assert eval_module._restored_failure(dict(detail.json())) == detail
