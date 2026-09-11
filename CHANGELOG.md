@@ -885,7 +885,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   capabilities its pooled backend really has, and only those, so a pool that cannot plan is still
   reported as unable to plan. The same declaration fixes the mirror image: `stream_answer` was
   declared unconditionally, so a pooled backend without it failed the call instead of taking the
-  buffered path.
+  buffered path. `Memory` now logs one warning at construction when `recall_planning` is on and
+  the answerer has no `plan_recall`, so that wiring failure is no longer silent; every planning
+  failure still resolves to the same fallback plan.
 - The live `mindbridge-bench eval` progress bar no longer appears frozen while a unit rebuilds,
   ingests, deliberates, or waits for its first answer. It preserves the truthful completed-sample
   count while refreshing elapsed time once a second and summarizing every active unit by phase.

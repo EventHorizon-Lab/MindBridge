@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 from collections.abc import AsyncIterator, Generator, Mapping, Sequence
 from dataclasses import replace
@@ -1595,6 +1596,7 @@ def test_the_lent_answerer_declares_the_planning_capability_its_pool_actually_ha
 
 def test_the_planner_runs_once_per_question_through_the_real_harness_path(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The whole chain: `_arm_answer` -> `AsyncMemory.ask_stream` -> the borrowed proxy.
 
@@ -1664,7 +1666,10 @@ def test_the_planner_runs_once_per_question_through_the_real_harness_path(
             return answered[0]
 
     try:
-        outcome = asyncio.run(run())
+        with caplog.at_level(logging.WARNING, logger="mindbridge.memory"):
+            outcome = asyncio.run(run())
+        # The store saw a planner at wiring time, not a proxy it had to fall back around.
+        assert not [message for message in caplog.messages if "cannot plan" in message]
         assert not isinstance(outcome, BaseException)
         assert outcome.prediction == "Ada."
         assert planned == [str(question.content[0])]

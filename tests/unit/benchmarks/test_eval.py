@@ -28,6 +28,7 @@ from opentelemetry.trace import Tracer
 from pydantic import ValidationError
 
 import mindbridge.benchmarks.eval as eval_module
+import mindbridge.models.base as base_module
 from mindbridge import (
     AbstentionReason,
     AnswerPolicy,
@@ -1190,6 +1191,42 @@ def test_borrowed_face_backend_preserves_the_runtime_protocol() -> None:
     assert isinstance(borrowed, FaceBackend)
     assert borrowed.analyze(()) == (FaceAnalysis(()),)
     borrowed.close()
+
+
+def _protocol_members(protocol: type) -> set[str]:
+    return {name for name in dir(protocol) if not name.startswith("_")}
+
+
+def test_every_lent_backend_declares_each_method_only_capability_its_pool_has() -> None:
+    """A `runtime_checkable` protocol with no properties is an optional capability that `Memory`
+    probes with `isinstance`, and the proxies have now hidden one of those twice. The expected
+    set is derived from `mindbridge.models.base`, so the next capability protocol, or a method
+    added to one, fails here instead of measuring the default policy under the harness. A
+    protocol with properties describes a slot and needs its own explicit proxy, as above."""
+    optional = [
+        protocol
+        for protocol in vars(base_module).values()
+        if isinstance(protocol, type)
+        and getattr(protocol, "_is_runtime_protocol", False)
+        and all(callable(getattr(protocol, name)) for name in _protocol_members(protocol))
+    ]
+    assert {protocol.__name__ for protocol in optional} >= {"RecallPlanningBackend"}
+    proxies = (
+        eval_module._BorrowedBackend,
+        eval_module._BorrowedGenerationBackend,
+        _BorrowedFaceBackend,
+        _BorrowedSpeechBackend,
+    )
+    for protocol in optional:
+        able = type(
+            "Able",
+            (),
+            {name: lambda self, *args, **kwargs: None for name in _protocol_members(protocol)},
+        )()
+        assert isinstance(able, protocol)
+        for proxy in proxies:
+            assert isinstance(proxy(able), protocol), (proxy.__name__, protocol.__name__)
+            assert not isinstance(proxy(object()), protocol), (proxy.__name__, protocol.__name__)
 
 
 @pytest.mark.parametrize("key", ("temperature", "seed", "max_tokens"))
