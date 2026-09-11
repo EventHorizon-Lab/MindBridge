@@ -81,9 +81,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   of returning early, and is still reported as abstained with `AbstentionReason.NO_EVIDENCE`.
   `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` take the same
   keyword-only argument, defaulted, so a custom backend only needs it once a caller opts in. The
-  benchmark harness sets `"best_effort"` for exactly `m3-bench-robot`, whose official evaluation
-  credits no abstention and whose question set holds no unanswerable item; every other task keeps
-  `"strict"`. `--answer-policy` and `benchmark.run.answer_policy` override that table for one run,
+  benchmark harness sets `"best_effort"` for exactly `m3-bench-robot` and the four `mm-lifelong-*`
+  splits, whose official evaluations credit no abstention and whose question sets hold no
+  unanswerable item; every other task keeps `"strict"`. `--answer-policy` and `benchmark.run.answer_policy` override that table for one run,
   and both the task and the sample rows record the policy the request carried.
 - Local storage advances to schema v18. Evidence is stored as clauses: a `CONSOLIDATE` operation's
   cited set is one conjunction, separate operations are alternatives, and withdrawing a source
@@ -875,6 +875,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- `mindbridge-bench eval` gives MM-Lifelong memories an event time. Each prepared clip carried
+  its `start_seconds`/`end_seconds` as metadata only, so every memory reached the store with no
+  `occurred_at` and the answerer was told to resolve "before"/"after" against `created_at` -- the
+  ingest wall clock, identical across a batch and unrelated to the video. The adapter now anchors
+  the offsets on one fixed epoch, so the store has a chronology and the questions are anchored at
+  the corpus end rather than at the run's wall clock. The `ref_at_300` offsets are unchanged.
 - `recall_planning` now actually plans under `mindbridge-bench eval`. The harness lends one
   answerer to every isolated store through a forwarding proxy, and `Memory` probes the optional
   `RecallPlanningBackend` capability with `isinstance` against a `runtime_checkable` protocol --

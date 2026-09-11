@@ -14,7 +14,7 @@ import time
 from argparse import ArgumentTypeError
 from collections.abc import Callable, Sequence
 from dataclasses import fields, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from inspect import getattr_static, signature
 from pathlib import Path
 from threading import Event as ThreadEvent
@@ -603,6 +603,77 @@ def test_write_artifacts_persists_the_effective_config_beside_the_results(tmp_pa
     assert (tmp_path / "config.yaml").read_bytes() == config_bytes
     for path in (tmp_path / "results.jsonl", tmp_path / "samples.jsonl"):
         assert all(isinstance(json.loads(line), dict) for line in path.read_bytes().splitlines())
+
+
+def test_mm_lifelong_memories_carry_their_media_offset_as_event_time(tmp_path: Path) -> None:
+    """A clip's place on the video timeline is the only event time the split has.
+
+    The manifest gives every part `start_seconds`/`end_seconds`, but the adapter stored them as
+    metadata alone, so every memory reached the store with no `occurred_at`: the answerer was
+    told to resolve "before"/"after" against `created_at`, the ingest wall clock, which repeats
+    across a batch and says nothing about the video. Anchoring the offsets on one fixed epoch
+    gives the store a real chronology and `_with_corpus_reference` a real corpus end.
+    """
+    from mindbridge.benchmarks.eval_adapters import _MEDIA_EPOCH, _mm_lifelong
+    from mindbridge.benchmarks.task_catalog import MediaSource, TaskSpec
+
+    dataset = tmp_path / "test.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "index": 0,
+                    "question": "How many monsters were defeated?",
+                    "answer": "5",
+                    "question_type": "Counting",
+                    "temporal_certificate": "Medium",
+                    "clue_intervals": [[867, 873]],
+                    "total_intervals": [[867, 873]],
+                }
+            ]
+        )
+    )
+    clips = []
+    for index in range(2):
+        clip = tmp_path / f"segment-{index:05d}.mp4"
+        clip.write_bytes(b"video")
+        clips.append(
+            {
+                "path": str(clip),
+                "source_id": f"0.mp4-{index:05d}",
+                "start_seconds": 30.0 * index,
+                "end_seconds": 30.0 * (index + 1),
+            }
+        )
+    spec = TaskSpec(
+        "mm-lifelong-day-test",
+        "MM-Lifelong",
+        "mm-lifelong/day/test.json",
+        "v1",
+        "owner/repo",
+        "0" * 40,
+        variant="day_test",
+        media_source=MediaSource("mm-lifelong"),
+    )
+    manifest = {"tasks": {"mm-lifelong-day-test": {"units": {"day_test": clips}}}}
+
+    (unit,) = _mm_lifelong(
+        spec, dataset, MediaResolver(spec.name, None, manifest, tmp_path), tmp_path, None, 0
+    )
+
+    assert [item.occurred_at for item in unit.memories] == [
+        _MEDIA_EPOCH,
+        _MEDIA_EPOCH + timedelta(seconds=30),
+    ]
+    assert [item.occurred_end for item in unit.memories] == [
+        _MEDIA_EPOCH + timedelta(seconds=30),
+        _MEDIA_EPOCH + timedelta(seconds=60),
+    ]
+    # The offsets the official Ref@300 scorer reads are untouched.
+    assert [(item.start_seconds, item.end_seconds) for item in unit.memories] == [
+        (0.0, 30.0),
+        (30.0, 60.0),
+    ]
 
 
 def test_mm_lifelong_ref_at_300_uses_official_quantized_iou() -> None:
@@ -5355,12 +5426,14 @@ def test_run_arms_hands_every_task_to_the_completion_callback(tmp_path: Path) ->
     assert [sample.prediction for sample in samples] == ["rewritten", "rewritten"]
 
 
-def test_only_the_task_whose_protocol_credits_no_abstention_asks_for_a_guess() -> None:
+def test_only_the_tasks_whose_protocol_credits_no_abstention_ask_for_a_guess() -> None:
     """Pinned as a set: widening it silently turns a reported refusal into an invented answer.
 
-    Every other task measures abstention in some form -- LongMemEval and MEMLENS carry abstention
-    abilities, ATM-Bench scores it as a class, LoCoMo's category 5 is adversarial -- so asking
-    those for a guess would be a scoring change, not a protocol alignment.
+    M3-Bench-Robot and MM-Lifelong are both judged against a reference answer on a scale with no
+    abstention class, so a refusal there is a zero. Every other task measures abstention in some
+    form -- LongMemEval and MEMLENS carry abstention abilities, ATM-Bench scores it as a class,
+    LoCoMo's category 5 is adversarial -- so asking those for a guess would be a scoring change,
+    not a protocol alignment.
 
     Membership only. That the mapping actually reaches the answerer is asserted end to end by
     `test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path`; comparing
@@ -5370,7 +5443,13 @@ def test_only_the_task_whose_protocol_credits_no_abstention_asks_for_a_guess() -
     from mindbridge.benchmarks.prompts import BEST_EFFORT_TASKS
     from mindbridge.benchmarks.task_catalog import TASKS
 
-    assert {"m3-bench-robot"} == BEST_EFFORT_TASKS
+    assert {
+        "m3-bench-robot",
+        "mm-lifelong-day-test",
+        "mm-lifelong-week-test",
+        "mm-lifelong-month-train",
+        "mm-lifelong-month-val",
+    } == BEST_EFFORT_TASKS
     assert set(TASKS) >= BEST_EFFORT_TASKS
 
 

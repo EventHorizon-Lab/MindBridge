@@ -12,11 +12,21 @@ from mindbridge.types import AnswerPolicy
 # The tasks whose official evaluation gives no credit for "unknown" and whose question sets hold
 # no genuinely unanswerable item, so an abstention there is a lost point rather than a correct
 # report. M3-Bench-Robot is scored by a judge against a reference answer with no abstention
-# class. Every other task keeps `strict`, because abstaining is part of what they measure:
-# LongMemEval and MEMLENS carry abstention abilities, ATM-Bench scores abstention as a class,
-# LoCoMo's category 5 is adversarial, and Mem-Gallery's `AR` mandates its own refusal wording.
-# This is protocol alignment on the request side; no scorer is changed by it.
-BEST_EFFORT_TASKS = frozenset({"m3-bench-robot"})
+# class; MM-Lifelong's judge grades semantic similarity to the reference on 0-5, so a refusal is
+# a 0 there too (measured: 132 of 200 day-split answers refused, 44 of them with a reference clip
+# already among the hits). Every other task keeps `strict`, because abstaining is part of what
+# they measure: LongMemEval and MEMLENS carry abstention abilities, ATM-Bench scores abstention
+# as a class, LoCoMo's category 5 is adversarial, and Mem-Gallery's `AR` mandates its own refusal
+# wording. This is protocol alignment on the request side; no scorer is changed by it.
+BEST_EFFORT_TASKS = frozenset(
+    {
+        "m3-bench-robot",
+        "mm-lifelong-day-test",
+        "mm-lifelong-week-test",
+        "mm-lifelong-month-train",
+        "mm-lifelong-month-val",
+    }
+)
 
 
 def task_answer_policy(task_name: str, override: AnswerPolicy | None = None) -> AnswerPolicy:

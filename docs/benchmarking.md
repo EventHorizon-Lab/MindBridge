@@ -1053,11 +1053,12 @@ Three result fields carry a caveat that decides whether they can be quoted:
   none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
   reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
   read the predictions before drawing a conclusion about refusal rates.
-- **One task asks the product for a committed answer rather than a refusal.**
+- **Two benchmarks ask the product for a committed answer rather than a refusal.**
   `mindbridge.benchmarks.prompts.task_answer_policy` maps each task to the `answer_policy` the
-  runner passes into `Memory.ask`, and one is `best_effort`: `m3-bench-robot`. This is protocol
-  alignment on the request side, not a scorer change -- its official evaluation gives no credit
-  for "unknown" (it is judged against a reference answer with no abstention class) and it ships
+  runner passes into `Memory.ask`, and `m3-bench-robot` and the four `mm-lifelong-*` splits are
+  `best_effort`. This is protocol alignment on the request side, not a scorer change -- their
+  official evaluations give no credit for "unknown" (both are judged against a reference answer
+  with no abstention class; MM-Lifelong's judge grades semantic similarity on 0--5) and they ship
   no genuinely unanswerable item, so an abstention there is a lost point rather than a correct
   report. Every other task keeps the product default `strict`,
   because abstaining is part of what they measure: LongMemEval and MEMLENS carry abstention

@@ -1471,6 +1471,7 @@ def test_a_replayed_answer_still_carries_the_ranked_list_it_was_scored_from(
     ("task_name", "override", "expected"),
     [
         ("m3-bench-robot", None, "best_effort"),
+        ("mm-lifelong-day-test", None, "best_effort"),
         ("atm-bench", None, "strict"),
         ("atm-bench", "best_effort", "best_effort"),
         ("m3-bench-robot", "strict", "strict"),
