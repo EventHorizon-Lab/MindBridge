@@ -139,7 +139,7 @@ rejected. The MCP-specific media bounds are listed below.
 | --- | --- | --- | --- |
 | `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | write, idempotent |
 | `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | write, not idempotent |
-| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | write, not idempotent |
+| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None`; `answer_policy="strict"` | `AnswerResponse` | write, not idempotent |
 | `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None`; `allow_partial_sources=false` | `ContextBundleResult` | write, not idempotent |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
@@ -179,7 +179,12 @@ an answer abstains, or a bundle carries no evidence -- the bounded recall-failur
 control plane's `QUERY_FAILURE` trigger reads; they are also not advertised as idempotent. Every
 tool has `open_world_hint=false`. `ask_memory` requires an answerer in the
 injected memory; without one it returns `model_error/backend_not_configured`. With the default
-`reinforce_on_answer=True`, it also reinforces the hits the answerer cites.
+`reinforce_on_answer=True`, it also reinforces the hits the answerer cites. Its `answer_policy`
+is `strict` or `best_effort`: the default refuses when the evidence is thin, while `best_effort`
+commits to the most likely answer -- for a multiple-choice question, always one of the options --
+and still reports `abstained`, so an agent that must produce an answer keeps the confidence
+signal without losing the answer. Under `best_effort` a question that grounds nothing spends a
+generation call too, where the default returns without one.
 
 `compile_context` is the preferred way to get task-ready context: it returns a structured,
 budgeted bundle with provenance instead of one sentence, calls no generation model, and stores no

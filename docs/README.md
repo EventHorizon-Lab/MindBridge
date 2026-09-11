@@ -19,6 +19,7 @@ have one place to stay current.
 | Compare current memory backends | [Competitor memory backends](research/competitor-memory-backends-2026-09-08.md) | [Hybrid score completion](research/hybrid-score-completion-2026-09-08.md) |
 | Review the measured memory changes | [Memory optimization report](research/memory-optimization-2026-09-07.md) | [Benchmarking](benchmarking.md) |
 | Review the 2026-09-08 memory backend work | [Chinese conclusions](research/2026-09-09-memory-backend-conclusions-zh.md) | [Research](research/2026-09-08-memory-backend-research.md), [validation](research/2026-09-08-memory-backend-validation.md), and [evaluation](research/2026-09-08-memory-backend-evaluation.md) |
+| Review the 2026-09-10 recall-programs round | [Recall programs round](research/2026-09-10-recall-programs-round.md) | [Recall programs spec](superpowers/specs/2026-09-10-recall-programs-design.md) and [Benchmarking](benchmarking.md) |
 | Review companion evidence obligations | [Companion evidence obligations](research/2026-09-09-companion-evidence-obligations-zh.md) | [Affective memory](affective-memory.md) and [Context compilation](context-compilation.md) |
 | Understand or extend the design | [Design principles](design-principles.md) | [Plugin architecture](plugin-architecture.md) |
 | Follow where the product is going | [Context OS direction](context-os.md) | [Design principles](design-principles.md) |

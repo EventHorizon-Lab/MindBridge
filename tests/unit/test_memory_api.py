@@ -34,6 +34,7 @@ from mindbridge._telemetry import (
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
     OPERATION_TTFT,
+    RECALL_NON_SELECTIVE_STEPS,
     TOKEN_COMPLETE,
     TOKEN_EXPECTED_REQUEST_COUNT,
     TOKEN_REPORTED_REQUEST_COUNT,
@@ -75,8 +76,10 @@ from mindbridge.models.base import (
     StreamingGenerationBackend,
 )
 from mindbridge.models.openai_sdk import OpenAIModels
+from mindbridge.recall import fallback_plan
 from mindbridge.types import (
     AbstentionReason,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     Blob,
@@ -127,7 +130,17 @@ class _FakeModels:
         self.embed_inputs: list[tuple[ModelInput, ...]] = []
         self.embed_tasks: list[EmbedTask] = []
         self.answer_calls: list[tuple[ModelInput, tuple[SearchHit, ...]]] = []
+        # Whether each answer was told its hits are a matched set in time order, not a ranking.
+        self.exhaustive_calls: list[bool] = []
         self.transcribe_calls: list[tuple[AssetRef, ...]] = []
+        # The recall plan this backend replies with, and every planning call it was asked for.
+        # None is a backend that plans nothing, which is what most of these tests want.
+        self.recall_plan: str | None = None
+        self.plan_error: ModelError | None = None
+        self.plan_calls: list[tuple[str, datetime, str, str]] = []
+        # How many of the next answers report thin evidence, which is what a second recall
+        # round exists to respond to.
+        self.abstentions = 0
         self.embedding_model = model
         self.embedding_space = f"{model}:2:test"
         self._legacy_embedding_spaces: frozenset[str] = frozenset()
@@ -168,11 +181,40 @@ class _FakeModels:
             (1.0, 0.0) if "red" in value.text.casefold() else (0.0, 1.0) for value in batch
         )
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
+    ) -> AnswerResult:
         grounded = tuple(hits)
         self.answer_calls.append((question, grounded))
+        self.exhaustive_calls.append(exhaustive)
         answer = f"Grounded in: {grounded[0].content}" if grounded else "I do not know."
+        if self.abstentions:
+            self.abstentions -= 1
+            return AnswerResult(
+                answer=answer,
+                hits=grounded,
+                abstained=True,
+                abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
+            )
         return AnswerResult(answer=answer, hits=grounded)
+
+    def plan_recall(
+        self,
+        question: str,
+        *,
+        reference_at: datetime,
+        corpus_digest: str,
+        attempted: str = "",
+    ) -> str | None:
+        self.plan_calls.append((question, reference_at, corpus_digest, attempted))
+        if self.plan_error is not None:
+            raise self.plan_error
+        return self.recall_plan
 
     def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
         batch = tuple(assets)
@@ -488,6 +530,11 @@ def _memory(
     index_speech: bool = MemoryConfig().index_speech,
     retrieval_mode: RetrievalMode = RetrievalMode.HYBRID,
     reinforce_on_answer: bool = True,
+    recall_planning: bool = MemoryConfig().recall_planning,
+    recall_set_budget_chars: int = MemoryConfig().recall_set_budget_chars,
+    recall_set_max_rows: int = MemoryConfig().recall_set_max_rows,
+    recall_rounds: int = MemoryConfig().recall_rounds,
+    tracer: Tracer | None = None,
 ) -> Memory:
     models = models or _FakeModels()
     return Memory(
@@ -501,6 +548,11 @@ def _memory(
         index_speech=index_speech,
         retrieval_mode=retrieval_mode,
         reinforce_on_answer=reinforce_on_answer,
+        recall_planning=recall_planning,
+        recall_set_budget_chars=recall_set_budget_chars,
+        recall_set_max_rows=recall_set_max_rows,
+        recall_rounds=recall_rounds,
+        tracer=tracer,
     )
 
 
@@ -780,6 +832,9 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Iterator[str]:
             del question, hits
             record_model_usage(input_tokens=5, output_tokens=3, total_tokens=8)
@@ -982,6 +1037,9 @@ def test_empty_stream_is_invalid_model_output(tmp_path: Path, chunks: tuple[str,
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Iterator[str]:
             del question, hits
             yield from chunks
@@ -1012,6 +1070,9 @@ def test_stream_ttft_requires_an_actual_model_request(tmp_path: Path) -> None:
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Iterator[str]:
             del question, hits
             mark_model_requests(0, token_usage_expected=0)
@@ -1045,6 +1106,9 @@ def test_streaming_answer_reports_only_the_hits_the_stream_used(tmp_path: Path) 
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             del question
             yield "grounded"
@@ -1065,6 +1129,9 @@ def test_streaming_answer_preserves_structured_abstention(tmp_path: Path) -> Non
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Generator[str, None, AnswerResult]:
             del question
             yield "unknown"
@@ -4873,7 +4940,14 @@ def test_omni_add_batches_declared_transcripts_and_ask_reuses_them(
 
 def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Path) -> None:
     class FabricatingModels(_FakeModels):
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
             super().answer(question, hits)
             fabricated = SearchHit(
                 id="fabricated",
@@ -4910,6 +4984,9 @@ class _CountingStreamer(_FakeModels):
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> Generator[str, None, tuple[SearchHit, ...]]:
         del question
         for part in ("the red ", "toolbox is ", "on the bench"):
@@ -5043,6 +5120,9 @@ def test_abandoning_ask_stream_closes_the_generation_stream_inside_the_operation
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             try:
                 yield from super().stream_answer(question, hits)
@@ -5107,7 +5187,14 @@ def test_ask_stream_records_time_to_first_token_on_the_generation_span(tmp_path:
 
 def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> None:
     class SelectingModels(_FakeModels):
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
             super().answer(question, hits)
             fabricated = SearchHit(
                 id="fabricated",
@@ -5138,7 +5225,14 @@ def test_answering_reinforces_only_the_evidence_the_model_cited(tmp_path: Path) 
     """
 
     class CitingModels(_FakeModels):
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
             super().answer(question, hits)
             return AnswerResult(answer="grounded", hits=(hits[0],))
 
@@ -5184,7 +5278,14 @@ def test_reinforce_on_answer_false_keeps_answering_free_of_side_effects(tmp_path
     """
 
     class CitingModels(_FakeModels):
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
             super().answer(question, hits)
             return AnswerResult(answer="grounded", hits=(hits[0],))
 
@@ -7042,3 +7143,903 @@ def test_erasing_a_person_leaves_an_irreversible_log_row_holding_no_content(
         assert memory.operations()[0].rolled_back_at is None
         assert memory.identity(survivor) is None
         assert '"speaker_name":null' in memory.get(record.id).content
+
+
+def test_ask_hands_the_caller_chosen_answer_policy_to_the_answerer(tmp_path: Path) -> None:
+    policies: list[str] = []
+
+    class _PolicyAnswerer(_FakeModels):
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
+            policies.append(answer_policy)
+            return super().answer(question, hits, answer_policy=answer_policy)
+
+    with _memory(tmp_path, _PolicyAnswerer()) as memory:
+        memory.add("the toolbox is red")
+        memory.ask("what colour is the toolbox?")
+        memory.ask("what colour is the toolbox?", answer_policy="best_effort")
+        with pytest.raises(ValidationError, match="answer_policy"):
+            memory.ask("what colour is the toolbox?", answer_policy="guess")  # type: ignore[arg-type]
+
+    assert policies == ["strict", "best_effort"]
+
+
+def test_a_backend_written_before_answer_policy_still_answers_at_the_default(
+    tmp_path: Path,
+) -> None:
+    """`GenerationBackend` is a `runtime_checkable` Protocol, so `isinstance` proves the method
+    exists but not that it takes this keyword. The default must send nothing new, or every
+    third-party backend written against the shipped two-argument signature breaks on its first
+    `ask()`. Opting in still needs a backend that accepts the keyword, which is pinned here as
+    the accepted cost.
+    """
+
+    class _LegacyAnswerer(_FakeModels):
+        def answer(  # type: ignore[override]
+            self, question: ModelInput, hits: Sequence[SearchHit]
+        ) -> AnswerResult:
+            del question
+            return AnswerResult(answer="Legacy.", hits=tuple(hits))
+
+    class _LegacyStreamingAnswerer(_LegacyAnswerer):
+        def stream_answer(
+            self, question: ModelInput, hits: Sequence[SearchHit]
+        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+            del question
+            yield "Legacy."
+            return tuple(hits)
+
+    for models in (_LegacyAnswerer(), _LegacyStreamingAnswerer()):
+        with _memory(tmp_path / type(models).__name__, models) as memory:
+            memory.add("the toolbox is red")
+            assert memory.ask("what colour is the toolbox?").answer == "Legacy."
+            with pytest.raises(ModelError):
+                memory.ask("what colour is the toolbox?", answer_policy="best_effort")
+
+
+class _PlannerlessAnswerer:
+    """A generation backend written before recall planning existed."""
+
+    generation_capabilities = ALL_INPUT_MODALITIES
+    generation_model = "planner-less"
+
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
+    ) -> AnswerResult:
+        del question, answer_policy
+        return AnswerResult(answer="answered", hits=tuple(hits))
+
+    def close(self) -> None:
+        return None
+
+
+def test_the_planner_is_told_the_clock_and_what_the_corpus_holds(tmp_path: Path) -> None:
+    """A plan that asks for a span or a modality nothing carries is a plan that reads nothing."""
+    models = _FakeModels()
+    reference = datetime(2026, 9, 10, 12, tzinfo=timezone.utc)
+    with _memory(tmp_path, models) as memory:
+        memory.add("a red wrench", occurred_at=datetime(2024, 9, 1, tzinfo=timezone.utc))
+        memory.add("a blue crate", occurred_at=datetime(2024, 9, 3, tzinfo=timezone.utc))
+
+        memory._recall_plan("what happened?", reference_at=reference, k=12)
+
+        question, clock, digest, attempted = models.plan_calls[0]
+        assert (question, clock, attempted) == ("what happened?", reference, "")
+        assert digest == (
+            "2 records; 2024-09-01T00:00:00.000000Z to 2024-09-03T00:00:00.000000Z; "
+            "modalities text; 0 named identities"
+        )
+
+
+def test_the_corpus_digest_is_recomputed_after_a_write_and_not_before(tmp_path: Path) -> None:
+    """It is cached on the store's commit counter, so it cannot go stale behind an ingest."""
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        assert memory._corpus_digest() == "empty"
+        unchanged = memory._corpus_digest()
+        memory.add("a red wrench", occurred_at=datetime(2024, 9, 1, tzinfo=timezone.utc))
+
+        assert unchanged == "empty"
+        assert memory._corpus_digest().startswith("1 records; ")
+
+
+def test_a_backend_that_cannot_plan_keeps_todays_single_search(tmp_path: Path) -> None:
+    """Route by capability: a third-party answerer is never called with a method it lacks."""
+    models = _FakeModels()
+    answerer = _PlannerlessAnswerer()
+    with Memory(tmp_path, embedder=models, answerer=answerer) as memory:
+        plan = memory._recall_plan(
+            "who signed?",
+            reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+            k=9,
+        )
+
+    assert plan == fallback_plan("who signed?", k=9)
+
+
+def test_a_planner_failure_leaves_the_question_running(tmp_path: Path) -> None:
+    """Planning is a hint. A provider that refused it has said nothing about answering."""
+    models = _FakeModels()
+    models.plan_error = ModelError("planner unavailable", reason="model_failed", stage="plan")
+    with _memory(tmp_path, models) as memory:
+        plan = memory._recall_plan(
+            "how many times?",
+            reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+            k=12,
+        )
+
+    assert plan == fallback_plan("how many times?", k=12)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        "",
+        "sorry, I cannot plan that",
+        '{"shape": "set", "steps": [{"op": "grep", "terms": ["a"]}]}',
+        '{"shape": "point", "steps": [{"op": "match", "terms": ["a"]}]}',
+    ],
+    ids=("nothing", "empty", "prose", "unknown-op", "point-asking-for-a-set"),
+)
+def test_a_plan_the_kernel_will_not_run_falls_back(tmp_path: Path, payload: str | None) -> None:
+    models = _FakeModels()
+    models.recall_plan = payload
+    with _memory(tmp_path, models) as memory:
+        plan = memory._recall_plan(
+            "how many times?",
+            reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+            k=12,
+        )
+
+    assert plan == fallback_plan("how many times?", k=12)
+
+
+def test_a_usable_plan_is_the_plan_that_runs(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = json.dumps(
+        {
+            "shape": "set",
+            "steps": [
+                {
+                    "op": "match",
+                    "terms": ["wrench"],
+                    "time": ["2024-09-01", "2024-10-01"],
+                    "max_rows": 50,
+                },
+                {"op": "similar", "query": "how many wrenches", "k": 5},
+            ],
+        }
+    )
+    with _memory(tmp_path, models) as memory:
+        plan = memory._recall_plan(
+            "how many wrenches did I mention?",
+            reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+            k=12,
+        )
+
+    assert plan.shape == "set"
+    assert [step.op for step in plan.steps] == ["match", "similar"]
+    assert plan.steps[0].terms == ("wrench",)
+    assert plan.steps[0].occurred_until == datetime(2024, 10, 1, tzinfo=timezone.utc)
+    assert plan.steps[1].k == 5
+
+
+DAY = datetime(2024, 9, 1, tzinfo=timezone.utc)
+
+
+def _dated_corpus(memory: Memory) -> None:
+    """Three dated records, two of which share a word no ranking has to prefer."""
+    memory.add("a red wrench", occurred_at=DAY)
+    memory.add("a blue wrench", occurred_at=DAY + timedelta(days=1))
+    memory.add("a green crate", occurred_at=DAY + timedelta(days=2))
+
+
+def _partly_matched_corpus(memory: Memory) -> None:
+    """Five dated records whose matched set and ranked window overlap only partly.
+
+    The fake embedder's only axis is the word "red", so nothing containing it ranks for a
+    question that does not: the two red wrenches are reachable by predicate and never by rank,
+    and the crate and the pallet the other way round. That is the shape the union rule is about,
+    and the shape a single corpus of interchangeable records cannot show.
+    """
+    memory.add("a red wrench", occurred_at=DAY)
+    memory.add("a red wrench, spare", occurred_at=DAY + timedelta(days=1))
+    memory.add("a blue wrench", occurred_at=DAY + timedelta(days=2))
+    memory.add("a green crate", occurred_at=DAY + timedelta(days=3))
+    memory.add("a green pallet", occurred_at=DAY + timedelta(days=4))
+
+
+def _plan(shape: str, *steps: dict[str, object]) -> str:
+    return json.dumps({"shape": shape, "steps": list(steps)})
+
+
+def test_recall_planning_off_asks_nobody_and_grounds_what_the_ranking_earned(
+    tmp_path: Path,
+) -> None:
+    """The default is the whole of today's behaviour: no plan call, no extra line, same hits."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("which wrench is red?", limit=2)
+        ranked = memory.search("which wrench is red?", limit=2)
+
+    assert models.plan_calls == []
+    question, grounded = models.answer_calls[-1]
+    assert [hit.id for hit in grounded] == [hit.id for hit in ranked]
+    assert [hit.id for hit in answered.hits] == [hit.id for hit in ranked]
+    assert question.text.startswith("which wrench is red?\n\nReference time for relative dates: ")
+    assert question.text.count("\n\n") == 1
+    assert "Recall program" not in question.text
+
+
+def test_a_point_plan_grounds_exactly_as_the_unplanned_path_does(tmp_path: Path) -> None:
+    """Planning a point question buys a call and changes nothing else, deliberately.
+
+    Widening `k` on a point question is a measured null, so the plan the planner is allowed to
+    return for one leads to the same evidence the ranking already chose.
+    """
+    planned = _FakeModels()
+    planned.recall_plan = _plan("point", {"op": "similar", "query": "the red wrench", "k": 3})
+    plain = _FakeModels()
+    with _memory(tmp_path / "planned", planned, recall_planning=True) as memory:
+        _dated_corpus(memory)
+        memory.ask("which wrench is red?", limit=2)
+    with _memory(tmp_path / "plain", plain) as memory:
+        _dated_corpus(memory)
+        memory.ask("which wrench is red?", limit=2)
+
+    planned_question, planned_hits = planned.answer_calls[-1]
+    plain_question, plain_hits = plain.answer_calls[-1]
+    assert [hit.id for hit in planned_hits] == [hit.id for hit in plain_hits]
+    assert planned_question.text == plain_question.text
+
+
+def test_a_set_plan_grounds_the_whole_matched_set_in_time_order(tmp_path: Path) -> None:
+    """A count is only answerable from a set, so the evidence follows the predicate, not rank."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("how many wrenches did I mention?", limit=1)
+
+    question, grounded = models.answer_calls[-1]
+    # `limit=1` would have grounded one hit; the set is what the question asked for.
+    assert [hit.content for hit in grounded] == ["a red wrench", "a blue wrench"]
+    assert [hit.content for hit in answered.hits] == ["a red wrench", "a blue wrench"]
+    assert "Recall program (set): records containing wrench (2)." in question.text
+    assert "every record those reads matched, in time order" in question.text
+
+
+def test_a_set_plan_adds_its_matched_rows_to_the_window_the_ranking_earned(
+    tmp_path: Path,
+) -> None:
+    """A predicate that matched one record must not cost the question its other evidence.
+
+    Measured on ATM-Hard: a plan whose exhaustive reads returned a few rows used to ground on
+    only those rows, and the questions whose ranked window held the gold lost it -- 12 grounded
+    records down to 1, 2, 4 and 5. The set is what the predicate adds; the window is what the
+    question already had.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["blue"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("how many wrenches did I mention?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        # The one record the predicate matched, then the two the ranking earned.
+        "a blue wrench",
+        "a red wrench",
+        "a green crate",
+    ]
+    assert [hit.content for hit in answered.hits] == [hit.content for hit in grounded]
+    # The reader is holding both, so the note has to separate them: counting a top-ranked record
+    # as one the predicate matched is the same wrong total the completeness line exists to stop.
+    assert "records containing blue (1)" in question.text
+    assert "The top-ranked records for the question follow them" in question.text
+
+
+def test_a_set_plan_that_matched_nothing_grounds_exactly_as_the_unplanned_path_does(
+    tmp_path: Path,
+) -> None:
+    """A predicate that matched nothing has said nothing, least of all that there is no evidence.
+
+    This is the worst case of grounding on the exhaustive rows alone: on ATM-Hard it turned a
+    question the unplanned path answered into a refusal, because the evidence set the reader was
+    given was empty while the ranking held twelve records.
+    """
+    planned = _FakeModels()
+    planned.recall_plan = _plan("set", {"op": "match", "terms": ["zebra"]})
+    plain = _FakeModels()
+    with _memory(tmp_path / "planned", planned, recall_planning=True) as memory:
+        _dated_corpus(memory)
+        answered = memory.ask("how many wrenches did I mention?", limit=2)
+    with _memory(tmp_path / "plain", plain) as memory:
+        _dated_corpus(memory)
+        memory.ask("how many wrenches did I mention?", limit=2)
+
+    _planned_question, planned_hits = planned.answer_calls[-1]
+    _plain_question, plain_hits = plain.answer_calls[-1]
+    assert [hit.content for hit in planned_hits] == [hit.content for hit in plain_hits]
+    assert answered.answer.startswith("Grounded in: ")
+
+
+def test_the_grounded_set_is_the_matched_rows_in_time_order_then_the_ranking(
+    tmp_path: Path,
+) -> None:
+    """One order, whatever produced a row: the predicate's set in time, then rank, then nothing.
+
+    A record both reads found is in the set once, and it keeps the earlier seat -- the note calls
+    the leading rows a complete set, so a matched record listed among the ranked tail instead
+    would contradict it.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "set",
+        {"op": "match", "terms": ["wrench"]},
+        {"op": "similar", "query": "wrenches", "k": 3},
+    )
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _partly_matched_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=5)
+
+    _question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        # Matched, in time order. The blue wrench keeps its seat here although it ranked fourth,
+        # and the two red wrenches were also the top of the ranking.
+        "a red wrench",
+        "a red wrench, spare",
+        "a blue wrench",
+        # Ranked, by rank: the pallet ranked third, the crate fifth.
+        "a green pallet",
+        "a green crate",
+    ]
+    assert len({hit.id for hit in grounded}) == len(grounded)
+
+
+@pytest.mark.parametrize(
+    ("shape", "step", "exhaustive"),
+    [
+        ("set", {"op": "match", "terms": ["wrench"]}, True),
+        ("point", {"op": "similar", "query": "the red wrench", "k": 3}, False),
+    ],
+    ids=("a-matched-set", "a-ranking"),
+)
+def test_the_answerer_is_told_whether_its_evidence_is_a_set_or_a_ranking(
+    tmp_path: Path,
+    shape: str,
+    step: dict[str, object],
+    exhaustive: bool,
+) -> None:
+    """The note says the rows are in time order, so the prompt has to agree with the note.
+
+    A backend cannot see this in the hits: the same `SearchHit` sequence is a ranking on one
+    question and a predicate's whole set on another, and only the plan knows which.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan(shape, step)
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=2)
+
+    assert models.exhaustive_calls == [exhaustive]
+
+
+def test_a_truncated_set_tells_the_reader_it_is_not_a_set(tmp_path: Path) -> None:
+    """The count the budget dropped is the difference between an answer and a wrong total.
+
+    What the budget may drop is a matched record beyond the ranked window. The window itself is
+    what the question would have been answered from with no plan at all, so a budget that
+    trimmed it would make planning a way to lose evidence.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=20) as memory:
+        _partly_matched_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=3)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        # Two matched records, and the pallet the ranking found: the blue wrench is the matched
+        # record the budget had no room for, and it is outside the three-record window.
+        "a red wrench",
+        "a red wrench, spare",
+        "a green pallet",
+    ]
+    assert "1 further matched records are not shown" in question.text
+    assert "do not state a total" in question.text
+
+
+def test_a_cut_similarity_row_does_not_make_the_matched_set_incomplete(tmp_path: Path) -> None:
+    """Completeness is a property of the predicate, not of how deep the ranking got to go.
+
+    Counting a dropped `similar` row as a missing "matched record" told a reader holding every
+    record the predicate matched that it held an incomplete set, which withdraws exactly the
+    licence -- to state a total -- that running the set read bought.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "set",
+        {"op": "match", "terms": ["wrench"]},
+        {"op": "similar", "query": "wrenches", "k": 5},
+    )
+    with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=60) as memory:
+        _partly_matched_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    # Every matched record is grounded, and so is the two-record window; the crate ranked fifth,
+    # outside the window, and is what the budget had no room for.
+    assert [hit.content for hit in grounded] == [
+        "a red wrench",
+        "a red wrench, spare",
+        "a blue wrench",
+        "a green pallet",
+    ]
+    assert "every record those reads matched, in time order" in question.text
+    assert "do not state a total" not in question.text
+
+
+def test_a_set_plan_grounds_within_the_callers_own_evidence_budget(tmp_path: Path) -> None:
+    """A caller who bounded the prompt bounded it for every question shape, not just ranked ones."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        evidence_budget_chars=20,
+    ) as memory:
+        _partly_matched_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=3)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        "a red wrench",
+        "a red wrench, spare",
+        "a green pallet",
+    ]
+    assert "1 further matched records are not shown" in question.text
+
+
+def test_a_set_plan_grounds_a_bounded_number_of_media_rows(tmp_path: Path) -> None:
+    """Every grounded media row is recognition work, so a set read may not hand over the corpus.
+
+    Face and speech recognition run over the media that reaches the answer call -- writes, and
+    paid again on a replan -- so the cap is twice the window the caller asked for. Text rows in
+    the same set are unaffected, and the rows the cap dropped are reported as not shown.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["frame"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        for index in range(4):
+            memory.add(
+                (f"frame {index}", Blob(str(index).encode(), "image/png")),
+                occurred_at=DAY + timedelta(days=index),
+            )
+        memory.add("frame notes, in text", occurred_at=DAY + timedelta(days=9))
+        # Records the predicate does not match and the question does not rank, so that the five
+        # rows it does match are a selective read rather than the whole corpus -- which would be
+        # the other guard, and would contribute no rows for this cap to bound.
+        for index in range(30):
+            memory.add(f"red bolt {index}", occurred_at=DAY + timedelta(days=100 + index))
+
+        memory.ask("how many frames?", limit=1)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        "frame 0",
+        "frame 1",
+        "frame notes, in text",
+    ]
+    assert "2 further matched records are not shown" in question.text
+
+
+def _flooding_corpus(memory: Memory) -> None:
+    """Five dated records every one of which the word "wrench" selects.
+
+    The shape LoCoMo has: every record carries the term the plan matches on, so the predicate is
+    the corpus and completeness over it says nothing about the question.
+    """
+    for index in range(5):
+        memory.add(f"a wrench, mention {index}", occurred_at=DAY + timedelta(days=index))
+
+
+def test_a_predicate_that_matched_most_of_the_corpus_grounds_like_no_plan_at_all(
+    tmp_path: Path,
+) -> None:
+    """A non-selective read is the corpus, not evidence, so it contributes nothing.
+
+    Measured on LoCoMo dev (525 questions): the planner chose `entity` on 229 of them, no
+    identity registry existed so the step degraded to matching the name as text, and on a corpus
+    whose every turn reads "[date] Caroline said: ..." that name selected ~300 of ~600 records.
+    Handing those to the reader cost accuracy 0.721 -> 0.528 on exactly those questions and
+    raised abstention from 18 to 57. The reader is told what the predicate matched and that what
+    it holds is the ranking instead -- never that the rows are a complete set.
+    """
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    unplanned = _FakeModels()
+    with _memory(tmp_path / "unplanned", unplanned) as memory:
+        _flooding_corpus(memory)
+        memory.ask("what was said about the wrench?", limit=1)
+
+    planned = _FakeModels()
+    planned.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(
+        tmp_path / "planned",
+        planned,
+        recall_planning=True,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        _flooding_corpus(memory)
+        memory.ask("what was said about the wrench?", limit=1)
+    provider.shutdown()
+
+    question, grounded = planned.answer_calls[-1]
+    _unplanned_question, unplanned_hits = unplanned.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [hit.content for hit in unplanned_hits]
+    assert "matched too many records to enumerate (5 of 5)" in question.text
+    assert "only the top-ranked records for the question are shown" in question.text
+    assert "every record those reads matched" not in question.text
+    assert "do not state a total" in question.text
+    recall = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.recall"
+    )
+    assert recall.attributes is not None
+    assert recall.attributes[RECALL_NON_SELECTIVE_STEPS] == 1
+
+
+def test_a_selective_predicate_on_the_same_corpus_still_grounds_its_whole_set(
+    tmp_path: Path,
+) -> None:
+    """The guard is a selectivity threshold, not a ceiling on set reads.
+
+    Same corpus and same predicate as above; only the ask's own grounding limit moved, which is
+    what the floor under the corpus share is expressed in. The set is grounded and declared
+    complete, so a count over it is still licensed.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _flooding_corpus(memory)
+
+        memory.ask("how many wrenches were mentioned?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [f"a wrench, mention {index}" for index in range(5)]
+    assert "records containing wrench (5)" in question.text
+    assert "every record those reads matched, in time order" in question.text
+    assert "too many records to enumerate" not in question.text
+
+
+def test_a_matched_set_is_capped_in_rows_as_well_as_characters(tmp_path: Path) -> None:
+    """A short-record corpus fits hundreds of matched rows inside the character budget.
+
+    `recall_set_max_rows` is the other axis of the same bound: the rows arrive chronological, the
+    cap keeps the earliest of them -- the read's own order, not a second ranking -- and the rest
+    are reported as matched records not shown, which is what makes the set incomplete. The ranked
+    window is outside the cap, so this can never cost a question the evidence it already had.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True, recall_set_max_rows=60) as memory:
+        for index in range(70):
+            memory.add(f"wrench {index}", occurred_at=DAY + timedelta(days=index))
+        # Twenty records the predicate does not match and the ranking does: the fake embedder's
+        # only axis is the word "red", so these are the window and the wrenches are the set.
+        for index in range(20):
+            memory.add(f"red thing {index}", occurred_at=DAY + timedelta(days=100 + index))
+
+        memory.ask("what red things did I mention?", limit=18)
+
+    question, grounded = models.answer_calls[-1]
+    matched = [hit.content for hit in grounded if hit.content.startswith("wrench ")]
+    window = [hit.content for hit in grounded if hit.content.startswith("red thing ")]
+    # The earliest sixty of the seventy matched rows, in the order the read returned them.
+    assert matched == [f"wrench {index}" for index in range(60)]
+    assert len(window) == 18
+    assert "10 further matched records are not shown" in question.text
+    assert "do not state a total" in question.text
+
+
+def test_a_read_that_filled_its_own_bound_is_reported_as_incomplete(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"], "max_rows": 1})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?")
+
+    question, _grounded = models.answer_calls[-1]
+    assert "some matching records were not read" in question.text
+
+
+def test_a_read_a_scope_shrank_below_its_bound_is_still_reported_as_truncated(
+    tmp_path: Path,
+) -> None:
+    """The bound is applied in SQL, the caller's scope after it, so rows alone cannot say.
+
+    Here the predicate filled its bound and the spatial scope then dropped every row it selected.
+    Deciding completeness from the rows would announce an empty evidence set as "every record
+    those reads matched", which is the strongest possible licence to state a total.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"], "max_rows": 2})
+    elsewhere = SpatialContext(
+        frame_id="workshop",
+        anchor=SpatialAnchor.OBSERVER,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+    )
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        memory.ask(
+            "how many wrenches?",
+            scope=RetrievalScope(near=elsewhere, radius_m=1.0),
+        )
+
+    question, grounded = models.answer_calls[-1]
+    assert grounded == ()
+    assert "some matching records were not read" in question.text
+    assert "every record those reads matched" not in question.text
+
+
+def test_a_sequence_plan_grounds_the_records_around_what_it_found(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "sequence",
+        {"op": "match", "terms": ["crate"]},
+        {"op": "neighbors", "of": "step:0", "before": 1, "after": 0},
+    )
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        memory.ask("what did I say just before the crate?")
+
+    question, grounded = models.answer_calls[-1]
+    # The adjacent pair in corpus order, then the one ranked record neither read had already.
+    assert [hit.content for hit in grounded] == [
+        "a blue wrench",
+        "a green crate",
+        "a red wrench",
+    ]
+    assert "the 1 before and 0 after each of them (1)" in question.text
+
+
+def test_an_entity_plan_falls_back_to_the_name_as_text_when_no_identity_carries_it(
+    tmp_path: Path,
+) -> None:
+    """A person the store knows only as words in other records is still an entity question."""
+    models = _FakeModels()
+    models.recall_plan = _plan("entity", {"op": "entity", "name": "Lily"})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        memory.add("Lily brought the red wrench", occurred_at=DAY)
+        memory.add("a green crate arrived", occurred_at=DAY + timedelta(days=1))
+
+        memory.ask("what do I know about Lily?")
+
+    question, grounded = models.answer_calls[-1]
+    # The record about Lily leads; the crate is the ranked window, which the entity read adds to
+    # rather than replaces.
+    assert [hit.content for hit in grounded] == [
+        "Lily brought the red wrench",
+        "a green crate arrived",
+    ]
+    assert "records about Lily (1)" in question.text
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        {"op": "match", "terms": ["wrench" * 40]},
+        {"op": "entity", "name": "Lily" * 60},
+    ],
+    ids=("over-long-term", "over-long-name"),
+)
+def test_a_plan_the_store_would_refuse_answers_from_the_ranking_instead_of_raising(
+    tmp_path: Path,
+    step: dict[str, object],
+) -> None:
+    """Plan text is a model's output, so a read the store rejects may not surface as an error.
+
+    The store refuses a match term over its own limit with a `ValueError`, which nothing on the
+    answer path catches; the plan is unrunnable at validation instead, and the question keeps the
+    single search `ask` has always made.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", step)
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("how many wrenches?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    assert answered.answer.startswith("Grounded in: ")
+    assert len(grounded) == 2
+    assert "Recall program" not in question.text
+
+
+def test_an_exhaustive_read_keeps_the_callers_own_scope(tmp_path: Path) -> None:
+    """A plan may narrow what `ask` reads; it may never widen it past what the caller allowed."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        memory.add("a red wrench", occurred_at=DAY, memory_type=MemoryType.EPISODIC)
+        memory.add("a blue wrench", occurred_at=DAY + timedelta(days=1))
+
+        memory.ask("how many wrenches?", memory_type=MemoryType.EPISODIC)
+
+    _question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == ["a red wrench"]
+
+
+def test_a_thin_best_effort_answer_buys_one_replan_round(tmp_path: Path) -> None:
+    """The one failure worth another call is the one the first answer diagnosed itself."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    models.abstentions = 1
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("how many wrenches?", answer_policy="best_effort")
+
+    assert len(models.plan_calls) == 2
+    assert models.plan_calls[0][3] == ""
+    assert "reported insufficient_evidence" in models.plan_calls[1][3]
+    # A count and a date span, not labels: `E`-numbers here would not be the reader's, which are
+    # assigned to the qualified subset of the evidence and to nothing when none of it qualifies.
+    assert "read 3 records dated 2024-09-01 to 2024-09-03" in models.plan_calls[1][3]
+    assert "E1" not in models.plan_calls[1][3]
+    assert len(models.answer_calls) == 2
+    assert answered.abstained is False
+
+
+def test_a_refusal_the_caller_asked_for_is_not_replanned_behind_their_back(
+    tmp_path: Path,
+) -> None:
+    """Under `strict` the abstention is the caller's answer, not a failure to work around."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    models.abstentions = 1
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("how many wrenches?")
+
+    assert len(models.plan_calls) == 1
+    assert len(models.answer_calls) == 1
+    assert answered.abstained is True
+
+
+def test_one_round_is_a_configured_ceiling_on_replanning(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    models.abstentions = 2
+    with _memory(tmp_path, models, recall_planning=True, recall_rounds=1) as memory:
+        _dated_corpus(memory)
+
+        memory.ask("how many wrenches?", answer_policy="best_effort")
+
+    assert len(models.plan_calls) == 1
+    assert len(models.answer_calls) == 1
+
+
+def test_a_streaming_caller_sees_only_the_round_that_stands(tmp_path: Path) -> None:
+    """A replanned round is not on the wire at all, so the stream is one answer.
+
+    Two complete answers with no boundary between them is not something a caller can render, and
+    a caller who concatenated the deltas would hold text the terminal result contradicts. So a
+    round a later one may replace is held until it is known to stand, and the answer streamed is
+    the answer returned. The last round -- and every round under `strict`, where no replan is
+    possible -- streams as the provider produces it.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    models.abstentions = 1
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        chunks = list(memory.ask_stream("how many wrenches?", limit=2, answer_policy="best_effort"))
+
+    deltas = [chunk.text for chunk in chunks if chunk.result is None]
+    finals = [chunk.result for chunk in chunks if chunk.result is not None]
+    assert len(models.answer_calls) == 2
+    assert len(finals) == 1
+    assert "".join(deltas) == finals[0].answer
+    assert finals[0].abstained is False
+
+
+def test_a_streaming_round_nothing_can_replace_is_not_held_back(tmp_path: Path) -> None:
+    """Holding a round costs the caller its time to first token, so only a replannable one is."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    streamed: list[str] = []
+    with _memory(tmp_path, models, recall_planning=True, recall_rounds=1) as memory:
+        _dated_corpus(memory)
+
+        for chunk in memory.ask_stream("how many wrenches?", answer_policy="best_effort"):
+            if chunk.result is None:
+                streamed.append(chunk.text)
+            else:
+                # The deltas arrived before the terminal chunk, not with it.
+                assert streamed and chunk.result.answer == "".join(streamed)
+
+
+def test_planning_and_the_reads_it_names_happen_inside_a_span(tmp_path: Path) -> None:
+    """The `mindbridge.retrieve` leg closes on the ranked hits; these run after it.
+
+    A planning call and a set of exhaustive table scans with no span of their own are latency
+    the trace cannot attribute: the operation gets longer and nothing says which leg grew.
+    """
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        recall_planning=True,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        _dated_corpus(memory)
+        memory.ask("how many wrenches?")
+    provider.shutdown()
+
+    spans = exporter.get_finished_spans()
+    recall = next(span for span in spans if span.name == "mindbridge.recall")
+    ask = next(span for span in spans if span.name == "mindbridge.ask")
+    assert recall.parent is not None
+    assert recall.parent.span_id == ask.context.span_id
+    planned = next(
+        span
+        for span in spans
+        if span.name == "mindbridge.model.generation" and span.parent is not None
+    )
+    assert planned.parent is not None
+    assert planned.parent.span_id == recall.context.span_id
+
+
+@pytest.mark.parametrize(
+    ("setting", "value", "error"),
+    [
+        ("recall_planning", "yes", "recall_planning must be a boolean"),
+        ("recall_set_budget_chars", 0, "recall_set_budget_chars must be a positive integer"),
+        ("recall_rounds", -1, "recall_rounds must be a positive integer"),
+    ],
+)
+def test_the_recall_settings_are_validated_at_open(
+    tmp_path: Path,
+    setting: str,
+    value: object,
+    error: str,
+) -> None:
+    with pytest.raises(ValidationError, match=error):
+        Memory(tmp_path, embedder=_FakeModels(), **{setting: value})  # type: ignore[arg-type]

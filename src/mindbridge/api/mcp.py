@@ -41,6 +41,7 @@ from mindbridge.api.messages import error_message
 from mindbridge.exceptions import MindBridgeError
 from mindbridge.types import (
     AbstentionReason,
+    AnswerPolicy,
     ContextBudget,
     ContextUnknownKind,
     FaceObservation,
@@ -114,7 +115,9 @@ _TOOL_ARGUMENTS = {
             "explain",
         }
     ),
-    "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at", "scope"}),
+    "ask_memory": frozenset(
+        {"question", "limit", "memory_type", "reference_at", "scope", "answer_policy"}
+    ),
     "compile_context": frozenset(
         {"goal", "budget", "reference_at", "scope", "allow_partial_sources"}
     ),
@@ -178,6 +181,13 @@ _BUDGET_DESCRIPTION = (
     # the default became 16,000, and an agent budgets against what this sentence claims.
     f" the defaults, which are {_BUDGET.max_chars:,} characters and {_BUDGET.max_items} items"
     " with no deadline."
+)
+_ANSWER_POLICY_DESCRIPTION = (
+    "What to do when the retrieved memories are thin. `strict`, the default, refuses and returns"
+    " a fixed sentence with `abstained` true. `best_effort` instead commits to the most likely"
+    " answer the evidence supports -- for a multiple-choice question, always one of the options --"
+    " and still sets `abstained`, so you learn the answer was a guess without losing it. Choose"
+    " `best_effort` only when an unanswerable question is not a possibility you need reported."
 )
 _MEMORY_ID_DESCRIPTION = (
     "The `id` a previous `add_memory`, `search_memories`, or `list_memories` result returned."
@@ -612,15 +622,20 @@ def build_mcp_server(
             AwareDatetime | None, Field(description=_REFERENCE_AT_DESCRIPTION)
         ] = None,
         scope: Annotated[RetrievalScope | None, Field(description=_SCOPE_DESCRIPTION)] = None,
+        answer_policy: Annotated[
+            AnswerPolicy, Field(description=_ANSWER_POLICY_DESCRIPTION)
+        ] = "strict",
     ) -> AnswerResponse:
         """Answer a question using only the memories retrieved for it.
 
         Requires a generation backend in the host process: without one every call fails with
         `model_error/backend_not_configured`, so use `search_memories` if you are not sure one is
         configured. Returns the answer with the hits it used; `abstained` is true when the answerer
-        reported no usable evidence, and the answer is then a fixed sentence rather than a guess.
-        Stores no memory, but each call spends another generation, so retry only on a retryable
-        error. When this server was built with `embodied_operations=False`, answering over a
+        reported no usable evidence, and under the default `answer_policy` the answer is then a
+        fixed sentence rather than a guess. Stores no memory, but each call spends another
+        generation, so retry only on a retryable error. Under `best_effort` a question that
+        grounds nothing spends that generation too, where the default returns without a call.
+        When this server was built with `embodied_operations=False`, answering over a
         photo or video may still identify who appears in it, but a corroborated voice-and-face
         pair is never fused into one identity: that merge authority stays withheld along with
         `analyze_faces`.
@@ -631,6 +646,7 @@ def build_mcp_server(
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            answer_policy=answer_policy,
             link_identities=embodied_operations,
         )
         return AnswerResponse.model_validate(result)

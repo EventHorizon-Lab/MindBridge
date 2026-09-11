@@ -25,6 +25,7 @@ import mindbridge.configuration as configuration
 import mindbridge.models.openai_sdk as openai_sdk
 import mindbridge.recipes as recipes_module
 from mindbridge import (
+    AnswerPolicy,
     AnswerResult,
     Blob,
     EvidenceBasis,
@@ -48,7 +49,12 @@ from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL, VISION_BATCHES_FAIL
 from mindbridge.configuration import resolve_memory_config
 from mindbridge.exceptions import ValidationError
 from mindbridge.memory import declared_capabilities
-from mindbridge.models.base import FormationBackend, GenerationBackend, ModelInput
+from mindbridge.models.base import (
+    FormationBackend,
+    GenerationBackend,
+    ModelInput,
+    VisionDescriptionBackend,
+)
 from mindbridge.types import IndexQuantization
 
 
@@ -218,7 +224,14 @@ def test_a_former_is_declaratively_reachable_but_never_implicit(
         formation_model = "gpt-5-mini"
         formation_space = "gpt-5-mini:mindbridge-formation-v1:test"
 
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
             raise AssertionError("composition must not call the model")
 
         def form(
@@ -615,7 +628,14 @@ class _FormingEmbedder(TinyEmbedder):
     formation_space = "tiny-former:v1"
     generation_capabilities = frozenset({Modality.TEXT})
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
+    ) -> AnswerResult:
         raise AssertionError("not called")
 
     def __init__(self) -> None:
@@ -791,7 +811,14 @@ class _ConsolidatingEmbedder(TinyEmbedder):
     def __init__(self) -> None:
         self.shown: list[tuple[str, ...]] = []
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
+    ) -> AnswerResult:
         raise AssertionError("not called")
 
     def consolidate(
@@ -1101,6 +1128,47 @@ def test_the_vision_slot_accepts_only_visual_modalities(tmp_path: Path) -> None:
     assert MindBridgeConfig.model_validate(
         {**base, "vision": {"provider": "openai"}}
     ).vision.modalities == frozenset({Modality.IMAGE})  # type: ignore[union-attr]
+
+
+def test_the_vision_slot_forwards_its_own_transport_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`max_retries` and `timeout` have to reach the describer's client, not just validate.
+
+    The describer's fail-open is what keeps a throttled endpoint from losing memories, and it is
+    also what makes a throttled ingest lose every caption in the burst instead of failing loudly.
+    Retries are the first line against that, so the slot's own budget must be reachable from
+    configuration rather than inherited from the SDK default.
+    """
+    captured: dict[str, object] = {}
+    marker = cast(VisionDescriptionBackend, object())
+
+    def build(**values: object) -> VisionDescriptionBackend:
+        captured.update(values)
+        return marker
+
+    monkeypatch.setattr(recipes_module, "_owned_openai_models", build)
+    spec = configuration.OpenAIVisionConfig(
+        provider="openai",
+        model="qwen3.8-27b",
+        modalities=frozenset({Modality.IMAGE, Modality.VIDEO}),
+        base_url="https://example.invalid/api/v1",
+        api_key=cast(Any, "caption-key"),
+        timeout=300,
+        max_retries=5,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+
+    assert configuration._build_vision(spec) is marker
+    assert captured == {
+        "base_url": "https://example.invalid/api/v1",
+        "api_key": "caption-key",
+        "timeout": 300.0,
+        "max_retries": 5,
+        "generation_model": "qwen3.8-27b",
+        "generation_capabilities": frozenset({Modality.IMAGE, Modality.VIDEO}),
+        "generation_extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
 
 
 def test_a_failing_describer_never_fails_the_write_it_was_decorating(

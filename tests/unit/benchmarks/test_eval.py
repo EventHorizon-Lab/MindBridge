@@ -30,6 +30,7 @@ from pydantic import ValidationError
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
     AbstentionReason,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -666,14 +667,13 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
     assert backend.transcription_space == "speech-space"
 
 
-def test_response_cache_namespace_changes_with_runner_recipe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assert eval_module.EVAL_SCHEMA_VERSION == 17
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v16"
-    arguments = cast(
+def _namespace_arguments() -> eval_module._Arguments:
+    """The subset of a run's arguments the response-cache namespace is built from."""
+    return cast(
         eval_module._Arguments,
         SimpleNamespace(
+            tasks=("m3-bench-robot", "locomo-refined"),
+            answer_policy=None,
             device=None,
             seed=7,
             gen_kwargs="{}",
@@ -685,6 +685,41 @@ def test_response_cache_namespace_changes_with_runner_recipe(
             compile_max_chars=16000,
         ),
     )
+
+
+def test_response_cache_namespace_changes_with_the_answer_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached answer is an answer to the policy that was requested, per task.
+
+    Without the policy in the namespace, a `best_effort` arm run over an existing cache replays
+    the strict refusals already in it and records them as `best_effort` -- the arm reports the
+    baseline's refusal rate as its own. The resolved per-task policy is in there too, so widening
+    `BEST_EFFORT_TASKS` cannot replay a task's older strict answers under its new default.
+    """
+    from mindbridge.benchmarks import prompts
+
+    arguments = _namespace_arguments()
+    before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
+
+    for override in ("strict", "best_effort"):
+        forced = cast(
+            eval_module._Arguments,
+            SimpleNamespace(**{**vars(arguments), "answer_policy": override}),
+        )
+        assert _cache_namespace(forced, ModelConfig(), {"text": 1}) != before
+
+    monkeypatch.setattr(prompts, "BEST_EFFORT_TASKS", frozenset({"locomo-refined"}))
+
+    assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
+
+
+def test_response_cache_namespace_changes_with_runner_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert eval_module.EVAL_SCHEMA_VERSION == 17
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v16"
+    arguments = _namespace_arguments()
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
 
     monkeypatch.setattr(eval_module, "EVAL_RUNNER_VERSION", "next-runner-recipe")
@@ -757,7 +792,9 @@ def test_backend_pool_forwards_every_memory_setting(
     monkeypatch.setattr(eval_module, "Memory", Recorder)
     monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = object.__new__(eval_module._BackendPool)
-    settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
+    settings = MemoryConfig(
+        evidence_budget_chars=4_242, minimum_relevance=0.11, recall_set_max_rows=17
+    )
     pool._settings = settings
     pool._tracer = trace.get_tracer(__name__)
     for entry in fields(MemoryPlugins):
@@ -980,6 +1017,8 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
             seed=7,
             device="cuda:1",
             recall_limit=20,
+            tasks=("atm-bench",),
+            answer_policy=None,
             model="mindbridge",
             blind=False,
             ingest="add",
@@ -1224,6 +1263,7 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             assert limit == 5
             observed.append(reference_at)
@@ -1336,8 +1376,10 @@ async def test_answer_many_receives_the_fallback_reference_clock() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             assert limit == 5
+            del answer_policy
             observed.append(reference_at)
             return AnswerResult("Now")
 
@@ -1601,8 +1643,9 @@ class _FakeMemory:
         *,
         limit: int,
         reference_at: datetime | None = None,
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
-        del reference_at
+        del reference_at, answer_policy
         self.events.append(f"ask:{question}:{limit}")
         return AnswerResult("A")
 
@@ -2450,8 +2493,9 @@ async def test_runner_scores_the_actual_ranking_at_a_causal_cutoff(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             _record_retrieval_results((ranked,))
             return AnswerResult("answer", (ranked,))
 
@@ -2573,9 +2617,10 @@ async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             nonlocal active, peak
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             active += 1
             peak = max(peak, active)
             await asyncio.sleep(0.01)
@@ -2637,8 +2682,9 @@ async def test_standalone_search_reopens_warm_stores_after_every_answer(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             events.append(f"answer-start:{question}")
             await asyncio.sleep(0)
             events.append(f"answer-end:{question}")
@@ -2727,8 +2773,9 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             events.append(f"answer:{question}")
             _record_retrieval_results(
                 (
@@ -2802,6 +2849,7 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             unit_concurrency=1,
             request_concurrency=1,
             recall_limit=3,
+            answer_policy=None,
             predict_only=False,
             log_samples=False,
             arms=(eval_module.DEFAULT_ARM,),
@@ -2908,8 +2956,9 @@ async def test_answer_many_latency_excludes_request_semaphore_wait() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             if question == "slow":
                 slow_started.set()
                 await release_slow.wait()
@@ -2949,8 +2998,9 @@ async def test_answer_many_reports_each_completed_answer_immediately() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             if question == "slow":
                 await release_slow.wait()
             return AnswerResult("A")
@@ -2993,8 +3043,9 @@ async def test_answer_many_reports_failed_outcome_immediately() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             if question == "failed":
                 raise RuntimeError("answer failed")
             await release_slow.wait()
@@ -3056,9 +3107,10 @@ async def test_unit_preserves_answers_before_a_systemic_query_embedding_failure(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             nonlocal calls
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             calls += 1
             if calls == 3:
                 raise ModelError(
@@ -3122,9 +3174,10 @@ async def test_generation_502_does_not_trigger_embedding_fail_fast() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             nonlocal calls
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             calls += 1
             if calls == 1:
                 raise ModelError(
@@ -3164,8 +3217,9 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             await release_slow.wait()
             return AnswerResult("A")
 
@@ -3316,8 +3370,9 @@ async def test_answer_many_preserves_structured_abstention() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             return AnswerResult(
                 "unknown",
                 abstained=True,
@@ -3630,6 +3685,70 @@ def test_a_task_worded_refusal_counts_as_an_abstention() -> None:
     assert not eval_module._declined("She went to the market.", question)
     # A task that mandates nothing must not have refusals invented for it.
     assert not eval_module._declined("Insufficient information", replace(question, refusal=None))
+
+
+def test_memlens_attaches_its_published_images_only_where_the_file_is_present(
+    tmp_path: Path,
+) -> None:
+    # 65.7% of MEMLENS answers live in the image rather than its BLIP caption, so a present
+    # file must reach the model as media. The release ships those images separately, and a
+    # checkout without them must keep emitting exactly the captioned text it emitted before.
+    dataset = tmp_path / "memlens.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "information_extraction",
+                    "question": "What did the receipt total?",
+                    "answer": "$42.00",
+                    "question_date": "2025/01/15 (Wed) 10:00",
+                    "haystack_dates": ["2025/01/14 (Tue) 09:00"],
+                    "haystack_sessions": [
+                        [
+                            {
+                                "role": "user",
+                                "content": "Here is the receipt.",
+                                "images": [
+                                    {
+                                        "file": "needle_images/present.jpg",
+                                        "blip_caption": "a photo of a receipt",
+                                    },
+                                    {
+                                        "file": "needle_images/absent.jpg",
+                                        "blip_caption": "a photo of a menu",
+                                    },
+                                ],
+                            }
+                        ]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    auxiliary = tmp_path / "memlens" / "agent_subset_195.json"
+    auxiliary.parent.mkdir()
+    auxiliary.write_text(json.dumps({"n_questions": 1, "question_ids": ["q1"]}), encoding="utf-8")
+    captioned = (
+        "[2025-01-14T09:00:00+00:00] user: Here is the receipt."
+        "\nImage needle_images/present.jpg: a photo of a receipt"
+        "\nImage needle_images/absent.jpg: a photo of a menu"
+    )
+
+    def content() -> tuple[str | Path, ...]:
+        loaded = load_task(
+            TASKS["memlens-32k"], root=tmp_path, dataset_path=dataset, verify_digest=False
+        )
+        return loaded.units[0].memories[0].content
+
+    assert content() == (captioned,)
+
+    image = tmp_path / "memlens" / "release_images" / "needle_images" / "present.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\xff\xd8\xff")
+
+    assert content() == (captioned, image.resolve())
 
 
 def test_memlens_questions_declare_the_refusal_their_own_prompt_mandates(tmp_path: Path) -> None:
@@ -4827,6 +4946,7 @@ def _streaming_arguments(output_path: Path, **overrides: object) -> eval_module.
         "quiet": False,
         "log_samples": False,
         "recall_limit": 20,
+        "answer_policy": None,
         "resume": False,
         "run_id": "run",
         "seed": 7,
@@ -5148,3 +5268,22 @@ def test_run_arms_hands_every_task_to_the_completion_callback(tmp_path: Path) ->
     # Called once per task, in task order, before the next task starts.
     assert seen == [("atm-bench", 1), ("locomo-refined", 1)]
     assert [sample.prediction for sample in samples] == ["rewritten", "rewritten"]
+
+
+def test_only_the_task_whose_protocol_credits_no_abstention_asks_for_a_guess() -> None:
+    """Pinned as a set: widening it silently turns a reported refusal into an invented answer.
+
+    Every other task measures abstention in some form -- LongMemEval and MEMLENS carry abstention
+    abilities, ATM-Bench scores it as a class, LoCoMo's category 5 is adversarial -- so asking
+    those for a guess would be a scoring change, not a protocol alignment.
+
+    Membership only. That the mapping actually reaches the answerer is asserted end to end by
+    `test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path`; comparing
+    `task_answer_policy` with its own frozenset here would pass with the harness wired to
+    nothing.
+    """
+    from mindbridge.benchmarks.prompts import BEST_EFFORT_TASKS
+    from mindbridge.benchmarks.task_catalog import TASKS
+
+    assert {"m3-bench-robot"} == BEST_EFFORT_TASKS
+    assert set(TASKS) >= BEST_EFFORT_TASKS

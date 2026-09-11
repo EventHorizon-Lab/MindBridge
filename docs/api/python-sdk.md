@@ -344,6 +344,7 @@ ask(
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
     link_identities: bool = True,
+    answer_policy: AnswerPolicy = "strict",
 ) -> AnswerResult
 
 ask_stream(
@@ -354,6 +355,7 @@ ask_stream(
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
     link_identities: bool = True,
+    answer_policy: AnswerPolicy = "strict",
 ) -> Iterator[AnswerChunk]
 ```
 
@@ -377,6 +379,26 @@ retrieved hits the answerer actually used. A candidate's effective dense score c
 ANN hit or from exact scoring of its persisted vectors when the lexical route alone admitted its
 parent. `index_ids` records the index candidates that admitted the parent; it does not identify
 their route or enumerate every persisted part considered during exact score completion.
+
+`answer_policy` is the caller's, because abstaining is right for one caller and wrong for
+another. The default `"strict"` refuses when the retrieved evidence is thin: `answer` is a fixed
+sentence, `abstained` is true, and `abstention_reason` says why. `"best_effort"` instructs the
+answerer to commit to the single most likely answer the evidence supports instead -- for a
+multiple-choice question, always one of the offered options -- and to flag the low confidence
+with a structured marker, which MindBridge reads and removes. The result then carries the same
+`abstained` and `abstention_reason` alongside a usable `answer`, so nothing about the confidence
+signal is lost. Choose it when an unanswerable question is not a case you need reported, such as
+multiple choice or a protocol that gives no credit for "unknown"; keep the default when it is.
+Under `"best_effort"` a question that retrieved nothing at all still reaches the model as a
+guess, and is still reported as `abstained` with `AbstentionReason.NO_EVIDENCE`. Streaming yields
+the provider's own deltas, marker included; the terminal `AnswerResult` carries the cleaned
+answer, so render a stream on `abstained` rather than on the text.
+
+`ask_stream()` yields the deltas of one answer, never of two. With `recall_planning` on, a
+`"best_effort"` answer the answerer flagged as thin buys a second round, and a round another
+round may replace is held rather than streamed: the concatenated deltas are always the answer the
+terminal `AnswerResult` carries. The cost is that round's time to first token, paid only where a
+replan is possible -- never under `strict`, and never on the last round.
 
 `ask` may run face recognition on a retrieved photo or video to identify who appears in it before
 answering. With the default `link_identities=True`, a voice-and-face pair corroborated across
@@ -1014,7 +1036,7 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 125 supported names exported by `mindbridge`:
+These are the 126 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
@@ -1022,7 +1044,7 @@ These are the 125 supported names exported by `mindbridge`:
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemoryPlugins`, `resolve_memory_config` |
 | Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `AnswerChunk`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextExcerpt`, `ContextPresentation`, `ContextSymbol`, `ContextCitation`, `TextSpanSelector`, `TextSpanPiece`, `ContextConflict`, `ContextUnknown`, `AffectCue`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport`, `ConsentClaim`, `ExportBundle`, `RetentionPolicy`, `RetentionReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
-| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `ContextSymbolNamespace`, `ContextSymbolCoverage`, `ContextSymbolRole`, `AbstentionReason`, `IndexQuantization`, `RetrievalMode`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
+| Enums and literal aliases | `AnswerPolicy`, `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `ContextSymbolNamespace`, `ContextSymbolCoverage`, `ContextSymbolRole`, `AbstentionReason`, `IndexQuantization`, `RetrievalMode`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
 | Bundled adapters | `JinaOmniEmbedder`, `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
@@ -1032,7 +1054,7 @@ These are the 125 supported names exported by `mindbridge`:
 `MemoryRecord.content` is the caller's text followed by any text the configured models derived
 from the media. Derived sections are appended, never substituted: what the caller supplied stays
 byte-identical at the front, and each derived section is introduced by its own marker line --
-`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, `[facts:<asset_id>]`, or
 `[speech identities:<asset_id>]` -- so a reader can separate interpretation from evidence and see
 which asset it came from. `add` derives before its first write and `settle` derives after
 `capture` already committed, so both paths leave the same record; the raw media is never rewritten
@@ -1141,11 +1163,17 @@ EmbeddingBackend.embed(
 GenerationBackend.answer(
     question: ModelInput,
     hits: Sequence[SearchHit],
+    *,
+    answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
 ) -> AnswerResult
 
 StreamingGenerationBackend.stream_answer(
     question: ModelInput,
     hits: Sequence[SearchHit],
+    *,
+    answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
 ) -> Iterator[str]
 
 TranscriptionBackend.transcribe(
@@ -1204,6 +1232,14 @@ against the source modality and spatial frame, assigns identity, links evidence,
 like a former it proposes and never writes storage. An `IDENTIFY` proposal carries an
 `IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
 evidence, and the kernel builds the typed assertion.
+
+`answer_policy` and `exhaustive` are keyword-only and defaulted on both generation protocols, and
+MindBridge sends each one only when it is not its default. A backend written against the earlier
+two-argument signature therefore keeps answering; accept `answer_policy` to support
+`"best_effort"`, which otherwise fails the call with `ModelError`. `exhaustive` is true when a
+recall program produced the hits as every record its predicate matched, in time order, rather
+than as a ranking -- the bundled adapter uses it to describe the evidence order to the reader,
+which is the one thing about the hits a prompt cannot infer from the hits.
 
 The bundled OpenAI former receives compact observation aliases, enriched content and assets, plus
 the observation basis, confidence, explicit validity bounds, and spatial frame/anchor. It does not
@@ -1359,10 +1395,19 @@ embed(
     task: EmbedTask = EmbedTask.DOCUMENT,
 ) -> tuple[tuple[float, ...], ...]
 form(inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]
-answer(question: ModelInput | str, hits: Sequence[SearchHit]) -> AnswerResult
+answer(
+    question: ModelInput | str,
+    hits: Sequence[SearchHit],
+    *,
+    answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
+) -> AnswerResult
 stream_answer(
     question: ModelInput | str,
     hits: Sequence[SearchHit],
+    *,
+    answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
 ) -> Generator[str, None, tuple[SearchHit, ...]]
 transcribe(assets: Sequence[AssetRef]) -> tuple[str, ...]
 close() -> None

@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import math
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Generator, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,12 +14,15 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from openai import OpenAI
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.util.types import AttributeValue
 
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
     AnswerChunk,
+    AnswerPolicy,
     AnswerResult,
     AsyncMemory,
     ContextBudget,
@@ -32,7 +35,16 @@ from mindbridge import (
     ModelInput,
     SearchHit,
 )
-from mindbridge._telemetry import SPAN_KIND, _record_retrieval_results
+from mindbridge._telemetry import (
+    RECALL_COMPLETE,
+    RECALL_EXHAUSTIVE_ROWS,
+    RECALL_FALLBACK,
+    RECALL_NON_SELECTIVE_STEPS,
+    RECALL_REPLAN,
+    RECALL_SHAPE,
+    SPAN_KIND,
+    _record_retrieval_results,
+)
 from mindbridge.benchmarks.eval import (
     DEFAULT_ARM,
     PRODUCT_ARM,
@@ -54,13 +66,21 @@ from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_SAMPLE,
     BENCHMARK_TASK,
     BENCHMARK_TASK_SPAN,
+    RECALL_SPAN,
     EvaluationTelemetry,
+    SampleGrounding,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.model_config import DEFAULT_TIMEOUT_SECONDS, ModelConfig
 from mindbridge.benchmarks.official_scorers import metric_is_official, retrieval_gold_ids
 from mindbridge.benchmarks.task_catalog import TaskSpec
 from mindbridge.configuration import OpenAIEmbeddingConfig
+from mindbridge.models.base import (
+    GenerationBackend,
+    RecallPlanningBackend,
+    StreamingGenerationBackend,
+)
+from mindbridge.models.openai_sdk import OpenAIModels
 
 _ATOMIC_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO, Modality.VIDEO})
 
@@ -1060,6 +1080,84 @@ def test_budget_loss_is_joined_onto_the_sample_that_lost_it() -> None:
         telemetry.close()
 
 
+def test_recall_planning_activation_is_aggregated_per_task_and_stamped_per_sample() -> None:
+    """A run has to say whether the planner ran, in what shape, and how often it fell back.
+
+    Every planning failure resolves to the fallback plan on purpose, so a result document that
+    reports only scores cannot distinguish "planning is off" from "planning ran and decided
+    nothing": the r0910 R1 arm looked like an active planner and had made no plan call at all.
+    """
+    telemetry = EvaluationTelemetry()
+    plans: tuple[tuple[str, dict[str, AttributeValue]], ...] = (
+        (
+            "atm-bench/unit/q1",
+            {
+                RECALL_SHAPE: "set",
+                RECALL_EXHAUSTIVE_ROWS: 12,
+                RECALL_COMPLETE: False,
+                RECALL_NON_SELECTIVE_STEPS: 1,
+            },
+        ),
+        (
+            "atm-bench/unit/q2",
+            {
+                RECALL_SHAPE: "point",
+                RECALL_EXHAUSTIVE_ROWS: 0,
+                RECALL_COMPLETE: True,
+                RECALL_FALLBACK: True,
+            },
+        ),
+        (
+            "atm-bench/unit/q2",
+            {
+                RECALL_SHAPE: "set",
+                RECALL_EXHAUSTIVE_ROWS: 6,
+                RECALL_COMPLETE: False,
+                RECALL_REPLAN: True,
+            },
+        ),
+    )
+    try:
+        for sample_id, attributes in plans:
+            with (
+                eval_module._answer_span(telemetry.tracer, "atm-bench", sample_id),
+                telemetry.tracer.start_as_current_span(
+                    RECALL_SPAN,
+                    attributes={SPAN_KIND: "stage", **attributes},
+                ),
+            ):
+                pass
+
+        recall = cast(
+            dict[str, object],
+            cast(dict[str, object], telemetry.result("atm-bench", question_count=2))["recall"],
+        )
+        assert recall["plan_count"] == 3
+        assert recall["shapes"] == {"point": 1, "set": 2}
+        assert recall["fallback_count"] == 1
+        assert recall["replan_count"] == 1
+        assert recall["incomplete_count"] == 2
+        # A predicate that matched most of the corpus contributed no rows, which is a
+        # different failure from a read that filled its bound and has to be visible as one.
+        assert recall["non_selective_steps"] == 1
+        rows = cast(dict[str, object], recall["exhaustive_rows"])
+        assert rows["average"] == pytest.approx(6.0)
+
+        # The last plan a sample ran is the one its answer was grounded on.
+        assert telemetry.sample_grounding("atm-bench/unit/q1") == SampleGrounding(0, 0, "set")
+        joined = _with_grounding_loss(
+            (
+                _sample_with({"accuracy": 1.0}),
+                _sample_with({"accuracy": 1.0}, arm="blind"),
+            ),
+            telemetry,
+        )
+        assert joined[0].recall_shape == "set"
+        assert joined[1].recall_shape is None
+    finally:
+        telemetry.close()
+
+
 def test_answer_span_attributes_name_the_task_and_the_sample() -> None:
     telemetry = EvaluationTelemetry()
     seen: list[dict[str, object]] = []
@@ -1084,6 +1182,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
         eval_module._Arguments,
         SimpleNamespace(
             arms=(DEFAULT_ARM, "blind", "random"),
+            answer_policy=None,
             full_context_chars=24_000,
             ingest="add",
             deliberate=False,
@@ -1364,3 +1463,221 @@ def test_a_replayed_answer_still_carries_the_ranked_list_it_was_scored_from(
     assert retrieval["unranked_labelled_question_count"] == 0
     # The bound recall was measured under, not the `--recall-limit` that bounds `ask`.
     assert retrieval["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+
+
+@pytest.mark.parametrize(
+    ("task_name", "override", "expected"),
+    [
+        ("m3-bench-robot", None, "best_effort"),
+        ("atm-bench", None, "strict"),
+        ("atm-bench", "best_effort", "best_effort"),
+        ("m3-bench-robot", "strict", "strict"),
+    ],
+)
+def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path(
+    tmp_path: Path, task_name: str, override: str | None, expected: str
+) -> None:
+    """The whole chain: `_arm_answer` -> `AsyncMemory.ask_stream` -> `_BorrowedGenerationBackend`.
+
+    The harness lends one answerer to every per-unit memory, so the borrowed wrapper is the last
+    hop before the provider. It once declared the keyword and dropped it, which made the whole
+    arm a silent no-op that no fake-`ask` test could see. The same wrapper forwards `exhaustive`,
+    which is why this answerer accepts it: a wrapper that dropped an argument the protocol
+    declares would fail the call instead of the arm.
+    """
+    recorded: list[str] = []
+
+    class Answerer:
+        generation_capabilities = _ATOMIC_MODALITIES
+        generation_model = "fake-generator"
+
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: str = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
+            del question
+            recorded.append(answer_policy)
+            return AnswerResult("Ada.", tuple(hits))
+
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: str = "strict",
+            exhaustive: bool = False,
+        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+            del question
+            recorded.append(answer_policy)
+            yield "Ada."
+            return tuple(hits)
+
+        def close(self) -> None:
+            return None
+
+    borrowed = eval_module._BorrowedGenerationBackend(Answerer())
+    _, _, question = _task()
+
+    async def run() -> eval_module._AnswerOutcome | BaseException:
+        async with AsyncMemory(
+            Memory(
+                tmp_path,
+                embedder=_TinyEmbedder(),
+                answerer=cast(GenerationBackend, borrowed),
+                minimum_relevance=0,
+            )
+        ) as memory:
+            await memory.add("Ada signed the contract")
+            answered = await _answer_many(
+                memory,
+                (question,),
+                request_concurrency=1,
+                recall_limit=5,
+                arm=PRODUCT_ARM,
+                task_name=task_name,
+                unit_id="unit",
+                answer_policy=cast(AnswerPolicy | None, override),
+            )
+            return answered[0]
+
+    outcome = asyncio.run(run())
+    assert not isinstance(outcome, BaseException)
+    assert outcome.prediction == "Ada."
+    assert recorded == [expected]
+
+    # The buffered half of the same wrapper, which a non-streaming provider takes.
+    recorded.clear()
+    borrowed.answer(ModelInput("who signed it?"), (), answer_policy="best_effort")
+    assert recorded == ["best_effort"]
+
+
+def test_the_lent_answerer_declares_the_planning_capability_its_pool_actually_has() -> None:
+    """`isinstance` against a `runtime_checkable` protocol reads attributes statically.
+
+    So a `plan_recall` reachable only through the proxy's `__getattr__` was invisible to
+    `Memory._recall_plan`, which fell back to the point plan for every question under the
+    harness: measured, one generation call per question and the baseline's own hits. The
+    declaration has to follow the pooled backend both ways -- absent when the pool cannot plan,
+    or route-by-capability would claim a capability no one has.
+    """
+    pooled = OpenAIModels(OpenAI(api_key="test-key", base_url="http://127.0.0.1:1/v1"))
+    lent = eval_module._BorrowedGenerationBackend(pooled)
+
+    assert isinstance(lent, RecallPlanningBackend)
+    assert isinstance(lent, StreamingGenerationBackend)
+
+    class Unplanned:
+        generation_capabilities = _ATOMIC_MODALITIES
+
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: str = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
+            del question, answer_policy, exhaustive
+            return AnswerResult("Ada.", tuple(hits))
+
+        def close(self) -> None:
+            return None
+
+    bare = eval_module._BorrowedGenerationBackend(Unplanned())
+    assert isinstance(bare, GenerationBackend)
+    assert not isinstance(bare, RecallPlanningBackend)
+    assert not isinstance(bare, StreamingGenerationBackend)
+
+
+def test_the_planner_runs_once_per_question_through_the_real_harness_path(
+    tmp_path: Path,
+) -> None:
+    """The whole chain: `_arm_answer` -> `AsyncMemory.ask_stream` -> the borrowed proxy.
+
+    `recall_planning` is only observable through the plan call, and the fallback is silent by
+    design, so a hidden capability reads exactly like a planner that chose a point plan. This
+    asserts the call happened, and the trace attribute says it was the planner's plan rather
+    than the fallback.
+    """
+    planned: list[str] = []
+
+    class Planner:
+        generation_capabilities = _ATOMIC_MODALITIES
+        generation_model = "fake-planner"
+
+        def plan_recall(
+            self,
+            question: str,
+            *,
+            reference_at: datetime,
+            corpus_digest: str,
+            attempted: str = "",
+        ) -> str | None:
+            del reference_at, corpus_digest, attempted
+            planned.append(question)
+            return json.dumps({"shape": "set", "steps": [{"op": "match", "terms": ["signed"]}]})
+
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: str = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
+            del question, answer_policy, exhaustive
+            return AnswerResult("Ada.", tuple(hits))
+
+        def close(self) -> None:
+            return None
+
+    borrowed = eval_module._BorrowedGenerationBackend(Planner())
+    _, _, question = _task()
+    telemetry = EvaluationTelemetry()
+
+    async def run() -> eval_module._AnswerOutcome | BaseException:
+        async with AsyncMemory(
+            Memory(
+                tmp_path,
+                embedder=_TinyEmbedder(),
+                answerer=cast(GenerationBackend, borrowed),
+                minimum_relevance=0,
+                recall_planning=True,
+                tracer=telemetry.tracer,
+            )
+        ) as memory:
+            await memory.add("Ada signed the contract")
+            answered = await _answer_many(
+                memory,
+                (question,),
+                request_concurrency=1,
+                recall_limit=5,
+                arm=PRODUCT_ARM,
+                task_name="atm-bench",
+                unit_id="unit",
+                tracer=telemetry.tracer,
+            )
+            return answered[0]
+
+    try:
+        outcome = asyncio.run(run())
+        assert not isinstance(outcome, BaseException)
+        assert outcome.prediction == "Ada."
+        assert planned == [str(question.content[0])]
+        recall = cast(
+            dict[str, object],
+            cast(dict[str, object], telemetry.result("atm-bench", question_count=1))["recall"],
+        )
+        assert recall["plan_count"] == 1
+        assert recall["shapes"] == {"set": 1}
+        assert recall["fallback_count"] == 0
+        # The recall stage runs inside the answer span, so its shape reaches the sample row.
+        grounding = telemetry.sample_grounding("atm-bench/unit/q1")
+        assert grounding is not None
+        assert grounding.recall_shape == "set"
+    finally:
+        telemetry.close()

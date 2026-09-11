@@ -5,11 +5,13 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.types import (
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     FormationProposal,
@@ -324,12 +326,26 @@ class FaceBackend(Protocol):
 
 @runtime_checkable
 class GenerationBackend(Protocol):
-    """One thread-safe grounded-answer adapter over a provider SDK."""
+    """One thread-safe grounded-answer adapter over a provider SDK.
+
+    Both keyword arguments are defaulted and sent only when they are not their default, so a
+    backend written against the two-argument signature keeps answering. `exhaustive` says the
+    hits are every record a recall program's predicate matched, in time order, rather than a
+    ranking -- the one thing a grounded prompt cannot infer from the hits themselves and gets
+    wrong by describing their order as rank.
+    """
 
     @property
     def generation_capabilities(self) -> frozenset[Modality]: ...
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult: ...
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
+    ) -> AnswerResult: ...
 
     def close(self) -> None: ...
 
@@ -342,7 +358,33 @@ class StreamingGenerationBackend(Protocol):
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> Iterator[str]: ...
+
+
+@runtime_checkable
+class RecallPlanningBackend(Protocol):
+    """Optional generation capability that plans how to retrieve for one question.
+
+    The return value is the model's own JSON text, which the kernel validates: a backend that
+    cannot plan, or one whose plan is unusable, costs the caller a fallback to plain similarity
+    search and nothing else. `corpus_digest` is one line describing what is in the store, so a
+    plan cannot ask for a time span or a modality that does not exist. `attempted` describes what
+    an earlier round of the same question already read and why it was not enough; it is empty on
+    the first round and sent only when it is not, so a backend written against the shorter
+    signature keeps planning.
+    """
+
+    def plan_recall(
+        self,
+        question: str,
+        *,
+        reference_at: datetime,
+        corpus_digest: str,
+        attempted: str = "",
+    ) -> str | None: ...
 
 
 @runtime_checkable
@@ -383,6 +425,25 @@ class VisionDescriptionBackend(Protocol):
     @property
     def vision_space(self) -> str: ...
 
-    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]: ...
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        """Return one caption per input, in order -- never more, never fewer, never empty.
+
+        `inputs[i].text`, when set, is derived transcript context this write already knows about
+        the visual -- the clip's own words under the `speaker_N` labels the index prints, not
+        anything the caller wrote. It is context to read, not content to echo back: repeating it
+        verbatim in the caption duplicates text the document already carries under its own
+        section.
+
+        A line starting with the literal prefix ``Fact:`` is reserved syntax, not prose. The
+        kernel splits it out of the visible caption into its own indexed `[facts:<asset>]`
+        section (`_split_description`), so a fact must never depend on surrounding sentences to
+        be read correctly. One fact shape is more than indexed text: a line reading exactly
+        ``speaker_N is called <name>`` (case-insensitive, tolerant of `speaker N`/`speaker-N`)
+        binds the diarised label `speaker_N` to a stated name and performs an automatic
+        `IDENTIFY` write the caller can see through `operations()` and reverse through
+        `rollback()` -- never a label this clip's own recognizer did not produce, and never over
+        a name the identity already carries.
+        """
+        ...
 
     def close(self) -> None: ...

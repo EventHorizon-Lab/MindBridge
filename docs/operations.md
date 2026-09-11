@@ -286,6 +286,11 @@ Watch these degradation and recognition attributes:
   because the model's prompt exceeded its context.
 - `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` count evidence
   removed from OpenAI grounding requests.
+- `mindbridge.recall.shape`, `mindbridge.recall.ops`, `mindbridge.recall.exhaustive_rows`,
+  `mindbridge.recall.complete`, `mindbridge.recall.replan`, and `mindbridge.recall.fallback`
+  describe one `mindbridge.recall` stage, present only when `recall_planning` is on. Every
+  planning failure resolves to the same fallback plan, so `fallback` is the only signal that the
+  planner did not decide that question, and `complete` is what licenses a count over the set.
 - `mindbridge.formation.refused_proposals` counts the proposals the kernel refused to ground,
   totalled over the whole operation span and present only when formation ran; the model adapter's
   `mindbridge.formation.dropped_proposals` counts the ones it could not read at all.
