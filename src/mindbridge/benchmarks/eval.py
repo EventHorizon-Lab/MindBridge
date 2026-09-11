@@ -187,6 +187,7 @@ from mindbridge.models.base import (
     SpeechBackend,
     TranscriptionBackend,
     VisionDescriptionBackend,
+    _is_generation_abort_rejection,
 )
 from mindbridge.models.jina import (
     DEFAULT_JINA_DIMENSION,
@@ -369,13 +370,20 @@ class _JudgeConfig:
 
 @dataclass(frozen=True, slots=True)
 class FailureDetail:
-    """Safe, stable benchmark failure diagnostics."""
+    """Safe, stable benchmark failure diagnostics.
+
+    `message` is the provider's own words when it gave any, else the failure's text: the stable
+    fields say a request was rejected, only the words say whether the prompt was malformed or the
+    gateway aborted its own generation, and a one-in-two-hundred failure cannot be reproduced on
+    demand afterwards. Whitespace-normalized and bounded like `scorer_error`.
+    """
 
     source_id: str | None
     code: str
     reason: str | None
     stage: str | None
     cause_type: str | None
+    message: str | None = None
 
     def json(self) -> dict[str, str | None]:
         return {
@@ -384,6 +392,7 @@ class FailureDetail:
             "reason": self.reason,
             "stage": self.stage,
             "cause_type": self.cause_type,
+            "message": self.message,
         }
 
 
@@ -467,6 +476,11 @@ def _transient_provider_failure(error: BaseException) -> bool:
             return getattr(current, "code", None) != "insufficient_quota"
         if isinstance(current, transient):
             return True
+        # A 400 is `request_rejected` and permanent, except the one a gateway sends when it
+        # aborted its own JSON generation: the answer path streams `response_format` replies,
+        # and that rejection is a fact about the provider at that second, not about the prompt.
+        if _is_generation_abort_rejection(current):
+            return True
     return False
 
 
@@ -535,6 +549,7 @@ class SampleResult:
     error_reason: str | None = None
     error_stage: str | None = None
     error_cause_type: str | None = None
+    error_message: str | None = None
     retrieval_diagnostic_error: FailureDetail | None = None
     cached: bool = False
     prompt: tuple[str, ...] | None = None
@@ -600,6 +615,7 @@ class SampleResult:
             "error_reason": self.error_reason,
             "error_stage": self.error_stage,
             "error_cause_type": self.error_cause_type,
+            "error_message": self.error_message,
             "retrieval_diagnostic_error": (
                 None
                 if self.retrieval_diagnostic_error is None
@@ -2645,6 +2661,7 @@ def _restored_failure(payload: Mapping[str, object]) -> FailureDetail:
         reason=_optional_text(payload["reason"]),
         stage=_optional_text(payload["stage"]),
         cause_type=_optional_text(payload["cause_type"]),
+        message=_optional_text(payload.get("message")),
     )
 
 
@@ -3759,6 +3776,7 @@ def _sample(
         error_reason=None if error_detail is None else error_detail.reason,
         error_stage=None if error_detail is None else error_detail.stage,
         error_cause_type=None if error_detail is None else error_detail.cause_type,
+        error_message=None if error_detail is None else error_detail.message,
         retrieval_diagnostic_error=retrieval_diagnostic_error,
         abstained=abstained,
         abstention_reason=abstention_reason,
@@ -7064,7 +7082,26 @@ def _failure_detail(error: BaseException, *, source_id: str | None = None) -> Fa
         reason=error.reason if isinstance(error, MindBridgeError) else None,
         stage=error.stage if isinstance(error, MindBridgeError) else None,
         cause_type=None if cause is None else type(cause).__name__,
+        message=_failure_message(error),
     )
+
+
+_FAILURE_MESSAGE_CHARS = 500
+
+
+def _failure_message(error: BaseException) -> str | None:
+    """The provider's parsed error body when the chain carries one, else the failure's own text.
+
+    Only the SDK exception's parsed body is read, never a transport exception's text: that text
+    names the request URL, and a URL may carry credentials.
+    """
+    for current in _exception_chain(error):
+        body = getattr(current, "body", None)
+        message = body.get("message") if isinstance(body, Mapping) else None
+        if isinstance(message, str) and message.strip():
+            return " ".join(message.split())[:_FAILURE_MESSAGE_CHARS]
+    text = " ".join(str(error).split())
+    return text[:_FAILURE_MESSAGE_CHARS] or None
 
 
 def _task_seed(seed: int, task: str) -> int:

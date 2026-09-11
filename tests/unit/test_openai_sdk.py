@@ -1028,6 +1028,72 @@ def test_streamed_json_completion_never_accepts_partial_content_after_an_iterato
     assert stream.closed is True
 
 
+def test_streamed_completion_dropped_by_the_peer_is_a_connection_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A peer that closes the stream raises the transport's exception, not the SDK's.
+
+    The SDK only translates failures while the request is in flight; one benchmark answer that
+    streamed for 463 seconds and then lost its connection was recorded with no reason at all, so
+    nothing waited it out. It is a fact about the network, and the closed vocabulary already has
+    the word for it.
+    """
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+
+    class _DroppedStream:
+        closed = False
+
+        def __iter__(self) -> "_DroppedStream":
+            return self
+
+        def __next__(self) -> SimpleNamespace:
+            raise httpx.RemoteProtocolError("peer closed connection without sending complete body")
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = _DroppedStream()
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_request: stream))
+    )
+    monkeypatch.setattr(OpenAIModels, "_client", lambda _self, _operation: fake_client)
+    model = OpenAIModels(
+        generation_model="caption-model",
+        generation_capabilities=frozenset({Modality.IMAGE}),
+        embedding_dimension=2,
+        generation_stream=True,
+    )
+
+    with pytest.raises(ModelError) as failure:
+        model.describe((ModelInput(assets=(picture,)),))
+
+    assert failure.value.reason == "connection_failed"
+    assert failure.value.retryable is True
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize("transport_name", ["httpx", "httpx2"])
+def test_provider_reason_classifies_transport_failures_from_either_http_library(
+    transport_name: str,
+) -> None:
+    # The locked environment runs the SDK on httpx2 and older ones on httpx; the exception that
+    # reaches the adapter belongs to whichever the installed SDK imported, so both are known.
+    transport = pytest.importorskip(transport_name)
+    request = transport.Request("POST", "https://sdk.example.test/v1/chat/completions")
+    assert (
+        openai_backend._provider_reason(transport.RemoteProtocolError("dropped", request=request))
+        == "connection_failed"
+    )
+    assert openai_backend._provider_reason(transport.ReadError("reset", request=request)) == (
+        "connection_failed"
+    )
+    assert openai_backend._provider_reason(transport.ReadTimeout("slow", request=request)) == (
+        "timeout"
+    )
+    # Unrelated failures stay unclassified rather than being guessed into a retry.
+    assert openai_backend._provider_reason(RuntimeError("connection ended")) is None
+
+
 @pytest.mark.parametrize(
     "choices",
     [

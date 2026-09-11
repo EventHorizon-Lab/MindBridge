@@ -265,7 +265,9 @@ Three things bound what it costs and what it can do:
   while producing the JSON reply ("Model output became abnormal ... generation was aborted ...
   Please retry") is retried the same way, because an identical request there routinely succeeds
   seconds later; every other `request_rejected` -- a rejected image, an unsupported request --
-  still fails open on the first attempt. The SDK client's
+  still fails open on the first attempt. A connection the peer drops while a response body or
+  stream is being read is classified `connection_failed` like one dropped during the request,
+  whichever HTTP transport the installed SDK runs on. The SDK client's
   own `max_retries` budget is spent inside each of those attempts, so `max_retries` on this slot
   raises the per-attempt budget and is worth setting above the SDK default for a long ingest. A
   provider that throttles a corpus throttles it for minutes, which is long enough for a

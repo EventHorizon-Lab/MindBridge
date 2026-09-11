@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
 import math
 import time
@@ -1975,10 +1976,35 @@ def _provider_reason(error: Exception) -> str | None:
         (openai.APITimeoutError, "timeout"),
         (openai.APIConnectionError, "connection_failed"),
         (openai.BadRequestError, "request_rejected"),
+        # The SDK translates transport failures only while the request itself is in flight. A
+        # peer that drops the connection while the response body or a stream is being read
+        # raises the transport's own exception, and one 463-second answer was recorded as an
+        # unclassified failure for exactly that. Timeouts subclass the transport error, so they
+        # are matched first.
+        (_transport_errors("TimeoutException"), "timeout"),
+        (_transport_errors("TransportError"), "connection_failed"),
     ):
         if isinstance(error, provider_error):
             return reason
     return None
+
+
+def _transport_errors(name: str) -> tuple[type[BaseException], ...]:
+    """The named exception from every HTTP transport the SDK may be running on.
+
+    Locked environments run the SDK on ``httpx2`` and older ones on ``httpx``; the exception
+    that reaches this adapter belongs to whichever the installed SDK imported.
+    """
+    classes = []
+    for module_name in ("httpx", "httpx2"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        candidate = getattr(module, name, None)
+        if isinstance(candidate, type) and issubclass(candidate, BaseException):
+            classes.append(candidate)
+    return tuple(classes)
 
 
 def _is_context_length_rejection(error: BaseException | None) -> bool:

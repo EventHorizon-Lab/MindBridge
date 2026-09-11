@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -447,3 +447,23 @@ class VisionDescriptionBackend(Protocol):
         ...
 
     def close(self) -> None: ...
+
+
+def _is_generation_abort_rejection(error: object) -> bool:
+    """Recognize a gateway that aborted its own generation and reported it as a 400.
+
+    Measured live on one inner-prism gateway: 'Model output became abnormal while generating a
+    JSON response for response_format. The generation was aborted because the partial output may
+    be incomplete or invalid JSON. Please retry the request or adjust your prompt or JSON
+    schema.' An identical request seconds later routinely succeeds, so this is a fact about the
+    provider at that moment, not about the request. Most 400s -- a malformed prompt, an
+    unsupported image -- are permanent, hence a narrow message match rather than a status rule.
+    Duck-typed on the SDK exception's own ``status_code`` and parsed ``body``, so the product
+    needs no import of the optional adapter that raised it.
+    """
+    if getattr(error, "status_code", None) != 400:
+        return False
+    body = getattr(error, "body", None)
+    message = body.get("message") if isinstance(body, Mapping) else getattr(body, "message", None)
+    normalized = message.casefold() if isinstance(message, str) else ""
+    return "model output became abnormal" in normalized and "generation was aborted" in normalized
