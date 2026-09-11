@@ -266,8 +266,10 @@ directories can run concurrently. A `Memory` created before `fork()` is rejected
 Model calls and separate SQLite transactions may overlap. SQLite serializes its own writers with
 `BEGIN IMMEDIATE`. A process-local write lock protects outbox application, destructive operations,
 index replacement, final record and asset hydration, and add-time speaker identity updates, whose
-identity changes must roll back with a failed add. Ordinary Zvec queries may overlap; replacement
-and close wait for active queries.
+identity changes must roll back with a failed add. Ordinary Zvec queries may overlap with each
+other; every native write, flush, optimize, replacement, and close waits for active queries and
+excludes them, because Zvec 0.7 lets a query on one collection read a segment store that a
+concurrent flush is freeing (alibaba/zvec#714), which surfaced as a bus error in a long benchmark.
 
 `reindex()` reads authoritative SQLite pages, replaces the Zvec collection, then replays the
 outbox so writes committed during the scan are retained. `close()` rejects new work, waits for

@@ -1001,6 +1001,14 @@ their planned rows as structured errors. Input-specific HTTP 400, 413, 415, and 
 use item isolation, and a generation-stage provider failure remains an ordinary per-question
 error.
 
+Before any of that classification, a connection, timeout, rate-limit, or HTTP 5xx failure from the
+embedding, generation, or judge endpoint is retried with exponential backoff (capped at 30 seconds
+between attempts) for up to ten minutes. Such a failure describes the network at that second, not
+the answer, write, or verdict it interrupted, and one fourteen-hour run lost its `longmemeval-s`
+score to eight connection resets during judging. Only the attempt that succeeded is timed. An
+outage longer than the budget still produces the structured errors described above and still
+invalidates the score, so a dead endpoint is never hidden.
+
 The standard CLI does not persist each question inside one unfinished task. The frozen long-run
 EgoLife protocol adds that narrower behavior with an attempt-owned benchmark source overlay; it
 does not change `mindbridge-bench eval`. Its private `samples.generation.journal.jsonl` writes and

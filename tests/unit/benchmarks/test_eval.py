@@ -5324,3 +5324,43 @@ def test_only_the_task_whose_protocol_credits_no_abstention_asks_for_a_guess() -
 
     assert {"m3-bench-robot"} == BEST_EFFORT_TASKS
     assert set(TASKS) >= BEST_EFFORT_TASKS
+
+
+@pytest.mark.asyncio
+async def test_retry_transient_waits_out_provider_outages_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A connection reset describes the network, not the answer; it is waited out within a budget.
+    # A rejected request is a fact about the request and is raised at once, and an outage that
+    # outlives the budget surfaces as the same structured error the caller already records.
+    monkeypatch.setattr(eval_module, "_TRANSIENT_RETRY_SECONDS", 0.2)
+    monkeypatch.setattr(eval_module, "_TRANSIENT_RETRY_CAP_SECONDS", 0.01)
+    calls = 0
+
+    async def flaky() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise ModelError("reset", reason="connection_failed", stage="generate")
+        return "answered"
+
+    assert await eval_module._retry_transient(flaky) == "answered"
+    assert calls == 3
+
+    async def rejected() -> str:
+        nonlocal calls
+        calls += 1
+        raise ModelError("bad request", reason="request_rejected", stage="generate")
+
+    calls = 0
+    with pytest.raises(ModelError, match="bad request"):
+        await eval_module._retry_transient(rejected)
+    assert calls == 1
+
+    async def outage() -> str:
+        raise ModelError("still down", reason="timeout", stage="embed")
+
+    started = time.monotonic()
+    with pytest.raises(ModelError, match="still down"):
+        await eval_module._retry_transient(outage)
+    assert time.monotonic() - started < 2
