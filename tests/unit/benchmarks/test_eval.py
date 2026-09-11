@@ -2361,6 +2361,189 @@ async def test_causal_ingest_retains_release_order_at_equal_boundaries(tmp_path:
     ]
 
 
+def test_planned_ingest_count_stops_at_the_latest_cutoff() -> None:
+    unit = EvalUnit(
+        "unit",
+        (
+            MemoryItem("early", ("early",), end_seconds=5),
+            MemoryItem("later", ("later",), end_seconds=15),
+            MemoryItem("tail", ("tail",), end_seconds=25),
+        ),
+        (
+            EvalQuestion(
+                "q1", ("first",), expected_choice="A", score_kind="choice", cutoff_seconds=5
+            ),
+            EvalQuestion(
+                "q2", ("second",), expected_choice="A", score_kind="choice", cutoff_seconds=20
+            ),
+        ),
+    )
+
+    assert eval_module._planned_ingest_count(unit) == 2
+    assert (
+        eval_module._planned_ingest_count(
+            replace(
+                unit,
+                questions=(
+                    *unit.questions,
+                    EvalQuestion("q3", ("third",), expected_choice="A", score_kind="choice"),
+                ),
+            )
+        )
+        == 3
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingest_progress_completes_even_when_a_cutoff_stops_short(tmp_path: Path) -> None:
+    task = _resumable_task(
+        tmp_path,
+        [
+            MemoryItem("early", ("early",), end_seconds=5),
+            MemoryItem("later", ("later",), end_seconds=15),
+        ],
+        10,
+    )
+    ingest: list[tuple[int, int]] = []
+    samples: list[tuple[int, int]] = []
+
+    await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=_store_factory([]),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        on_progress=lambda completed, total: samples.append((completed, total)),
+        on_ingest_progress=lambda completed, total: ingest.append((completed, total)),
+    )
+
+    # The tail sits past the only question's cutoff and is never written, so it is not counted
+    # either: the total is the corpus this unit will reach, not the corpus it was handed.
+    assert ingest == [(0, 1), (1, 1)]
+    assert samples == [(1, 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_fully_cached_unit_completes_its_ingest_share_without_writing(
+    tmp_path: Path,
+) -> None:
+    task = _resumable_task(
+        tmp_path,
+        [MemoryItem(str(number), (str(number),)) for number in range(3)],
+        None,
+    )
+
+    class Cache:
+        def get(self, _task: str, _unit_id: str, _question_id: str) -> object:
+            return SimpleNamespace(
+                prediction="A",
+                confidence=0.0,
+                memory_ids=(),
+                evidence=(),
+                abstained=False,
+                abstention_reason=None,
+                ranked_source_ids=None,
+            )
+
+        def put(self, *_args: object) -> None:
+            pass
+
+    events: list[str] = []
+    ingest: list[tuple[int, int]] = []
+
+    await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=_store_factory(events),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        response_cache=cast(ResponseCache, Cache()),
+        on_ingest_progress=lambda completed, total: ingest.append((completed, total)),
+    )
+
+    # Nothing was written, so a bar driven by chunk boundaries alone would hang one unit short of
+    # its total for the rest of the task.
+    assert events == []
+    assert ingest == [(0, 3), (3, 3)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_units_share_one_monotone_ingest_count(tmp_path: Path) -> None:
+    spec = TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40)
+    task = LoadedTask(
+        spec,
+        tmp_path / "fixture.json",
+        "1" * 64,
+        tuple(
+            EvalUnit(
+                f"unit-{unit}",
+                tuple(MemoryItem(f"{unit}-{item}", (f"{unit}-{item}",)) for item in range(5)),
+                (EvalQuestion("q1", ("first",), expected_choice="A", score_kind="choice"),),
+            )
+            for unit in range(4)
+        ),
+    )
+    ingest: list[tuple[int, int]] = []
+
+    await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=_store_factory([]),
+        batch_size=2,
+        unit_concurrency=3,
+        request_concurrency=2,
+        recall_limit=5,
+        on_ingest_progress=lambda completed, total: ingest.append((completed, total)),
+    )
+
+    # Workers accumulate into one count, so the bar reads the corpus rather than any one unit.
+    # A total that moved would be rejected by the deferred bar, and a count that went backwards
+    # would drive a negative delta into tqdm.
+    counts = [completed for completed, _total in ingest]
+    assert {total for _completed, total in ingest} == {20}
+    assert counts == sorted(counts)
+    assert counts[0] == 0
+    assert counts[-1] == 20
+
+
+@pytest.mark.asyncio
+async def test_resumed_ingest_progress_starts_from_the_checkpoint(tmp_path: Path) -> None:
+    task = _resumable_task(
+        tmp_path,
+        [MemoryItem(str(number), (str(number),)) for number in range(4)],
+        None,
+    )
+    await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=_store_factory([], chunks=2),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="recipe",
+    )
+
+    resumed: list[tuple[int, int]] = []
+    await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run", resume=True),
+        memory_factory=_store_factory([]),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="recipe",
+        on_ingest_progress=lambda completed, total: resumed.append((completed, total)),
+    )
+
+    assert resumed == [(0, 4), (2, 4), (3, 4), (4, 4)]
+
+
 @pytest.mark.asyncio
 async def test_resume_rebuilds_a_store_that_ran_past_a_pending_cutoff(tmp_path: Path) -> None:
     task = _resumable_task(

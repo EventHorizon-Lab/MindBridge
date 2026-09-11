@@ -267,14 +267,23 @@ repository rather than the process directory; `--data-root` defaults to
 `<benchmarks-root>/data`. Run `mindbridge-bench eval --help` for the full concurrency, cache,
 generation, and comparison options.
 
-Unless `--quiet` is set, `eval` reports sample and judge progress to stderr. On a terminal that
-is a live progress bar with an ETA. While a sample is still rebuilding, ingesting, deliberating,
-or answering, the bar keeps its honest completed-sample count but refreshes its elapsed time and
-labels the active phase. Concurrent units are summarized by phase rather than letting a completed
-unit leave a stale label behind. When stderr is a file or a pipe, where a redrawn bar is
-unreadable, the same counts and ETA are written as one line at most once a minute, plus the first
-and the last completion, so a stalled run says so immediately and the log always ends on the
-final count.
+Unless `--quiet` is set, `eval` reports ingest, sample, and judge progress to stderr. On a
+terminal those are live progress bars with an ETA. While a sample is still rebuilding, ingesting,
+deliberating, or answering, the sample bar keeps its honest completed-sample count but refreshes
+its elapsed time and labels the active phase. Concurrent units are summarized by phase rather than
+letting a completed unit leave a stale label behind.
+
+A unit writes every memory a question is allowed to have seen before it answers that question, so
+a task whose questions carry no cutoff writes its whole corpus first and the sample bar honestly
+reads zero for as long as that takes -- hours, on a video task. The ingest bar beneath it is what
+shows those hours moving: it counts memories written across every unit of the task, against the
+number those units will reach at their latest cutoff. A resumed run starts it at the checkpoint
+rather than at zero, and a unit answered entirely from the response cache completes its share
+without writing, so the bar still finishes.
+
+When stderr is a file or a pipe, where a redrawn bar is unreadable, the same counts and ETA are
+written as one line at most once a minute, plus the first and the last completion, so a stalled
+run says so immediately and the log always ends on the final count.
 
 `--verbosity` sets the log level for the run and claims the root handler before an imported
 dependency can raise it: `funasr`, `modelscope`, `numba` and others each turn their own logging
