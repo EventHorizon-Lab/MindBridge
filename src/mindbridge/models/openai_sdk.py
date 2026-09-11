@@ -1215,7 +1215,7 @@ class OpenAIModels:
         except ModelError:
             raise
         except Exception as error:
-            fallback = self._short_video_fallback(
+            fallback = self._media_rejection_fallback(
                 question, hits, grounded, error, answer_policy=answer_policy
             )
             if fallback is None:
@@ -1237,7 +1237,7 @@ class OpenAIModels:
                     stage="generate",
                 ) from retry_error
 
-    def _short_video_fallback(
+    def _media_rejection_fallback(
         self,
         question: ModelInput | str,
         retrieved: Sequence[SearchHit],
@@ -1246,10 +1246,11 @@ class OpenAIModels:
         *,
         answer_policy: AnswerPolicy = "strict",
     ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | None:
-        if not _is_short_video_rejection(error):
+        rejected = _rejected_media_modality(error)
+        if rejected is None:
             return None
         # ponytail: the provider does not identify the rejected clip; keep every hit's text and
-        # non-video media, then replace this with asset-specific fallback if APIs expose an ID.
+        # other media, then replace this with asset-specific fallback if APIs expose an ID.
         reduced = tuple(
             replace(
                 hit,
@@ -1257,11 +1258,7 @@ class OpenAIModels:
                 modality=ModelInput(text=hit.content, assets=assets).modality,
             )
             for hit in grounded
-            if (
-                assets := tuple(
-                    asset for asset in hit.assets if asset.modality is not Modality.VIDEO
-                )
-            )
+            if (assets := tuple(asset for asset in hit.assets if asset.modality is not rejected))
             or hit.content.strip()
         )
         if reduced == tuple(grounded):
@@ -2028,19 +2025,34 @@ def _is_context_length_rejection(error: BaseException | None) -> bool:
     )
 
 
-def _is_short_video_rejection(error: Exception) -> bool:
-    """Recognize a provider-declared content constraint without routing by provider name."""
+def _rejected_media_modality(error: Exception) -> Modality | None:
+    """Which grounding media a provider declared it will not process, by its own words.
+
+    "The video file is too short" is a duration constraint; "Input video data may contain
+    inappropriate content" is a content-inspection refusal, measured live on one gateway that
+    answered it for two of thirteen questions over the same bedroom clips. Neither names the
+    clip, both name the modality, and both are permanent for this request while the same
+    memories' text is not, so the answer falls back to the text and the other media. Routing is
+    by the provider's declared constraint, never by provider name.
+    """
     try:
         import openai
     except ImportError:  # pragma: no cover - a client call implies the SDK imported already
-        return False
+        return None
+    if not isinstance(error, openai.BadRequestError):
+        return None
     message = _member(getattr(error, "body", None), "message")
     normalized = message.casefold() if isinstance(message, str) else ""
-    return (
-        isinstance(error, openai.BadRequestError)
-        and "video" in normalized
-        and "too short" in normalized
-    )
+    if "too short" not in normalized and "inappropriate content" not in normalized:
+        return None
+    for modality, word in (
+        (Modality.VIDEO, "video"),
+        (Modality.IMAGE, "image"),
+        (Modality.AUDIO, "audio"),
+    ):
+        if word in normalized:
+            return modality
+    return None
 
 
 def _require_capabilities(
