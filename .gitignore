@@ -36,3 +36,6 @@ celerybeat-schedule
 # The subagent-driven-development skill assumes this directory is ignored; it holds working
 # notes for one plan and nothing another checkout needs.
 .superpowers/
+
+# Agent-created linked worktrees are local-only.
+/.claude/worktrees/
