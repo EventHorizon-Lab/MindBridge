@@ -79,12 +79,13 @@ searchable at once; the Zvec flush that acknowledges them runs once 256 applied 
 when a drain applied a deletion, inside `optimize()` and `reindex()`, and at `close()`. Zvec also
 performs bounded automatic optimization after enough pending vectors or durable segments
 accumulate. That bound is a write-side one that a session below roughly 65,000 written rows never
-reaches, so `close()` merges the durable segments as well whenever the store holds more than one.
-The count is read from the files on disk, so an inherited store is merged by the first session
-that closes it whether or not that session wrote; a session that opens a single-segment store and
-flushes once closes without merging. This is what keeps short sessions from growing the index:
-five one-record sessions over a 481 MB store left it at 511 MB in seven segments without the
-merge, and at 481 MB in one segment with it, for about 1.4 s of close each.
+reaches, so a session that flushed at least once merges the durable segments at `close()` as well
+whenever two or more of them are persisted. A session that only read the store never does, so
+opening someone else's store to search it, back it up, or check a result hands the bytes back
+unchanged; its compaction debt is paid by the next session that writes. This is what keeps short
+sessions from growing the index: five one-record sessions over a 481 MB store left it at 511 MB in
+seven segments without the merge, and at 481 MB in one segment with it, for about 1.4 s of close
+each.
 
 From the live owner, rebuild or optimize explicitly when measurement or diagnosis justifies it:
 

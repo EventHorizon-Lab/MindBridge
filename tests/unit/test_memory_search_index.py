@@ -635,6 +635,74 @@ def test_close_does_not_optimize_a_session_that_flushed_once(
     assert _vector_segments(tmp_path) == 1
 
 
+def _segment_files(data_dir: Path) -> dict[str, int]:
+    """The durable segments by name and size; a merge rewrites this map, a read must not.
+
+    Not every file under `zvec/`: MindBridge has no read-only open, so the embedded RocksDB stores
+    behind the scalar, full-text and id-map fields write a fresh log, MANIFEST and OPTIONS whenever
+    the collection is opened at all. That churn belongs to the open, not the close, and no policy
+    here can remove it. The three suffixes below are the durable segments -- exactly what
+    `_persisted_segment_count` counts, what a merge rewrites, and what a reader must hand back
+    unchanged.
+    """
+    zvec = data_dir / "zvec"
+    return {
+        str(file.relative_to(zvec)): file.stat().st_size
+        for file in sorted(zvec.rglob("*"))
+        if file.is_file() and file.suffix in {".proxima", ".ipc", ".sst"}
+    }
+
+
+def _segmented_store(data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave a store in two durable segments, the state an earlier owner hands over.
+
+    The merge under test is what stops a store reaching this state, so the fixture has to write
+    with it disabled rather than by writing more.
+    """
+    monkeypatch.setattr(ZvecIndex, "optimize", lambda self, *, concurrency=0: None)
+    with Memory(data_dir, embedder=_Embedder()) as memory:
+        kitchen = memory.add("the kitchen at dusk")
+        memory.add("the garden at noon")
+        memory.delete(kitchen.id)
+        memory.add("the hallway at dawn")
+    monkeypatch.undo()
+    assert _vector_segments(data_dir) == 2
+
+
+def test_a_session_that_only_reads_leaves_a_segmented_store_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening a store to read it must not rewrite it, however much compaction debt it carries.
+
+    An eval harness, a backup tool, or an operator checking a result opens someone else's store
+    and is entitled to hand back the bytes it was given. Paying the debt needs a writer, and one
+    will come: every writing session ends compacted, which is what bounds the growth.
+    """
+    _segmented_store(tmp_path, monkeypatch)
+    before = _segment_files(tmp_path)
+    optimizations = _counted_optimizations(monkeypatch)
+
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        assert memory.search("dawn", limit=10)
+
+    assert optimizations == []
+    assert _segment_files(tmp_path) == before
+
+
+def test_a_session_that_writes_one_record_merges_an_inherited_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One record is enough to make a session the one that pays the inherited debt."""
+    _segmented_store(tmp_path, monkeypatch)
+    optimizations = _counted_optimizations(monkeypatch)
+
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        memory.add("the balcony at midnight")
+
+    assert optimizations == [0]
+    assert _vector_segments(tmp_path) == 1
+
+
 def test_repeated_short_sessions_do_not_grow_the_index(tmp_path: Path) -> None:
     """`open -> add one record -> close` in a loop must not accrue a segment per session.
 
