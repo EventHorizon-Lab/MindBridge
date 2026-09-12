@@ -7046,12 +7046,15 @@ def _content(parts: tuple[str | Path, ...]) -> str | Path | tuple[str | Path, ..
 
 
 def _memory_content(item: MemoryItem) -> str | tuple[str | Path, ...]:
-    marker = f"[source_id: {item.source_id}]"
     first, *rest = item.content
-    parts: tuple[str | Path, ...] = (
-        (f"{marker}\n{first}", *rest) if isinstance(first, str) else (marker, first, *rest)
-    )
-    return cast(str, parts[0]) if len(parts) == 1 else parts
+    if not isinstance(first, str):
+        # A media item's source id is already metadata, which is where `_evidence` reads it. As
+        # content it was a third retrieval key and made the aggregate key differ from the clip's
+        # own key even for a clip with no speech, so every clip went to the embedder twice; a
+        # clip with a transcript still does, because its aggregate key carries the transcript.
+        return item.content
+    labelled = f"[source_id: {item.source_id}]\n{first}"
+    return labelled if not rest else (labelled, *rest)
 
 
 def _memory_metadata(item: MemoryItem) -> dict[str, object]:

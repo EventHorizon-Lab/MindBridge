@@ -28,6 +28,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Literal, NoReturn
 
+import numpy as np
+
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.models.base import FaceAnalysis, SpeechAnalysis
 from mindbridge.types import (
@@ -3404,9 +3406,14 @@ class LocalStore:
         dimensions = {len(values) for values in speakers.values()}
         if 0 in dimensions or len(dimensions) > 1:
             raise ValueError("speaker exemplars must share one non-zero dimension")
+        # A centroid no turn is labelled with carries no speech. Enrolled, it minted an identity
+        # and an exemplar that every later asset was matched against and nothing ever cited:
+        # 27,056 of 44,857 identities on one 12,684-clip ingest. Every speech backend converges
+        # here, so this is where they stay out.
         normalized = {
             label: _normalized_vector(values, "speaker exemplar")
             for label, values in speakers.items()
+            if label in labels
         }
         now = datetime.now(timezone.utc)
         transcript = "\n".join(turn.text for turn in analysis.turns)
@@ -5970,18 +5977,10 @@ class LocalStore:
             """,
             (modality, space_id, dimension),
         ).fetchall()
-        existing: dict[str, list[tuple[tuple[float, ...], str]]] = {}
-        for row in rows:
-            identity_id = _row_text(row, "identity_id")
-            existing.setdefault(identity_id, []).append(
-                (
-                    _normalized_vector(
-                        _unpack_vector(_row_blob(row, "vector"), dimension),
-                        f"stored {modality} exemplar",
-                    ),
-                    _row_text(row, "created_at"),
-                )
-            )
+        # ponytail: the bank is rebuilt from a full-table read on every recognised asset (about
+        # 60 ms at 46k rows); cache it per (modality, space, dimension) and invalidate at every
+        # `identity_exemplars` writer -- including the `identities` cascades -- if that matters.
+        bank = _ExemplarBank(rows, dimension=dimension, modality=modality)
         preferred_identity = (
             None
             if preferred_identity is None
@@ -6000,7 +5999,7 @@ class LocalStore:
             ).fetchone()
             is None
         )
-        known_identities = set(existing)
+        known_identities = bank.identity_ids
         if preferred_exists and preferred_identity is not None:
             known_identities.add(preferred_identity)
         # Consent restrains enrolment, not recognition. A person who withheld or withdrew it
@@ -6014,10 +6013,7 @@ class LocalStore:
         now_text = _datetime_text(now)
         for label, vectors in observations.items():
             group_claims = claimed.setdefault(claim_groups[label], set())
-            # ponytail: local identity populations use a linear scan; add a vector index only
-            # after profiling shows identity matching matters beside model inference.
-            accepted = _accepted_identity(
-                existing,
+            accepted = bank.best(
                 vectors,
                 claimed=group_claims,
                 minimum_similarity=minimum_similarity,
@@ -6052,18 +6048,21 @@ class LocalStore:
                 )
                 changes[identity_id] = _IdentityChange(identity_id, previous)
             identity_exists = identity_id in known_identities
-            existing[identity_id] = _write_identity_exemplars(
-                connection,
+            bank.replace(
                 identity_id,
-                existing.get(identity_id, ()),
-                vectors,
-                modality=modality,
-                model_id=model_id,
-                space_id=space_id,
-                dimension=dimension,
-                exemplar_limit=exemplar_limit,
-                identity_exists=identity_exists,
-                now_text=now_text,
+                _write_identity_exemplars(
+                    connection,
+                    identity_id,
+                    bank.stored(identity_id),
+                    vectors,
+                    modality=modality,
+                    model_id=model_id,
+                    space_id=space_id,
+                    dimension=dimension,
+                    exemplar_limit=exemplar_limit,
+                    identity_exists=identity_exists,
+                    now_text=now_text,
+                ),
             )
             known_identities.add(identity_id)
             matches[label] = (
@@ -9813,34 +9812,116 @@ def _normalized_vector(values: Sequence[float], name: str) -> tuple[float, ...]:
     return tuple(value / magnitude for value in normalized)
 
 
-def _accepted_identity(
-    exemplars_by_identity: dict[str, list[tuple[tuple[float, ...], str]]],
-    vectors: Sequence[tuple[float, ...]],
-    *,
-    claimed: set[str],
-    minimum_similarity: float,
-    minimum_margin: float,
-) -> tuple[str, float] | None:
-    ranked = sorted(
-        (
-            (
-                identity_id,
-                max(
-                    math.fsum(a * b for a, b in zip(vector, stored, strict=True))
-                    for vector in vectors
-                    for stored, _created_at in exemplars
-                ),
+class _ExemplarBank:
+    """Every stored exemplar of one modality, space and dimension, scored as one matrix.
+
+    Recognition scores one observation against the whole bank, so the bank is the unit of work:
+    one `frombuffer` over the fetched BLOBs and one matrix product per label, instead of
+    unpacking and re-normalising every row into Python tuples on every call. Measured on a
+    46,360-exemplar store that per-row path cost 1.3 s per speaker label and grew with every
+    clip ingested; the matrix costs tens of milliseconds. Rows arrive ordered by identity then
+    position, so each identity is one contiguous slice. Exemplars written during the call are
+    kept as the exact tuples the write path returned, and `stored()` re-derives a stored row the
+    way the write path does, so a re-observation of the same centroid still compares equal to
+    what is stored; the matrix is for scoring only.
+    """
+
+    def __init__(self, rows: Sequence[sqlite3.Row], *, dimension: int, modality: str) -> None:
+        self._name = f"stored {modality} exemplar"
+        self._ids: list[str] = []
+        self._created = [_row_text(row, "created_at") for row in rows]
+        owners = []
+        for row in rows:
+            identity_id = _row_text(row, "identity_id")
+            if not self._ids or self._ids[-1] != identity_id:
+                self._ids.append(identity_id)
+            owners.append(len(self._ids) - 1)
+        self._position = {identity_id: index for index, identity_id in enumerate(self._ids)}
+        self._owner = np.asarray(owners, dtype=np.int64)
+        self._raw = np.frombuffer(
+            b"".join(_row_blob(row, "vector") for row in rows), dtype="<f4"
+        ).reshape(len(rows), dimension)
+        matrix = np.asarray(self._raw, dtype=np.float64)
+        if not np.isfinite(matrix).all():
+            raise ValueError(f"{self._name} must contain finite values")
+        magnitudes = np.linalg.norm(matrix, axis=1)
+        if (magnitudes == 0.0).any():
+            raise ValueError(f"{self._name} must not be a zero vector")
+        matrix /= magnitudes[:, np.newaxis]
+        self._matrix = matrix
+        self._written: dict[str, list[tuple[tuple[float, ...], str]]] = {}
+
+    @property
+    def identity_ids(self) -> set[str]:
+        return set(self._ids)
+
+    def best(
+        self,
+        vectors: Sequence[tuple[float, ...]],
+        *,
+        claimed: set[str],
+        minimum_similarity: float,
+        minimum_margin: float,
+    ) -> tuple[str, float] | None:
+        """Return the unclaimed identity whose best exemplar scores highest, or none.
+
+        The score is the maximum cosine over the identity's exemplars and the observations. An
+        exact tie goes to the smaller identity id. Below the similarity floor nobody matches; a
+        runner-up inside the margin makes the match ambiguous and it is refused rather than
+        guessed.
+        """
+        if not self._ids:
+            return None
+        observed = np.asarray(vectors, dtype=np.float64)
+        scores = np.full(len(self._ids), -np.inf)
+        if self._owner.size:
+            np.maximum.at(scores, self._owner, (self._matrix @ observed.T).max(axis=1))
+        for identity_id, exemplars in self._written.items():
+            written = np.asarray([vector for vector, _created_at in exemplars], dtype=np.float64)
+            scores[self._position[identity_id]] = (
+                (written @ observed.T).max() if exemplars else -np.inf
             )
-            for identity_id, exemplars in exemplars_by_identity.items()
-            if identity_id not in claimed
-        ),
-        key=lambda item: (-item[1], item[0]),
-    )
-    if not ranked or ranked[0][1] < minimum_similarity:
-        return None
-    if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < minimum_margin:
-        return None
-    return ranked[0]
+        for identity_id in claimed:
+            position = self._position.get(identity_id)
+            if position is not None:
+                scores[position] = -np.inf
+        top = float(scores.max())
+        if top < minimum_similarity:
+            return None
+        winners = np.flatnonzero(scores == top)
+        winner = min(self._ids[index] for index in winners)
+        if len(winners) > 1:
+            runner_up = top
+        else:
+            scores[winners[0]] = -np.inf
+            runner_up = float(scores.max())
+        if top - runner_up < minimum_margin:
+            return None
+        return winner, top
+
+    def stored(self, identity_id: str) -> list[tuple[tuple[float, ...], str]]:
+        """Return one identity's exemplars as the write path stores them, in position order."""
+        written = self._written.get(identity_id)
+        if written is not None:
+            return list(written)
+        position = self._position.get(identity_id)
+        if position is None:
+            return []
+        first, last = np.searchsorted(self._owner, [position, position + 1])
+        return [
+            (
+                _normalized_vector(tuple(float(value) for value in self._raw[row]), self._name),
+                self._created[row],
+            )
+            for row in range(int(first), int(last))
+        ]
+
+    def replace(self, identity_id: str, exemplars: Sequence[tuple[tuple[float, ...], str]]) -> None:
+        """Record the rows just written for one identity, enrolling a new identity."""
+        if identity_id not in self._position:
+            self._position[identity_id] = len(self._ids)
+            self._ids.append(identity_id)
+        self._written[identity_id] = list(exemplars)
 
 
 def _write_identity_exemplars(

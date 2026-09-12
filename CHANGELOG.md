@@ -520,6 +520,27 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- Identity matching scores one observation against the whole exemplar bank as a matrix instead
+  of unpacking and re-normalising every stored exemplar into Python tuples on every call.
+  Measured on a 46,360-exemplar store the per-row scan cost 1.3 s per speaker label and grew
+  with every clip; the matrix costs about 0.16 s, most of it the read. Results are unchanged:
+  the best identity by its highest exemplar, ties broken by identity id, refused below
+  `speaker_similarity` or inside `speaker_margin`. `numpy` is now a core dependency; it was
+  already installed through `zvec`.
+- Speech recognition enrols only the speaker centroids a transcribed turn is labelled with. A
+  centroid no turn uses carries no speech, so all it did was mint an identity and an exemplar
+  that every later asset was matched against and nothing cited: 27,056 of 44,857 identities on
+  one 12,684-clip ingest. The rule lives in the store, where every `SpeechBackend` converges.
+- The `mm-lifelong` task group is the evaluation splits: `mm-lifelong-day-test`,
+  `mm-lifelong-week-test`, and `mm-lifelong-month-val`. `mm-lifelong-month-train` is the released
+  training split, cut from the same 105 h of video as `month_val`, so the group ingested that
+  video twice; it stays selectable by name.
+- `mindbridge-bench eval` no longer writes a `[source_id: …]` text line into media-only
+  memories. The id is already metadata, which is what evidence and retrieval scoring read; as
+  content it was a third retrieval key and made the aggregate key differ from the clip's own
+  key even when the clip had no speech, so every clip was uploaded to the embedder twice; a clip
+  with a transcript still is, since its aggregate key carries the transcript. Text memories keep
+  the label.
 - **Breaking:** `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` declare
   a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
   `isinstance` checks the method name rather than its signature, so a custom backend written

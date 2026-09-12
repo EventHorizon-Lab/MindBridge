@@ -452,7 +452,7 @@ adapter version, so response caches from the earlier source-ID scheme are not re
 | --- | --- | --- | --- |
 | WorldMemArena (`worldmemarena`) | Causal multimodal agent and lifelong sessions with checkpoint QA, updates, temporal reasoning, visual recall/search, and cross-modal reasoning | `correct_ratio`; the official configurable Correct/Hallucination/Omission judge, plus `answer_f1` and `answer_bleu1` | Pinned Hugging Face JSON and images; automatic |
 | EgoTempo (`egotempo`) | Open-ended temporal QA over Ego4D clips; use for temporal grounding rather than multi-session retrieval | `accuracy`; judge `gemini-1.5-flash` | Pinned GitHub annotations; media needs Ego4D authorization and AWS credentials |
-| MM-Lifelong (`mm-lifelong`: day/week/month) | Day-to-month video memory, multi-interval clues, temporal localization, and open-ended answers; use for duration scaling | `answer_accuracy`; judge `gpt-5` | Pinned Hugging Face annotations and split media; automatic |
+| MM-Lifelong (`mm-lifelong`: day/week/month-val; `mm-lifelong-month-train` by name) | Day-to-month video memory, multi-interval clues, temporal localization, and open-ended answers; use for duration scaling | `answer_accuracy`; judge `gpt-5` | Pinned Hugging Face annotations and split media; automatic |
 | SuperMemory-VQA (`supermemory-vqa`) | Causal multi-video memory, skill breakdowns, answerability, and unanswerable cases; use for lifelong video QA | `qa_accuracy`; deterministic choice scorer | Pinned Hugging Face annotations, transcripts, and video; automatic |
 | M3-Bench (`m3-bench`: robot/web) | Causal long-video memory and open-ended QA; use for robot and web-video histories | `accuracy`; judge `gpt-4o-2024-11-20` | Pinned GitHub annotations; robot media from Hugging Face, web media through `yt-dlp` |
 | Video-MME-v2 (`video-mme-v2`) | Four-question relevance/logic groups with level and reasoning-head breakdowns; use when grouped consistency matters | `rating` and auxiliary `accuracy` (both 0--100); deterministic grouped scorer | Pinned Hugging Face Parquet and media volumes; automatic |
@@ -1081,8 +1081,8 @@ Three result fields carry a caveat that decides whether they can be quoted:
   question. The bare question is preserved as `EvalQuestion.source_question` and is what the
   scorers and judges read, but no public surface routes it to retrieval while keeping the template
   for generation. Read any retrieval-side result on a templated task as measuring the template
-  too, the same way the `[source_id: ...]` marker the runner prefixes to every stored memory is
-  part of what the full-text index sees.
+  too, the same way the `[source_id: ...]` marker the runner prefixes to every stored text
+  memory is part of what the full-text index sees.
 - **`retrieval_*` scores the retriever's ranked candidate list, not the answer's evidence.** The
   runner observes the list already produced inside `Memory.ask`, before grounding and generation;
   it issues no scoring search. The artifact records that answer's configured candidate depth, and

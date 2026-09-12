@@ -211,6 +211,14 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "atm-bench-main",
     )
     assert expand(("video-*",)) == ("video-mme-v2",)
+    # The group is the evaluation set: month_train is the released training split, and its
+    # 105 h of video is the same media month_val ingests, so the group would ingest it twice.
+    assert expand(("mm-lifelong",)) == (
+        "mm-lifelong-day-test",
+        "mm-lifelong-week-test",
+        "mm-lifelong-month-val",
+    )
+    assert expand(("mm-lifelong-month-train",)) == ("mm-lifelong-month-train",)
     with pytest.raises(ValueError, match="unknown task"):
         expand(("video-mme",))
     with pytest.raises(ValueError, match="unknown task"):

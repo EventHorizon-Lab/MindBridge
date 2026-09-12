@@ -3587,3 +3587,105 @@ def test_identity_id_for_name_resolves_through_a_merge_and_declines_a_stranger(
         assert store.identity_id_for_name("LI  HUA") is None
         assert store.identity_id_for_name("Someone Else") is None
         assert store.identity_id_for_name("   ") is None
+
+
+def test_exemplar_bank_ranks_identities_like_the_per_row_scan_did() -> None:
+    """One matrix replaces the per-call unpack of every stored exemplar into Python tuples.
+
+    Measured on a 46,360-exemplar store the old path cost 1.3 s per speaker label, 0.86 s of it
+    re-normalising rows in Python; on a 12,684-clip video that was two thirds of the ingest wall
+    clock. The bank keeps the scan's contract: the best identity by its highest exemplar, ties
+    broken by identity id, refused below the similarity floor or inside the margin, and claimed
+    identities skipped.
+    """
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("CREATE TABLE e (identity_id, position, vector, created_at)")
+        connection.executemany(
+            "INSERT INTO e VALUES (?, ?, ?, ?)",
+            [
+                ("id-a", 0, store_module._pack_vector((1.0, 0.0)), "t1"),
+                ("id-b", 0, store_module._pack_vector((0.6, 0.8)), "t2"),
+                ("id-b", 1, store_module._pack_vector((0.0, 1.0)), "t3"),
+                ("id-c", 0, store_module._pack_vector((2.0, 0.0)), "t4"),
+            ],
+        )
+        rows = connection.execute(
+            "SELECT identity_id, position, vector, created_at FROM e ORDER BY identity_id, position"
+        ).fetchall()
+
+    bank = store_module._ExemplarBank(rows, dimension=2, modality="voice")
+
+    assert bank.identity_ids == {"id-a", "id-b", "id-c"}
+    # Stored rows are normalised on read, so id-c's (2, 0) ties id-a exactly; the tie is a margin
+    # refusal, and with the margin off the smaller id wins, as the sorted scan did.
+    assert (
+        bank.best(((1.0, 0.0),), claimed=set(), minimum_similarity=0.78, minimum_margin=0.05)
+        is None
+    )
+    accepted = bank.best(((1.0, 0.0),), claimed=set(), minimum_similarity=0.78, minimum_margin=0.0)
+    assert accepted is not None and accepted[0] == "id-a" and accepted[1] == pytest.approx(1.0)
+    accepted = bank.best(
+        ((1.0, 0.0),), claimed={"id-a"}, minimum_similarity=0.78, minimum_margin=0.0
+    )
+    assert accepted is not None and accepted[0] == "id-c"
+    # An identity scores by its best exemplar over every observation.
+    accepted = bank.best(
+        ((0.0, 1.0), (0.6, 0.8)), claimed=set(), minimum_similarity=0.78, minimum_margin=0.05
+    )
+    assert accepted is not None and accepted[0] == "id-b" and accepted[1] == pytest.approx(1.0)
+    # Observations are scored as given, so a short vector scores short: (0.5, 0.5) reaches 0.7
+    # against id-b and stays under the floor.
+    assert (
+        bank.best(((0.5, 0.5),), claimed=set(), minimum_similarity=0.78, minimum_margin=0.05)
+        is None
+    )
+    # The write path reads an identity's exemplars back as tuples and replaces them afterwards.
+    # Vectors are FP32 BLOBs, so they come back FP32-rounded, as the unpacked tuples did.
+    stored = bank.stored("id-b")
+    assert [created for _vector, created in stored] == ["t2", "t3"]
+    assert [vector for vector, _created in stored] == [
+        pytest.approx((0.6, 0.8)),
+        pytest.approx((0.0, 1.0)),
+    ]
+    assert bank.stored("id-new") == []
+    bank.replace("id-new", [((0.0, -1.0), "t5")])
+    accepted = bank.best(
+        ((0.0, -1.0),), claimed=set(), minimum_similarity=0.78, minimum_margin=0.05
+    )
+    assert accepted is not None and accepted[0] == "id-new"
+    assert "id-new" in bank.identity_ids
+
+
+def test_write_speech_enrols_only_the_speaker_centroids_a_turn_uses(tmp_path: Path) -> None:
+    """A centroid no turn is labelled with carries no speech and would only mint an identity.
+
+    Measured on a 12,684-clip ingest: 27,056 of 44,857 identities were never referenced by a
+    speech segment, and every one of them sat in the exemplar bank every later asset was matched
+    against. The rule lives here because every speech backend converges on `write_speech`.
+    """
+    asset = _asset(b"voice", modality="audio", mime_type="audio/wav", name="voice.wav")
+    memory = replace(_memory("voice"), content="", modality="audio", assets=(asset,))
+
+    with LocalStore(tmp_path) as store:
+        store.write_memories((memory,))
+        segments = store.write_speech(
+            asset.asset_id,
+            SpeechAnalysis(
+                turns=(SpeechTurn(0, 800, "hello", "1"),),
+                speakers=(
+                    SpeakerEmbedding("0", (1.0, 0.0)),
+                    SpeakerEmbedding("1", (0.0, 1.0)),
+                    SpeakerEmbedding("2", (0.6, 0.8)),
+                ),
+            ),
+            model_id="cam++",
+            space_id="cam++:test",
+        )
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            identities = connection.execute("SELECT COUNT(*) FROM identities").fetchone()[0]
+            exemplars = connection.execute("SELECT COUNT(*) FROM identity_exemplars").fetchone()[0]
+
+    assert [segment.speaker_id for segment in segments] == [segments[0].speaker_id]
+    assert segments[0].speaker_id is not None
+    assert (identities, exemplars) == (1, 1)

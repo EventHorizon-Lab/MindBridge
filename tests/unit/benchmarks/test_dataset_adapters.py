@@ -1005,6 +1005,29 @@ def test_longmemeval_labels_the_answer_turn_and_every_block_it_was_split_into(
     assert question.metadata["answer_session_ids"] == ("s2",)
 
 
+def test_media_only_memory_items_carry_their_source_id_as_metadata_not_text(
+    tmp_path: Path,
+) -> None:
+    """The `[source_id: …]` line is a text memory's label; a clip already has it in metadata.
+
+    As content it became a third retrieval key (the marker text) and made the aggregate key
+    differ from the clip's own key, so every 30 s clip was uploaded to the embedder twice. The
+    harness reads source ids from metadata (`_evidence`), never from content.
+    """
+    from mindbridge.benchmarks.eval import _memory_content, _memory_metadata
+    from mindbridge.benchmarks.eval_adapters import MemoryItem
+
+    clip = tmp_path / "segment.mp4"
+    clip.write_bytes(b"video")
+
+    assert _memory_content(MemoryItem("0.mp4-00001", (clip,), 30.0, 60.0)) == (clip,)
+    assert _memory_metadata(MemoryItem("0.mp4-00001", (clip,), 30.0, 60.0))["source_id"] == (
+        "0.mp4-00001"
+    )
+    assert _memory_content(MemoryItem("t", ("hello",))) == "[source_id: t]\nhello"
+    assert _memory_content(MemoryItem("t", ("hello", clip))) == ("[source_id: t]\nhello", clip)
+
+
 def test_longmemeval_source_labels_are_evaluator_only(tmp_path: Path) -> None:
     """Changing release labels cannot change stored memories or their gold join."""
     from mindbridge.benchmarks.eval import _cache_task, _memory_content, _memory_metadata

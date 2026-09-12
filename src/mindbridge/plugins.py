@@ -161,7 +161,7 @@ class MemoryConfig:
     # ships `configuration.json` with `"model": {"yesOrno_thr": 0.31}`, and ModelScope's own
     # `speaker_verification_light_pipeline` reads that field as its decision threshold — raw
     # `torch.nn.CosineSimilarity`, `yes` iff `score >= thr` — the same quantity
-    # `_accepted_identity` compares. But 0.31 is calibrated for ONE pair of embeddings, and this
+    # `_ExemplarBank.best` compares. But 0.31 is calibrated for ONE pair of embeddings, and this
     # matcher accepts on a `max` over up to 20 stored exemplars. Max-over-N is monotone in N, so a
     # pair threshold is a strict LOWER bound on the correct max-over-N threshold, never the value:
     # measured on this matcher, the max-over-20 score for mutually orthogonal random 192-d

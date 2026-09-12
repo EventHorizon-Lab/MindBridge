@@ -288,6 +288,7 @@ def test_the_product_cli_cannot_reach_the_benchmark_family(tmp_path: Path) -> No
 
 def test_dependency_surface_is_exact() -> None:
     assert {_name(item) for item in DEPENDENCIES} == {
+        "numpy",
         "opentelemetry-api",
         "pydantic",
         "zvec",
@@ -315,7 +316,6 @@ def test_dependency_surface_is_exact() -> None:
             "cairosvg",
             "funasr",
             "librosa",
-            "numpy",
             "sentence-transformers",
             "soundfile",
             "torch",
