@@ -72,10 +72,18 @@ class Projection(Traced):
         self._deferral = local()
 
     def flush_pending(self) -> None:
-        """Flush applied-but-unacknowledged rows, if any; `close()` calls this last."""
+        """Flush applied rows and merge this session's segments; `close()` calls this last."""
         if self._unflushed_operations:
             with self._trace("mindbridge.index.sync", kind="stage"):
                 self.flush()
+        # Every durable segment is a cost every later search pays, and the write-side merge bound
+        # is 64 flushes, so a store under roughly 65 000 rows per session was handed to its next
+        # owner segmented: merging five real stores recovered 24-47 % of their Zvec bytes and
+        # 14-45 pp of search p50 without changing a result. Close is the one moment no writer is
+        # waiting, so merge here when this session left more than one segment behind -- and only
+        # then, or `open, add one record, close` in a loop pays a merge per record.
+        with translate_index_errors("optimize the search index"):
+            self._index.optimize_if_needed(minimum_flushes=2)
 
     def drain(self, *, force: bool = False) -> None:
         """Apply current SQLite truth to Zvec; flush and acknowledge once enough has been applied.

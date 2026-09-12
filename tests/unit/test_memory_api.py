@@ -498,8 +498,10 @@ class _FakeIndex:
         del concurrency
         self.optimize_calls += 1
 
-    def optimize_if_needed(self, *, minimum_unindexed: int = 100_000) -> bool:
-        del minimum_unindexed
+    def optimize_if_needed(
+        self, *, minimum_unindexed: int = 100_000, minimum_flushes: int = 64
+    ) -> bool:
+        del minimum_unindexed, minimum_flushes
         self.optimize_if_needed_calls += 1
         return False
 

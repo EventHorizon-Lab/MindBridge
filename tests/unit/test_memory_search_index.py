@@ -38,6 +38,7 @@ from mindbridge._telemetry import (
 )
 from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local.store.index import IndexOutbox
+from mindbridge.infrastructure.local.zvec_index import ZvecIndex
 from mindbridge.kernel.derived import (
     MAX_DESCRIBE_CONTEXT_CHARACTERS,
     speaker_labels,
@@ -580,6 +581,57 @@ def test_reindexing_does_not_re_describe_stored_visuals(tmp_path: Path) -> None:
 
         assert describer.calls == 1
         assert _caption(memory.get(record.id).content) == caption
+
+
+def _vector_segments(data_dir: Path) -> int:
+    """Count the durable Zvec segments on disk; every later search pays for each of them."""
+    return len(list((data_dir / "zvec").rglob("*.proxima")))
+
+
+def _counted_optimizations(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record every merge the index runs, so "did not optimize" is also assertable."""
+    calls: list[int] = []
+    original = ZvecIndex.optimize
+
+    def counted(self: ZvecIndex, *, concurrency: int = 0) -> None:
+        calls.append(concurrency)
+        original(self, concurrency=concurrency)
+
+    monkeypatch.setattr(ZvecIndex, "optimize", counted)
+    return calls
+
+
+def test_close_merges_the_segments_a_session_leaves_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store below the automatic merge bound is handed to its next owner in one segment.
+
+    The write-side bound is 64 flushes, so every store under roughly 65 000 rows written in a
+    session used to be closed segmented: measured on five real stores, merging them recovered
+    24-47 % of the Zvec bytes and 14-45 pp of search p50, and changed no result.
+    """
+    optimizations = _counted_optimizations(monkeypatch)
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        kitchen = memory.add("the kitchen at dusk")
+        memory.add("the garden at noon")
+        # A deletion is made durable at once, so this session flushes twice: here, and at close.
+        memory.delete(kitchen.id)
+        memory.add("the hallway at dawn")
+
+    assert optimizations == [0]
+    assert _vector_segments(tmp_path) == 1
+
+
+def test_close_does_not_optimize_a_session_that_flushed_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`open -> add -> close` in a loop must not pay a merge per record it wrote."""
+    optimizations = _counted_optimizations(monkeypatch)
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        memory.add("the kitchen at dusk")
+
+    assert optimizations == []
+    assert _vector_segments(tmp_path) == 1
 
 
 def test_decay_demotes_an_old_memory_without_evicting_it(tmp_path: Path) -> None:

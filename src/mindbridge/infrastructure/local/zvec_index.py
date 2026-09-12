@@ -488,9 +488,11 @@ class ZvecIndex:
         self,
         *,
         minimum_unindexed: int = _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS,
+        minimum_flushes: int = _AUTO_OPTIMIZE_FLUSHES,
     ) -> bool:
         """Run maintenance after a meaningful flat-buffer or durable-segment buildup."""
         _require_positive(minimum_unindexed, "minimum_unindexed")
+        _require_positive(minimum_flushes, "minimum_flushes")
         # Every collection shares one process FD table. Serializing maintenance prevents several
         # otherwise-isolated stores from all opening replacement segments at the same pressure
         # boundary. Reads of other collections remain independent.
@@ -515,7 +517,7 @@ class ZvecIndex:
             self._optimization_watermark = min(self._optimization_watermark, document_count)
             indexed = _indexed_document_count(stats)
             if (
-                self._flushes_since_optimization < _AUTO_OPTIMIZE_FLUSHES
+                self._flushes_since_optimization < minimum_flushes
                 and document_count - max(indexed, self._optimization_watermark) < minimum_unindexed
             ):
                 return False

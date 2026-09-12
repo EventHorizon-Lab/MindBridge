@@ -65,7 +65,9 @@ class Index(Protocol):
 
     def optimize(self, *, concurrency: int = 0) -> None: ...
 
-    def optimize_if_needed(self, *, minimum_unindexed: int = 100_000) -> bool: ...
+    def optimize_if_needed(
+        self, *, minimum_unindexed: int = 100_000, minimum_flushes: int = 64
+    ) -> bool: ...
 
     def rebuild(
         self,
