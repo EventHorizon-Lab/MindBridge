@@ -27,7 +27,7 @@ from mindbridge import (
 )
 from mindbridge.infrastructure.local import IndexDocument, StoredEmbedding
 from mindbridge.infrastructure.local.zvec_index import ZvecIndex
-from mindbridge.memory import _index_recipe
+from mindbridge.kernel.contracts import index_recipe_for
 
 _NOW = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
 _SPACE = "pushdown-probe:2"
@@ -177,7 +177,7 @@ def test_a_collection_built_before_the_filter_fields_rebuilds_without_re_embeddi
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:"
         f"context-keys-v10:quantization-{IndexQuantization.NONE.value}"
     )
-    assert previous != _index_recipe(IndexQuantization.NONE)
+    assert previous != index_recipe_for(IndexQuantization.NONE)
 
     with Memory(tmp_path, embedder=_CountingEmbedder(), minimum_relevance=0) as memory:
         record = memory.add(

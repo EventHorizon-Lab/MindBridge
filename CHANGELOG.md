@@ -520,6 +520,19 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- The kernel is one module per plane instead of one `memory.py`. `Memory` and `AsyncMemory` stay
+  in `memory.py` as facades that validate, wire, and forward; the write, retrieval, answering,
+  compilation, identity, control, records, perception, and projection planes live in
+  `mindbridge.kernel`, each a class whose constructor names every store, index, backend, setting,
+  and sibling plane it uses, so the wiring in `Memory.__init__` is the dependency graph. The
+  async observation streams moved to `mindbridge.streams` and are still exported from
+  `mindbridge`; `declared_capabilities`, which only the CLI and tests reached through
+  `mindbridge.memory`, now lives in `mindbridge.kernel.contracts`.
+  `LocalStore` is likewise one connection pool with one attribute per table family --
+  `records`, `captures`, `semantics`, `control`, `identities`, `media`, `index`, `recall` -- in
+  `mindbridge.infrastructure.local.store`, a package whose top-level imports are unchanged.
+  No on-disk schema, public signature, response type, endpoint, tool, or error changed; the
+  [architecture guide](docs/architecture.md#code-layout) owns the layout.
 - **Breaking:** `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` declare
   a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
   `isinstance` checks the method name rather than its signature, so a custom backend written

@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from mindbridge.infrastructure.local import LocalStore, StoredEmbedding, StoredMemory
+from mindbridge.infrastructure.local.store._connections import Connections
 
 _NOW = datetime(2026, 9, 2, 12, 0, 0, tzinfo=timezone.utc)
 _SPACE = "place-probe:2"
@@ -66,22 +67,24 @@ def _embedding(memory_id: str, *, object_part: int = 0) -> StoredEmbedding:
 def test_place_id_round_trips_and_stays_optional(tmp_path: Path) -> None:
     """A place is a label a robot may or may not have, so absence is a first-class value."""
     with LocalStore(tmp_path) as store:
-        store.write_memory(
+        store.records.write_memory(
             _memory("labelled", "the blue inhaler is in the top drawer", place_id="kitchen")
         )
-        store.write_memory(_memory("unlabelled", "someone mentioned Thursday"))
+        store.records.write_memory(_memory("unlabelled", "someone mentioned Thursday"))
 
-        labelled = store.read_memory("labelled")
-        unlabelled = store.read_memory("unlabelled")
+        labelled = store.records.read_memory("labelled")
+        unlabelled = store.records.read_memory("unlabelled")
         assert labelled is not None and labelled.place_id == "kitchen"
         assert unlabelled is not None and unlabelled.place_id is None
 
         # The batch read and the listing hydrate the same column, not just the single read.
-        assert [memory.place_id for memory in store.read_memories(("labelled", "unlabelled"))] == [
+        assert [
+            memory.place_id for memory in store.records.read_memories(("labelled", "unlabelled"))
+        ] == [
             "kitchen",
             None,
         ]
-        assert {memory.memory_id: memory.place_id for memory in store.list_memories()} == {
+        assert {memory.memory_id: memory.place_id for memory in store.records.list_memories()} == {
             "labelled": "kitchen",
             "unlabelled": None,
         }
@@ -116,28 +119,32 @@ def test_hydrating_a_candidate_slate_scopes_it_by_place(tmp_path: Path) -> None:
     it composes with the bitemporal and metric arguments instead of shadowing them.
     """
     with LocalStore(tmp_path) as store:
-        store.write_memory(_memory("kitchen-1", "the kettle is on", place_id="kitchen"))
-        store.write_memory(_memory("kitchen-2", "the top drawer is open", place_id="kitchen"))
-        store.write_memory(_memory("garden-1", "the hose is coiled", place_id="garden"))
-        store.write_memory(_memory("nowhere", "someone said Thursday"))
+        store.records.write_memory(_memory("kitchen-1", "the kettle is on", place_id="kitchen"))
+        store.records.write_memory(
+            _memory("kitchen-2", "the top drawer is open", place_id="kitchen")
+        )
+        store.records.write_memory(_memory("garden-1", "the hose is coiled", place_id="garden"))
+        store.records.write_memory(_memory("nowhere", "someone said Thursday"))
         slate = ("garden-1", "kitchen-2", "nowhere", "kitchen-1")
 
         # No place scope hydrates the whole slate, in the caller's ranking.
-        assert [memory.memory_id for memory in store.read_memories(slate)] == list(slate)
+        assert [memory.memory_id for memory in store.records.read_memories(slate)] == list(slate)
 
         # A place scope keeps the ranking and drops everything else, unlabelled rows included.
-        assert [memory.memory_id for memory in store.read_memories(slate, place_id="kitchen")] == [
+        assert [
+            memory.memory_id for memory in store.records.read_memories(slate, place_id="kitchen")
+        ] == [
             "kitchen-2",
             "kitchen-1",
         ]
-        assert [memory.memory_id for memory in store.read_memories(slate, place_id="garden")] == [
-            "garden-1"
-        ]
-        assert store.read_memories(slate, place_id="attic") == ()
+        assert [
+            memory.memory_id for memory in store.records.read_memories(slate, place_id="garden")
+        ] == ["garden-1"]
+        assert store.records.read_memories(slate, place_id="attic") == ()
 
         # A blank label is a caller error, not "every memory".
         with pytest.raises(ValueError, match="place_id"):
-            store.read_memories(slate, place_id="")
+            store.records.read_memories(slate, place_id="")
 
 
 def test_the_query_a_scoped_hydration_actually_runs_uses_the_place_index(
@@ -157,21 +164,23 @@ def test_the_query_a_scoped_hydration_actually_runs_uses_the_place_index(
     would observe nothing.
     """
     statements: list[str] = []
-    real_open = LocalStore._open_connection
+    real_open = Connections._open_connection
 
-    def tracing_open(store: LocalStore, *, secure_delete: bool = False) -> sqlite3.Connection:
+    def tracing_open(store: Connections, *, secure_delete: bool = False) -> sqlite3.Connection:
         connection = real_open(store, secure_delete=secure_delete)
         connection.set_trace_callback(statements.append)
         return connection
 
-    monkeypatch.setattr(LocalStore, "_open_connection", tracing_open)
+    monkeypatch.setattr(Connections, "_open_connection", tracing_open)
     with LocalStore(tmp_path) as store:
         for index in range(6):
             place = "kitchen" if index == 0 else None
-            store.write_memory(_memory(f"m-{index}", f"observation {index}", place_id=place))
+            store.records.write_memory(
+                _memory(f"m-{index}", f"observation {index}", place_id=place)
+            )
         slate = tuple(f"m-{index}" for index in range(6))
         statements.clear()
-        scoped = store.read_memories(slate, place_id="kitchen")
+        scoped = store.records.read_memories(slate, place_id="kitchen")
 
         assert [memory.memory_id for memory in scoped] == ["m-0"]
         # The trace callback reports expanded SQL, so the captured statement needs no bindings
@@ -197,19 +206,23 @@ def test_the_query_a_scoped_hydration_actually_runs_uses_the_place_index(
 def test_changing_a_place_label_requeues_the_search_index(tmp_path: Path) -> None:
     """Zvec carries `place_id` as a filter field, so relabelling a room reprojects the memory."""
     with LocalStore(tmp_path) as store:
-        store.write_memory(_memory("relabelled", "the kettle is on", place_id="kitchen"))
-        store.write_embedding(_embedding("relabelled"))
-        store.acknowledge_index_operations(store.pending_index_operations())
-        assert store.pending_index_operations() == ()
+        store.records.write_memory(_memory("relabelled", "the kettle is on", place_id="kitchen"))
+        store.index.write_embedding(_embedding("relabelled"))
+        store.index.acknowledge_index_operations(store.index.pending_index_operations())
+        assert store.index.pending_index_operations() == ()
 
-        store.write_memory(_memory("relabelled", "the kettle is on", place_id="utility room"))
-        reread = store.read_memory("relabelled")
+        store.records.write_memory(
+            _memory("relabelled", "the kettle is on", place_id="utility room")
+        )
+        reread = store.records.read_memory("relabelled")
         assert reread is not None and reread.place_id == "utility room"
-        assert [operation.embedding_id for operation in store.pending_index_operations()] == [
+        assert [operation.embedding_id for operation in store.index.pending_index_operations()] == [
             "relabelled#0"
         ]
-        store.acknowledge_index_operations(store.pending_index_operations())
+        store.index.acknowledge_index_operations(store.index.pending_index_operations())
 
         # Rewriting the same label is not a change, so it still costs nothing.
-        store.write_memory(_memory("relabelled", "the kettle is on", place_id="utility room"))
-        assert store.pending_index_operations() == ()
+        store.records.write_memory(
+            _memory("relabelled", "the kettle is on", place_id="utility room")
+        )
+        assert store.index.pending_index_operations() == ()

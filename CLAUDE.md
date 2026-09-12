@@ -8,7 +8,7 @@ public-contract rules, coding style, test requirements, and quality gates.
 Do not maintain another copy of MindBridge's API inventory in this file. Verify behavior against:
 
 - `src/mindbridge/__init__.py`, `memory.py`, `types.py`, and `exceptions.py` for the public Python
-  surface;
+  surface, and `kernel/` for the planes `Memory` forwards to;
 - `src/mindbridge/api/app.py` and `api/mcp.py` for REST and the fifteen MCP tools;
 - `src/mindbridge/cli.py` and `benchmarks/cli.py` for console entry points;
 - [the architecture guide](docs/architecture.md) for storage, routing, isolation, and extension

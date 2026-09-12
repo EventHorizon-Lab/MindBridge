@@ -24,10 +24,7 @@ from typing import Literal, NamedTuple, Protocol, TypeVar, cast
 
 # The store's own bounds on one primitive read. Imported rather than restated so a plan can never
 # ask for more rows than the read will return, nor for a term the read will refuse.
-from mindbridge.infrastructure.local.store import _RECALL_MAX_ROWS as RECALL_MAX_ROWS
-from mindbridge.infrastructure.local.store import (
-    _RECALL_MAX_TERM_CHARS as RECALL_MAX_TERM_CHARS,
-)
+from mindbridge.infrastructure.local.store import RECALL_MAX_ROWS, RECALL_MAX_TERM_CHARS
 from mindbridge.types import MemoryType, Modality, SearchHit
 
 RecallShape = Literal["point", "set", "sequence", "entity", "composite"]

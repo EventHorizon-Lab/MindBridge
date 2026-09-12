@@ -46,7 +46,8 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
-from mindbridge.memory import Memory, declared_capabilities
+from mindbridge.kernel.contracts import declared_capabilities
+from mindbridge.memory import Memory
 from mindbridge.types import (
     AffectCue,
     AssetRef,

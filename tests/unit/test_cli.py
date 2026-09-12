@@ -36,7 +36,7 @@ from mindbridge.api.errors import ErrorEnvelope
 from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, _parser, main
 from mindbridge.control import load_operation
 from mindbridge.exceptions import MindBridgeError, ValidationError
-from mindbridge.memory import declared_capabilities
+from mindbridge.kernel.contracts import declared_capabilities
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.models.funasr import DEFAULT_FUNASR_MODEL_ID
 from mindbridge.models.jina import DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION

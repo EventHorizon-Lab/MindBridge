@@ -667,7 +667,7 @@ def test_retention_flushes_the_index_once_for_a_page_of_deletions(tmp_path: Path
         report = memory.apply_retention()
         assert report.deleted == 3
         assert flushes == 1
-        assert memory._store.pending_index_operations() == ()
+        assert memory._store.index.pending_index_operations() == ()
         assert memory.search("aged note", limit=10) == ()
 
 

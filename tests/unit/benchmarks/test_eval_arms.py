@@ -1561,7 +1561,7 @@ def test_the_lent_answerer_declares_the_planning_capability_its_pool_actually_ha
     """`isinstance` against a `runtime_checkable` protocol reads attributes statically.
 
     So a `plan_recall` reachable only through the proxy's `__getattr__` was invisible to
-    `Memory._recall_plan`, which fell back to the point plan for every question under the
+    `Answering._recall_plan`, which fell back to the point plan for every question under the
     harness: measured, one generation call per question and the baseline's own hits. The
     declaration has to follow the pooled backend both ways -- absent when the pool cannot plan,
     or route-by-capability would claim a capability no one has.

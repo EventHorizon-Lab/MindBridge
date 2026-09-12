@@ -25,6 +25,7 @@ from threading import Barrier
 import pytest
 
 from mindbridge.infrastructure.local import LocalStore, StoredMemory
+from mindbridge.infrastructure.local.store._connections import Connections
 
 _NOW = datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -44,18 +45,18 @@ def test_repeated_reads_open_one_connection_rather_than_one_each(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opened = 0
-    real_open = LocalStore._open_connection
+    real_open = Connections._open_connection
 
-    def counting_open(store: LocalStore, *, secure_delete: bool = False) -> sqlite3.Connection:
+    def counting_open(store: Connections, *, secure_delete: bool = False) -> sqlite3.Connection:
         nonlocal opened
         opened += 1
         return real_open(store, secure_delete=secure_delete)
 
     with LocalStore(tmp_path) as store:
-        store.write_memory(_memory("m-0"))
-        monkeypatch.setattr(LocalStore, "_open_connection", counting_open)
+        store.records.write_memory(_memory("m-0"))
+        monkeypatch.setattr(Connections, "_open_connection", counting_open)
         for _ in range(20):
-            assert store.read_memories(("m-0",))[0].memory_id == "m-0"
+            assert store.records.read_memories(("m-0",))[0].memory_id == "m-0"
 
     assert opened == 0, "a warm pool must satisfy a read without connecting"
 
@@ -64,8 +65,8 @@ def test_two_nested_checkouts_get_two_connections(tmp_path: Path) -> None:
     """The pool is what makes nesting safe: an inner block cannot join an outer transaction."""
     with (
         LocalStore(tmp_path) as store,
-        store._connection() as outer,
-        store._connection() as inner,
+        store._connections.connection() as outer,
+        store._connections.connection() as inner,
     ):
         assert outer is not inner
         outer.execute("BEGIN IMMEDIATE")
@@ -78,11 +79,11 @@ def test_two_nested_checkouts_get_two_connections(tmp_path: Path) -> None:
 
 def test_concurrent_readers_never_hold_the_same_connection(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
-        store.write_memory(_memory("m-0"))
+        store.records.write_memory(_memory("m-0"))
         both_inside = Barrier(2, timeout=30)
 
         def borrow() -> int:
-            with store._connection() as connection:
+            with store._connections.connection() as connection:
                 both_inside.wait()
                 connection.execute("SELECT 1").fetchone()
                 return id(connection)
@@ -96,16 +97,16 @@ def test_concurrent_readers_never_hold_the_same_connection(tmp_path: Path) -> No
 
 def test_a_failed_statement_does_not_poison_the_next_read(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
-        store.write_memory(_memory("m-0"))
-        with pytest.raises(sqlite3.OperationalError), store._connection() as connection:
+        store.records.write_memory(_memory("m-0"))
+        with pytest.raises(sqlite3.OperationalError), store._connections.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("SELECT * FROM a_table_that_does_not_exist")
 
         # The failed borrower left a write transaction open. Returning that connection to the pool
         # would hand the open transaction to whoever borrowed it next.
-        assert store.read_memories(("m-0",))[0].memory_id == "m-0"
-        store.write_memory(_memory("m-1"))
-        assert {memory.memory_id for memory in store.read_memories(("m-0", "m-1"))} == {
+        assert store.records.read_memories(("m-0",))[0].memory_id == "m-0"
+        store.records.write_memory(_memory("m-1"))
+        assert {memory.memory_id for memory in store.records.read_memories(("m-0", "m-1"))} == {
             "m-0",
             "m-1",
         }
@@ -113,14 +114,14 @@ def test_a_failed_statement_does_not_poison_the_next_read(tmp_path: Path) -> Non
 
 def test_close_reclaims_the_pooled_connections(tmp_path: Path) -> None:
     store = LocalStore(tmp_path)
-    store.write_memory(_memory("m-0"))
-    store.read_memories(("m-0",))
-    pooled = tuple(store._pool)
+    store.records.write_memory(_memory("m-0"))
+    store.records.read_memories(("m-0",))
+    pooled = tuple(store._connections._pool)
     assert pooled, "a completed read must leave its connection idle in the pool"
 
     store.close()
 
-    assert not store._pool
+    assert not store._connections._pool
     for connection in pooled:
         with pytest.raises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")

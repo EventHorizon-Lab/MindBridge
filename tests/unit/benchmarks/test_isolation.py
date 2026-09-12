@@ -26,7 +26,7 @@ _NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 def _write_unit(data_dir: str, unit: int, control: Connection) -> None:
     try:
         with LocalStore(data_dir) as store:
-            store.write_memory(
+            store.records.write_memory(
                 StoredMemory(
                     memory_id=_MEMORY_ID,
                     content=_CONTENT,
@@ -35,7 +35,7 @@ def _write_unit(data_dir: str, unit: int, control: Connection) -> None:
                     updated_at=_NOW,
                 )
             )
-            stored = store.read_memory(_MEMORY_ID)
+            stored = store.records.read_memory(_MEMORY_ID)
             if stored is None:
                 raise RuntimeError("child could not read its memory")
             control.send(stored.metadata_json)
@@ -137,7 +137,7 @@ def test_parallel_units_have_independent_local_stores(tmp_path: Path) -> None:
     assert all(process.exitcode == 0 for process in processes)
     for index, data_dir in enumerate(unit_dirs):
         with LocalStore(data_dir) as store:
-            stored = store.read_memory(_MEMORY_ID)
+            stored = store.records.read_memory(_MEMORY_ID)
             assert stored is not None
             assert stored.content == _CONTENT
             assert stored.metadata_json == f'{{"unit":{index}}}'

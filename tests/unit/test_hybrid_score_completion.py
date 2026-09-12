@@ -153,7 +153,7 @@ def test_completion_uses_every_parent_part_without_an_additional_model_call(
     embedder = _DirectionalEmbedder()
     with Memory(tmp_path, embedder=embedder, minimum_relevance=0, ambiguity_margin=0) as memory:
         record = memory.add(("rare aggregate preface", "aligned part"))
-        documents = memory._store.read_memory_index_documents((record.id,))
+        documents = memory._store.index.read_memory_index_documents((record.id,))
         assert len(documents) >= 2
         aggregate_id = documents[0].embedding.embedding_id
         assert documents[0].embedding.values == pytest.approx((0.0, 1.0))
@@ -201,7 +201,7 @@ def test_a_valid_zero_dense_hit_is_not_treated_as_a_missing_score(
             ),
         )
         requested: list[tuple[str, ...]] = []
-        original = memory._store.iter_memory_embedding_vectors
+        original = memory._store.index.iter_memory_embedding_vectors
 
         def read_vectors(
             memory_ids: Sequence[str],
@@ -212,7 +212,7 @@ def test_a_valid_zero_dense_hit_is_not_treated_as_a_missing_score(
             requested.append(tuple(memory_ids))
             yield from original(memory_ids, space_id=space_id, task=task)
 
-        monkeypatch.setattr(memory._store, "iter_memory_embedding_vectors", read_vectors)
+        monkeypatch.setattr(memory._store.index, "iter_memory_embedding_vectors", read_vectors)
 
         result = memory.search_with_trace("rare")
 
@@ -250,7 +250,7 @@ def test_completion_reads_only_records_that_survive_type_time_and_known_at_scope
             lambda *_args, **_kwargs: tuple(_lexical_hit(memory_id) for memory_id in ids),
         )
         requested: list[tuple[str, ...]] = []
-        original = memory._store.iter_memory_embedding_vectors
+        original = memory._store.index.iter_memory_embedding_vectors
 
         def read_vectors(
             memory_ids: Sequence[str],
@@ -261,7 +261,7 @@ def test_completion_reads_only_records_that_survive_type_time_and_known_at_scope
             requested.append(tuple(memory_ids))
             yield from original(memory_ids, space_id=space_id, task=task)
 
-        monkeypatch.setattr(memory._store, "iter_memory_embedding_vectors", read_vectors)
+        monkeypatch.setattr(memory._store.index, "iter_memory_embedding_vectors", read_vectors)
 
         hits = memory.search(
             "rare",
@@ -308,7 +308,7 @@ def test_corrupt_persisted_vector_uses_the_storage_error_path(
             # score completion rather than the earlier outbox-replay corruption boundary.
             connection.execute("DELETE FROM search_index_queue")
 
-        original = memory._store.iter_memory_embedding_vectors
+        original = memory._store.index.iter_memory_embedding_vectors
         iterator_spies: list[_CloseTrackingIterator] = []
 
         def tracked_vectors(
@@ -321,7 +321,7 @@ def test_corrupt_persisted_vector_uses_the_storage_error_path(
             iterator_spies.append(spy)
             return spy
 
-        monkeypatch.setattr(memory._store, "iter_memory_embedding_vectors", tracked_vectors)
+        monkeypatch.setattr(memory._store.index, "iter_memory_embedding_vectors", tracked_vectors)
 
         with pytest.raises(StorageError) as raised:
             memory.search("rare")
@@ -350,7 +350,7 @@ def test_dense_mode_keeps_the_index_score_and_skips_completion(
             lambda *_args, **_kwargs: (IndexHit(id=record.id, relevance=0.25, confidence=0.625),),
         )
         monkeypatch.setattr(
-            memory._store,
+            memory._store.index,
             "iter_memory_embedding_vectors",
             lambda *_args, **_kwargs: pytest.fail("dense mode must not complete scores"),
         )
