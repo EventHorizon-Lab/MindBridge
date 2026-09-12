@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import sqlite3
 import unicodedata
@@ -12,7 +11,6 @@ from typing import Literal
 
 from mindbridge.infrastructure.local.store._codec import (
     SQLITE_PARAMETER_BATCH,
-    canonical_json,
     datetime_text,
     normalized_vector,
     optional_row_text,
@@ -91,54 +89,6 @@ def delete_unobserved_identities(
           )
         """,
         tuple(identity_ids),
-    )
-
-
-# The kernel derives a naming assertion's IDs in `memory.py`; importing it here would invert the
-# dependency, so the two payloads are restated for the migration and pinned by a contract test
-# that registers the same name through the kernel and compares the IDs it mints.
-NAMING_RECIPE = "mindbridge-identity-naming-v1"
-
-
-NAMING_PREDICATE = "identity"
-
-
-def naming_assertion_ids(
-    identity_id: str,
-    name: str,
-    relationship: str | None,
-) -> tuple[str, str]:
-    """Return the `(memory_id, lineage_id)` the kernel mints for one host naming assertion."""
-    lineage = canonical_json(
-        {
-            "kind": MemoryKind.ENTITY.value,
-            "predicate": NAMING_PREDICATE,
-            "frame_id": None,
-            "anchor": None,
-            "subject": None,
-            "identity_id": identity_id,
-        }
-    )
-    formation = canonical_json(
-        {
-            "recipe": NAMING_RECIPE,
-            "kind": MemoryKind.ENTITY.value,
-            "identity_id": identity_id,
-            "subject": canonical_subject(name),
-            "predicate": NAMING_PREDICATE,
-            "value": canonical_subject(relationship),
-            "assertion_basis": EvidenceBasis.USER_STATEMENT.value,
-            "cue_modality": None,
-            "episode_source": None,
-            "content": None,
-            "valid_from": None,
-            "valid_until": None,
-            "spatial": None,
-        }
-    )
-    return (
-        hashlib.sha256(f"mindbridge-formation-v1:{formation}".encode()).hexdigest(),
-        hashlib.sha256(f"mindbridge-lineage-v1:{lineage}".encode()).hexdigest(),
     )
 
 

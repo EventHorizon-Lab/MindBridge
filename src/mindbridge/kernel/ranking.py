@@ -549,23 +549,6 @@ def retrieval_is_ambiguous(
     return difference < margin
 
 
-def ranked_relevance(
-    memory: StoredMemory,
-    relevance: float,
-    *,
-    reference_at: datetime,
-    temporal_range: tuple[datetime, datetime] | None,
-    decay_half_life: timedelta | None,
-) -> float:
-    return ranking_signals(
-        memory,
-        relevance,
-        reference_at=reference_at,
-        temporal_range=temporal_range,
-        decay_half_life=decay_half_life,
-    )[0]
-
-
 def ranking_signals(
     memory: StoredMemory,
     relevance: float,

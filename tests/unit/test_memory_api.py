@@ -73,7 +73,7 @@ from mindbridge.kernel.derived import derived_text
 from mindbridge.kernel.ranking import (
     LEXICAL_FULL_COVERAGE_RELEVANCE,
     merge_index_hits,
-    ranked_relevance,
+    ranking_signals,
 )
 from mindbridge.kernel.runtime import translate_index_errors
 from mindbridge.kernel.temporal import parse_temporal_range
@@ -1666,23 +1666,23 @@ def test_decay_reranks_softly_and_requires_explicit_reinforcement(tmp_path: Path
         assert stored.access_count == 1
         assert stored.last_accessed_at is not None
         assert (
-            ranked_relevance(
+            ranking_signals(
                 stored,
                 0.5,
                 reference_at=stored.last_accessed_at,
                 temporal_range=None,
                 decay_half_life=None,
-            )
+            )[0]
             > 0.5
         )
         assert (
-            ranked_relevance(
+            ranking_signals(
                 stored,
                 0.5,
                 reference_at=reference,
                 temporal_range=None,
                 decay_half_life=None,
-            )
+            )[0]
             == 0.5
         )
 

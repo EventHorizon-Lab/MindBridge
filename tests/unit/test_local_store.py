@@ -35,11 +35,6 @@ from mindbridge.infrastructure.local import (
     UnsupportedSchemaError,
 )
 from mindbridge.infrastructure.local.store import SCHEMA_VERSION
-from mindbridge.infrastructure.local.store._identity import (
-    NAMING_PREDICATE,
-    NAMING_RECIPE,
-    naming_assertion_ids,
-)
 from mindbridge.models.base import (
     FaceAnalysis,
     FaceEmbedding,
@@ -2742,43 +2737,6 @@ def test_provisional_identities_only_asks_about_the_people_the_memories_observed
             (_embedding("e-naming-2", "naming-2"),),
         )
         assert store.identities.provisional_identities(("observed",)) == {}
-
-
-def test_the_backfilled_naming_assertion_carries_the_id_the_kernel_would_mint(
-    tmp_path: Path,
-) -> None:
-    """The migration restates two hashes `memory.py` owns; this is the pin that keeps them equal.
-
-    If they drift, a legacy store re-registered under the same name grows a second assertion
-    instead of treating the repeat as the no-op it is documented to be.
-    """
-    import mindbridge.kernel.formation as formation_module
-
-    identity_id = "identity-legacy"
-    proposal = formation_module.naming_proposal(
-        "Alice", "sister", basis=EvidenceBasis.USER_STATEMENT
-    )
-    context = formation_module.formation_context(
-        None,
-        proposal,
-        model_id=None,
-        recipe=formation_module.NAMING_RECIPE,
-        recorded_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        identity_id=identity_id,
-    )
-    kernel_memory_id = formation_module.formation_memory_id(
-        identity_id,
-        proposal,
-        recipe=formation_module.NAMING_RECIPE,
-        context=context,
-    )
-
-    assert naming_assertion_ids(identity_id, "Alice", "sister") == (
-        kernel_memory_id,
-        context.lineage_id,
-    )
-    assert NAMING_RECIPE == formation_module.NAMING_RECIPE
-    assert NAMING_PREDICATE == formation_module.NAMING_PREDICATE
 
 
 def _apply_joint_clause_operation(

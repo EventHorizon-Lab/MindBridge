@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import sqlite3
 import struct
@@ -47,10 +46,6 @@ def prepare_write_batch(
     for embedding in supplied_embeddings:
         supplied_by_memory[embedding.memory_id].add(embedding.embedding_id)
     return supplied_memories, supplied_embeddings, supplied_by_memory
-
-
-def canonical_json(payload: Mapping[str, object]) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def memory_from_row(
