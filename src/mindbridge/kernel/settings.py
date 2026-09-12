@@ -72,9 +72,7 @@ def resolve_settings(
 ) -> Settings:
     """Validate every `MemoryConfig` field once, at wiring, and fail before storage opens."""
     quantization = validated_index_quantization(index_quantization)
-    if not isinstance(retention, RetentionPolicy):
-        raise ValidationError("retention must be a RetentionPolicy value")
-    return Settings(
+    settings = Settings(
         index_quantization=quantization,
         index_recipe=index_recipe_for(quantization),
         retrieval_mode=validated_retrieval_mode(retrieval_mode),
@@ -106,3 +104,6 @@ def resolve_settings(
         query_failure_history=positive_int(query_failure_history, "query_failure_history"),
         retention=retention,
     )
+    if not isinstance(settings.retention, RetentionPolicy):
+        raise ValidationError("retention must be a RetentionPolicy value")
+    return settings

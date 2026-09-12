@@ -1686,6 +1686,24 @@ def test_decay_reranks_softly_and_requires_explicit_reinforcement(tmp_path: Path
         )
 
 
+def test_settings_report_the_first_invalid_field_in_declaration_order(tmp_path: Path) -> None:
+    # `retention` is checked after every other setting, as it was before the kernel split, so
+    # a caller with two bad fields keeps seeing the same message.
+    with pytest.raises(ValidationError, match="speaker_similarity"):
+        Memory(
+            tmp_path,
+            embedder=_FakeModels(),
+            speaker_similarity=2.0,
+            retention="forever",  # type: ignore[arg-type]
+        )
+
+
+def test_close_is_a_no_op_before_the_constructor_has_wired_anything() -> None:
+    memory = Memory.__new__(Memory)
+    memory.close()
+    memory.close()
+
+
 @pytest.mark.parametrize("days", [True, 0, -1, float("nan"), float("inf"), "7"])
 def test_decay_half_life_rejects_invalid_values(tmp_path: Path, days: object) -> None:
     with pytest.raises(ValidationError, match="positive finite number"):

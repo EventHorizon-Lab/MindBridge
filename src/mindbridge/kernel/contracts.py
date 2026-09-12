@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from mindbridge.exceptions import ModelError, ValidationError
+from mindbridge.infrastructure.local.zvec_index import validate_index_configuration
 from mindbridge.kernel.content import PreparedContent, prepared_modalities
 from mindbridge.kernel.validation import positive_int
 from mindbridge.models.base import (
@@ -387,6 +388,7 @@ class Backends:
 
 def resolve_backends(
     *,
+    index_quantization: IndexQuantization,
     embedder: EmbeddingBackend,
     answerer: GenerationBackend | None,
     transcriber: SpeechBackend | TranscriptionBackend | None,
@@ -399,6 +401,11 @@ def resolve_backends(
     embedding_capabilities, embedding_model, space_id, embedding_dimension = _embedding_contract(
         embedder
     )
+    try:
+        validate_index_configuration(embedding_dimension, index_quantization)
+    except ValueError as error:
+        raise ValidationError(str(error)) from None
+    generation_capabilities = _generation_contract(answerer)
     transcription_capabilities, transcription_space = _transcription_contract(transcriber)
     vision_capabilities, vision_model, vision_space = _vision_contract(vision_describer)
     face_capabilities, face_model, face_space, face_analysis_space = _face_contract(face_analyzer)
@@ -416,7 +423,7 @@ def resolve_backends(
         embedding_model=embedding_model,
         space_id=space_id,
         embedding_dimension=embedding_dimension,
-        generation_capabilities=_generation_contract(answerer),
+        generation_capabilities=generation_capabilities,
         transcription_capabilities=transcription_capabilities,
         transcription_space=transcription_space,
         vision_capabilities=vision_capabilities,

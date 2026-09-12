@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import builtins
 import logging
-import shutil
 from collections.abc import (
     AsyncGenerator,
     AsyncIterable,
@@ -47,14 +46,13 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.infrastructure.local.assets import AssetStore
-from mindbridge.infrastructure.local.zvec_index import ZvecIndex, validate_index_configuration
+from mindbridge.infrastructure.local.zvec_index import ZvecIndex
 from mindbridge.kernel.answering import ASYNC_QUEUE_TIME_MS, Answering
 from mindbridge.kernel.compilation import Compilation
 from mindbridge.kernel.contracts import (
     STORE_METADATA_KEYS,
     close_quietly,
     declared_capabilities,
-    known_metadata_upgrade,
     resolve_backends,
     unique_resources,
 )
@@ -69,7 +67,13 @@ from mindbridge.kernel.materialization import Materializer
 from mindbridge.kernel.projection import Projection
 from mindbridge.kernel.records import Records
 from mindbridge.kernel.retrieval import Retrieval
-from mindbridge.kernel.runtime import Index, Storage, open_store, translate_storage_errors
+from mindbridge.kernel.runtime import (
+    Index,
+    Storage,
+    ensure_store_metadata,
+    open_store,
+    translate_storage_errors,
+)
 from mindbridge.kernel.settings import resolve_settings
 from mindbridge.kernel.speech import Speech
 from mindbridge.kernel.validation import strict_bool
@@ -214,6 +218,7 @@ class Memory:
         )
         try:
             self._backends = resolve_backends(
+                index_quantization=self._settings.index_quantization,
                 embedder=embedder,
                 answerer=answerer,
                 transcriber=transcriber,
@@ -222,13 +227,6 @@ class Memory:
                 former=former,
                 consolidator=consolidator,
             )
-            try:
-                validate_index_configuration(
-                    self._backends.embedding_dimension,
-                    self._settings.index_quantization,
-                )
-            except ValueError as error:
-                raise ValidationError(str(error)) from None
             assets = AssetStore(self.data_dir)
             self._storage = Storage(
                 store=self._store,
@@ -268,7 +266,9 @@ class Memory:
             self._lifecycle.collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
             index_missing = not index_path.exists()
-            index_rebuild, embedding_rebuild = self._ensure_store_metadata(index_path)
+            index_rebuild, embedding_rebuild = ensure_store_metadata(
+                self._store, self._backends, self._settings, index_path
+            )
             if embedding_rebuild:
                 _LOGGER.warning(
                     "re-embedding stored memories for space %s", self._backends.space_id
@@ -1066,57 +1066,6 @@ class Memory:
         """Merge staged Zvec vectors into the configured index."""
         return self._projection.optimize()
 
-    def _ensure_store_metadata(self, index_path: Path) -> tuple[bool, bool]:
-        expected = {
-            STORE_METADATA_KEYS["model"]: self._backends.embedding_model,
-            STORE_METADATA_KEYS["space"]: self._backends.space_id,
-            STORE_METADATA_KEYS["transcription"]: self._backends.transcription_space,
-            STORE_METADATA_KEYS["dimension"]: str(self._backends.embedding_dimension),
-            STORE_METADATA_KEYS["index"]: self._settings.index_recipe,
-        }
-        if self._backends.face_analyzer is not None:
-            expected[STORE_METADATA_KEYS["face"]] = self._backends.face_space
-            expected[STORE_METADATA_KEYS["face_analysis"]] = self._backends.face_analysis_space
-        rebuild_index = False
-        rebuild_embeddings = False
-        legacy_embedding_spaces = cast(
-            frozenset[str],
-            getattr(self._backends.embedder, "_legacy_embedding_spaces", frozenset()),
-        )
-        with translate_storage_errors("validate local store metadata"):
-            for key, value in expected.items():
-                stored = self._store.get_metadata(key)
-                if stored is None:
-                    if key == STORE_METADATA_KEYS["index"] and index_path.exists():
-                        rebuild_index = True
-                        rebuild_embeddings = True
-                    else:
-                        self._store.set_metadata(key, value)
-                elif stored == value:
-                    continue
-                elif (
-                    requires_reembedding := known_metadata_upgrade(
-                        key,
-                        stored,
-                        legacy_embedding_spaces,
-                    )
-                ) is not None:
-                    rebuild_index = True
-                    rebuild_embeddings = rebuild_embeddings or requires_reembedding
-                else:
-                    raise StorageError(
-                        f"local store metadata mismatch for {key}: expected {value!r}, "
-                        f"found {stored!r}"
-                    )
-            if rebuild_index:
-                if index_path.exists():
-                    shutil.rmtree(index_path)
-                if not rebuild_embeddings:
-                    self._store.set_metadata(
-                        STORE_METADATA_KEYS["index"], self._settings.index_recipe
-                    )
-        return rebuild_index, rebuild_embeddings
-
     def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
         return self._ingestion.add_stream_input(item)
 
@@ -1125,7 +1074,10 @@ class Memory:
 
     def close(self) -> None:
         """Close model, index, and SQLite resources; repeated calls are harmless."""
-        if not self._lifecycle.begin_close():
+        # A constructor that failed before wiring already closed what it had opened and left
+        # nothing here to close, so this is the same no-op a closed instance gets.
+        lifecycle: Lifecycle | None = getattr(self, "_lifecycle", None)
+        if lifecycle is None or not lifecycle.begin_close():
             return
         try:
             with self._write_lock:

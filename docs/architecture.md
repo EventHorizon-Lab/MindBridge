@@ -52,9 +52,10 @@ The pure modules beside them -- `content.py` for what the caller gave, `derived.
 model derived, `temporal.py`, `ranking.py`, `contracts.py`, `validation.py`, `settings.py` --
 read no storage and call no model; they are the functions the planes agree on, and they are
 where a rule about identity, ranking, or derived text lives exactly once. Two small shared
-modules complete the kernel: `runtime.py` holds the `Storage` bundle, the `Index` protocol, and
-the boundary error translation every plane uses, and `tracing.py` holds the `Traced` base class
-that gives each plane its spans. The top-level `streams.py` holds the async observation streams
+modules complete the kernel: `runtime.py` holds the `Storage` bundle, the `Index` protocol, the
+boundary error translation every plane uses, and the store-marker reconciliation that decides
+whether an opening store must rebuild its index or re-embed, and `tracing.py` holds the `Traced`
+base class that gives each plane its spans. The top-level `streams.py` holds the async observation streams
 over `AsyncMemory`.
 
 `infrastructure/local/store/` mirrors the same discipline for SQLite. `LocalStore` owns one
