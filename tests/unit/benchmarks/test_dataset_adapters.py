@@ -1007,7 +1007,11 @@ def test_longmemeval_labels_the_answer_turn_and_every_block_it_was_split_into(
 
 def test_longmemeval_source_labels_are_evaluator_only(tmp_path: Path) -> None:
     """Changing release labels cannot change stored memories or their gold join."""
-    from mindbridge.benchmarks.eval import _cache_task, _memory_content, _memory_metadata
+    from mindbridge.benchmarks.eval import (
+        _cache_task,
+        _memory_content,
+        _memory_metadata,
+    )
     from mindbridge.benchmarks.longmemeval import LONGMEMEVAL_ADAPTER_VERSION
 
     def load_with_labels(first: str, second: str) -> LoadedTask:

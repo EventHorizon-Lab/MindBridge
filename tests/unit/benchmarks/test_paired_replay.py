@@ -17,7 +17,8 @@ from types import ModuleType
 import httpx
 import pytest
 
-from mindbridge.benchmarks.eval import _BaselineGenerator, _load_memory_config
+from mindbridge.benchmarks.eval_arms import _BaselineGenerator
+from mindbridge.benchmarks.eval_config import _load_memory_config
 from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.types import SearchHit
 

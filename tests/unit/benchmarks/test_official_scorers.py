@@ -10,10 +10,13 @@ from typing import Any, cast
 
 import pytest
 
-import mindbridge.benchmarks.eval as eval_module
-from mindbridge.benchmarks.eval import SampleResult, _apply_judges, _metrics
+from mindbridge.benchmarks import eval_config as eval_config_module
+from mindbridge.benchmarks import eval_judge as eval_judge_module
 from mindbridge.benchmarks.eval_adapters import EvalQuestion, EvalUnit, LoadedTask
 from mindbridge.benchmarks.eval_cache import CachedAnswer
+from mindbridge.benchmarks.eval_judge import _apply_judges
+from mindbridge.benchmarks.eval_metrics import _metrics
+from mindbridge.benchmarks.eval_results import SampleResult
 from mindbridge.benchmarks.eval_telemetry import BENCHMARK_JUDGE_SPAN, EvaluationTelemetry
 from mindbridge.benchmarks.official_scorers import (
     JudgeMessage,
@@ -287,7 +290,7 @@ async def test_atm_official_judge_uses_minimal_reasoning() -> None:
         metadata={"qtype": "open_end"},
     )
 
-    scores, _, _ = await eval_module._judge_call(
+    scores, _, _ = await eval_judge_module._judge_call(
         cast(Any, SimpleNamespace(responses=Responses())),
         plan.calls[0],
         sample=sample,
@@ -295,7 +298,7 @@ async def test_atm_official_judge_uses_minimal_reasoning() -> None:
         call_index=0,
         cache=None,
         semaphore=asyncio.Semaphore(1),
-        config=eval_module._JudgeConfig(
+        config=eval_config_module._JudgeConfig(
             model="gpt-5-mini",
             base_url="https://api.openai.com/v1",
         ),
@@ -340,7 +343,7 @@ async def test_judge_cache_hit_does_not_create_a_model_node() -> None:
     )
     telemetry = EvaluationTelemetry()
     try:
-        scores, _, cached = await eval_module._traced_judge_call(
+        scores, _, cached = await eval_judge_module._traced_judge_call(
             cast(Any, SimpleNamespace()),
             plan.calls[0],
             sample=sample,
@@ -348,7 +351,7 @@ async def test_judge_cache_hit_does_not_create_a_model_node() -> None:
             call_index=0,
             cache=cast(Any, Cache()),
             semaphore=asyncio.Semaphore(1),
-            config=eval_module._JudgeConfig(
+            config=eval_config_module._JudgeConfig(
                 model="gpt-5-mini",
                 base_url="https://api.openai.com/v1",
             ),
@@ -428,7 +431,7 @@ def test_results_mark_proxy_judge_metrics_nonofficial(tmp_path: Path) -> None:
         judge_model="qwen3.8-27b",
     )
     arguments = cast(
-        eval_module._Arguments,
+        eval_config_module._Arguments,
         SimpleNamespace(seed=7, bootstrap_samples=20, recall_limit=20, blind=False),
     )
 
@@ -502,14 +505,14 @@ async def test_unified_eval_applies_and_records_the_official_judge(
         scorer_protocol="locomo_refined_judge_887091190789",
     )
     arguments = cast(
-        eval_module._Arguments,
+        eval_config_module._Arguments,
         SimpleNamespace(quiet=True, use_cache=None, run_id="run", log_samples=True),
     )
     judged = await _apply_judges(
         (task,),
         (sample,),
         arguments=arguments,
-        config=eval_module._JudgeConfig(
+        config=eval_config_module._JudgeConfig(
             model="qwen3-14b",
             base_url="https://judge.example/v1",
             api_key="EMPTY",

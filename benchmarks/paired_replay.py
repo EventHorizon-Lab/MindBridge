@@ -1095,7 +1095,9 @@ async def worker(  # noqa: C901 - compile and store-free control share capture s
     plan_path: Path, output: Path, arm: str
 ) -> int:
     from mindbridge import ContextBudget
-    from mindbridge.benchmarks.eval import _BackendPool, _BaselineGenerator, _load_memory_config
+    from mindbridge.benchmarks.eval import _BackendPool
+    from mindbridge.benchmarks.eval_arms import _BaselineGenerator
+    from mindbridge.benchmarks.eval_config import _load_memory_config
     from mindbridge.benchmarks.model_config import ModelConfig
 
     plan = _load_plan(plan_path)

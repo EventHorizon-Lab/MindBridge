@@ -13,7 +13,8 @@ from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from mindbridge.benchmarks.eval import _BackendPool, _jsonl_bytes
+from mindbridge.benchmarks.eval import _BackendPool
+from mindbridge.benchmarks.eval_artifacts import _jsonl_bytes
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.locomo_refined import (
     LOCOMO_REFINED_ADAPTER_VERSION,
