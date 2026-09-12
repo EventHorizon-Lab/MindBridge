@@ -68,7 +68,7 @@ Memory(
     retrieval_mode: RetrievalMode = RetrievalMode.HYBRID,
     minimum_relevance: float = 0.10,
     ambiguity_margin: float = 0.01,
-    evidence_budget_chars: int | None = None,
+    evidence_budget_chars: int | None = 24_000,
     decay_half_life_days: float | None = None,
     reinforce_on_answer: bool = True,
     speaker_similarity: float = 0.78,
@@ -120,10 +120,12 @@ and resolved speaker names out of retrieval text and out of `add`-time identity 
 and absent from the first `limit` of them contributes its best hit in the last slot, so one
 modality cannot shut the others out.
 
-`evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer keeps
-those hits and then admits more ranked evidence while its text-equivalent cost fits the budget:
-2,000 characters per image, 4,000 per audio asset, and 12,000 per video asset. It raises a floor
-rather than imposing a ceiling, so bound a prompt by lowering `limit` and leaving the budget unset.
+`evidence_budget_chars` (default `24_000`) keeps the `limit` hits and then admits more ranked
+evidence while its text-equivalent cost fits the budget: 2,000 characters per image, 4,000 per
+audio asset, and 12,000 per video asset. `None` grounds `ask()` on exactly `limit` hits. The
+budget raises a floor rather than imposing a ceiling, so bound a prompt by lowering `limit` and
+setting the budget to `None`; `AnswerResult.hits` reports every record the answer was grounded on,
+which with the default budget is usually more than `limit` on a corpus of short records.
 The per-setting semantics and calibration notes live in
 [configuration](../configuration.md#local-memory-settings).
 

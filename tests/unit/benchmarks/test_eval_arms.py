@@ -1348,13 +1348,17 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     assert rows[0]["official_metric"] is True
     assert rows[1]["official_metric"] is False
     assert arms["selected"] == [DEFAULT_ARM, "blind", "random"]
-    assert arms["retrieval_candidate_limit"] == 60
+    # No config file, so the product default budget applies and `ask` ranks the full pool.
+    assert arms["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
     assert arms["retrieval_candidate_limit_arm"] == DEFAULT_ARM
     assert arms["search_e2e_limit"] == arguments.recall_limit
     definitions = cast(dict[str, dict[str, object]], arms["definitions"])
     assert set(definitions) == {DEFAULT_ARM, "blind", "random"}
-    assert definitions[DEFAULT_ARM]["retrieval_candidate_limit"] == 60
-    assert definitions[DEFAULT_ARM]["answer_retrieval_candidate_limit"] == 60
+    assert definitions[DEFAULT_ARM]["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+    assert definitions[DEFAULT_ARM]["answer_retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+    assert definitions[DEFAULT_ARM]["retrieval_candidate_limit_basis"] == (
+        "full rerank pool because evidence_budget_chars is configured"
+    )
     assert definitions[DEFAULT_ARM]["answer_surface"] == {"atm-bench-main": "ask"}
     assert (
         definitions[DEFAULT_ARM]["compile_surface_prompt"]
@@ -1366,7 +1370,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     assert definitions["blind"]["prompt"] == eval_module.BLIND_PROMPT_VERSION
     assert definitions["blind"]["official_metrics"] is False
     retrieval = {row["arm"]: cast(dict[str, object], row["retrieval"]) for row in rows}
-    assert retrieval[DEFAULT_ARM]["retrieval_candidate_limit"] == 60
+    assert retrieval[DEFAULT_ARM]["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
     assert retrieval["random"]["retrieval_candidate_limit"] == arguments.recall_limit
     assert "retrieval_candidate_limit" not in retrieval["blind"]
     assert results["status"] == "completed_with_errors"
@@ -1379,11 +1383,21 @@ def test_answer_retrieval_candidate_limit_matches_budget_policy() -> None:
         embedding=OpenAIEmbeddingConfig(provider="openai"),
         settings=MemoryConfig(evidence_budget_chars=4_242),
     )
+    unbudgeted = MindBridgeConfig(
+        embedding=OpenAIEmbeddingConfig(provider="openai"),
+        settings=MemoryConfig(evidence_budget_chars=None),
+    )
 
-    assert eval_module._answer_retrieval_candidate_limit(1, None) == 3
-    assert eval_module._answer_retrieval_candidate_limit(20, None) == 60
-    assert eval_module._answer_retrieval_candidate_limit(50, None) == RETRIEVAL_CANDIDATE_LIMIT
+    assert eval_module._answer_retrieval_candidate_limit(1, unbudgeted) == 3
+    assert eval_module._answer_retrieval_candidate_limit(20, unbudgeted) == 60
+    assert (
+        eval_module._answer_retrieval_candidate_limit(50, unbudgeted) == RETRIEVAL_CANDIDATE_LIMIT
+    )
     assert eval_module._answer_retrieval_candidate_limit(1, budgeted) == RETRIEVAL_CANDIDATE_LIMIT
+    # Without a config file the harness builds `Memory` from the product defaults, which carry a
+    # budget, so the mirror has to report the full pool there as well.
+    assert MemoryConfig().evidence_budget_chars is not None
+    assert eval_module._answer_retrieval_candidate_limit(1, None) == RETRIEVAL_CANDIDATE_LIMIT
 
 
 def test_baseline_generator_uses_the_configured_generation_model(

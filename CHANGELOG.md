@@ -579,6 +579,22 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   key even when the clip had no speech, so every clip was uploaded to the embedder twice; a clip
   with a transcript still is, since its aggregate key carries the transcript. Text memories keep
   the label.
+- `MemoryConfig.evidence_budget_chars` defaults to `24_000` instead of `None`, so `ask()` grounds
+  on the `limit` hits and then on as many further ranked records as fit 24,000 characters of
+  evidence (media charged at its text equivalent), up to the 100-record rerank pool. A record
+  count was the wrong unit for the grounding window: record size is the caller's, so `limit=12`
+  was 2.5 k characters on a dialogue corpus and 12 k on a chat-assistant one. Measured paired
+  against a same-code control on the 2026-09-11 baseline reader, the default widened
+  LoCoMo-Refined's window from 12 to ~100 turns for +0.090 [+0.042, +0.110] on three development
+  conversations and +0.076 [+0.054, +0.098] on four held-out ones, cutting refusals from 70 to 24
+  of 592; widened LongMemEval-S from 12 to ~26 turns for +0.067 [+0.017, +0.117]; and widened
+  MemLens from 12 to ~17 turns for no change. The cost is the answer prompt: 4.8x the tokens and
+  2x the latency on the short-turn corpus, unchanged where records were already long.
+  `AnswerResult.hits`, `/v1/ask`, and `ask_memory` therefore report more than `limit` hits by
+  default; lower the budget to trade evidence for tokens, or set it to `None` to restore the
+  exact-`limit` window. The setting's calibration note in `plugins.py` records the measurement,
+  including the 8,000-character point (+0.055 / +0.063 on LoCoMo at 2.1x the tokens, half a row
+  on LongMemEval).
 - **Breaking:** `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` declare
   a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
   `isinstance` checks the method name rather than its signature, so a custom backend written
@@ -964,6 +980,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   shape of an identifier. The same label is written as a text part immediately before the
   asset's own media parts, so the number is defined where the media is: a short video that
   arrives as several stills no longer shifts every later attachment by the extra frames.
+- `mindbridge-bench eval` reports the settings it ran with. The effective-config `config.yaml`,
+  the `memory_config` block of `results.jsonl`, and the resume checkpoints echoed the parsed
+  file's `reinforce_on_answer: true` while every product arm ran with it pinned to `false`; they
+  now carry the pinned value, so a run interrupted under the previous code cannot be `--resume`d
+  by the new one and re-ingests instead. `arms.definitions.*.retrieval_candidate_limit` and its
+  `_basis` also read the product default budget when the run has no config file, instead of
+  reporting `min(100, recall_limit * 3)` for a window `ask` actually ranked 100 deep.
 - `recall_planning` now actually plans under `mindbridge-bench eval`. The harness lends one
   answerer to every isolated store through a forwarding proxy, and `Memory` probes the optional
   `RecallPlanningBackend` capability with `isinstance` against a `runtime_checkable` protocol --
