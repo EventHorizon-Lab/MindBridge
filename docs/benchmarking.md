@@ -357,7 +357,7 @@ mindbridge-bench eval \
 
 | Arm | Answers from | Retrieval | Reports |
 | --- | --- | --- | --- |
-| `mindbridge` | `Memory.ask` over retrieved evidence | the product's | every metric |
+| `mindbridge` | `Memory.ask` over retrieved evidence, or -- on the tasks `task_answer_surface` maps to `compile`, today `personamem-v3` -- the generator over `Memory.compile`'s bundle | the product's | every metric |
 | `blind` | the generator's prior, with no evidence | none | answer metrics only |
 | `full-context` | the corpus stuffed into one prompt, oldest first, under `--full-context-chars` | none | answer metrics only |
 | `random` | nothing; it generates no answer | a seeded shuffle of an independently fetched top-100 pool for gold-labelled questions (`recall_limit` otherwise) | retrieval metrics only |
@@ -585,7 +585,9 @@ Protocol boundaries that affect interpretation are explicit rather than approxim
   `final_score`. As in upstream `report_results.py`, its category result uses `tau_norm`.
 - PersonaMem-v3 reads the released fields and causally masks future events. Task families requiring
   structured actions, response-threaded clusters, or paired-row deltas carry no official headline;
-  `profile.json` is scorer-side ground truth and is never ingested as memory.
+  `profile.json` is scorer-side ground truth and is never ingested as memory. Its product arm
+  answers through `Memory.compile` and the configured generator rather than `Memory.ask`; see the
+  note "One task answers through `Memory.compile`" under "Results and reproducibility" below.
 - SuperMemory-VQA reports `qa_accuracy`; `qa_mrr` is unavailable because the answer backend does
   not expose answer-option scores.
 - OpenEQA reports 0--100 `llm_match` plus `llm_match_score_1_5`. Its fixed-history adapter is
@@ -935,9 +937,9 @@ which is the honest state and not a defect to paper over.
 | `mem-gallery` | `clue_ids`, the clue round IDs | Exact |
 | `worldmemarena` | Gold `image_id` and scorer-authored `memory_id` points | Exact for image IDs; `mp_*` memory points are unresolved rather than leaked into memory |
 | `mm-lifelong` | `total_intervals`, and `clue_intervals[].video_id` on the week and month splits | Interval-level only, and already reported as the official `ref_at_300`. The clue video IDs cannot be joined: prepared clips are keyed by file stem, not by release video ID |
-| `supermemory-vqa` | `question_evidence.time_spans[].video_id`, kept as `source_video_ids` | Source-video level only. The join exists — `prepare_media` writes `<video_id>-video-#####` — but scoring it needs a group recall ("any clip of each gold video"), a different operator from the exact set recall above. Not implemented |
+| `supermemory-vqa` | `question_evidence.time_spans[].video_id`, kept as `source_video_ids` | Source-video level only. The join exists — `prepare_media` writes `<video_id>-video-#####` — and the group operator ("any clip of each gold video") now exists as `evidence_groups`, but the adapter does not yet emit the clip groups. Not wired |
 | `m3-bench` | `timestamp` and `before_clip` | Not derivable: both say when the question is asked, not where the answer is |
-| `memlens` | Nothing beyond the answer | Not derivable |
+| `memlens` | `answer_session_ids`, the sessions holding the answer, on every row; refusal rows list none | Exact at session level. One memory is one turn, so each answer session is one group of stored turn IDs (`evidence_groups`) and counts as retrieved when any of them is ranked; the random-ranker row uses the matching hypergeometric expectation |
 | `clbench` | `context_id`, which names the whole unit | Not derivable: a label equal to the unit cannot separate rankers |
 | `beam` | Rubrics and reference answers; `turns[].id` is a turn's own index and no question refers to one | Not derivable |
 | `personamem-v3` | Slate-internal `_origin` and `_held_out_persona_item` | Unresolved. Those fields are deliberately excluded from the rendered slate because they are the answer; whether `_origin` names a `source_object_id` that matches an `event_id` needs a check against the corpus |
@@ -945,7 +947,7 @@ which is the honest state and not a defect to paper over.
 | `openeqa` | `episode_history`, which is the unit | Not derivable |
 | `video-mme-v2` | Nothing beyond the answer | Not derivable |
 
-So exact retrieval quality is measurable on five families in the catalog, plus the image-labelled
+So exact retrieval quality is measurable on six families in the catalog, plus the image-labelled
 subset of WorldMemArena. Its `recall_at_20` remains a diagnostic for those compatible source-ID
 labels, not a universal benchmark metric.
 
@@ -1050,7 +1052,7 @@ optional model-server counter deltas split around each judge pass, so judge work
 the product measurement window. `--stream-results` remains accepted as an explicit spelling of the
 default.
 
-Three result fields carry a caveat that decides whether they can be quoted:
+Several result fields carry a caveat that decides whether they can be quoted:
 
 - **`official_metric` means the pinned upstream protocol publishes that metric and, for a judged
   one, that the required judge produced it.** The retrieval and joint diagnostics -- `retrieval_*`
@@ -1080,6 +1082,28 @@ Three result fields carry a caveat that decides whether they can be quoted:
   silently comparable with an earlier `strict` run of the same task. `--answer-policy`, or
   `benchmark.run.answer_policy`, overrides the whole table for one run when the policy itself is
   what is being measured; the resolved `config.yaml` records it as `answer_policy_override`.
+- **One task answers through `Memory.compile` rather than `Memory.ask`.**
+  `mindbridge.benchmarks.prompts.task_answer_surface` maps each task to the product surface the
+  `mindbridge` arm answers through, and one is `compile`: `personamem-v3`. `Memory.ask` answers
+  only from retrieved hits, uses no outside knowledge, and abstains when they are thin -- the
+  contract for a question whose answer is in memory. PersonaMem-v3's chatbot, agentic, and
+  proactive families instead ask for an assistant's response -- write a post in the user's
+  voice, answer a how-to question, decide whether to nudge -- and are judged as one. Measured on
+  the 2026-09-11 baseline run under `ask`, abstention was 84 % on `proactive_actions`, 46 % on
+  `chatbot_response`, 42 % on `agentic`, and every abstained row on a personalize or agentic
+  task type scored zero (on `over_personalization` a refusal scores above an answer, which is a
+  quirk of that family's rubric, not evidence the surface fits). On a `compile` task the product
+  arm calls `Memory.compile` under the `--compile-max-*` budget, renders the bundle, and hands it
+  to the configured generator under a harness-owned assistant prompt, versioned
+  `mindbridge_compile_surface_v1`: general knowledge allowed, no facts about the user the
+  memories do not support. It is the same generator the baselines use, but not the same prompt
+  -- the `compile` baseline keeps the full-context wording. Such a task row and its sample rows
+  carry `answer_policy: null`, since no `ask` request was made, and `arms.definitions.mindbridge`
+  records the `answer_surface` table for the run's tasks. Retrieval metrics need the ranked list
+  `ask` exposes and `Memory.compile` exposes none, so on a `compile` task the product rows carry
+  no ranked list and are neither flagged nor scored for retrieval (PersonaMem-v3 carries no gold
+  source IDs in any case). The surface table is part of the response-cache namespace, so
+  widening it cannot replay a task's older `ask` answers.
 - **A task whose query prompt mandates a format or a refusal wording puts that wording into
   retrieval, not only into generation.** `EvalQuestion.content` is what the runner passes to
   `Memory.ask`, and `ask` takes one content input for both legs, so the instruction is matched

@@ -868,6 +868,13 @@ def _memlens(
             for turn in session.turns
         )
         prompt = MEMLENS_QUERY_PROMPT.text.format(question=question.question)
+        # The release labels the answer at session level only, and one memory here is one
+        # turn, so the gold label is a group of stored turn IDs per answer session: a session
+        # is retrieved when any turn of it is ranked. Refusal rows name no answer session
+        # and so carry no gold, which is correct -- there is nothing to retrieve.
+        answer_sessions = tuple(
+            session for session in question.sessions if session.is_answer_session
+        )
         units.append(
             EvalUnit(
                 question.question_id,
@@ -881,6 +888,14 @@ def _memlens(
                             "question_type": question.question_type,
                             "question_subtype": question.question_subtype,
                             "old_answer": question.old_answer,
+                            "answer_session_ids": tuple(
+                                session.session_id for session in answer_sessions
+                            ),
+                            "evidence_groups": tuple(
+                                tuple(turn.turn_id for turn in session.turns)
+                                for session in answer_sessions
+                                if session.turns
+                            ),
                         },
                         reference_at=question.question_date,
                         source_question=question.question,

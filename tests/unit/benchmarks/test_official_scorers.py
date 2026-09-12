@@ -19,6 +19,7 @@ from mindbridge.benchmarks.official_scorers import (
     JudgeMessage,
     JudgePlan,
     combine_judge_scores,
+    gold_source_groups,
     judge_model_is_official,
     judge_plan,
     local_scores,
@@ -1061,3 +1062,11 @@ def test_retrieval_gold_ids_come_from_any_labelled_question() -> None:
     assert retrieval_gold_ids("locomo-refined", {"evidence_ids": ["D1:3"]}) == ("D1:3",)
     assert retrieval_gold_ids("longmemeval-s", {"evidence_ids": ["s1_T0002"]}) == ("s1_T0002",)
     assert retrieval_gold_ids("memlens-32k", {"question_type": "temporal"}) == ()
+    # A session-level label is one group of turn IDs per answer session; the ranked retrieval
+    # query has to be able to reach every member, so the groups are flattened here.
+    assert retrieval_gold_ids(
+        "memlens-32k", {"evidence_groups": [["s1_T0000", "s1_T0001"], ["s2_T0003"]]}
+    ) == ("s1_T0000", "s1_T0001", "s2_T0003")
+    # One parser for both readers: a label of blanks is no label to either of them.
+    assert retrieval_gold_ids("memlens-32k", {"evidence_groups": [["  "]]}) == ()
+    assert gold_source_groups({"evidence_ids": ["a", "", "a"]}, "evidence_ids") == (("a",),)

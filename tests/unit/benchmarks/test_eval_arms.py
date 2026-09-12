@@ -749,6 +749,76 @@ def test_compile_arm_answers_from_a_rendered_bundle_via_the_public_sdk(tmp_path:
     assert "Ada signed the contract" in rendered_context
 
 
+def test_the_product_arm_answers_a_compile_surface_task_from_the_compiled_bundle(
+    tmp_path: Path,
+) -> None:
+    """On a task `task_answer_surface` maps to `compile`, the product arm is `Memory.compile`
+    plus the generator standing in for the host assistant -- under the assistant prompt, not the
+    baseline's "answer only, guess" one -- and never reaches `Memory.ask`."""
+    generator = _RecordingGenerator("a post in your voice")
+    arm = _Arm(DEFAULT_ARM, generator=cast(eval_module._BaselineGenerator, generator))
+    _, _, question = _task(labelled=False)
+
+    async def run() -> eval_module._AnswerOutcome | BaseException:
+        async with AsyncMemory(
+            Memory(tmp_path, embedder=_TinyEmbedder(), minimum_relevance=0)
+        ) as memory:
+            await memory.add("Ada signed the contract")
+            answered = await _answer_many(
+                memory,
+                (question,),
+                request_concurrency=1,
+                recall_limit=20,
+                arm=arm,
+                task_name="personamem-v3",
+                unit_id="unit",
+                compile_budget=ContextBudget(max_items=5, max_chars=2_000),
+            )
+            return answered[0]
+
+    outcome = asyncio.run(run())
+    assert not isinstance(outcome, BaseException)
+    assert outcome.prediction == "a post in your voice"
+    assert outcome.compiled_items is not None and outcome.compiled_items >= 1
+    assert len(generator.calls) == 1
+    _, rendered = generator.calls[0]
+    assert rendered is not None and rendered.startswith("# Context: who signed it?")
+    assert generator.media_calls[0]["system_prompt"] == eval_module._COMPILE_SURFACE_SYSTEM_PROMPT
+    # No `ask` request was made, so the row records no policy; and with no ranked list to
+    # observe the row is not flagged as a missing retrieval diagnostic.
+    assert outcome.retrieval_diagnostic_error is None
+    task, unit, _ = _task("personamem-v3", labelled=False)
+    row = _sample(
+        task, unit, question, outcome, ingest_failures=0, predict_only=True, log_samples=False
+    )
+    assert row.answer_policy is None
+    assert not row.abstained
+
+
+def test_the_product_arm_keeps_asking_on_an_ask_surface_task_even_with_a_generator() -> None:
+    """A multi-task run lends the product arm a generator for its compile-surface task; that
+    must not turn its other tasks into a full-context baseline."""
+    generator = _RecordingGenerator()
+    arm = _Arm(DEFAULT_ARM, generator=cast(eval_module._BaselineGenerator, generator))
+    memory = _RankedMemory((), ())
+    _, _, question = _task(labelled=False)
+
+    outcome = _outcome(memory, question, arm=arm, task_name="atm-bench")
+
+    assert outcome.prediction == "Ada."
+    assert memory.asked == 1
+    assert generator.calls == []
+
+
+def test_the_generator_is_built_for_the_product_arm_only_when_a_task_needs_the_compile_surface() -> (
+    None
+):
+    assert eval_module._generator_arms(("mindbridge",), ("locomo-refined",)) == frozenset()
+    assert eval_module._generator_arms(("mindbridge",), ("personamem-v3",)) == {"mindbridge"}
+    assert eval_module._generator_arms(("mindbridge", "blind"), ("locomo-refined",)) == {"blind"}
+    assert eval_module._generator_arms(("compile", "random"), ("personamem-v3",)) == {"compile"}
+
+
 def test_compile_arm_records_partial_sources_separately_from_full_evidence(
     tmp_path: Path,
 ) -> None:
@@ -1285,7 +1355,12 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     assert set(definitions) == {DEFAULT_ARM, "blind", "random"}
     assert definitions[DEFAULT_ARM]["retrieval_candidate_limit"] == 60
     assert definitions[DEFAULT_ARM]["answer_retrieval_candidate_limit"] == 60
-    assert definitions[DEFAULT_ARM]["retrieval"] == (
+    assert definitions[DEFAULT_ARM]["answer_surface"] == {"atm-bench-main": "ask"}
+    assert (
+        definitions[DEFAULT_ARM]["compile_surface_prompt"]
+        == eval_module.COMPILE_SURFACE_PROMPT_VERSION
+    )
+    assert cast(str, definitions[DEFAULT_ARM]["retrieval"]).startswith(
         "Memory.ask in-answer ranked list; no second scoring search"
     )
     assert definitions["blind"]["prompt"] == eval_module.BLIND_PROMPT_VERSION

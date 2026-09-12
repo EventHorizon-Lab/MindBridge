@@ -385,7 +385,32 @@ def metric_is_official(task: str, metric: str, judge_model: str, *, uses_judge: 
     return judge_model_is_official(task, judge_model)
 
 
-_GOLD_SOURCE_KEYS = ("evidence_ids", "clue_ids")
+# Gold retrieval labels, in the order one question's label is looked up. `evidence_ids` and
+# `clue_ids` name gold sources one by one; `evidence_groups` nests one sequence of source IDs per
+# gold group, any one of which retrieved counts -- a release that labels the answering session
+# while one memory is one turn (MEMLENS) publishes exactly that.
+GOLD_SOURCE_KEYS = ("evidence_ids", "clue_ids", "evidence_groups")
+
+
+def gold_source_groups(metadata: Mapping[str, object], key: str) -> tuple[tuple[str, ...], ...]:
+    """Return one label as groups of source IDs, any one of which is a hit, in label order.
+
+    A flat label is one singleton group per ID, so exact set recall is the special case of
+    group recall where every group has one member and the two formulas coincide. Blank members
+    are not IDs and are dropped, so a label of blanks is no label.
+    """
+    value = metadata.get(key)
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    groups: list[tuple[str, ...]] = []
+    for item in value:
+        members = (
+            item if isinstance(item, Sequence) and not isinstance(item, str | bytes) else (item,)
+        )
+        group = tuple(dict.fromkeys(str(member) for member in members if str(member).strip()))
+        if group:
+            groups.append(group)
+    return tuple(dict.fromkeys(groups))
 
 
 def retrieval_gold_ids(task: str, metadata: Mapping[str, object]) -> tuple[str, ...]:
@@ -394,10 +419,13 @@ def retrieval_gold_ids(task: str, metadata: Mapping[str, object]) -> tuple[str, 
     Any adapter that labels a question with stored source IDs gets the ranked retrieval query and
     a measured recall; keying this on two families left LoCoMo and LongMemEval, which carry exact
     turn-level labels, with a recall number computed from the generator's citations instead.
+    Groups are flattened: every member is a source the ranked query has to be able to reach.
     """
     del task
-    for key in _GOLD_SOURCE_KEYS:
-        sources = _deduplicated_sources(_metadata_values(metadata, key))
+    for key in GOLD_SOURCE_KEYS:
+        sources = tuple(
+            dict.fromkeys(member for group in gold_source_groups(metadata, key) for member in group)
+        )
         if sources:
             return sources
     return ()

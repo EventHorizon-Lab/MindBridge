@@ -147,6 +147,47 @@ def test_memlens_reads_direct_and_data_wrapped_releases_without_changing_root_er
     assert load_memlens(direct_path) == wrapped
 
 
+def test_memlens_marks_the_published_answer_sessions_and_rejects_ones_outside_the_haystack(
+    tmp_path: Path,
+) -> None:
+    """`answer_session_ids` is the only gold retrieval label MEMLENS publishes.
+
+    Every released row carries it, as a subset of `haystack_session_ids`; refusal rows carry
+    an empty list. Dropping it left the task's retrieval quality reported as unmeasurable.
+    """
+    record = {
+        "question_id": "q1",
+        "question_type": "information_extraction",
+        "question": "What is my favorite color?",
+        "answer": "Blue.",
+        "question_date": "2025/01/15 (Wed) 10:00",
+        "haystack_dates": ["2025/01/13 (Mon) 09:00", "2025/01/14 (Tue) 09:00"],
+        "haystack_session_ids": ["sess_a", "sess_b"],
+        "answer_session_ids": ["sess_b"],
+        "haystack_sessions": [
+            [{"role": "user", "content": "It rained today."}],
+            [{"role": "user", "content": "My favorite color is blue."}],
+        ],
+    }
+    (question,) = load_memlens(_write(tmp_path / "labelled.json", [record]))
+    assert [session.is_answer_session for session in question.sessions] == [False, True]
+
+    refusal = {**record, "question_id": "q2", "answer_session_ids": []}
+    (unlabelled,) = load_memlens(_write(tmp_path / "refusal.json", [refusal]))
+    assert not any(session.is_answer_session for session in unlabelled.sessions)
+
+    stray = {**record, "answer_session_ids": ["sess_zzz"]}
+    with pytest.raises(ValueError, match="names answer sessions outside its haystack"):
+        load_memlens(_write(tmp_path / "stray.json", [stray]))
+
+    # A file without published session IDs keeps loading: the label is checked against the
+    # IDs the loader synthesises, not against the absent list.
+    synthesised = {k: v for k, v in record.items() if k != "haystack_session_ids"}
+    synthesised["answer_session_ids"] = ["session_0001"]
+    (derived,) = load_memlens(_write(tmp_path / "synthesised.json", [synthesised]))
+    assert [session.is_answer_session for session in derived.sessions] == [False, True]
+
+
 def test_clbench_splits_the_question_off_its_reference_document(tmp_path: Path) -> None:
     document = "PARA ONE\n\nPARA TWO"
     records = [
