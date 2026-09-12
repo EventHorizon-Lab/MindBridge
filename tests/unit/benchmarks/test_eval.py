@@ -715,6 +715,21 @@ def test_response_cache_namespace_changes_with_the_answer_policy(
     assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
 
 
+def test_response_cache_namespace_changes_with_the_answer_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Widening `COMPILE_SURFACE_TASKS` must not replay a task's cached `ask` answers as answers
+    from the compiled bundle."""
+    from mindbridge.benchmarks import prompts
+
+    arguments = _namespace_arguments()
+    before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
+
+    monkeypatch.setattr(prompts, "COMPILE_SURFACE_TASKS", frozenset({"locomo-refined"}))
+
+    assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
+
+
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3836,6 +3851,53 @@ def test_memlens_attaches_its_published_images_only_where_the_file_is_present(
     assert content() == (captioned, image.resolve())
 
 
+def test_memlens_carries_its_answer_sessions_as_gold_turn_groups(tmp_path: Path) -> None:
+    """One memory is one turn and the release labels sessions, so the gold label is one group
+    of stored turn IDs per answer session; an empty turn is not stored and so is not gold."""
+    dataset = tmp_path / "memlens.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "information_extraction",
+                    "question": "What is my favorite color?",
+                    "answer": "Blue.",
+                    "question_date": "2025/01/15 (Wed) 10:00",
+                    "haystack_dates": ["2025/01/13 (Mon) 09:00", "2025/01/14 (Tue) 09:00"],
+                    "haystack_session_ids": ["sess_a", "sess_b"],
+                    "answer_session_ids": ["sess_b"],
+                    "haystack_sessions": [
+                        [{"role": "user", "content": "It rained today."}],
+                        [
+                            {"role": "user", "content": "My favorite color is blue."},
+                            {"role": "assistant", "content": ""},
+                            {"role": "assistant", "content": "Noted."},
+                        ],
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    auxiliary = tmp_path / "memlens" / "agent_subset_195.json"
+    auxiliary.parent.mkdir()
+    auxiliary.write_text(json.dumps({"n_questions": 1, "question_ids": ["q1"]}), encoding="utf-8")
+
+    loaded = load_task(
+        TASKS["memlens-32k"], root=tmp_path, dataset_path=dataset, verify_digest=False
+    )
+    unit = loaded.units[0]
+    question = unit.questions[0]
+
+    assert question.metadata["answer_session_ids"] == ("sess_b",)
+    assert question.metadata["evidence_groups"] == (("sess_b_T0000", "sess_b_T0002"),)
+    # Every gold member names a stored memory, so the join needs no unresolved report.
+    stored = {item.source_id for item in unit.memories}
+    assert set(question.metadata["evidence_groups"][0]) <= stored
+    assert "evidence_ids" not in question.metadata
+
+
 def test_memlens_questions_declare_the_refusal_their_own_prompt_mandates(tmp_path: Path) -> None:
     # Loading the real task, not the helper in isolation: a declaration the loader never attaches
     # returns the reported refusal rate to zero while the model keeps refusing, and a test of the
@@ -5372,6 +5434,23 @@ def test_only_the_task_whose_protocol_credits_no_abstention_asks_for_a_guess() -
 
     assert {"m3-bench-robot"} == BEST_EFFORT_TASKS
     assert set(TASKS) >= BEST_EFFORT_TASKS
+
+
+def test_only_personamem_answers_through_the_compile_surface() -> None:
+    """The one task whose queries want an assistant's response, not a fact read from memory.
+
+    `Memory.ask` uses no outside knowledge and abstains on thin evidence, which on the
+    2026-09-11 baseline left 84 % of PersonaMem-v3's proactive rows and 42-46 % of its agentic
+    and chatbot rows refused, every one scored zero. Every other task asks for something its
+    memories contain, and its abstentions are part of what it measures.
+    """
+    from mindbridge.benchmarks.prompts import COMPILE_SURFACE_TASKS, task_answer_surface
+    from mindbridge.benchmarks.task_catalog import TASKS
+
+    assert {"personamem-v3"} == COMPILE_SURFACE_TASKS
+    assert set(TASKS) >= COMPILE_SURFACE_TASKS
+    assert task_answer_surface("personamem-v3") == "compile"
+    assert task_answer_surface("locomo-refined") == "ask"
 
 
 @pytest.mark.asyncio

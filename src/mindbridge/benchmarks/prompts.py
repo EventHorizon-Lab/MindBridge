@@ -6,8 +6,11 @@ observe/recall path may read them, and they must never influence the shared answ
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 from mindbridge.types import AnswerPolicy
+
+AnswerSurface = Literal["ask", "compile"]
 
 # The tasks whose official evaluation gives no credit for "unknown" and whose question sets hold
 # no genuinely unanswerable item, so an abstention there is a lost point rather than a correct
@@ -17,6 +20,15 @@ from mindbridge.types import AnswerPolicy
 # LoCoMo's category 5 is adversarial, and Mem-Gallery's `AR` mandates its own refusal wording.
 # This is protocol alignment on the request side; no scorer is changed by it.
 BEST_EFFORT_TASKS = frozenset({"m3-bench-robot"})
+
+# The tasks whose queries ask for an assistant's response rather than a fact read out of memory.
+# `Memory.ask` answers only from retrieved hits, uses no outside knowledge, and abstains when the
+# hits are thin -- the right contract for a question with an answer in memory, and the wrong one
+# for "write this post in my voice" or "[system prompt] Decide: ping again, or stay silent".
+# Those tasks answer through `Memory.compile` plus the configured generator. One task has one
+# surface, ranking rows included. The measurements behind the mapping are in
+# docs/benchmarking.md, under "One task answers through `Memory.compile`".
+COMPILE_SURFACE_TASKS = frozenset({"personamem-v3"})
 
 
 def task_answer_policy(task_name: str, override: AnswerPolicy | None = None) -> AnswerPolicy:
@@ -28,6 +40,11 @@ def task_answer_policy(task_name: str, override: AnswerPolicy | None = None) -> 
     if override is not None:
         return override
     return "best_effort" if task_name in BEST_EFFORT_TASKS else "strict"
+
+
+def task_answer_surface(task_name: str) -> AnswerSurface:
+    """Return the product surface the default arm answers one task through."""
+    return "compile" if task_name in COMPILE_SURFACE_TASKS else "ask"
 
 
 @dataclass(frozen=True, slots=True)

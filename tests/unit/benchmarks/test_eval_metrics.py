@@ -786,6 +786,41 @@ def test_random_ranker_expectation_is_reported_next_to_measured_recall() -> None
     assert cast(Mapping[str, object], retrieval["candidate_pool_size"])["mean"] == pytest.approx(10)
 
 
+def test_group_labels_count_a_gold_session_as_retrieved_when_any_of_its_turns_is_ranked() -> None:
+    """MEMLENS labels the answering session while one memory is one turn.
+
+    Scoring that as exact set recall over every turn of the session would cap R@k by the
+    session's length; the honest operator is "any member of each group", with the random
+    ranker's expectation raised to match, and a singleton group is the old formula exactly.
+    """
+    sample = _sample(
+        "q1",
+        sources=("s1", "s2", "s3"),
+        gold=(("g1", "g2"), ("s3",)),  # type: ignore[arg-type]
+        candidate_count=10,
+        gold_key="evidence_groups",
+    )
+
+    retrieval = eval_module._retrieval_quality(
+        (sample,), seed=7, bootstrap_samples=32, recall_limit=100
+    )
+    measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
+    random_ranker = cast(Mapping[str, Mapping[str, object]], retrieval["random_ranker_recall_at_k"])
+
+    assert retrieval["gold_evidence_key"] == "evidence_groups"
+    assert retrieval["labelled_question_count"] == 1
+    # Neither group is reached at rank 1; the second group's only turn sits at rank 3.
+    assert cast(float, measured["1"]["mean"]) == pytest.approx(0.0)
+    assert cast(float, measured["5"]["mean"]) == pytest.approx(0.5)
+    # Hypergeometric: a two-turn session is hit at k = 1 with chance 0.2, a one-turn one with
+    # 0.1; both are certain once k reaches the pool.
+    assert cast(float, random_ranker["1"]["mean"]) == pytest.approx(0.15)
+    assert cast(float, random_ranker["10"]["mean"]) == pytest.approx(1.0)
+    assert eval_module._random_group_hit(10, 1, 5) == pytest.approx(0.5)
+    assert eval_module._random_group_hit(10, 1, 20) == pytest.approx(1.0)
+    assert eval_module._random_group_hit(10, 4, 7) == pytest.approx(1.0)
+
+
 def test_retrieval_cutoffs_use_the_actual_ask_candidate_window() -> None:
     sample = _sample("q1", sources=("s1",), gold=("s1",), candidate_count=20)
 

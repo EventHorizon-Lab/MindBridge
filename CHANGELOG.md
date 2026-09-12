@@ -10,6 +10,23 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `mindbridge-bench eval` answers `personamem-v3` through `Memory.compile` and the configured
+  generator instead of `Memory.ask`. `mindbridge.benchmarks.prompts.task_answer_surface` owns the
+  per-task mapping, next to `task_answer_policy`. `ask` answers only from retrieved hits with no
+  outside knowledge and abstains on thin evidence; PersonaMem-v3's chatbot, agentic, and proactive
+  families ask for an assistant's response and are judged as one. Measured on the 2026-09-11
+  baseline, `ask` abstained on 84 % of `proactive_actions`, 46 % of `chatbot_response` and 42 % of
+  `agentic` rows, every abstained personalize or agentic row scoring zero. The compiled bundle is
+  handed to the generator under a harness-owned assistant prompt, `mindbridge_compile_surface_v1`;
+  such rows carry `answer_policy: null`, the arm definition records the `answer_surface` table,
+  and the table is part of the response-cache namespace.
+- The MEMLENS adapter reads the release's `answer_session_ids` -- present on every row, empty on
+  refusal rows -- as `MemLensSession.is_answer_session` and emits them as `evidence_groups`: one
+  group of stored turn IDs per answer session, retrieved when any member is ranked. The retrieval
+  block scores group labels with that operator and a hypergeometric random-ranker row; a flat
+  `evidence_ids` label is the singleton case and keeps its numbers. MEMLENS retrieval quality was
+  reported as unmeasurable before this, and the benchmarking guide said the release published
+  no label.
 - `ask()` can plan how to retrieve before it retrieves, behind `recall_planning` (default
   `False`). Similarity answers "what is most like this"; it has no way to express what a count, a
   list of "all", an adjacency, or "everything about this person" asks for, and measured on the
