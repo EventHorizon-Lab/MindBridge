@@ -2344,6 +2344,14 @@ async def _run_arms(
                 total=sample_count,
                 enabled=not arguments.quiet,
             ) as progress,
+            # A unit writes its whole corpus before it answers one question, so the sample bar
+            # can sit at zero for an hour on a media task. The ingest bar is what proves that
+            # hour is progress. Its total is fixed for the task and known only to the runner,
+            # which is why the bar is deferred until the runner reports it; a second total would
+            # be rejected rather than resize the bar.
+            _deferred_progress(
+                f"ingesting {task.spec.name}", "item", enabled=not arguments.quiet
+            ) as ingest_progress,
             traced_span(
                 tracer,
                 BENCHMARK_TASK_SPAN,
@@ -2382,6 +2390,7 @@ async def _run_arms(
                 deliberate=arguments.deliberate,
                 tracer=tracer,
                 on_progress=progress,
+                on_ingest_progress=ingest_progress,
                 on_activity=progress.set_activity,
                 on_search_replay_ready=deferred_searches.append,
             )
@@ -2416,6 +2425,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     deliberate: bool = False,
     tracer: Tracer | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    on_ingest_progress: Callable[[int, int], None] | None = None,
     on_activity: Callable[[str], None] | None = None,
     on_search_replay_ready: Callable[[_SearchReplay], None] | None = None,
     prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
@@ -2433,8 +2443,19 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     completed = 0
     total = sum(len(unit.questions) for unit in task.units) * len(arms)
     notify_progress = on_progress or _ignore_progress
+    notify_ingest = on_ingest_progress or _ignore_progress
     notify_activity = on_activity or _ignore_activity
     unit_activities: list[str | None] = [None] * len(task.units)
+    # One bar spans the task rather than one per unit: concurrent workers would otherwise fight
+    # over the terminal, and what a reader wants is how much of the corpus is written, not which
+    # worker wrote it. An arm that reads no memory ingests nothing and draws no bar.
+    reads_memory = any(arm.reads_memory for arm in arms)
+    planned_ingest = tuple(
+        _planned_ingest_count(unit) if reads_memory else 0 for unit in task.units
+    )
+    ingest_total = sum(planned_ingest)
+    ingested_total = 0
+    notify_ingest(0, ingest_total)
     for index, unit in enumerate(task.units):
         queue.put_nowait((index, unit))
 
@@ -2452,6 +2473,20 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 else _IngestCheckpoint(run, unit.unit_id, ingest_digest)
             )
             reported = 0
+            reported_ingest = 0
+
+            def ingest_advanced(count: int, planned: int = planned_ingest[index]) -> None:
+                # A checkpoint resumes mid-corpus and a cached unit skips the corpus outright,
+                # so the count arrives as an absolute position and may not arrive at all. The
+                # clamp is not load-bearing -- `_IngestCheckpoint.start` already drops a note that
+                # runs past the first pending cutoff -- it only keeps a display value honest.
+                nonlocal ingested_total, reported_ingest
+                bounded = min(count, planned)
+                if bounded <= reported_ingest:
+                    return
+                ingested_total += bounded - reported_ingest
+                reported_ingest = bounded
+                notify_ingest(ingested_total, ingest_total)
 
             def activity(
                 phase: str, unit_index: int = index, unit_total: int = len(task.units)
@@ -2490,6 +2525,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 deliberate=deliberate,
                 tracer=tracer,
                 on_sample_completed=sample_completed,
+                on_ingested=ingest_advanced,
                 on_activity=activity,
                 on_store_ready=store_ready,
                 prefetch_speech=prefetch_speech,
@@ -2497,6 +2533,9 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             slots[index] = samples
             for _ in range(len(samples) - reported):
                 sample_completed()
+            # A unit that answered from the cache, or whose cutoffs stop short of its tail, wrote
+            # fewer items than planned. Settling its share here is what lets the bar finish.
+            ingest_advanced(planned_ingest[index])
             unit_activities[index] = None
             notify_activity(_activity_summary(unit_activities, len(task.units)))
             queue.task_done()
@@ -2750,15 +2789,21 @@ def _holds_anything(directory: Path) -> bool:
     return directory.is_dir() and any(directory.iterdir())
 
 
-def _checkpoint_writer(
+def _ingest_observer(
     checkpoint: _IngestCheckpoint | None,
     ingested: int,
     failures: Sequence[FailureDetail],
-) -> Callable[[int], None] | None:
-    """Note each committed chunk so a killed run resumes from it instead of from zero."""
-    if checkpoint is None:
-        return None
-    return lambda done: checkpoint.record(ingested + done, failures)
+    notify: Callable[[int], None],
+) -> Callable[[int], None]:
+    """Note each committed chunk: a killed run resumes from it, and a live bar advances on it."""
+
+    def observe(done: int) -> None:
+        written = ingested + done
+        if checkpoint is not None:
+            checkpoint.record(written, failures)
+        notify(written)
+
+    return observe
 
 
 async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one lifecycle
@@ -2783,12 +2828,14 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     deliberate: bool = False,
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
+    on_ingested: Callable[[int], None] | None = None,
     on_activity: Callable[[str], None] | None = None,
     on_store_ready: Callable[[], None] | None = None,
     prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     ordered = tuple((arm, question) for arm in arms for question in unit.questions)
     notify_store_ready = on_store_ready or _ignore_store_ready
+    notify_ingested = on_ingested or _ignore_ingested
     notify_activity = on_activity or _ignore_activity
     results: dict[tuple[str, str], SampleResult] = {}
     for arm in arms:
@@ -2852,6 +2899,8 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                 memories, cutoffs, memory_factory=memory_factory, data_dir=data_dir
             )
             ingest_failures = len(ingest_failure_details)
+            # A resumed store starts the bar where the killed run left it, not at zero.
+            notify_ingested(ingested)
         async with memory_factory(data_dir) as memory:
             for cutoff in cutoffs:
                 end = _prefix_end(memories, cutoff, pending)
@@ -2865,7 +2914,9 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                         tracer=tracer,
                         mode=ingest_mode,
                         arm=memory_arm,
-                        on_chunk=_checkpoint_writer(checkpoint, ingested, ingest_failure_details),
+                        on_chunk=_ingest_observer(
+                            checkpoint, ingested, ingest_failure_details, notify_ingested
+                        ),
                         prefetch=prefetch_speech,
                     )
                     ingested = end
@@ -5973,6 +6024,10 @@ def _ignore_activity(_activity: str) -> None:
     pass
 
 
+def _ignore_ingested(_written: int) -> None:
+    pass
+
+
 def _activity_summary(activities: Sequence[str | None], total: int) -> str:
     active = tuple((index, phase) for index, phase in enumerate(activities) if phase is not None)
     if not active:
@@ -7157,6 +7212,20 @@ def _memory_metadata(item: MemoryItem) -> dict[str, object]:
 
 def _memory_end(item: MemoryItem) -> float:
     return math.inf if item.end_seconds is None else item.end_seconds
+
+
+def _planned_ingest_count(unit: EvalUnit) -> int:
+    """Count the memories a unit will write, so an ingest bar has a total before it starts.
+
+    The causal cursor stops at the latest cutoff any question asks for, so a unit whose questions
+    all carry one never writes its tail. Counting from every question rather than from the pending
+    set holds the total still when a resumed run answers only some of them.
+    """
+    boundary = -math.inf
+    for question in unit.questions:
+        cutoff = math.inf if question.cutoff_seconds is None else question.cutoff_seconds
+        boundary = max(boundary, cutoff)
+    return sum(1 for item in unit.memories if _memory_end(item) <= boundary)
 
 
 def _prefix_end(memories: Sequence[MemoryItem], cutoff: float | None, start: int = 0) -> int:
