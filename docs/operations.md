@@ -78,7 +78,9 @@ Normal startup, add, delete, and search operations drain the SQLite outbox. Drai
 searchable at once; the Zvec flush that acknowledges them runs once 256 applied rows accumulate,
 when a drain applied a deletion, inside `optimize()` and `reindex()`, and at `close()`. Zvec also
 performs bounded automatic optimization after enough pending vectors or durable segments
-accumulate.
+accumulate. That bound is a write-side one that a session below roughly 65,000 written rows never
+reaches, so `close()` merges the durable segments as well whenever the session left more than one
+behind; a session that flushed once closes without merging.
 
 From the live owner, rebuild or optimize explicitly when measurement or diagnosis justifies it:
 
@@ -88,9 +90,10 @@ memory.optimize()
 print(f"reindexed {count} memories")
 ```
 
-`reindex()` replaces the derived collection from SQLite FP32 embeddings and then replays writes
-committed during its scan. `optimize()` drains and acknowledges pending work, merges staged
-vectors, and flushes the collection. Neither operation repairs missing media or converts an
+`reindex()` replaces the derived collection from SQLite FP32 embeddings, replays writes committed
+during its scan, and merges the segments that replay leaves behind, so it ends no more segmented
+than `optimize()` does. `optimize()` drains and acknowledges pending work, merges staged vectors,
+and flushes the collection. Neither operation repairs missing media or converts an
 incompatible embedding space.
 
 If Zvec cannot open or appears corrupt:
@@ -137,6 +140,11 @@ MindBridge does not call `zvec.init()`. Account for several focused dense routes
 route, with at most four outer search workers per search. Keep `IndexQuantization.NONE` unless
 measured capacity and retrieval results justify a lossy mode. Changing only quantization rebuilds
 Zvec from stored vectors; `RABITQ` requires dimensions from 64 through 4095 and native support.
+Zvec 0.7 writes the quantized structure beside the FP32 vectors rather than in place of them, so a
+lossy mode lowers distance-computation cost and resident search footprint while *raising* bytes on
+disk: measured on one 5,882-record store, `zvec/` grew 54 % under `FP16`, 55 % under `INT8` and
+86 % under `RABITQ`, with ranking unchanged. Read it as a memory and latency setting, not as a way
+to store less.
 
 ## Capacity
 
@@ -150,7 +158,7 @@ Monitor:
 - Backup age, restore-test result, and observed recovery duration.
 
 Original media and FP32 embeddings remain authoritative storage costs even when Zvec uses
-quantization. Composite and long-text records create bounded additional embedding documents.
+quantization, which adds its structure beside them. Composite and long-text records create bounded additional embedding documents.
 
 ## Telemetry
 
