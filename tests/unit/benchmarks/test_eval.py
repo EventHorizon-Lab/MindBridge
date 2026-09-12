@@ -15,6 +15,7 @@ from argparse import ArgumentTypeError
 from collections.abc import Callable, Sequence
 from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from inspect import getattr_static, signature
 from pathlib import Path
 from threading import Event as ThreadEvent
@@ -104,7 +105,13 @@ from mindbridge.benchmarks.official_scorers import scorer_protocol, task_family
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
 from mindbridge.configuration import OpenAIEmbeddingConfig, OpenAIGenerationConfig
-from mindbridge.models.base import EmbedTask, ModelInput, SpeechAnalysis, SpeechBackend
+from mindbridge.models.base import (
+    EmbedTask,
+    ModelInput,
+    SpeechAnalysis,
+    SpeechBackend,
+    SpeechTurn,
+)
 
 
 def _sample_fixture(example_id: int, answer: str | None = None) -> SampleResult:
@@ -725,6 +732,73 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
     assert calls == [(assets[1],)]
     assert backend.analyze((assets[0],)) == (SpeechAnalysis((), ()),)
     assert skipped_request_counts == [0]
+
+
+def test_benchmark_speech_backend_serves_prefetched_analyses_without_a_second_model_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Analysing the next chunk while the store embeds the current one is only a win if the
+    store's own `analyze` for those clips then costs nothing: same bytes, same digest, one
+    model call. A clip nobody prefetched is still analysed on demand, in order.
+    """
+    ahead = tmp_path / "ahead.mp4"
+    ahead.write_bytes(b"ahead")
+    fresh = tmp_path / "fresh.mp4"
+    fresh.write_bytes(b"fresh")
+    digests = {path: sha256(path.read_bytes()).hexdigest() for path in (ahead, fresh)}
+    calls: list[tuple[str, ...]] = []
+
+    class Backend:
+        transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+
+        def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+            calls.append(tuple(asset.id for asset in assets))
+            return tuple(
+                SpeechAnalysis((SpeechTurn(0, 500, asset.name or "", "0"),), ()) for asset in assets
+            )
+
+    monkeypatch.setattr(eval_module, "_has_audio", lambda path: True)
+    backend = _BorrowedSpeechBackend(Backend())
+
+    backend.prefetch((MemoryItem("ahead", (ahead,)),))
+    stored = tuple(
+        AssetRef(digests[path], Modality.VIDEO, "video/mp4", 5, digests[path], path.name, path)
+        for path in (fresh, ahead)
+    )
+    analyses = backend.analyze(stored)
+
+    assert [turn.text for analysis in analyses for turn in analysis.turns] == [
+        "fresh.mp4",
+        "ahead.mp4",
+    ]
+    assert calls == [(digests[ahead],), (digests[fresh],)]
+    # Consumed once: asking again analyses afresh rather than serving a stale entry.
+    backend.analyze((stored[1],))
+    assert calls[-1] == (digests[ahead],)
+
+
+@pytest.mark.asyncio
+async def test_ingest_chunks_prefetch_the_next_chunk_before_writing_the_current_one() -> None:
+    events: list[str] = []
+
+    async def ingest(chunk: Sequence[MemoryItem]) -> int:
+        events.append("ingest:" + ",".join(item.source_id for item in chunk))
+        return 0
+
+    def prefetch(chunk: Sequence[MemoryItem]) -> None:
+        events.append("prefetch:" + ",".join(item.source_id for item in chunk))
+
+    items = tuple(MemoryItem(str(index), (f"text {index}",)) for index in range(5))
+
+    await eval_module._ingest_chunks(ingest, items, batch_size=2, on_chunk=None, prefetch=prefetch)
+
+    assert events == [
+        "prefetch:2,3",
+        "ingest:0,1",
+        "prefetch:4",
+        "ingest:2,3",
+        "ingest:4",
+    ]
 
 
 def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:

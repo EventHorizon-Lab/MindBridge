@@ -25,13 +25,14 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile, gettempdir
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast, get_args, overload
 
 import yaml
@@ -264,6 +265,20 @@ _MODALITY_BY_SUFFIX = {
     ".png": Modality.IMAGE,
     ".wav": Modality.AUDIO,
     ".webm": Modality.VIDEO,
+}
+_MEDIA_TYPE_BY_SUFFIX = {
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
 }
 
 # The question-metadata fields each benchmark family groups its per-question
@@ -839,36 +854,7 @@ class _BaselineGenerator:
         modality = _MODALITY_BY_SUFFIX.get(resolved.suffix.casefold())
         if modality is None:
             raise ValueError(f"benchmark query media has unsupported suffix: {resolved}")
-        media_types = {
-            Modality.AUDIO: {
-                ".aac": "audio/aac",
-                ".flac": "audio/flac",
-                ".m4a": "audio/mp4",
-                ".mp3": "audio/mpeg",
-                ".wav": "audio/wav",
-            },
-            Modality.IMAGE: {".jpeg": "image/jpeg", ".jpg": "image/jpeg", ".png": "image/png"},
-            Modality.VIDEO: {
-                ".mkv": "video/x-matroska",
-                ".mov": "video/quicktime",
-                ".mp4": "video/mp4",
-                ".webm": "video/webm",
-            },
-        }
-        digest = hashlib.sha256()
-        with resolved.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        asset_id = digest.hexdigest()
-        asset = AssetRef(
-            id=asset_id,
-            modality=modality,
-            media_type=media_types[modality][resolved.suffix.casefold()],
-            size_bytes=resolved.stat().st_size,
-            sha256=asset_id,
-            name=resolved.name,
-            path=resolved,
-        )
+        asset = _media_asset_ref(resolved, modality)
         self._query_asset_cache[resolved] = asset
         return asset
 
@@ -1170,12 +1156,75 @@ class _BorrowedFaceBackend(_BorrowedBackend):
         return cast(FaceBackend, self._backend).analyze(assets)
 
 
+def _media_asset_ref(path: Path, modality: Modality) -> AssetRef:
+    """Describe a local media file the way the store will, keyed by its content digest."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    asset_id = digest.hexdigest()
+    return AssetRef(
+        id=asset_id,
+        modality=modality,
+        media_type=_MEDIA_TYPE_BY_SUFFIX[path.suffix.casefold()],
+        size_bytes=path.stat().st_size,
+        sha256=asset_id,
+        name=path.name,
+        path=path,
+    )
+
+
 class _BorrowedSpeechBackend(_BorrowedBackend):
-    """Skip visual-only videos before lending the shared speech backend."""
+    """Skip visual-only videos before lending the shared speech backend, and analyse ahead.
+
+    The store ingests a chunk as speech, then embedding, then write, so the GPU idles while the
+    embedding request is in flight and the network idles while the speech model runs -- measured
+    at about 5 s and 3.7 s of a 10 s batch. `prefetch()` analyses the next chunk's clips on one
+    background thread while the store embeds and writes the current one; the store's own
+    `analyze()` for those clips then finds the result here. Entries are keyed by content digest,
+    which is also the store's asset id, so the source clip and the copy the store analyses are
+    the same bytes. Only the analysis runs early: the store still writes chunk by chunk, so
+    corpus order and every stored row are what they were.
+    """
+
+    def __init__(self, backend: object) -> None:
+        super().__init__(backend)
+        self._ahead: dict[str, Future[dict[str, SpeechAnalysis]]] = {}
+        self._ahead_lock = Lock()
+        # One worker: the speech model serialises on its own lock, and a second thread would
+        # only queue behind it.
+        self._ahead_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speech-ahead")
 
     @property
     def transcription_capabilities(self) -> frozenset[Modality]:
         return cast(SpeechBackend, self._backend).transcription_capabilities
+
+    def prefetch(self, items: Sequence[MemoryItem]) -> None:
+        """Analyse these items' audible media in the background, once per distinct clip."""
+        refs = []
+        for item in items:
+            for atom in item.content:
+                if not isinstance(atom, Path):
+                    continue
+                modality = _MODALITY_BY_SUFFIX.get(atom.suffix.casefold())
+                if modality not in self.transcription_capabilities:
+                    continue
+                if modality is Modality.VIDEO and not _has_audio(atom):
+                    continue
+                refs.append(_media_asset_ref(atom, modality))
+        with self._ahead_lock:
+            fresh = tuple({ref.id: ref for ref in refs if ref.id not in self._ahead}.values())
+            if not fresh:
+                return
+            future = self._ahead_worker.submit(self._analyze_by_id, fresh)
+            for ref in fresh:
+                self._ahead[ref.id] = future
+
+    def _analyze_by_id(self, assets: Sequence[AssetRef]) -> dict[str, SpeechAnalysis]:
+        analyses = cast(SpeechBackend, self._backend).analyze(assets)
+        if len(analyses) != len(assets):
+            raise RuntimeError("speech backend returned the wrong number of analyses")
+        return {asset.id: analysis for asset, analysis in zip(assets, analyses, strict=True)}
 
     @property
     def transcription_model(self) -> str:
@@ -1191,17 +1240,30 @@ class _BorrowedSpeechBackend(_BorrowedBackend):
             for asset in assets
         )
         audible = tuple(asset for asset, include in zip(assets, selected, strict=True) if include)
-        if audible:
-            generated = cast(SpeechBackend, self._backend).analyze(audible)
+        with self._ahead_lock:
+            futures = {
+                asset.id: self._ahead.pop(asset.id) for asset in audible if asset.id in self._ahead
+            }
+        ahead: dict[str, SpeechAnalysis] = {}
+        for asset_id, future in futures.items():
+            # A prefetch that failed is simply analysed again here, where the error belongs to
+            # the write that needed it.
+            with suppress(Exception):
+                ahead[asset_id] = future.result()[asset_id]
+        missing = tuple(asset for asset in audible if asset.id not in ahead)
+        if missing:
+            generated = cast(SpeechBackend, self._backend).analyze(missing)
         else:
             record_unmetered_model_usage(request_count=0)
             generated = ()
-        if len(generated) != len(audible):
+        if len(generated) != len(missing):
             raise RuntimeError("speech backend returned the wrong number of analyses")
-        pending = iter(generated)
+        fresh = dict(zip((asset.id for asset in missing), generated, strict=True))
         return tuple(
-            next(pending) if include else SpeechAnalysis(turns=(), speakers=())
-            for include in selected
+            (ahead.get(asset.id) or fresh[asset.id])
+            if include
+            else SpeechAnalysis(turns=(), speakers=())
+            for asset, include in zip(assets, selected, strict=True)
         )
 
 
@@ -1376,6 +1438,11 @@ class _BackendPool:
             # the order their updates committed, so a run stops being reproducible from its seed.
             reinforce_on_answer=False,
         )
+
+    def prefetch_speech(self, items: Sequence[MemoryItem]) -> None:
+        """Analyse the next chunk's speech while a store embeds and writes the current one."""
+        if isinstance(self._transcriber, _BorrowedSpeechBackend):
+            self._transcriber.prefetch(items)
 
     def memory(self, data_dir: Path) -> AsyncMemory:
         # Forwarded from the dataclass rather than field by field. The hand-written list silently
@@ -1986,6 +2053,7 @@ def _execute(
                     )
                 )
             try:
+                prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None
                 if all_cached:
                     memory_factory = _cache_only_memory
                 else:
@@ -2001,6 +2069,7 @@ def _execute(
                         description_cache=_description_cache_path(arguments, memory_config),
                     )
                     memory_factory = pool.memory
+                    prefetch_speech = pool.prefetch_speech
                     embedding_warmup_count = pool.embedding_warmup_count
                 metric_starts = (
                     {}
@@ -2022,6 +2091,7 @@ def _execute(
                             config=config,
                             memory_config=memory_config,
                             on_task_complete=task_completed,
+                            prefetch_speech=prefetch_speech,
                         )
                     )
                 model_servers = _server_metric_results(
@@ -2201,6 +2271,7 @@ async def _run_all(
     config: ModelConfig | None = None,
     memory_config: MindBridgeConfig | None = None,
     on_task_complete: _TaskCompletion | None = None,
+    prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     generated_arms = {"blind", "full-context", "compile"}
     generator = (
@@ -2236,6 +2307,7 @@ async def _run_all(
             tracer=tracer,
             on_task_complete=on_task_complete,
             memory_config=memory_config,
+            prefetch_speech=prefetch_speech,
         )
     finally:
         if generator is not None:
@@ -2253,6 +2325,7 @@ async def _run_arms(
     tracer: Tracer,
     on_task_complete: _TaskCompletion | None = None,
     memory_config: MindBridgeConfig | None = None,
+    prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     compile_budget = ContextBudget(
         max_items=arguments.compile_max_items,
@@ -2292,6 +2365,7 @@ async def _run_arms(
                 task,
                 run=run,
                 memory_factory=memory_factory,
+                prefetch_speech=prefetch_speech,
                 batch_size=batch_sizes[task.spec.name],
                 unit_concurrency=arguments.unit_concurrency,
                 request_concurrency=arguments.request_concurrency,
@@ -2344,6 +2418,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     on_progress: Callable[[int, int], None] | None = None,
     on_activity: Callable[[str], None] | None = None,
     on_search_replay_ready: Callable[[_SearchReplay], None] | None = None,
+    prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     """Run normalized units with bounded workers while preserving release order."""
     if min(batch_size, unit_concurrency, request_concurrency, recall_limit) <= 0:
@@ -2417,6 +2492,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 on_sample_completed=sample_completed,
                 on_activity=activity,
                 on_store_ready=store_ready,
+                prefetch_speech=prefetch_speech,
             )
             slots[index] = samples
             for _ in range(len(samples) - reported):
@@ -2709,6 +2785,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     on_sample_completed: Callable[[], None] | None = None,
     on_activity: Callable[[str], None] | None = None,
     on_store_ready: Callable[[], None] | None = None,
+    prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     ordered = tuple((arm, question) for arm in arms for question in unit.questions)
     notify_store_ready = on_store_ready or _ignore_store_ready
@@ -2789,6 +2866,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                         mode=ingest_mode,
                         arm=memory_arm,
                         on_chunk=_checkpoint_writer(checkpoint, ingested, ingest_failure_details),
+                        prefetch=prefetch_speech,
                     )
                     ingested = end
                     if deliberate:
@@ -3131,6 +3209,7 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
     tracer: Tracer | None = None,
     mode: str = DEFAULT_INGEST_MODE,
     arm: str = DEFAULT_ARM,
+    prefetch: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> int:
     # An arm that reads no memory never reaches here: `_run_unit` skips ingestion for it, so the
     # blind control cannot accidentally score a store it was supposed to run without.
@@ -3196,7 +3275,9 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
         )
 
     chunk_ingest = capture_chunk if mode == "capture" else add_chunk
-    return await _ingest_chunks(chunk_ingest, items, batch_size=batch_size, on_chunk=on_chunk)
+    return await _ingest_chunks(
+        chunk_ingest, items, batch_size=batch_size, on_chunk=on_chunk, prefetch=prefetch
+    )
 
 
 async def _ingest_chunks(
@@ -3205,10 +3286,17 @@ async def _ingest_chunks(
     *,
     batch_size: int,
     on_chunk: Callable[[int], None] | None,
+    prefetch: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> int:
-    """Ingest one chunk at a time, noting each boundary a killed run could restart from."""
+    """Ingest one chunk at a time, noting each boundary a killed run could restart from.
+
+    Chunks still commit in order; `prefetch` only lets the speech model start on the next chunk
+    while the store embeds and writes this one.
+    """
     failures = 0
     for offset in range(0, len(items), batch_size):
+        if prefetch is not None and offset + batch_size < len(items):
+            prefetch(items[offset + batch_size : offset + 2 * batch_size])
         # Every item of a chunk is written or counted as failed by the time it returns, so a
         # chunk boundary is the only place a resumable note is exactly true.
         failures += await ingest_chunk(items[offset : offset + batch_size])

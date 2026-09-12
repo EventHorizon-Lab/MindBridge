@@ -531,6 +531,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   centroid no turn uses carries no speech, so all it did was mint an identity and an exemplar
   that every later asset was matched against and nothing cited: 27,056 of 44,857 identities on
   one 12,684-clip ingest. The rule lives in the store, where every `SpeechBackend` converges.
+- `mindbridge-bench eval` analyses the next ingest chunk's speech while the store embeds and
+  writes the current one. The store runs speech, then embedding, then the write for each chunk,
+  so the GPU idled during the embedding request and the network idled during speech -- measured
+  at about 5 s and 3.7 s of a 10 s batch. The lent speech backend now takes a look-ahead: one
+  background thread analyses the next chunk's clips, keyed by content digest (the store's asset
+  id), and the store's own call for those clips finds the result. Chunks still commit in order,
+  so corpus order and every stored row are unchanged; only the analysis starts early.
 - The `mm-lifelong` task group is the evaluation splits: `mm-lifelong-day-test`,
   `mm-lifelong-week-test`, and `mm-lifelong-month-val`. `mm-lifelong-month-train` is the released
   training split, cut from the same 105 h of video as `month_val`, so the group ingested that

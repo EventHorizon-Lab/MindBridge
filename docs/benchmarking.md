@@ -763,7 +763,7 @@ gaps do not inflate the denominator. TTFT and token-per-call distributions also 
 | Block | Boundary and quantities |
 | --- | --- |
 | `duration_seconds` | Gap-free active wall-time unions for the product and judge phases. Its average denominator is the union of sample IDs measured in either phase, so a cached product answer judged by an uncached call is counted once. |
-| `ingest` | Attempt, success, and error counts; attempted and accepted items; durable/searchable batch latency; compute and active-wall throughput. |
+| `ingest` | Attempt, success, and error counts; attempted and accepted items; durable/searchable batch latency; compute and active-wall throughput. Speech analysis for a chunk usually ran ahead of it on the lent speech backend while the previous chunk was embedding, so a batch's durable latency excludes most of that model time; the transcription spans still carry it. |
 | `search_e2e` | Run-global, post-answer warm-store replay of public `Memory.search(limit=recall_limit)`. The second pass starts only after every selected task has finished its formal answers. Its caller span starts before request admission and `sdk_operation` is the nested SDK boundary. Replay nodes and tokens remain isolated under `diagnostic`. |
 | `ask_retrieval_core` | The complete retrieval prerequisite inside `Memory.ask`: content preparation, temporal/scope handling, query speech, embedding, index lookup, and ranking. |
 | `answer` | Caller end-to-end completion latency and TTFT, plus nested SDK operation latency, generation TTFT, generation first-chunk time, and throughput. |
