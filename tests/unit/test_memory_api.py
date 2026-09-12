@@ -8100,3 +8100,34 @@ def test_the_recall_settings_are_validated_at_open(
 ) -> None:
     with pytest.raises(ValidationError, match=error):
         Memory(tmp_path, embedder=_FakeModels(), **{setting: value})  # type: ignore[arg-type]
+
+
+def test_ask_reports_hits_in_rank_order_whatever_order_the_answerer_read_them_in(
+    tmp_path: Path,
+) -> None:
+    """The reader may be handed the window as a timeline; the caller still gets the ranking.
+
+    `AnswerResult.hits` is the retrieval contract -- the harness measures recall from it and a
+    caller reads its top as the best match -- so the order an adapter chose for its own prompt
+    must not leak into it.
+    """
+
+    class _ReorderingModels(_FakeModels):
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
+            result = super().answer(question, hits[::-1], answer_policy=answer_policy)
+            return replace(result, hits=tuple(hits[::-1]))
+
+    with _memory(tmp_path, _ReorderingModels()) as memory:
+        records = _hundred_character_records(memory, 6)
+        _rank_all(records)
+
+        result = memory.ask("find evidence", limit=3)
+
+    assert [hit.id for hit in result.hits] == [record.id for record in records[:3]]

@@ -108,14 +108,31 @@ class MemoryConfig:
     # from the rest only weakly, so the answering model does the final selection and benefits
     # from seeing more candidates. `None` grounds on exactly `limit`.
     #
-    # This raises a floor; it is not a ceiling. The `limit` hits are kept unconditionally, so the
-    # prompt is bounded by `limit` times the size of a memory and setting this can only make it
-    # larger. On LoCoMo-Refined it turns a 20-memory window into 56.3 and the answer prompt from
-    # 2 856 tokens to 7 648 for a score change of 0.003, inside that task's 0.029 noise. Nor is
-    # `limit` a token control once this is set: at limit 3 and limit 20 the same budget refills
-    # the window to the same 56.3 memories, Jaccard 0.986. Bound a prompt by lowering `limit`
-    # with this left at `None`.
-    evidence_budget_chars: _PositiveInt | None = None
+    # A record count is the wrong unit for that window, because record size is the caller's: a
+    # dialogue turn is ~200 characters, a chat-assistant turn ~1 000, so `limit=12` is 2.5 k
+    # characters of evidence on one corpus and 12 k on another. The budget is the unit that
+    # holds across corpora, and it has to exceed what a dozen long records already cost or the
+    # change of unit is nominal on exactly the corpora where a count misleads most. Measured on
+    # the 2026-09-11 baseline reader (`qwen3.8-27b`, `recall_limit 12`, paired per question
+    # against a same-code control): 24 000 characters widened a LoCoMo-Refined window from 12 to
+    # ~100 turns for +0.090 [+0.042, +0.110] on 3 conversations (41 W / 10 L / 295 T) and +0.076
+    # [+0.054, +0.098] on a 4-conversation holdout (61 / 16 / 515), cutting refusals from 70 to
+    # 24 of 592; widened LongMemEval-S from 12 to ~26 turns for +0.067 [+0.017, +0.117]
+    # (9 / 1 / 110); and widened MemLens from 12 to ~17 turns for no change (2 / 3 / 45). The
+    # cost is the answer prompt: 4.8x the tokens and 2x the latency on the short-turn corpus,
+    # unchanged where the records were already long. Media corpora were not re-measured: at the
+    # text-equivalent charges (2 000 per image, 12 000 per video) the budget admits up to twelve
+    # more images or two more videos per `ask`, and every grounded media row pays face and
+    # speech recognition plus the reader's media tokens. 8 000 characters bought most of the LoCoMo
+    # gain (+0.055 / +0.063) at 2.1x the tokens but added half a row on LongMemEval, so the
+    # larger budget is the default and a caller who wants the cheaper window lowers it. An earlier
+    # null at `limit=20` (56 rows, +0.003) was measured on a different reader.
+    #
+    # This raises a floor; it is not a ceiling. The `limit` hits are kept unconditionally, so
+    # setting it can only make the prompt larger, and `limit` stops being a token control once
+    # it is set: the budget refills the window to the same width whatever `limit` was. Bound a
+    # prompt by lowering this, or by lowering `limit` with this set to `None`.
+    evidence_budget_chars: _PositiveInt | None = 24_000
     # Whether `ask` asks the answerer how to retrieve before retrieving. Off by default: it costs
     # one extra generation call per question, and it only pays where similarity has no way to
     # express the question -- a count, a list of "all", an adjacency, everything about a person.

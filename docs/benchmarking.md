@@ -904,7 +904,8 @@ because the judge omitted usage on some requests; the cost axis needs the produc
 measured. Recall scores the ranked candidate list that `Memory.ask` already produced before
 grounding, never the narrower evidence the generator saw and never a second search. That list is
 captured against the same causal store state as the answer. Its configured depth is 100 when
-`evidence_budget_chars` is set and otherwise `min(100, recall_limit * 3)`; both the configured depth
+`evidence_budget_chars` is set, which it is by default, and otherwise `min(100, recall_limit * 3)`;
+both the configured depth
 and the returned count are recorded. The random arm requests 100 for gold-labelled questions and
 `recall_limit` otherwise. New response-cache entries preserve the ranked IDs; a legacy cache entry
 without one is counted in

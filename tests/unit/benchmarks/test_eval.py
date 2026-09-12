@@ -4122,6 +4122,10 @@ benchmark:
     }
     assert document["benchmark"]["judge"]["model"] == "cli-judge"
     assert document["benchmark"]["run"]["limit"] == 1
+    # The artifact describes the run that produced the results: the pool pins answer-time
+    # reinforcement off for every product arm, so the file must not echo the input's `true`.
+    assert memory_config is not None and memory_config.settings.reinforce_on_answer is True
+    assert document["product"]["settings"]["reinforce_on_answer"] is False
 
 
 def test_eval_streams_task_results_by_default_and_can_be_disabled() -> None:
@@ -4372,6 +4376,35 @@ def test_eval_memory_config_survives_an_empty_gen_kwargs(tmp_path: Path) -> None
     assert resolved is not None
     assert resolved.generation is not None
     assert resolved.generation.extra_body is None
+
+
+def test_eval_memory_config_pins_reinforcement_off_without_a_generation_section(
+    tmp_path: Path,
+) -> None:
+    """The reported settings must match the pool's whatever sections the file declares.
+
+    The pin used to live behind the `generation` rebuild, so a file that left generation to the
+    environment reported `reinforce_on_answer: true` for a run that had it off.
+    """
+    # The file loader fills a default generation block, so the section-less shape is the one a
+    # host composes directly, which `resolve_memory_config` accepts.
+    config = MindBridgeConfig(
+        data_dir=tmp_path,
+        embedding=OpenAIEmbeddingConfig(provider="openai"),
+        generation=None,
+        settings=MemoryConfig(reinforce_on_answer=True),
+    )
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(gen_kwargs="", seed=0, device=None),
+    )
+
+    resolved = eval_module._evaluation_memory_config(config, ModelConfig(), arguments)
+
+    assert config.settings.reinforce_on_answer is True
+    assert resolved is not None and resolved.generation is None
+    assert resolved.settings.reinforce_on_answer is False
+    assert eval_module._memory_config_payload(resolved)["settings"]["reinforce_on_answer"] is False  # type: ignore[index]
 
 
 def test_committed_example_configuration_still_loads() -> None:

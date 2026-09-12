@@ -4606,14 +4606,22 @@ def _answer_retrieval_candidate_limit(
     memory_config: MindBridgeConfig | None,
 ) -> int:
     """Mirror the ranked window ``Memory.ask`` requests from the retrieval kernel."""
-    evidence_budget_chars = (
-        None if memory_config is None else memory_config.settings.evidence_budget_chars
-    )
     return (
         RETRIEVAL_CANDIDATE_LIMIT
-        if evidence_budget_chars is not None
+        if _evidence_budget_chars(memory_config) is not None
         else min(RETRIEVAL_CANDIDATE_LIMIT, recall_limit * 3)
     )
+
+
+def _evidence_budget_chars(memory_config: MindBridgeConfig | None) -> int | None:
+    """The budget the product arm grounds with, which is the product default when no file set it.
+
+    A run without a config file builds its `Memory` from `MemoryConfig()` plus the harness's own
+    two overrides, so the default budget applies there too; reading `None` for that case made
+    the reported candidate limit disagree with the window `ask` actually ranked.
+    """
+    settings = MemoryConfig() if memory_config is None else memory_config.settings
+    return settings.evidence_budget_chars
 
 
 def _arm_provenance(
@@ -4625,9 +4633,7 @@ def _arm_provenance(
         arguments.recall_limit,
         memory_config,
     )
-    evidence_budget_chars = (
-        None if memory_config is None else memory_config.settings.evidence_budget_chars
-    )
+    evidence_budget_chars = _evidence_budget_chars(memory_config)
     definitions: dict[str, object] = {
         DEFAULT_ARM: {
             "answers_from": "retrieved memories",
@@ -6876,6 +6882,14 @@ def _evaluation_memory_config(
 ) -> MindBridgeConfig | None:
     if config is None:
         return None
+    # The pool pins answer-time reinforcement off for every product arm (see `_BackendPool`), so
+    # the settings this run reports -- in the effective-config artifact, `results.jsonl`, and
+    # the resume checkpoints -- have to say so too, whether or not the file has a `generation`
+    # section. The 2026-09-11 baseline's `config.yaml` said `reinforce_on_answer: true` while
+    # every store's `access_count` column stayed at zero.
+    config = config.model_copy(
+        update={"settings": replace(config.settings, reinforce_on_answer=False)}
+    )
     generation = config.generation
     if generation is None:
         return config
