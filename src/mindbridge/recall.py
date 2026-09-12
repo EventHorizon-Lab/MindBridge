@@ -108,6 +108,10 @@ class RecallStep:
     max_rows: int = DEFAULT_MAX_ROWS
     # The index of an earlier step whose rows are this step's anchors.
     of: int | None = None
+    # The index of an earlier step whose rows bound this step's time span: their event times and
+    # the dates their text states. `"time": "step:N"` on a `match` or `window`; the bounds are
+    # only known once that step has run, so they live on the result rather than here.
+    time_of: int | None = None
     before: int = 2
     after: int = 2
     name: str | None = None
@@ -154,6 +158,10 @@ class RecallStepResult:
     # so the count lives here rather than in `rows`: it is what the reader is told the predicate
     # matched, and what says the step's own set is not the evidence.
     non_selective: int = 0
+    # The time bounds the read actually ran with: the plan's own, or the span derived from an
+    # earlier step's rows, which the note has to state because the plan text never named it.
+    occurred_from: datetime | None = None
+    occurred_until: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +241,16 @@ class RecallReader(Protocol):
 
     def entity(self, name: str, *, max_rows: int) -> RecallRows: ...
 
+    def time_span(self, rows: Sequence[SearchHit]) -> tuple[datetime, datetime] | None:
+        """The half-open span these rows cover: event times and the dates their text states.
+
+        `None` when no row carries a time, so a step bounded on them reads nothing. The dates a
+        record states are part of its span because that is where a trip's dates live: a booking
+        confirmation is sent weeks before the stay it names, and only its text says when the
+        stay is.
+        """
+        ...
+
 
 def fallback_plan(question: str, *, k: int = DEFAULT_SIMILAR_K) -> RecallPlan:
     """The plan that is today's behaviour: one similarity search over the raw question.
@@ -299,16 +317,22 @@ def execute(
     exhaustive: dict[str, SearchHit] = {}
     ranked: dict[str, SearchHit] = {}
     by_step: list[tuple[SearchHit, ...]] = []
+    # A derived span is a scan over an anchor step's rows, and several steps may bind to the
+    # same anchor, so it is derived once per anchor. `by_step` entries never change once appended.
+    derived_spans: dict[int, tuple[datetime, datetime] | ValueError | OverflowError | None] = {}
     for step in plan.steps:
         bound = step.k if step.op == "similar" else step.max_rows
+        span: tuple[datetime | None, datetime | None] | None = None
         try:
-            rows, selected = _run(step, reader, by_step)
-        except ValueError:
+            span = _step_span(step, reader, by_step, derived_spans)
+            rows, selected = _run(step, reader, by_step, span)
+        except (ValueError, OverflowError):
             # A primitive rejecting its own arguments is a read that did not happen. Every field
             # reaching one came from a model's plan text, and `ask()` raising a bare `ValueError`
             # from that would make model output an exception; reporting the step as having filled
             # its bound says the truth instead, which is that records this predicate matches were
-            # never read.
+            # never read. A derived span is data from stored records the same way, so a date the
+            # calendar cannot hold is the same non-read rather than an exception out of `ask()`.
             rows, selected = (), bound
         non_selective = selected if step.op in _EXHAUSTIVE_OPS and selected > ceiling else 0
         if non_selective:
@@ -320,6 +344,8 @@ def execute(
                 rows=len(rows),
                 bounded=selected >= bound,
                 non_selective=non_selective,
+                occurred_from=None if span is None else span[0],
+                occurred_until=None if span is None else span[1],
             )
         )
         target = ranked if step.op == "similar" else exhaustive
@@ -393,15 +419,15 @@ def _step_note(step: RecallStep, outcome: RecallStepResult, active_records: int)
         # No count of rows: there are none, and the reader has to be told why rather than shown a
         # zero it would read as "nothing matched". What it holds instead is the ranking.
         return (
-            f"{detail}{_span_note(step)} matched too many records to enumerate "
+            f"{detail}{_span_note(outcome)} matched too many records to enumerate "
             f"({outcome.non_selective} of {active_records}); only the top-ranked records for "
             "the question are shown"
         )
-    return f"{detail}{_span_note(step)} ({outcome.rows})"
+    return f"{detail}{_span_note(outcome)} ({outcome.rows})"
 
 
-def _span_note(step: RecallStep) -> str:
-    start, until = step.occurred_from, step.occurred_until
+def _span_note(outcome: RecallStepResult) -> str:
+    start, until = outcome.occurred_from, outcome.occurred_until
     if start is not None and until is not None:
         return f" between {start.isoformat()} and {until.isoformat()}"
     if start is not None:
@@ -411,30 +437,62 @@ def _span_note(step: RecallStep) -> str:
     return ""
 
 
+def _step_span(
+    step: RecallStep,
+    reader: RecallReader,
+    by_step: Sequence[tuple[SearchHit, ...]],
+    derived_spans: dict[int, tuple[datetime, datetime] | ValueError | OverflowError | None],
+) -> tuple[datetime | None, datetime | None] | None:
+    """The time bounds one step reads with: its own, or the span of the step it is bound to.
+
+    `None` when a derived span has nothing to derive from: the anchor step read no dated rows, so
+    a step bound to it reads nothing rather than the whole corpus. Bounds a plan wrote are passed
+    through, either half possibly open. Derived spans are memoised in `derived_spans` by anchor,
+    a failed derivation included, so every step bound to one anchor sees the same outcome and
+    the anchor's rows are scanned once.
+    """
+    if step.time_of is None:
+        if step.occurred_from is None and step.occurred_until is None:
+            return None
+        return (step.occurred_from, step.occurred_until)
+    if step.time_of not in derived_spans:
+        try:
+            derived_spans[step.time_of] = reader.time_span(by_step[step.time_of])
+        except (ValueError, OverflowError) as error:
+            derived_spans[step.time_of] = error
+    cached = derived_spans[step.time_of]
+    if isinstance(cached, Exception):
+        raise cached
+    return cached
+
+
 def _run(
     step: RecallStep,
     reader: RecallReader,
     by_step: Sequence[tuple[SearchHit, ...]],
+    span: tuple[datetime | None, datetime | None] | None,
 ) -> RecallRows:
     """Dispatch one step, or read nothing when its own inputs are missing."""
     if step.op == "similar":
         return reader.similar(step.query or "", k=step.k)
     if step.op == "match":
+        if step.time_of is not None and span is None:
+            return RecallRows((), 0)
         return reader.match(
             step.terms,
             any_of=step.any_of,
-            occurred_from=step.occurred_from,
-            occurred_until=step.occurred_until,
+            occurred_from=None if span is None else span[0],
+            occurred_until=None if span is None else span[1],
             modality=step.modality,
             memory_type=step.memory_type,
             max_rows=step.max_rows,
         )
     if step.op == "window":
-        if step.occurred_from is None or step.occurred_until is None:
+        if span is None or span[0] is None or span[1] is None:
             return RecallRows((), 0)
         return reader.window(
-            occurred_from=step.occurred_from,
-            occurred_until=step.occurred_until,
+            occurred_from=span[0],
+            occurred_until=span[1],
             modality=step.modality,
             memory_type=step.memory_type,
             max_rows=step.max_rows,
@@ -491,7 +549,16 @@ def _step(raw_step: object, *, index: int, reference_at: datetime) -> RecallStep
     values = _fields(raw_step)
     if values is None:
         return None
-    window = _window(values.get("time"), reference_at=reference_at)
+    time_of = None
+    if isinstance(values.get("time"), str):
+        # `"time": "step:N"` binds this read's span to an earlier step's rows. A forward or
+        # malformed reference is not a plan, exactly as it is not for `of`.
+        time_of = _anchor(values.get("time"), index=index)
+        if time_of is False:
+            return None
+        window: tuple[datetime | None, datetime | None] | None = (None, None)
+    else:
+        window = _window(values.get("time"), reference_at=reference_at)
     modality = _enum(values.get("modality"), Modality)
     memory_type = _enum(values.get("memory_type"), MemoryType)
     terms = _terms(values.get("terms"))
@@ -518,6 +585,7 @@ def _step(raw_step: object, *, index: int, reference_at: datetime) -> RecallStep
                 high=RECALL_MAX_ROWS,
             ),
             of=anchor,
+            time_of=time_of,
             before=_clamped(values.get("before"), default=2, low=0, high=_MAX_NEIGHBOURS),
             after=_clamped(values.get("after"), default=2, low=0, high=_MAX_NEIGHBOURS),
             name=_text(values.get("name")),
@@ -531,7 +599,11 @@ def _usable(step: RecallStep) -> RecallStep | None:
         return None
     if step.op == "match" and not step.terms:
         return None
-    if step.op == "window" and (step.occurred_from is None or step.occurred_until is None):
+    if (
+        step.op == "window"
+        and step.time_of is None
+        and (step.occurred_from is None or step.occurred_until is None)
+    ):
         return None
     if step.op == "neighbors" and (step.of is None or step.before + step.after == 0):
         return None

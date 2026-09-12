@@ -230,7 +230,10 @@ With `recall_planning` enabled, `ask()` adds a second retrieval semantics beside
 The answerer is asked for a recall plan -- a question shape and bounded reads -- and the reads
 that are not `similar` are answered by predicate rather than by rank: substring matching over
 `content`, an event-time window, the records adjacent in corpus order, or the records one
-identity is in. They read SQLite only, hydrate through the same authoritative scoped read as
+identity is in. A `match` or `window` step may bind its time span to an earlier step
+(`"time": "step:N"`): the span those rows cover, from their event times and the absolute dates
+their text states, so a booking confirmation found first can bound the photos read second even
+though the confirmation itself arrived weeks before the trip. They read SQLite only, hydrate through the same authoritative scoped read as
 every other hit, and are bounded by an explicit row count. Because that bound is applied while
 IDs are selected and bitemporal, spatial and metric scope is applied while they are hydrated,
 each read reports how many records it selected as well as the rows it returned: only the
