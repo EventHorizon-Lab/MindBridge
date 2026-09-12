@@ -296,6 +296,11 @@ class Projection(Traced):
             # blindly acknowledging so records committed after its SQLite scan cannot be lost.
             self.drain()
             self.flush()
+            # That replay writes the whole checkpoint a second time, one durable segment per
+            # flush-sized page, over the merged collection `rebuild` just wrote -- measured on a
+            # 578 MB store as Zvec +143 % and search p50 7.8x. Merge them, or the repair the
+            # operations guide recommends leaves the index worse than doing nothing.
+            self._merge_segments()
             return memory_count
 
     def optimize(self) -> None:
@@ -306,6 +311,9 @@ class Projection(Traced):
         ):
             self.drain()
             self.flush()
-            with translate_index_errors("optimize the search index"):
-                self._index.optimize()
-                self._index.flush()
+            self._merge_segments()
+
+    def _merge_segments(self) -> None:
+        with translate_index_errors("optimize the search index"):
+            self._index.optimize()
+            self._index.flush()

@@ -634,6 +634,24 @@ def test_close_does_not_optimize_a_session_that_flushed_once(
     assert _vector_segments(tmp_path) == 1
 
 
+def test_reindexing_leaves_the_index_merged(tmp_path: Path) -> None:
+    """The rebuild checkpoints every embedding in the outbox and then replays it over itself.
+
+    That replay writes the corpus a second time in flush-sized pages, one durable segment each,
+    on top of the merged collection `rebuild` just wrote -- measured on a 578 MB store as Zvec
+    +143 % and search p50 7.8x, in the operation the troubleshooting guide recommends for repair.
+    """
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        for text in ("the kitchen at dusk", "the garden at noon", "the hallway at dawn"):
+            memory.add(text)
+
+        assert memory.reindex() == 3
+
+        assert _vector_segments(tmp_path) == 1
+        # One text memory keys one embedding, so the rebuilt index holds every stored row.
+        assert cast(ZvecIndex, memory._index).doc_count == 3
+
+
 def test_decay_demotes_an_old_memory_without_evicting_it(tmp_path: Path) -> None:
     """`minimum_relevance` gates evidence quality, not the recency priors applied after it.
 

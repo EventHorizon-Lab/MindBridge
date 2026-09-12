@@ -4586,10 +4586,13 @@ def test_keyset_pages_reindex_optimize_and_missing_index_recovery(tmp_path: Path
             break
     assert len(seen) == len(set(seen)) == len(records)
     assert memory.reindex() == len(records)
+    # A rebuild merges the segments its own outbox replay leaves behind, so the explicit
+    # `optimize()` below is the second merge rather than the first.
+    assert _FakeIndex.instances[-1].optimize_calls == 1
     memory.optimize()
     assert _FakeIndex.instances[-1].rebuild_calls == 1
     assert _FakeIndex.instances[-1].rebuild_batch_sizes == [256]
-    assert _FakeIndex.instances[-1].optimize_calls == 1
+    assert _FakeIndex.instances[-1].optimize_calls == 2
     memory.close()
 
     embed_calls = len(models.embed_batches)
