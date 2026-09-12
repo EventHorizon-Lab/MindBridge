@@ -11,15 +11,63 @@ This page defines implementation invariants. See [core concepts](concepts.md) fo
 
 | Component | Responsibility |
 | --- | --- |
-| `Memory` | Coordinate public operations, model capabilities, storage, retrieval, and lifecycle. |
+| `Memory` | Validate policy and backend contracts once, open storage in order, wire the kernel planes, and forward every public operation to the plane that owns it. |
+| Kernel planes (`mindbridge.kernel`) | One object per concern -- write, retrieval, answering, compilation, identity, control, records, perception, projection -- each constructed with exactly the store, index, backends, settings, and sibling planes it uses. |
 | Model backends | Embed, generate, transcribe or analyze speech, analyze faces, describe images, propose typed formations, or propose memory-control-plane operations. |
-| `LocalStore` | Persist authoritative records, FP32 embeddings, analysis and identity state, compatibility metadata, and the index outbox in SQLite. |
+| `LocalStore` | Persist authoritative records, FP32 embeddings, analysis and identity state, compatibility metadata, and the index outbox in SQLite, one table family per attribute over one connection pool. |
 | `AssetStore` | Persist immutable image, video, and audio bytes by SHA-256. |
 | `ZvecIndex` | Maintain rebuildable dense, lexical, type, and event-time search projections. |
 | REST, MCP, and CLI adapters | Translate their protocol and call the same `Memory` kernel. |
 
 One physical `data_dir` is one memory domain and may have one live owner. Metadata is application
 data, not an account, authorization, request, or isolation boundary.
+
+## Code layout
+
+`memory.py` holds the two public facades, `Memory` and `AsyncMemory`, and nothing else that
+decides behavior. `Memory.__init__` is the one place the runtime is assembled: it resolves
+`Settings` and `Backends`, opens the store, constructs the planes that need no index, upgrades
+and re-embeds the store if its markers say so, opens the index, constructs the remaining planes,
+and drains the outbox. Every plane's dependencies are keyword arguments to its constructor, so
+the wiring in that method is the dependency graph, and a plane cannot reach a resource it was
+not handed.
+
+| Module | Plane | Owns |
+| --- | --- | --- |
+| `kernel/lifecycle.py` | `Lifecycle` | Operation leases, fork detection, close coordination, and the media leases an operation holds. |
+| `kernel/materialization.py` | `Materializer` | Validating caller content and leasing its media before any model runs. |
+| `kernel/hydration.py` | `Hydrator` | Stored rows to public `MemoryRecord`, `SearchHit`, and `AssetRef` values. |
+| `kernel/speech.py`, `vision.py`, `embedding.py` | `Speech`, `Vision`, `Embedding` | The perception planes: transcripts and voice identities; descriptions, faces, and cross-modal links; routing content into the embedder and keying rows. |
+| `kernel/projection.py` | `Projection` | Applying committed SQLite truth to Zvec through the outbox, batched flushes, `reindex()`, `optimize()`. |
+| `kernel/retrieval.py` | `Retrieval` | Index candidates, authoritative hydration, and one ranking, shared by search, answer, compile, and the control plane. |
+| `kernel/formation.py` | `Formation` | Running the formation backend over committed sources and committing accepted proposals. |
+| `kernel/identity.py` | `Identities` | Naming, consent, linking, unlinking, and erasing people. |
+| `kernel/ingestion.py` | `Ingestion` | `add`, `add_many`, `capture`, `settle`, and streamed observations. |
+| `kernel/answering.py` | `Answering` | Grounding, recall programs, generation routing, and streamed answer validation. |
+| `kernel/compilation.py` | `Compilation` | Evidence closure over lineage, consent, and actors; the pure selection stays in `context.py`. |
+| `kernel/control_plane.py` | `ControlPlane` | Proposing, applying, auditing, and reversing operations. |
+| `kernel/records.py` | `Records` | `get`, `list`, `delete`, `export`, retention, and reinforcement. |
+
+The pure modules beside them -- `content.py` for what the caller gave, `derived.py` for what a
+model derived, `temporal.py`, `ranking.py`, `contracts.py`, `validation.py`, `settings.py` --
+read no storage and call no model; they are the functions the planes agree on, and they are
+where a rule about identity, ranking, or derived text lives exactly once. Two small shared
+modules complete the kernel: `runtime.py` holds the `Storage` bundle, the `Index` protocol, the
+boundary error translation every plane uses, and the store-marker reconciliation that decides
+whether an opening store must rebuild its index or re-embed, and `tracing.py` holds the `Traced`
+base class that gives each plane its spans. The top-level `streams.py` holds the async observation streams
+over `AsyncMemory`.
+
+`infrastructure/local/store/` mirrors the same discipline for SQLite. `LocalStore` owns one
+`Connections` pool and one directory lock and exposes eight families -- `records`, `captures`,
+`semantics`, `control`, `identities`, `media`, `index`, `recall` -- each the writer of its own
+tables. A transaction that spans families, such as a formation commit, lives in the family that
+owns the primary write and calls the other families' connection-level functions inside it. The
+private modules (`_connections.py`, `_lineage.py`, `_selection.py`, `_identity.py`,
+`_membership.py`, `_candidates.py`, `_operations.py`, `_recall.py`, `_outbox.py`, `_codec.py`,
+`_schema.py`) are the pool and those connection-level functions, grouped by the invariant they
+keep; product code outside the package imports only `LocalStore` and the row values, while
+white-box tests may reach the private modules directly.
 
 ## Durable state
 

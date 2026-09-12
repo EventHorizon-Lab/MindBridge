@@ -694,10 +694,10 @@ def _stream_then_die(data_dir: str, sender: Connection) -> None:
     Both group bounds are pushed out of reach so the kill lands in the window the test is
     about: after SQLite committed and before the deferred Zvec flush.
     """
-    import mindbridge.memory as memory_module
+    import mindbridge.kernel.ingestion as ingestion_module
 
-    memory_module._STREAM_GROUP_ITEMS = 1_000
-    memory_module._STREAM_GROUP_SECONDS = 1e9
+    ingestion_module.STREAM_GROUP_ITEMS = 1_000
+    ingestion_module.STREAM_GROUP_SECONDS = 1e9
     with Memory(Path(data_dir), embedder=TinyEmbedder(), minimum_relevance=0) as memory:
         committed = []
         for record in memory.add_stream(
@@ -709,7 +709,7 @@ def _stream_then_die(data_dir: str, sender: Connection) -> None:
         sender.send(
             (
                 committed,
-                len(memory._store.pending_index_operations()),
+                len(memory._store.index.pending_index_operations()),
                 cast(ZvecIndex, memory._index).doc_count,
             )
         )
@@ -741,12 +741,12 @@ def test_a_stream_killed_before_its_flush_is_drained_by_the_next_open(tmp_path: 
     with Memory(data_dir, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
         # The open replayed the rows into the index; they are acknowledged by the batched flush,
         # which `close()` takes below.
-        assert len(memory._store.pending_index_operations()) == _KILLED_STREAM_ITEMS
+        assert len(memory._store.index.pending_index_operations()) == _KILLED_STREAM_ITEMS
         assert cast(ZvecIndex, memory._index).doc_count == _KILLED_STREAM_ITEMS
         found = memory.search("streamed clip", limit=10)
         assert {hit.id for hit in found} == set(committed)
     with Memory(data_dir, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
-        assert memory._store.pending_index_operations() == ()
+        assert memory._store.index.pending_index_operations() == ()
         assert cast(ZvecIndex, memory._index).doc_count == _KILLED_STREAM_ITEMS
         assert [item.id for item in memory.list().items] == list(reversed(committed))
 
@@ -940,7 +940,7 @@ def test_a_finished_stream_never_leaves_another_thread_deferring(tmp_path: Path)
             thread.join(30)
 
         assert indexed == {"first": 1}
-        assert memory._deferring is False
+        assert memory._projection._deferring is False
 
 
 @pytest.mark.asyncio

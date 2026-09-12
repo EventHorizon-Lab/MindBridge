@@ -48,7 +48,7 @@ from mindbridge import (
 from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL, VISION_BATCHES_FAILED
 from mindbridge.configuration import resolve_memory_config
 from mindbridge.exceptions import ValidationError
-from mindbridge.memory import declared_capabilities
+from mindbridge.kernel.contracts import declared_capabilities
 from mindbridge.models.base import (
     FormationBackend,
     GenerationBackend,

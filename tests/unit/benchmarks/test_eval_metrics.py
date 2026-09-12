@@ -31,8 +31,11 @@ from mindbridge._telemetry import (
     TOKEN_AUDIO_SECONDS,
 )
 from mindbridge.benchmarks import eval as eval_module
+from mindbridge.benchmarks import eval_config as eval_config_module
+from mindbridge.benchmarks import eval_console as eval_console_module
+from mindbridge.benchmarks import eval_metrics as eval_metrics_module
+from mindbridge.benchmarks import eval_results as eval_results_module
 from mindbridge.benchmarks import eval_telemetry as eval_telemetry_module
-from mindbridge.benchmarks.eval import NOISE_FLOOR, SampleResult
 from mindbridge.benchmarks.eval_adapters import (
     EvalQuestion,
     EvalUnit,
@@ -40,6 +43,8 @@ from mindbridge.benchmarks.eval_adapters import (
     MemoryItem,
 )
 from mindbridge.benchmarks.eval_cache import EvidenceInterval
+from mindbridge.benchmarks.eval_metrics import NOISE_FLOOR
+from mindbridge.benchmarks.eval_results import SampleResult
 from mindbridge.benchmarks.eval_statistics import ScoredValue, percentile
 from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_ARM,
@@ -136,7 +141,7 @@ def _sample(
     )
 
 
-def _arguments(**overrides: object) -> eval_module._Arguments:
+def _arguments(**overrides: object) -> eval_config_module._Arguments:
     values: dict[str, object] = {
         "seed": 7,
         "bootstrap_samples": 32,
@@ -144,7 +149,7 @@ def _arguments(**overrides: object) -> eval_module._Arguments:
         "blind": False,
     }
     values.update(overrides)
-    return cast(eval_module._Arguments, SimpleNamespace(**values))
+    return cast(eval_config_module._Arguments, SimpleNamespace(**values))
 
 
 # --- family 1: ingestion latency to durable, searchable memory, plus throughput -------------
@@ -269,7 +274,7 @@ def test_answer_latency_names_the_quantity_it_measures() -> None:
     )
     task = cast(Any, SimpleNamespace(spec=SimpleNamespace(name="fixture")))
 
-    metrics = eval_module._metrics(task, samples, _arguments())
+    metrics = eval_metrics_module._metrics(task, samples, _arguments())
     latency = cast(Mapping[str, object], metrics["answer_latency_ms"])
 
     assert "memory.ask" in str(latency["measures"])
@@ -298,7 +303,7 @@ def test_a_failed_answer_counts_as_wrong_without_invalidating_the_task_score() -
         ),
     )
 
-    metrics = eval_module._metrics(task, (answered, failed), _arguments())
+    metrics = eval_metrics_module._metrics(task, (answered, failed), _arguments())
     score = cast(Mapping[str, object], metrics["score"])
 
     assert metrics["score_valid"] is True
@@ -318,7 +323,7 @@ def test_metrics_mark_an_unavailable_dataset_unit_as_incomplete() -> None:
         ),
     )
 
-    metrics = eval_module._metrics(task, (sample,), _arguments())
+    metrics = eval_metrics_module._metrics(task, (sample,), _arguments())
     coverage = cast(Mapping[str, object], metrics["dataset_coverage"])
 
     assert metrics["score_valid"] is False
@@ -342,7 +347,7 @@ def test_metrics_do_not_compare_a_selected_slice_to_the_full_dataset() -> None:
         ),
     )
 
-    metrics = eval_module._metrics(task, (sample,), _arguments(limit=1, offset=0))
+    metrics = eval_metrics_module._metrics(task, (sample,), _arguments(limit=1, offset=0))
     coverage = cast(Mapping[str, object], metrics["dataset_coverage"])
 
     assert metrics["score_valid"] is True
@@ -367,7 +372,7 @@ def test_openeqa_aggregate_keeps_the_official_zero_to_one_hundred_scale() -> Non
         ),
     )
 
-    result = eval_module._metrics(task, (sample,), _arguments())
+    result = eval_metrics_module._metrics(task, (sample,), _arguments())
 
     assert cast(Mapping[str, object], result["score"])["mean"] == 75.0
     metric = cast(Mapping[str, object], cast(Mapping[str, object], result["metrics"])["llm_match"])
@@ -399,7 +404,7 @@ def test_personamem_does_not_publish_a_biased_partial_micro_score() -> None:
         ),
     )
 
-    result = eval_module._metrics(task, (supported, unsupported), _arguments())
+    result = eval_metrics_module._metrics(task, (supported, unsupported), _arguments())
     score = cast(Mapping[str, object], result["score"])
     coverage = cast(Mapping[str, object], result["score_coverage"])
 
@@ -768,7 +773,7 @@ def test_random_ranker_expectation_is_reported_next_to_measured_recall() -> None
         _sample("q2", sources=("s3", "s1"), gold=("s1",), candidate_count=10),
     )
 
-    retrieval = eval_module._retrieval_quality(
+    retrieval = eval_metrics_module._retrieval_quality(
         samples, seed=7, bootstrap_samples=32, recall_limit=100
     )
     measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
@@ -801,7 +806,7 @@ def test_group_labels_count_a_gold_session_as_retrieved_when_any_of_its_turns_is
         gold_key="evidence_groups",
     )
 
-    retrieval = eval_module._retrieval_quality(
+    retrieval = eval_metrics_module._retrieval_quality(
         (sample,), seed=7, bootstrap_samples=32, recall_limit=100
     )
     measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
@@ -816,38 +821,38 @@ def test_group_labels_count_a_gold_session_as_retrieved_when_any_of_its_turns_is
     # 0.1; both are certain once k reaches the pool.
     assert cast(float, random_ranker["1"]["mean"]) == pytest.approx(0.15)
     assert cast(float, random_ranker["10"]["mean"]) == pytest.approx(1.0)
-    assert eval_module._random_group_hit(10, 1, 5) == pytest.approx(0.5)
-    assert eval_module._random_group_hit(10, 1, 20) == pytest.approx(1.0)
-    assert eval_module._random_group_hit(10, 4, 7) == pytest.approx(1.0)
+    assert eval_metrics_module._random_group_hit(10, 1, 5) == pytest.approx(0.5)
+    assert eval_metrics_module._random_group_hit(10, 1, 20) == pytest.approx(1.0)
+    assert eval_metrics_module._random_group_hit(10, 4, 7) == pytest.approx(1.0)
 
 
 def test_retrieval_cutoffs_use_the_actual_ask_candidate_window() -> None:
     sample = _sample("q1", sources=("s1",), gold=("s1",), candidate_count=20)
 
-    unbudgeted = eval_module._retrieval_quality(
+    unbudgeted = eval_metrics_module._retrieval_quality(
         (sample,),
         seed=7,
         bootstrap_samples=32,
         recall_limit=2,
     )
-    budgeted = eval_module._retrieval_quality(
+    budgeted = eval_metrics_module._retrieval_quality(
         (sample,),
         seed=7,
         bootstrap_samples=32,
         recall_limit=2,
-        retrieval_candidate_limit=eval_module.RETRIEVAL_CANDIDATE_LIMIT,
+        retrieval_candidate_limit=eval_config_module.RETRIEVAL_CANDIDATE_LIMIT,
     )
 
     assert unbudgeted["retrieval_candidate_limit"] == 6
     assert unbudgeted["truncated_cutoffs"] == [10, 20]
-    assert budgeted["retrieval_candidate_limit"] == eval_module.RETRIEVAL_CANDIDATE_LIMIT
+    assert budgeted["retrieval_candidate_limit"] == eval_config_module.RETRIEVAL_CANDIDATE_LIMIT
     assert budgeted["truncated_cutoffs"] == []
 
 
 def test_retrieval_quality_says_so_when_the_adapter_carries_no_gold_evidence() -> None:
     samples = (_sample("q1", sources=("s1",), gold=(), candidate_count=4),)
 
-    retrieval = eval_module._retrieval_quality(
+    retrieval = eval_metrics_module._retrieval_quality(
         samples, seed=7, bootstrap_samples=32, recall_limit=100
     )
 
@@ -868,10 +873,10 @@ def test_gold_evidence_that_named_no_stored_memory_is_counted_not_absorbed() -> 
         _sample("q2", sources=("s1",), gold=(), candidate_count=4, unresolved=("D9:8", "D9:7")),
     )
 
-    retrieval = eval_module._retrieval_quality(
+    retrieval = eval_metrics_module._retrieval_quality(
         samples, seed=7, bootstrap_samples=32, recall_limit=100
     )
-    controls = eval_module._controls("fixture", retrieval, None, is_blind_run=False)
+    controls = eval_metrics_module._controls("fixture", retrieval, None, is_blind_run=False)
 
     assert retrieval["gold_evidence_key"] is None
     assert retrieval["unresolved_gold_evidence_ids"] == 3
@@ -884,7 +889,7 @@ def test_a_partly_joined_label_list_reports_both_the_measured_and_the_missed_ids
         _sample("q2", sources=("s2",), gold=("s2",), candidate_count=4),
     )
 
-    retrieval = eval_module._retrieval_quality(
+    retrieval = eval_metrics_module._retrieval_quality(
         samples, seed=7, bootstrap_samples=32, recall_limit=100
     )
     measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
@@ -904,7 +909,7 @@ def test_recall_at_1_and_recall_at_20_are_only_accepted_together(cutoff: str) ->
         "random_ranker_recall_at_k": {cutoff: {"mean": 0.1}},
     }
 
-    controls = eval_module._controls("fixture", retrieval, None, is_blind_run=False)
+    controls = eval_metrics_module._controls("fixture", retrieval, None, is_blind_run=False)
 
     assert controls["missing"] == ["blind", "recall_at_20"]
     assert controls["interpretable"] is False
@@ -917,10 +922,10 @@ def test_controls_are_complete_only_with_all_three_baselines() -> None:
         "random_ranker_recall_at_k": {"1": {"mean": 0.1}, "20": {"mean": 1.0}},
     }
 
-    without_blind = eval_module._controls("fixture", retrieval, None, is_blind_run=False)
+    without_blind = eval_metrics_module._controls("fixture", retrieval, None, is_blind_run=False)
     # A non-retrieving arm has nothing for the retrieval controls to check: they do not apply,
     # so its row stays interpretable when the blind control is present.
-    non_retrieving = eval_module._controls(
+    non_retrieving = eval_metrics_module._controls(
         "fixture",
         {"recall_at_k": {}, "random_ranker_recall_at_k": {}},
         {"mean": 0.1},
@@ -930,8 +935,10 @@ def test_controls_are_complete_only_with_all_three_baselines() -> None:
     assert non_retrieving["retrieval_controls_applicable"] is False
     assert non_retrieving["missing"] == []
     assert non_retrieving["interpretable"] is True
-    with_blind = eval_module._controls("fixture", retrieval, {"mean": 0.383}, is_blind_run=False)
-    blind_run = eval_module._controls("fixture", retrieval, None, is_blind_run=True)
+    with_blind = eval_metrics_module._controls(
+        "fixture", retrieval, {"mean": 0.383}, is_blind_run=False
+    )
+    blind_run = eval_metrics_module._controls("fixture", retrieval, None, is_blind_run=True)
 
     assert without_blind["missing"] == ["blind"]
     assert with_blind["missing"] == []
@@ -945,7 +952,7 @@ def test_metrics_attach_the_controls_and_never_hide_a_missing_one() -> None:
     task = cast(Any, SimpleNamespace(spec=SimpleNamespace(name="fixture")))
     samples = (_sample("q1", sources=("s1",), gold=(), candidate_count=4),)
 
-    metrics = eval_module._metrics(task, samples, _arguments())
+    metrics = eval_metrics_module._metrics(task, samples, _arguments())
     controls = cast(Mapping[str, object], metrics["controls"])
 
     assert controls["interpretable"] is False
@@ -988,7 +995,7 @@ def test_table_prints_missing_controls_instead_of_only_a_score() -> None:
         ]
     }
 
-    table = eval_module._table(results)
+    table = eval_console_module._table(results)
 
     header, row = table.splitlines()
     assert "controls" in header
@@ -997,7 +1004,7 @@ def test_table_prints_missing_controls_instead_of_only_a_score() -> None:
     # Four absent control cells render as MISSING, and the summary column names all three.
     assert row.split().count("MISSING") == 5
     assert "MISSING random_ranker,blind,recall_at_20" in row
-    assert eval_module._uninterpretable_tasks(results) == (
+    assert eval_console_module._uninterpretable_tasks(results) == (
         "fixture reports a score without random_ranker, blind, recall_at_20",
     )
 
@@ -1032,12 +1039,12 @@ def test_table_shows_the_control_values_when_they_are_present() -> None:
         ]
     }
 
-    table = eval_module._table(results)
+    table = eval_console_module._table(results)
 
     assert "0.9941" in table
     assert "0.3830" in table
     assert "ok" in table
-    assert eval_module._uninterpretable_tasks(results) == ()
+    assert eval_console_module._uninterpretable_tasks(results) == ()
 
 
 def test_table_prints_the_product_token_cost_when_the_judge_left_the_total_null() -> None:
@@ -1072,7 +1079,7 @@ def test_table_prints_the_product_token_cost_when_the_judge_left_the_total_null(
         ]
     }
 
-    table = eval_module._table(results)
+    table = eval_console_module._table(results)
 
     # The marker says these are the product modules' tokens, not the run total.
     assert "80*" in table
@@ -1084,7 +1091,7 @@ def test_table_prints_the_product_token_cost_when_the_judge_left_the_total_null(
 
 def _blind_document(**overrides: object) -> dict[str, object]:
     document: dict[str, object] = {
-        "schema_version": eval_module.EVAL_SCHEMA_VERSION,
+        "schema_version": eval_results_module.EVAL_SCHEMA_VERSION,
         "run_id": "blind-run",
         "blind": True,
         "tasks": [
@@ -1115,7 +1122,7 @@ def test_blind_baseline_is_read_from_a_blind_run_of_the_same_inputs(tmp_path: Pa
     path = tmp_path / "results.jsonl"
     path.write_text(json.dumps(_blind_document()), encoding="utf-8")
 
-    rows = eval_module._blind_baseline_rows(tmp_path, (_loaded_task(),))
+    rows = eval_metrics_module._blind_baseline_rows(tmp_path, (_loaded_task(),))
 
     assert rows["fixture"]["mean"] == pytest.approx(0.383)
     assert rows["fixture"]["run_id"] == "blind-run"
@@ -1126,7 +1133,7 @@ def test_blind_baseline_rejects_a_run_that_had_memory(tmp_path: Path) -> None:
     path.write_text(json.dumps(_blind_document(blind=False)), encoding="utf-8")
 
     with pytest.raises(ValueError, match="--blind"):
-        eval_module._blind_baseline_rows(path, (_loaded_task(),))
+        eval_metrics_module._blind_baseline_rows(path, (_loaded_task(),))
 
 
 def test_blind_baseline_rejects_different_evaluation_inputs(tmp_path: Path) -> None:
@@ -1134,7 +1141,7 @@ def test_blind_baseline_rejects_different_evaluation_inputs(tmp_path: Path) -> N
     path.write_text(json.dumps(_blind_document()), encoding="utf-8")
 
     with pytest.raises(ValueError, match="evaluation inputs differ"):
-        eval_module._blind_baseline_rows(path, (_loaded_task("f" * 64),))
+        eval_metrics_module._blind_baseline_rows(path, (_loaded_task("f" * 64),))
 
 
 # --- noise floor -----------------------------------------------------------------------------
@@ -1148,7 +1155,8 @@ def test_noise_floor_reports_the_smallest_resolvable_difference() -> None:
     )
 
     noise = cast(
-        Mapping[str, object], eval_module._metrics(task, samples, _arguments())["noise_floor"]
+        Mapping[str, object],
+        eval_metrics_module._metrics(task, samples, _arguments())["noise_floor"],
     )
 
     assert noise["floor"] == pytest.approx(NOISE_FLOOR)
@@ -1188,7 +1196,7 @@ def test_metric_breakdown_families_all_exist_in_the_single_family_table() -> Non
 
     known = {task_family(name) for name in TASKS} - {None}
     task = cast(Any, SimpleNamespace(spec=SimpleNamespace(name="locomo-refined")))
-    declared = eval_module._metric_breakdowns(task, (), _arguments())
+    declared = eval_metrics_module._metric_breakdowns(task, (), _arguments())
 
     assert declared == {}
     assert "locomo-refined" in known
@@ -1226,13 +1234,13 @@ def test_table_refuses_a_task_row_that_carries_no_controls() -> None:
     }
 
     with pytest.raises(KeyError, match="controls"):
-        eval_module._table(results)
+        eval_console_module._table(results)
 
 
 def test_retrieved_sources_are_deduplicated_in_rank_order() -> None:
     sample = _sample("q", sources=("s1", "s1", "s2"), gold=("s2",), candidate_count=3)
 
-    assert eval_module._retrieved_sources(sample) == ("s1", "s2")
+    assert eval_metrics_module._retrieved_sources(sample) == ("s1", "s2")
 
 
 def test_retrieval_recall_scores_the_ranked_list_not_the_cited_evidence() -> None:
@@ -1253,7 +1261,7 @@ def test_retrieval_recall_scores_the_ranked_list_not_the_cited_evidence() -> Non
         ranked_source_ids_complete=False,
     )
 
-    retrieval = eval_module._retrieval_quality(
+    retrieval = eval_metrics_module._retrieval_quality(
         (cited_not_ranked, unranked), seed=7, bootstrap_samples=32, recall_limit=100
     )
     measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
@@ -1283,7 +1291,7 @@ def test_candidate_pool_stops_at_the_question_cutoff() -> None:
 def test_noise_floor_applies_the_measured_floor_to_a_tiny_standard_error() -> None:
     scored = (ScoredValue("a", "one", 1.0), ScoredValue("b", "two", 1.0))
 
-    noise = eval_module._noise_floor(scored, {"cluster_standard_error": 0.001})
+    noise = eval_metrics_module._noise_floor(scored, {"cluster_standard_error": 0.001})
 
     assert cast(float, noise["minimum_meaningful_difference"]) == pytest.approx(NOISE_FLOOR)
 
@@ -1291,7 +1299,7 @@ def test_noise_floor_applies_the_measured_floor_to_a_tiny_standard_error() -> No
 def test_noise_floor_widens_past_the_measured_floor_for_a_noisy_run() -> None:
     scored = (ScoredValue("a", "one", 1.0), ScoredValue("b", "two", 0.0))
 
-    noise = eval_module._noise_floor(scored, {"cluster_standard_error": 0.05})
+    noise = eval_metrics_module._noise_floor(scored, {"cluster_standard_error": 0.05})
 
     assert cast(float, noise["minimum_meaningful_difference"]) == pytest.approx(
         1.959963984540054 * 0.05 * math.sqrt(2)

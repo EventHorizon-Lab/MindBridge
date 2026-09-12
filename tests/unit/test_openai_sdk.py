@@ -23,7 +23,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-import mindbridge.memory as memory_module
+import mindbridge.kernel.formation as formation_module
 import mindbridge.models.openai_sdk as openai_backend
 from mindbridge._telemetry import (
     FORMATION_PROPOSALS_DROPPED,
@@ -4481,7 +4481,7 @@ def test_formation_prompt_states_every_source_rule_the_validator_enforces(
         context=ObservationContext(),
     )
 
-    assert memory_module._formation_refusal(proposal, source) is not None
+    assert formation_module.formation_refusal(proposal, source) is not None
     assert phrase in openai_backend._FORMATION_SYSTEM_PROMPT
 
 

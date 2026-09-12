@@ -25,6 +25,9 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode, Tracer
 
 import mindbridge.configuration as configuration_module
+import mindbridge.kernel.content as content_module
+import mindbridge.kernel.projection as projection_module
+import mindbridge.kernel.temporal as temporal_module
 import mindbridge.memory as memory_module
 from mindbridge import MemoryConfig, MemoryPlugins, RetrievalRejection
 from mindbridge._telemetry import (
@@ -63,8 +66,19 @@ from mindbridge.infrastructure.local.store import (
     StoredEmbedding,
     StoredMemory,
 )
+from mindbridge.infrastructure.local.store._connections import Connections
+from mindbridge.infrastructure.local.store.media import MediaAnalyses
+from mindbridge.infrastructure.local.store.records import MemoryRecords
 from mindbridge.infrastructure.local.zvec_index import IndexHit
-from mindbridge.memory import AsyncMemory, AsyncOmniPrefetch, Memory
+from mindbridge.kernel.derived import derived_text
+from mindbridge.kernel.ranking import (
+    LEXICAL_FULL_COVERAGE_RELEVANCE,
+    merge_index_hits,
+    ranking_signals,
+)
+from mindbridge.kernel.runtime import translate_index_errors
+from mindbridge.kernel.temporal import parse_temporal_range
+from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     EmbedTask,
     FaceAnalysis,
@@ -78,6 +92,7 @@ from mindbridge.models.base import (
 )
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.recall import fallback_plan
+from mindbridge.streams import AsyncOmniPrefetch
 from mindbridge.types import (
     AbstentionReason,
     AnswerPolicy,
@@ -771,7 +786,7 @@ def test_legacy_placed_memory_keeps_its_id_without_crossing_places(
     write_method: str,
 ) -> None:
     context = ObservationContext(place_id="kitchen")
-    current_identity = memory_module._observation_context_identity
+    current_identity = content_module.observation_context_identity
 
     def legacy_identity(value: ObservationContext) -> dict[str, object]:
         identity = current_identity(value)
@@ -779,7 +794,7 @@ def test_legacy_placed_memory_keeps_its_id_without_crossing_places(
         return identity
 
     with monkeypatch.context() as legacy:
-        legacy.setattr(memory_module, "_observation_context_identity", legacy_identity)
+        legacy.setattr(content_module, "observation_context_identity", legacy_identity)
         with _memory(tmp_path, _FakeModels()) as memory:
             original = getattr(memory, write_method)("red toolbox", context=context)
             if write_method == "capture":
@@ -1297,9 +1312,9 @@ def test_search_with_trace_explains_bounded_candidates_without_evidence_content(
         )
         second = memory.add("private-beta")
         weak = memory.add("private-weak")
-        first_documents = memory._store.read_memory_index_documents((first.id,))
-        second_documents = memory._store.read_memory_index_documents((second.id,))
-        weak_documents = memory._store.read_memory_index_documents((weak.id,))
+        first_documents = memory._store.index.read_memory_index_documents((first.id,))
+        second_documents = memory._store.index.read_memory_index_documents((second.id,))
+        weak_documents = memory._store.index.read_memory_index_documents((weak.id,))
         first_child = first_documents[-1].embedding.embedding_id
         second_index = second_documents[0].embedding.embedding_id
         weak_index = weak_documents[0].embedding.embedding_id
@@ -1357,10 +1372,10 @@ def test_search_with_trace_exposes_every_lexical_ranking_input(tmp_path: Path) -
         # on the lexical route's rank and full-coverage inputs.
         first = memory.add("red rare alpha")
         second = memory.add("red rare beta")
-        first_index = memory._store.read_memory_index_documents((first.id,))[
+        first_index = memory._store.index.read_memory_index_documents((first.id,))[
             0
         ].embedding.embedding_id
-        second_index = memory._store.read_memory_index_documents((second.id,))[
+        second_index = memory._store.index.read_memory_index_documents((second.id,))[
             0
         ].embedding.embedding_id
         index = _FakeIndex.instances[-1]
@@ -1558,17 +1573,17 @@ def test_a_transcribed_question_ends_with_the_reference_time(tmp_path: Path) -> 
 
 def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None:
     reference = datetime(2026, 8, 30, 12, tzinfo=timezone.utc)
-    relative = memory_module._parse_temporal_range("2024 days ago", reference)
+    relative = parse_temporal_range("2024 days ago", reference)
     assert relative is not None
     assert relative[0].date() == reference.date() - timedelta(days=2024)
-    assert memory_module._parse_temporal_range("X2024", reference) is None
-    assert memory_module._parse_temporal_range("resolution 2024p", reference) is None
-    assert memory_module._parse_temporal_range("release_2024", reference) is None
-    assert memory_module._parse_temporal_range("型号X2024年", reference) is None
-    assert memory_module._parse_temporal_range("2024年p", reference) is None
-    assert memory_module._parse_temporal_range("型号X2024年4月", reference) is None
-    assert memory_module._parse_temporal_range("X2024年04月p", reference) is None
-    cjk_year = memory_module._parse_temporal_range("2024年发生了什么?", reference)
+    assert parse_temporal_range("X2024", reference) is None
+    assert parse_temporal_range("resolution 2024p", reference) is None
+    assert parse_temporal_range("release_2024", reference) is None
+    assert parse_temporal_range("型号X2024年", reference) is None
+    assert parse_temporal_range("2024年p", reference) is None
+    assert parse_temporal_range("型号X2024年4月", reference) is None
+    assert parse_temporal_range("X2024年04月p", reference) is None
+    cjk_year = parse_temporal_range("2024年发生了什么?", reference)
     assert cjk_year is not None and cjk_year[0].year == 2024
 
     with _memory(tmp_path, _FakeModels()) as memory:
@@ -1593,7 +1608,7 @@ def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None
 def test_rolling_spans_resolve_in_every_calendar_unit() -> None:
     """ "Past two years" is a window that ends at the clock, in either language and any unit."""
     reference = datetime(2026, 8, 31, 12, tzinfo=timezone.utc)
-    parse = memory_module._parse_temporal_range
+    parse = temporal_module.parse_temporal_range
 
     assert parse("conferences I attended in the past two years", reference) == (
         datetime(2024, 8, 31, 12, tzinfo=timezone.utc),
@@ -1664,7 +1679,7 @@ def test_a_rolling_span_needs_its_count(
     """
     reference = datetime(2026, 8, 31, 12, tzinfo=timezone.utc)
 
-    assert memory_module._parse_temporal_range(question, reference) == expected
+    assert temporal_module.parse_temporal_range(question, reference) == expected
 
 
 @pytest.mark.parametrize(
@@ -1680,7 +1695,7 @@ def test_a_rolling_span_needs_its_count(
 def test_text_that_only_looks_like_a_stated_today_leaves_the_clock_alone(question: str) -> None:
     wall_clock = datetime(2026, 9, 11, 8, tzinfo=timezone.utc)
 
-    anchored, temporal_text = memory_module._temporal_context(
+    anchored, temporal_text = temporal_module.temporal_context(
         question, wall_clock, infer_reference=True
     )
 
@@ -1715,7 +1730,7 @@ def test_stated_dates_are_read_from_record_text(
 ) -> None:
     reference = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
-    span = memory_module._stated_date_span(text, reference)
+    span = temporal_module.stated_date_span(text, reference)
 
     assert span == (
         None
@@ -1744,7 +1759,7 @@ def test_a_row_span_prefers_stated_dates_and_falls_back_to_event_time() -> None:
     mail = _row("Booking: Z Hotel, June 23-24, 2022.", datetime(2022, 4, 1, 9, tzinfo=utc))
     photo = _row("a green pallet", datetime(2022, 6, 23, 14, tzinfo=utc))
 
-    assert memory_module._rows_time_span((mail, photo), reference) == (
+    assert temporal_module.rows_time_span((mail, photo), reference) == (
         datetime(2022, 6, 23, tzinfo=utc),
         datetime(2022, 6, 25, tzinfo=utc),
     )
@@ -1754,19 +1769,25 @@ def test_a_row_span_prefers_stated_dates_and_falls_back_to_event_time() -> None:
         "Booking: June 23-24, 2022. Terms updated January 2019.",
         datetime(2022, 6, 12, 22, tzinfo=utc),
     )
-    assert memory_module._rows_time_span((newsletter,), reference) == (
+    assert temporal_module.rows_time_span((newsletter,), reference) == (
         datetime(2022, 6, 12, 22, tzinfo=utc),
         datetime(2022, 6, 13, tzinfo=utc),
     )
     # One instant widens to the end of its day; no time at all is no span.
-    assert memory_module._rows_time_span((photo,), reference) == (
+    assert temporal_module.rows_time_span((photo,), reference) == (
         datetime(2022, 6, 23, 14, tzinfo=utc),
         datetime(2022, 6, 24, tzinfo=utc),
     )
-    assert memory_module._rows_time_span((_row("undated", None),), reference) is None
+    morning = _row("morning", datetime(2022, 6, 22, 9, tzinfo=utc))
+    evening = _row("evening", datetime(2022, 6, 23, 20, tzinfo=utc))
+    assert temporal_module.rows_time_span((morning, evening), reference) == (
+        datetime(2022, 6, 22, 9, tzinfo=utc),
+        datetime(2022, 6, 24, tzinfo=utc),
+    )
+    assert temporal_module.rows_time_span((_row("undated", None),), reference) is None
     # A sentinel event time cannot overflow the widening into an exception.
     assert (
-        memory_module._rows_time_span(
+        temporal_module.rows_time_span(
             (_row("forever", datetime(9999, 12, 31, tzinfo=utc)),), reference
         )
         is None
@@ -1786,13 +1807,13 @@ def test_a_stated_today_anchors_the_clock_in_every_common_spelling(spelling: str
     wall_clock = datetime(2026, 9, 11, 8, tzinfo=timezone.utc)
     question = f"Today is {spelling}, which conferences did I attend in the past two years?"
 
-    anchored, temporal_text = memory_module._temporal_context(
+    anchored, temporal_text = temporal_module.temporal_context(
         question, wall_clock, infer_reference=True
     )
 
     assert anchored == datetime(2025, 7, 1, tzinfo=timezone.utc)
     assert "today is" not in temporal_text.casefold()
-    assert memory_module._temporal_range(temporal_text, anchored) == (
+    assert temporal_module.query_temporal_range(temporal_text, anchored) == (
         datetime(2023, 7, 1, tzinfo=timezone.utc),
         anchored,
     )
@@ -1848,36 +1869,54 @@ def test_decay_reranks_softly_and_requires_explicit_reinforcement(tmp_path: Path
         hit = memory.search("shared memory", limit=1, reference_at=reference)[0]
         assert hit.id == fresh.id
         assert 0.0 < hit.score < 1.0
-        stored = memory._store.read_memory(fresh.id)
+        stored = memory._store.records.read_memory(fresh.id)
         assert stored is not None
         assert stored.access_count == 0
         assert memory.reinforce((fresh.id, fresh.id, "missing")) == 1
 
     with LocalStore(tmp_path) as store:
-        stored = store.read_memory(fresh.id)
+        stored = store.records.read_memory(fresh.id)
         assert stored is not None
         assert stored.access_count == 1
         assert stored.last_accessed_at is not None
         assert (
-            memory_module._ranked_relevance(
+            ranking_signals(
                 stored,
                 0.5,
                 reference_at=stored.last_accessed_at,
                 temporal_range=None,
                 decay_half_life=None,
-            )
+            )[0]
             > 0.5
         )
         assert (
-            memory_module._ranked_relevance(
+            ranking_signals(
                 stored,
                 0.5,
                 reference_at=reference,
                 temporal_range=None,
                 decay_half_life=None,
-            )
+            )[0]
             == 0.5
         )
+
+
+def test_settings_report_the_first_invalid_field_in_declaration_order(tmp_path: Path) -> None:
+    # `retention` is checked after every other setting, as it was before the kernel split, so
+    # a caller with two bad fields keeps seeing the same message.
+    with pytest.raises(ValidationError, match="speaker_similarity"):
+        Memory(
+            tmp_path,
+            embedder=_FakeModels(),
+            speaker_similarity=2.0,
+            retention="forever",  # type: ignore[arg-type]
+        )
+
+
+def test_close_is_a_no_op_before_the_constructor_has_wired_anything() -> None:
+    memory = Memory.__new__(Memory)
+    memory.close()
+    memory.close()
 
 
 @pytest.mark.parametrize("days", [True, 0, -1, float("nan"), float("inf"), "7"])
@@ -1955,7 +1994,9 @@ def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
         assert hits and hits[0].id == target.id
         assert index.lexical_search_calls == 2
 
-        monkeypatch.setattr(memory._store, "read_memories", lambda _memory_ids, **_scope: ())
+        monkeypatch.setattr(
+            memory._store.records, "read_memories", lambda _memory_ids, **_scope: ()
+        )
         assert memory.search("common witness in 2024", limit=1) == ()
 
 
@@ -2231,11 +2272,12 @@ def test_evidence_budget_charges_media_far_above_its_record_text(tmp_path: Path)
     assert len(media_hits) == 6
 
 
-def test_evidence_budget_rejects_values_that_cannot_bound_anything() -> None:
+def test_evidence_budget_rejects_values_that_cannot_bound_anything(tmp_path: Path) -> None:
     for value in (0, -1, True):
         with pytest.raises(ValidationError, match="evidence_budget_chars"):
-            memory_module._evidence_budget(value)
-    assert memory_module._evidence_budget(None) is None
+            Memory(tmp_path, embedder=_FakeModels(), evidence_budget_chars=value)
+    with Memory(tmp_path, embedder=_FakeModels(), evidence_budget_chars=None) as memory:
+        assert memory._settings.evidence_budget is None
 
 
 def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) -> None:
@@ -2257,7 +2299,7 @@ def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) ->
 
 
 def test_temporal_candidate_merge_keeps_the_best_vector_score() -> None:
-    merged = memory_module._merge_index_hits(
+    merged = merge_index_hits(
         (IndexHit(id="shared", relevance=0.2),),
         (IndexHit(id="shared", relevance=0.9),),
     )
@@ -2335,7 +2377,7 @@ def test_ask_without_answerer_fails_before_retrieval_or_reinforcement(tmp_path: 
         assert unconfigured.value.reason == "backend_not_configured"
         assert unconfigured.value.retryable is False
 
-        stored = memory._store.read_memory(record.id)
+        stored = memory._store.records.read_memory(record.id)
         assert stored is not None
         assert stored.access_count == 0
         assert models.embed_tasks == [EmbedTask.DOCUMENT]
@@ -2371,7 +2413,7 @@ def test_storage_failures_name_the_stage_that_failed(tmp_path: Path) -> None:
     with _memory(tmp_path) as memory:
         memory.add("remember this")
         with (
-            _failing_store(memory, "list_memories"),
+            _failing_store(memory._store.records, "list_memories"),
             pytest.raises(StorageError) as failure,
         ):
             memory.list()
@@ -2381,17 +2423,17 @@ def test_storage_failures_name_the_stage_that_failed(tmp_path: Path) -> None:
 
 
 @contextmanager
-def _failing_store(memory: Memory, method: str) -> Iterator[None]:
-    original = getattr(memory._store, method)
+def _failing_store(family: object, method: str) -> Iterator[None]:
+    original = getattr(family, method)
 
     def fail(*_args: object, **_kwargs: object) -> object:
         raise sqlite3.OperationalError("disk I/O error")
 
-    setattr(memory._store, method, fail)
+    setattr(family, method, fail)
     try:
         yield
     finally:
-        setattr(memory._store, method, original)
+        setattr(family, method, original)
 
 
 def test_explicit_embedder_owns_embedding_and_models_own_generation(tmp_path: Path) -> None:
@@ -2445,19 +2487,19 @@ def test_memory_composes_explicit_plugins_and_local_policy(tmp_path: Path) -> No
 
     with Memory.from_plugins(tmp_path, plugins=plugins, config=config) as memory:
         assert memory.add("red plugin-composed memory")
-        assert memory._embedder is models
-        assert memory._answerer is models
-        assert memory._transcriber is models
-        assert memory._face_analyzer is faces
+        assert memory._backends.embedder is models
+        assert memory._backends.answerer is models
+        assert memory._backends.transcriber is models
+        assert memory._backends.face_analyzer is faces
         assert _FakeIndex.instances[-1].quantization is IndexQuantization.FP16
-        assert memory._index_speech is True
-        assert memory._minimum_relevance == 0
-        assert memory._ambiguity_margin == 0
-        assert memory._decay_half_life == timedelta(days=7)
-        assert memory._speaker_similarity == 0.7
-        assert memory._speaker_margin == 0.04
-        assert memory._face_similarity == 0.3
-        assert memory._face_margin == 0.03
+        assert memory._settings.index_speech is True
+        assert memory._settings.minimum_relevance == 0
+        assert memory._settings.ambiguity_margin == 0
+        assert memory._settings.decay_half_life == timedelta(days=7)
+        assert memory._settings.speaker_similarity == 0.7
+        assert memory._settings.speaker_margin == 0.04
+        assert memory._settings.face_similarity == 0.3
+        assert memory._settings.face_margin == 0.03
 
     assert models.close_calls == 1
     assert faces.closed is True
@@ -2496,12 +2538,12 @@ def test_memory_from_config_uses_the_same_kernel_and_closes_resolved_backends(
     with Memory.from_config(config) as memory:
         record = memory.add("red declarative memory")
         assert memory.search("red declarative")[0].id == record.id
-        assert memory._embedder is embedder
-        assert memory._answerer is answerer
-        assert memory._transcriber is speech
-        assert memory._face_analyzer is faces
-        assert memory._index_speech is True
-        assert memory._minimum_relevance == 0
+        assert memory._backends.embedder is embedder
+        assert memory._backends.answerer is answerer
+        assert memory._backends.transcriber is speech
+        assert memory._backends.face_analyzer is faces
+        assert memory._settings.index_speech is True
+        assert memory._settings.minimum_relevance == 0
         assert _FakeIndex.instances[-1].quantization is IndexQuantization.FP16
 
     assert embedder.close_calls == 1
@@ -3170,13 +3212,13 @@ def test_face_voice_merge_atomically_refreshes_speech_index_and_keeps_alias(
         embedder.fail_documents = True
         with pytest.raises(ModelError, match="embed"):
             memory.faces(video.id)
-        assert memory._store.resolve_identity_id(voice_id) == voice_id
+        assert memory._store.identities.resolve_identity_id(voice_id) == voice_id
         assert memory.speech(video.id)[0].speaker_id == voice_id
         assert voice_id in memory.get(video.id).content
 
         embedder.fail_documents = False
         assert memory.faces(video.id)[0].identity_id == face_id
-        assert memory._store.resolve_identity_id(voice_id) == face_id
+        assert memory._store.identities.resolve_identity_id(voice_id) == face_id
         assert memory.speech(video.id)[0].speaker_id == face_id
         refreshed = memory.get(video.id)
         assert face_id in refreshed.content
@@ -4137,11 +4179,11 @@ def test_add_many_deduplicates_one_model_and_store_batch(
     tmp_path: Path,
 ) -> None:
     models = _FakeModels()
-    original = LocalStore.write_memories
+    original = MemoryRecords.write_memories
     store_batches: list[tuple[str, ...]] = []
 
     def counted_write(
-        store: LocalStore,
+        store: MemoryRecords,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
         *,
@@ -4154,7 +4196,7 @@ def test_add_many_deduplicates_one_model_and_store_batch(
         )
         return result
 
-    monkeypatch.setattr(LocalStore, "write_memories", counted_write)
+    monkeypatch.setattr(MemoryRecords, "write_memories", counted_write)
     with _memory(tmp_path, models) as memory:
         records = memory.add_many(("alpha", "alpha", "red beta"))
         assert [record.id for record in records] == [records[0].id, records[0].id, records[2].id]
@@ -4303,21 +4345,21 @@ def test_add_many_hydrates_the_index_outbox_in_batches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    original_connection = LocalStore._connection
+    original_connection = Connections.connection
     connection_count = 0
 
     @contextmanager
     def counted_connection(
-        store: LocalStore, *, secure_delete: bool = False
+        store: Connections, *, secure_delete: bool = False
     ) -> Iterator[sqlite3.Connection]:
-        # Mirrors `LocalStore._connection`, forwarding its keyword arguments. This test counts
+        # Mirrors `Connections.connection`, forwarding its keyword arguments. This test counts
         # connections, so it must not change which kind of connection the store asked for.
         nonlocal connection_count
         connection_count += 1
         with original_connection(store, secure_delete=secure_delete) as connection:
             yield connection
 
-    monkeypatch.setattr(LocalStore, "_connection", counted_connection)
+    monkeypatch.setattr(Connections, "connection", counted_connection)
     with _memory(tmp_path, _FakeModels()) as memory:
         before = connection_count
         memory.add_many(tuple(f"memory {index}" for index in range(100)))
@@ -4332,7 +4374,7 @@ def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
     bound the knob deciding how many of them a bulk write pays for. What the search index accepts
     in one write is a separate limit that `ZvecIndex` enforces for itself.
     """
-    bound = memory_module._OUTBOX_BATCH_SIZE
+    bound = projection_module.OUTBOX_BATCH_SIZE
     count = bound + bound // 2
     with _memory(tmp_path, _FakeModels()) as memory:
         memory.add_many(tuple(f"memory {index}" for index in range(count)))
@@ -4345,32 +4387,32 @@ def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
 
 def test_writes_apply_at_once_and_flush_in_batches(tmp_path: Path) -> None:
     """A write is searchable when it returns; the flush and acknowledgement wait for the bound."""
-    bound = memory_module._INDEX_FLUSH_OPERATIONS
+    bound = projection_module.INDEX_FLUSH_OPERATIONS
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
         record = memory.add("red kettle")
         assert len(index.upsert_calls) == 1
         assert index.flush_calls == 0
         assert [hit.id for hit in memory.search("red kettle")] == [record.id]
-        assert memory._store.pending_index_operations() != ()
+        assert memory._store.index.pending_index_operations() != ()
         # A later drain does not re-hydrate or re-apply what the index already holds.
         memory.search("red kettle")
         assert len(index.upsert_calls) == 1
         memory.add_many(tuple(f"kettle {position}" for position in range(bound)))
         assert index.flush_calls == 1
-        assert memory._store.pending_index_operations() == ()
+        assert memory._store.index.pending_index_operations() == ()
         memory.add("blue kettle")
         assert index.flush_calls == 1
-        assert memory._store.pending_index_operations() != ()
+        assert memory._store.index.pending_index_operations() != ()
     # `close()` flushes and acknowledges whatever the bound had not reached.
     assert index.flush_calls == 2
     with _memory(tmp_path, _FakeModels()) as memory:
-        assert memory._store.pending_index_operations() == ()
+        assert memory._store.index.pending_index_operations() == ()
 
 
 def test_a_failed_batched_flush_is_retried_without_reapplying_its_rows(tmp_path: Path) -> None:
     """The write that takes the flush reports its failure; the rows stay pending and applied."""
-    bound = memory_module._INDEX_FLUSH_OPERATIONS
+    bound = projection_module.INDEX_FLUSH_OPERATIONS
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
         index.fail_next_flush = True
@@ -4378,12 +4420,12 @@ def test_a_failed_batched_flush_is_retried_without_reapplying_its_rows(tmp_path:
             memory.add_many(tuple(f"kettle {position}" for position in range(bound)))
         assert index.flush_calls == 1
         applied = len(index.upsert_calls)
-        assert memory._store.pending_index_operations() != ()
+        assert memory._store.index.pending_index_operations() != ()
         assert len(memory.search("kettle", limit=5)) == 5
         # The read-only drain retried the flush and acknowledged every row without re-applying.
         assert index.flush_calls == 2
         assert len(index.upsert_calls) == applied
-        assert memory._store.pending_index_operations() == ()
+        assert memory._store.index.pending_index_operations() == ()
         memory.add("red kettle")
         assert len(index.upsert_calls) == applied + 1
         assert index.flush_calls == 2
@@ -4403,22 +4445,26 @@ def test_a_failed_flush_over_a_full_outbox_read_does_not_stall_later_writes(
         index.fail_next_flush = True
         with pytest.raises(IndexUnavailableError):
             memory.add_many(
-                tuple(f"window {position}" for position in range(memory_module._OUTBOX_BATCH_SIZE))
+                tuple(
+                    f"window {position}" for position in range(projection_module.OUTBOX_BATCH_SIZE)
+                )
             )
         assert index.flush_calls == 1
         record = memory.add("red teapot")
         assert index.flush_calls == 2
-        assert memory._store.pending_index_operations() == ()
+        assert memory._store.index.pending_index_operations() == ()
         assert record.id in {hit.id for hit in memory.search("red teapot")}
         # A read-only drain retries a still-failed flush too.
         index.fail_next_flush = True
         with pytest.raises(IndexUnavailableError):
             memory.add_many(
-                tuple(f"second {position}" for position in range(memory_module._OUTBOX_BATCH_SIZE))
+                tuple(
+                    f"second {position}" for position in range(projection_module.OUTBOX_BATCH_SIZE)
+                )
             )
         memory.search("red teapot")
         assert index.flush_calls == 4
-        assert memory._store.pending_index_operations() == ()
+        assert memory._store.index.pending_index_operations() == ()
 
 
 def test_close_reports_a_failed_batched_flush_and_the_next_open_replays_it(
@@ -4433,22 +4479,22 @@ def test_close_reports_a_failed_batched_flush_and_the_next_open_replays_it(
     assert index.closed is True
     with _memory(tmp_path, _FakeModels()) as memory:
         # The rows were pending in SQLite, so the open re-applied them; `close()` acknowledges.
-        assert len(memory._store.pending_index_operations()) > 0
+        assert len(memory._store.index.pending_index_operations()) > 0
         assert [hit.id for hit in memory.search("red lantern")] == [record.id]
     assert _FakeIndex.instances[-1].flush_calls == 1
     with _memory(tmp_path, _FakeModels()) as memory:
-        assert memory._store.pending_index_operations() == ()
+        assert memory._store.index.pending_index_operations() == ()
 
 
 def test_concurrent_adds_share_one_index_apply(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    original = LocalStore.write_memories
+    original = MemoryRecords.write_memories
     committed = Barrier(2)
 
     def synchronized_write(
-        store: LocalStore,
+        store: MemoryRecords,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
         *,
@@ -4458,7 +4504,7 @@ def test_concurrent_adds_share_one_index_apply(
         committed.wait(timeout=3)
         return result
 
-    monkeypatch.setattr(LocalStore, "write_memories", synchronized_write)
+    monkeypatch.setattr(MemoryRecords, "write_memories", synchronized_write)
     with (
         _memory(tmp_path, _FakeModels()) as memory,
         ThreadPoolExecutor(max_workers=2) as pool,
@@ -4477,7 +4523,7 @@ def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
     snapshot_taken = Event()
     add_committed = Event()
     original_rebuild = _FakeIndex.rebuild
-    original_write = LocalStore.write_memories
+    original_write = MemoryRecords.write_memories
 
     def paused_rebuild(
         index: _FakeIndex,
@@ -4497,7 +4543,7 @@ def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
         )
 
     def tracked_write(
-        store: LocalStore,
+        store: MemoryRecords,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
         *,
@@ -4512,7 +4558,7 @@ def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
     with _memory(tmp_path, _FakeModels()) as memory:
         existing = memory.add("existing")
         monkeypatch.setattr(_FakeIndex, "rebuild", paused_rebuild)
-        monkeypatch.setattr(LocalStore, "write_memories", tracked_write)
+        monkeypatch.setattr(MemoryRecords, "write_memories", tracked_write)
         with ThreadPoolExecutor(max_workers=2) as pool:
             reindexed = pool.submit(memory.reindex)
             assert snapshot_taken.wait(timeout=3)
@@ -4772,7 +4818,7 @@ def test_interrupted_reindex_is_completed_from_durable_sqlite(tmp_path: Path) ->
 def test_index_fd_exhaustion_keeps_the_actionable_cause() -> None:
     with (
         pytest.raises(IndexUnavailableError, match=r"901 descriptors.*soft limit is 1024"),
-        memory_module._translate_index_errors("update the search index"),
+        translate_index_errors("update the search index"),
     ):
         raise OSError(
             errno.EMFILE,
@@ -4785,7 +4831,7 @@ def test_formation_marker_commits_with_derived_sqlite_before_index_flush(
     tmp_path: Path,
 ) -> None:
     # Flush in every drain so the failure surfaces in the write that enqueued the row.
-    monkeypatch.setattr(memory_module, "_INDEX_FLUSH_OPERATIONS", 1)
+    monkeypatch.setattr(projection_module, "INDEX_FLUSH_OPERATIONS", 1)
 
     class FlushFailingFormer:
         formation_capabilities = frozenset({Modality.TEXT})
@@ -4999,17 +5045,17 @@ def test_persisted_media_reads_do_not_run_gc_ownership_queries(
     tmp_path: Path,
 ) -> None:
     calls = 0
-    original = LocalStore.read_unreferenced_assets
+    original = MediaAnalyses.read_unreferenced_assets
 
     def counted(
-        store: LocalStore,
+        store: MediaAnalyses,
         asset_ids: Sequence[str],
     ) -> tuple[StoredAsset, ...]:
         nonlocal calls
         calls += 1
         return original(store, asset_ids)
 
-    monkeypatch.setattr(LocalStore, "read_unreferenced_assets", counted)
+    monkeypatch.setattr(MediaAnalyses, "read_unreferenced_assets", counted)
     with _memory(tmp_path, _FakeModels()) as memory:
         record = memory.add(("red image", Blob(b"stored", "image/png", "stored.png")))
         calls = 0
@@ -5065,12 +5111,12 @@ def test_add_many_batches_distinct_audio_transcriptions(
     )
 
     def unexpected_transcript_transaction(
-        _store: LocalStore,
+        _store: MediaAnalyses,
         _values: Sequence[tuple[str, str]],
     ) -> int:
         pytest.fail("add_many wrote transcripts outside its memory transaction")
 
-    monkeypatch.setattr(LocalStore, "set_asset_transcripts", unexpected_transcript_transaction)
+    monkeypatch.setattr(MediaAnalyses, "set_asset_transcripts", unexpected_transcript_transaction)
     with _memory(tmp_path, models) as memory:
         records = memory.add_many(
             (
@@ -5078,7 +5124,7 @@ def test_add_many_batches_distinct_audio_transcriptions(
                 Blob(b"second audio", "audio/wav", "second.wav"),
             )
         )
-        stored = memory._store.read_assets(tuple(record.assets[0].id for record in records))
+        stored = memory._store.media.read_assets(tuple(record.assets[0].id for record in records))
 
     assert len(models.transcribe_calls) == 1
     assert len(models.transcribe_calls[0]) == 2
@@ -5115,17 +5161,17 @@ def test_omni_add_batches_declared_transcripts_and_ask_reuses_them(
         )
     )
     writes: list[tuple[tuple[str, str], ...]] = []
-    set_asset_transcripts = LocalStore.set_asset_transcripts
+    set_asset_transcripts = MediaAnalyses.set_asset_transcripts
 
     def record_transcript_transaction(
-        store: LocalStore,
+        store: MediaAnalyses,
         values: Sequence[tuple[str, str]],
     ) -> int:
         batch = tuple(values)
         writes.append(batch)
         return set_asset_transcripts(store, batch)
 
-    monkeypatch.setattr(LocalStore, "set_asset_transcripts", record_transcript_transaction)
+    monkeypatch.setattr(MediaAnalyses, "set_asset_transcripts", record_transcript_transaction)
 
     with _memory(tmp_path, models) as memory:
         memory.add_many(
@@ -5261,16 +5307,16 @@ def test_ask_stream_reinforces_before_it_hands_over_the_result(tmp_path: Path) -
 
         stream = memory.ask_stream("where is the red toolbox?")
         next(stream)
-        mid = memory._store.read_memory(record.id)
+        mid = memory._store.records.read_memory(record.id)
         assert mid is not None and mid.access_count == 0
 
         result = next(chunk.result for chunk in stream if chunk.result is not None)
-        settled = memory._store.read_memory(record.id)
+        settled = memory._store.records.read_memory(record.id)
 
         # Stopping on the terminal chunk is how a result is read, and a generator stays
         # suspended wherever the caller stops. Nothing may still be open there, or every
         # ordinary caller would pin an operation and hang `close()`.
-        assert memory._active_operations == 0
+        assert memory._lifecycle._active_operations == 0
 
     # A caller holding the result holds a settled store, so reading access counts straight
     # after the answer cannot race the reinforcement the answer caused.
@@ -5306,12 +5352,12 @@ def test_abandoning_ask_stream_releases_the_operation_it_holds(tmp_path: Path) -
 
         stream = memory.ask_stream("where is the red toolbox?")
         next(stream)
-        assert memory._active_operations == 1
+        assert memory._lifecycle._active_operations == 1
 
         # `close()` waits on open operations, so a stream that pinned one would hang shutdown
         # rather than fail a test.
         stream.close()
-        assert memory._active_operations == 0
+        assert memory._lifecycle._active_operations == 0
     finally:
         memory.close()
 
@@ -5455,20 +5501,20 @@ def test_answering_reinforces_only_the_evidence_the_model_cited(tmp_path: Path) 
         assert [hit.id for hit in result.hits] == [cited]
 
         # Bookkeeping must never cost an answer that has already been generated and paid for.
-        original = memory._store.reinforce_memories
+        original = memory._store.records.reinforce_memories
 
         def _refuse(memory_ids: Sequence[str], *, accessed_at: datetime) -> int:
             raise StorageError("reinforcement unavailable")
 
-        memory._store.reinforce_memories = _refuse  # type: ignore[method-assign]
+        memory._store.records.reinforce_memories = _refuse  # type: ignore[method-assign]
         try:
             assert memory.ask("red", limit=2).answer == "grounded"
         finally:
-            memory._store.reinforce_memories = original  # type: ignore[method-assign]
+            memory._store.records.reinforce_memories = original  # type: ignore[method-assign]
 
     with LocalStore(tmp_path) as store:
-        used = store.read_memory(cited)
-        unused = store.read_memory(ignored)
+        used = store.records.read_memory(cited)
+        unused = store.records.read_memory(ignored)
         assert used is not None and unused is not None
         # One count, not two: the second answer's reinforcement was the one that failed.
         assert used.access_count == 1
@@ -5505,7 +5551,7 @@ def test_reinforce_on_answer_false_keeps_answering_free_of_side_effects(tmp_path
         cited = result.hits[0].id
 
     with LocalStore(tmp_path) as store:
-        untouched = store.read_memory(cited)
+        untouched = store.records.read_memory(cited)
         assert untouched is not None
         assert untouched.access_count == 0
         assert untouched.last_accessed_at is None
@@ -5599,7 +5645,7 @@ def test_bare_media_memory_indexes_a_declared_transcript(tmp_path: Path) -> None
     with _memory(tmp_path, models) as memory:
         record = memory.add(Blob(b"kettle recording", "audio/wav", "kettle.wav"))
         index = _FakeIndex.instances[-1]
-        documents = memory._store.read_memory_index_documents((record.id,))
+        documents = memory._store.index.read_memory_index_documents((record.id,))
 
     assert "spoken red wrench" in record.content
     # Zvec attaches the BM25 document to the aggregate part alone, so an empty record content is
@@ -5645,7 +5691,7 @@ def test_the_transcript_marker_names_no_modality(tmp_path: Path) -> None:
     # floor, so every word of the marker is a term that makes this memory visible to any query
     # containing it. A marker naming a modality both mislabels a video transcript as audio and
     # hands each media memory a free match on an ordinary English word.
-    assert MemoryConfig().minimum_relevance < memory_module._LEXICAL_FULL_COVERAGE_RELEVANCE
+    assert MemoryConfig().minimum_relevance < LEXICAL_FULL_COVERAGE_RELEVANCE
     assert "spoken red wrench" in indexed
     assert not {"audio", "video"} & set(re.findall(r"\w+", indexed.casefold()))
 
@@ -5661,7 +5707,7 @@ def test_transcript_fallback_remains_when_speech_has_no_identity_block(tmp_path:
         transcript="spoken red wrench",
     )
 
-    derived = memory_module._derived_text("", (asset,))
+    derived = derived_text("", (asset,))
 
     assert derived == f"[transcript:{asset.asset_id}]\nspoken red wrench"
 
@@ -5683,7 +5729,7 @@ def test_audio_fallback_also_transcribes_declared_video_speech(tmp_path: Path) -
                 Blob(b"session frames", "video/mp4", "session.mp4"),
             )
         )
-        stored = memory._store.read_assets(tuple(asset.id for asset in record.assets))
+        stored = memory._store.media.read_assets(tuple(asset.id for asset in record.assets))
 
     assert len(models.transcribe_calls) == 1
     assert len(models.transcribe_calls[0]) == 2
@@ -5891,7 +5937,7 @@ def test_vlm_generation_recognizes_complete_speaker_identity_in_parallel(
         assert routed_hits[0].modality is Modality.VIDEO
         assert {asset.modality for asset in routed_hits[0].assets} == {Modality.VIDEO}
         assert "[speech identities:" not in result.hits[0].content
-        assert memory._store.read_asset(question_evidence[0]["asset_id"]) is None
+        assert memory._store.media.read_asset(question_evidence[0]["asset_id"]) is None
         assert len(speech.calls) == 2
 
 
@@ -6293,7 +6339,7 @@ async def test_async_ask_stream_releases_the_operation_when_the_caller_stops_ear
 
         # `aclose()` awaits the synchronous close through the worker, so the operation is
         # already released when it returns; a poll here would hide a leak behind a timeout.
-        assert memory._memory._active_operations == 0
+        assert memory._memory._lifecycle._active_operations == 0
     finally:
         await memory.close()
 
@@ -6495,7 +6541,7 @@ def test_capabilities_declares_what_a_composition_can_do(tmp_path: Path) -> None
     """A caller and an agent must be able to ask, not infer, what this composition supports.
 
     Nothing published this before, so the library itself reached
-    `self._memory._memory._embedding_capabilities` to learn it. When internal code needs two
+    `self._memory._memory._backends.embedding_capabilities` to learn it. When internal code needs two
     underscores to find a fact, an external caller has no route at all: `/healthz` returned
     `{"status": "ok"}` and no transport could report which modalities would actually work.
     """
@@ -6569,17 +6615,17 @@ def test_ranking_does_not_hydrate_stored_embedding_vectors(tmp_path: Path) -> No
         # the ranking path that follows is under test.
         store = memory._store
         calls: list[int] = []
-        original = store.read_index_documents
+        original = store.index.read_index_documents
 
         def _refuse(embedding_ids: Sequence[str]) -> tuple[IndexDocument, ...]:
             calls.append(len(embedding_ids))
             raise AssertionError("ranking hydrated whole index documents")
 
-        store.read_index_documents = _refuse  # type: ignore[method-assign]
+        store.index.read_index_documents = _refuse  # type: ignore[method-assign]
         try:
             hits = memory.search("winter", limit=5)
         finally:
-            store.read_index_documents = original  # type: ignore[method-assign]
+            store.index.read_index_documents = original  # type: ignore[method-assign]
 
     assert calls == []
     assert [hit.content for hit in hits][:1] == ["a stored fact about winter"]
@@ -6692,7 +6738,7 @@ def test_a_wearer_voice_binding_one_face_does_not_cascade_to_everybody(tmp_path:
             assert heard is not None
             voice_ids.setdefault(speaker, heard)
             face_ids.setdefault(seen, observed)
-        resolve = memory._store.resolve_identity_id
+        resolve = memory._store.identities.resolve_identity_id
         voices = {person: resolve(value) for person, value in voice_ids.items()}
         faces = {person: resolve(value) for person, value in face_ids.items()}
 
@@ -6751,9 +6797,9 @@ def test_scoped_survivor_count_returns_the_hits_the_discarded_hydration_did(
         )
         store = memory._store
         monkeypatch.setattr(
-            store,
+            store.records,
             "count_memories",
-            lambda memory_ids, **scope: len(store.read_memories(memory_ids, **scope)),
+            lambda memory_ids, **scope: len(store.records.read_memories(memory_ids, **scope)),
         )
         hydrated = tuple(
             memory.search(query, limit=limit, scope=scope) for query, limit, scope in searches
@@ -6769,7 +6815,7 @@ def test_scoped_survivor_count_returns_the_hits_the_discarded_hydration_did(
 def _stream_log(memory: Memory, index: _FakeIndex) -> list[tuple[str, tuple[str, ...]]]:
     """Record SQLite commits and Zvec mutations on one timeline."""
     log: list[tuple[str, tuple[str, ...]]] = []
-    write_memories = memory._store.write_memories
+    write_memories = memory._store.records.write_memories
     upsert = index.upsert
     flush = index.flush
 
@@ -6794,7 +6840,7 @@ def _stream_log(memory: Memory, index: _FakeIndex) -> list[tuple[str, tuple[str,
         flush()
         log.append(("flush", ()))
 
-    memory._store.write_memories = logged_write  # type: ignore[method-assign]
+    memory._store.records.write_memories = logged_write  # type: ignore[method-assign]
     index.upsert = logged_upsert  # type: ignore[method-assign]
     index.flush = logged_flush  # type: ignore[method-assign]
     return log
@@ -6809,7 +6855,7 @@ def test_add_stream_indexes_committed_items_in_bounded_groups(
     The stream groups the *apply*; the flush that acknowledges the rows is batched behind every
     write and here runs once, at `close()`.
     """
-    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+    monkeypatch.setattr("mindbridge.kernel.ingestion.STREAM_GROUP_SECONDS", 1e9)
 
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
@@ -6840,7 +6886,7 @@ def test_add_stream_applies_a_slow_source_on_the_time_bound(
     tmp_path: Path,
 ) -> None:
     """The elapsed bound is the one that fires when the source is slower than the group."""
-    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 0.0)
+    monkeypatch.setattr("mindbridge.kernel.ingestion.STREAM_GROUP_SECONDS", 0.0)
 
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
@@ -6859,7 +6905,7 @@ def test_a_stream_that_ended_stops_deferring_even_if_another_outlives_it(
     again: every later `add`, `delete` or `optimize` on that thread returned without flushing the
     index, and the rows stayed durable but unsearchable.
     """
-    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+    monkeypatch.setattr("mindbridge.kernel.ingestion.STREAM_GROUP_SECONDS", 1e9)
 
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
@@ -6907,7 +6953,7 @@ def test_a_stream_pumped_across_threads_stops_deferring_on_the_thread_that_opene
     left the opener deferring forever: every later `add` or `delete` on that worker returned
     without flushing the index and its rows stayed durable but unsearchable.
     """
-    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+    monkeypatch.setattr("mindbridge.kernel.ingestion.STREAM_GROUP_SECONDS", 1e9)
     exhausted = object()
 
     with _memory(tmp_path, _FakeModels()) as memory:
@@ -6939,7 +6985,7 @@ def test_search_during_a_stream_sees_the_committed_items(
     tmp_path: Path,
 ) -> None:
     """A group that has not flushed yet is still retrievable: `search` drains first."""
-    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+    monkeypatch.setattr("mindbridge.kernel.ingestion.STREAM_GROUP_SECONDS", 1e9)
 
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
@@ -6963,7 +7009,7 @@ def test_search_inside_a_live_stream_loop_sees_the_item_just_yielded(
     The stream defers its flushes on its own thread; a search on that same thread would otherwise
     skip the drain and miss every item committed since the last group boundary.
     """
-    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+    monkeypatch.setattr("mindbridge.kernel.ingestion.STREAM_GROUP_SECONDS", 1e9)
 
     with _memory(tmp_path, _FakeModels()) as memory:
         index = _FakeIndex.instances[-1]
@@ -6983,7 +7029,7 @@ def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+    monkeypatch.setattr("mindbridge.kernel.ingestion.STREAM_GROUP_SECONDS", 1e9)
 
     def contents() -> Iterator[str]:
         yield "first failing-stream clip"
@@ -6998,7 +7044,7 @@ def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
             next(stream)
         # The group never closed, so the projection work is still pending and durable.
         assert index.upsert_calls == []
-        assert memory._store.pending_index_operations() != ()
+        assert memory._store.index.pending_index_operations() != ()
         assert [item.id for item in memory.list().items] == [prefix[1].id, prefix[0].id]
         recovered = memory.search("failing-stream clip", limit=10)
 
@@ -7441,7 +7487,7 @@ def test_the_planner_is_told_the_clock_and_what_the_corpus_holds(tmp_path: Path)
         memory.add("a red wrench", occurred_at=datetime(2024, 9, 1, tzinfo=timezone.utc))
         memory.add("a blue crate", occurred_at=datetime(2024, 9, 3, tzinfo=timezone.utc))
 
-        memory._recall_plan("what happened?", reference_at=reference, k=12)
+        memory._answering._recall_plan("what happened?", reference_at=reference, k=12)
 
         question, clock, digest, attempted = models.plan_calls[0]
         assert (question, clock, attempted) == ("what happened?", reference, "")
@@ -7455,12 +7501,12 @@ def test_the_corpus_digest_is_recomputed_after_a_write_and_not_before(tmp_path: 
     """It is cached on the store's commit counter, so it cannot go stale behind an ingest."""
     models = _FakeModels()
     with _memory(tmp_path, models) as memory:
-        assert memory._corpus_digest() == "empty"
-        unchanged = memory._corpus_digest()
+        assert memory._answering._corpus_digest() == "empty"
+        unchanged = memory._answering._corpus_digest()
         memory.add("a red wrench", occurred_at=datetime(2024, 9, 1, tzinfo=timezone.utc))
 
         assert unchanged == "empty"
-        assert memory._corpus_digest().startswith("1 records; ")
+        assert memory._answering._corpus_digest().startswith("1 records; ")
 
 
 def test_a_backend_that_cannot_plan_keeps_todays_single_search(tmp_path: Path) -> None:
@@ -7468,7 +7514,7 @@ def test_a_backend_that_cannot_plan_keeps_todays_single_search(tmp_path: Path) -
     models = _FakeModels()
     answerer = _PlannerlessAnswerer()
     with Memory(tmp_path, embedder=models, answerer=answerer) as memory:
-        plan = memory._recall_plan(
+        plan = memory._answering._recall_plan(
             "who signed?",
             reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
             k=9,
@@ -7482,7 +7528,7 @@ def test_a_planner_failure_leaves_the_question_running(tmp_path: Path) -> None:
     models = _FakeModels()
     models.plan_error = ModelError("planner unavailable", reason="model_failed", stage="plan")
     with _memory(tmp_path, models) as memory:
-        plan = memory._recall_plan(
+        plan = memory._answering._recall_plan(
             "how many times?",
             reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
             k=12,
@@ -7506,7 +7552,7 @@ def test_a_plan_the_kernel_will_not_run_falls_back(tmp_path: Path, payload: str 
     models = _FakeModels()
     models.recall_plan = payload
     with _memory(tmp_path, models) as memory:
-        plan = memory._recall_plan(
+        plan = memory._answering._recall_plan(
             "how many times?",
             reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
             k=12,
@@ -7532,7 +7578,7 @@ def test_a_usable_plan_is_the_plan_that_runs(tmp_path: Path) -> None:
         }
     )
     with _memory(tmp_path, models) as memory:
-        plan = memory._recall_plan(
+        plan = memory._answering._recall_plan(
             "how many wrenches did I mention?",
             reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
             k=12,

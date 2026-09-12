@@ -70,7 +70,7 @@ def run_benchmark(
                 offset=offset,
                 rows=batch_rows,
             )
-            store.write_memories(memories, embeddings)
+            store.records.write_memories(memories, embeddings)
             _drain_batch(store, index, documents)
         ingest_seconds = perf_counter() - ingest_started
 
@@ -192,7 +192,7 @@ def _drain_batch(
     index: ZvecIndex,
     documents: Sequence[IndexDocument],
 ) -> None:
-    operations = store.pending_index_operations(limit=len(documents))
+    operations = store.index.pending_index_operations(limit=len(documents))
     expected_ids = tuple(document.embedding.embedding_id for document in documents)
     if tuple(operation.embedding_id for operation in operations) != expected_ids or any(
         operation.action != "upsert" for operation in operations
@@ -200,7 +200,7 @@ def _drain_batch(
         raise RuntimeError("local index outbox does not match the synthetic write batch")
     index.upsert(documents)
     index.flush()
-    if store.acknowledge_index_operations(operations) != len(operations):
+    if store.index.acknowledge_index_operations(operations) != len(operations):
         raise RuntimeError("local index outbox acknowledgement was incomplete")
 
 

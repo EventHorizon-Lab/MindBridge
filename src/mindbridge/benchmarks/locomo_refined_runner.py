@@ -14,8 +14,6 @@ from mindbridge.benchmarks.locomo_refined import (
     LoCoMoRefinedTurn,
 )
 
-LOCOMO_REFINED_PREDICTION_KEY = "predicted_answer"
-
 _Identifier = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=255),

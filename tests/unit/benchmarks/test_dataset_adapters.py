@@ -723,13 +723,13 @@ def test_personamem_v3_never_records_the_question_as_its_own_reference(tmp_path:
 def test_text_memories_split_passages_the_product_would_reject() -> None:
     """An oversized part is not just dropped -- it voids its whole unit.
 
-    `memory.add` rejects a part over `_MAX_TEXT_CHARACTERS`, the runner counts
+    `memory.add` rejects a part over `MAX_TEXT_CHARACTERS`, the runner counts
     an ingest failure, and `_apply_judges` then skips every question in that
     unit. BEAM turns reach 348,864 characters and LongMemEval has one of
     76,594, so unsplit storage silently left 70% of BEAM's 10M tier unjudged.
     """
     from mindbridge.benchmarks.eval_adapters import _text_memories
-    from mindbridge.memory import _MAX_TEXT_CHARACTERS
+    from mindbridge.kernel.validation import MAX_TEXT_CHARACTERS
 
     short = _text_memories("turn", "one short line")
     assert len(short) == 1
@@ -737,11 +737,11 @@ def test_text_memories_split_passages_the_product_would_reject() -> None:
     assert short[0].content == ("one short line",)
 
     long_turn = "word " * 120_000
-    assert len(long_turn) > _MAX_TEXT_CHARACTERS
+    assert len(long_turn) > MAX_TEXT_CHARACTERS
     parts = _text_memories("turn", long_turn, end_seconds=1_775_000_000.0)
     assert len(parts) > 1
     assert all(
-        len(text) <= _MAX_TEXT_CHARACTERS
+        len(text) <= MAX_TEXT_CHARACTERS
         for item in parts
         for text in item.content
         if isinstance(text, str)
@@ -1071,7 +1071,11 @@ def test_media_only_memory_items_carry_their_source_id_as_metadata_not_text(
 
 def test_longmemeval_source_labels_are_evaluator_only(tmp_path: Path) -> None:
     """Changing release labels cannot change stored memories or their gold join."""
-    from mindbridge.benchmarks.eval import _cache_task, _memory_content, _memory_metadata
+    from mindbridge.benchmarks.eval import (
+        _cache_task,
+        _memory_content,
+        _memory_metadata,
+    )
     from mindbridge.benchmarks.longmemeval import LONGMEMEVAL_ADAPTER_VERSION
 
     def load_with_labels(first: str, second: str) -> LoadedTask:

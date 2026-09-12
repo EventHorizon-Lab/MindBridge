@@ -34,12 +34,13 @@ from mindbridge.api.mcp import ContextBundleResult
 from mindbridge.cli import _bundle_value
 from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.infrastructure.local.store import (
-    _SCHEMA_VERSION,
+    SCHEMA_VERSION,
     LocalStore,
     StoredTextSelector,
     UnsupportedSchemaError,
 )
-from mindbridge.memory import _contextual_text_key_descriptors, _contextual_text_keys
+from mindbridge.infrastructure.local.store.index import IndexOutbox
+from mindbridge.kernel.content import contextual_text_key_descriptors, contextual_text_keys
 from mindbridge.models.base import EmbedTask, ModelInput
 
 REFERENCE = datetime(2026, 9, 9, tzinfo=timezone.utc)
@@ -174,8 +175,8 @@ def test_descriptors_preserve_existing_keys_for_unicode_strip_crlf_and_repeats()
     )
 
     for source in cases:
-        descriptors = _contextual_text_key_descriptors(source)
-        assert tuple(value.key for value in descriptors) == _contextual_text_keys(source)
+        descriptors = contextual_text_key_descriptors(source)
+        assert tuple(value.key for value in descriptors) == contextual_text_keys(source)
         for descriptor in descriptors:
             for span in descriptor.spans:
                 assert source[span.start_codepoint : span.end_codepoint]
@@ -286,16 +287,16 @@ def test_partial_sources_are_explicit_opt_in_and_default_skips_selector_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reads: list[tuple[str, ...]] = []
-    original = LocalStore.read_text_selectors
+    original = IndexOutbox.read_text_selectors
 
     def tracked(
-        store: LocalStore,
+        store: IndexOutbox,
         embedding_ids: Sequence[str],
     ) -> dict[str, tuple[StoredTextSelector, ...]]:
         reads.append(tuple(embedding_ids))
         return original(store, embedding_ids)
 
-    monkeypatch.setattr(LocalStore, "read_text_selectors", tracked)
+    monkeypatch.setattr(IndexOutbox, "read_text_selectors", tracked)
     with _memory(tmp_path) as memory:
         memory.add(_long_source(), occurred_at=REFERENCE)
         default = memory.compile(
@@ -553,7 +554,7 @@ def test_constraint_free_selector_tables_are_rejected_at_the_current_version(
         LocalStore(tmp_path)
 
     with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert (
             tuple(
                 connection.execute(

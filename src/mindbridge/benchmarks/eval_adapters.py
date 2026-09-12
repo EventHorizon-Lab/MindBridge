@@ -1186,7 +1186,7 @@ def _query_parts(template: str, question: str, **values: str) -> tuple[str, ...]
 
 
 # MindBridge caps one memory or query part at 65,536 characters
-# (`mindbridge.memory._MAX_TEXT_CHARACTERS`). CL-Bench reference documents run
+# (`mindbridge.kernel.validation.MAX_TEXT_CHARACTERS`). CL-Bench reference documents run
 # past 150,000, so a task's corpus has to be split before it can be stored at
 # all. Blocks are built well under the cap so that each one is also a usable
 # retrieval unit rather than one opaque record per task.

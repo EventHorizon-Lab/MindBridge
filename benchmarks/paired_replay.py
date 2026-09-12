@@ -1027,16 +1027,14 @@ def _import_identity(source_root: Path) -> dict[str, object]:
     imported = Path(mindbridge.__file__).resolve()
     if not imported.is_relative_to(source_root.resolve()):
         raise RuntimeError(f"imported MindBridge outside frozen source root: {imported}")
-    files = []
-    for relative in (
-        "__init__.py",
-        "memory.py",
-        "context.py",
-        "infrastructure/local/store.py",
-        "benchmarks/eval.py",
-    ):
-        path = source_root / "mindbridge" / relative
-        files.append({"path": relative, "sha256": _sha256_file(path)})
+    package = source_root / "mindbridge"
+    # Hash the source package so moving behavior into a new module cannot leave it outside
+    # the replay's identity, and both monolithic and refactored frozen trees remain readable.
+    files = [
+        {"path": path.relative_to(package).as_posix(), "sha256": _sha256_file(path)}
+        for path in sorted(package.rglob("*.py"))
+        if path.is_file()
+    ]
     return {
         "module_file": str(imported),
         "files": files,
@@ -1095,7 +1093,9 @@ async def worker(  # noqa: C901 - compile and store-free control share capture s
     plan_path: Path, output: Path, arm: str
 ) -> int:
     from mindbridge import ContextBudget
-    from mindbridge.benchmarks.eval import _BackendPool, _BaselineGenerator, _load_memory_config
+    from mindbridge.benchmarks.eval import _BackendPool
+    from mindbridge.benchmarks.eval_arms import _BaselineGenerator
+    from mindbridge.benchmarks.eval_config import _load_memory_config
     from mindbridge.benchmarks.model_config import ModelConfig
 
     plan = _load_plan(plan_path)

@@ -23,6 +23,9 @@ import mindbridge.benchmarks.eval as eval_module
 import mindbridge.benchmarks.eval_adapters as eval_adapters
 from mindbridge import MemoryConfig, MemoryPlugins, MindBridgeConfig, Modality
 from mindbridge._telemetry import MODEL_MODULE, SPAN_KIND, mark_model_requests, model_span
+from mindbridge.benchmarks import eval_arms as eval_arms_module
+from mindbridge.benchmarks import eval_config as eval_config_module
+from mindbridge.benchmarks import eval_results as eval_results_module
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
 from mindbridge.benchmarks.download import _snapshot, acquire_media
 from mindbridge.benchmarks.eval import _cache_task
@@ -417,7 +420,7 @@ def test_response_cache_write_uses_the_selected_arm_namespace() -> None:
         (),
         (EvalQuestion("question", ("Question?",), references=("Answer",)),),
     )
-    outcome = eval_module._AnswerOutcome("Answer", 1.0, 0.5, (), ())
+    outcome = eval_results_module._AnswerOutcome("Answer", 1.0, 0.5, (), ())
 
     eval_module._cache_outcome(
         cast(Any, cache),
@@ -426,7 +429,7 @@ def test_response_cache_write_uses_the_selected_arm_namespace() -> None:
         unit.questions[0],
         outcome,
         0,
-        arm=eval_module._Arm("blind"),
+        arm=eval_arms_module._Arm("blind"),
     )
 
     assert calls[0][0] == f"blind:fixture:v1:{'e' * 64}"
@@ -1494,16 +1497,16 @@ def test_the_description_cache_is_opened_only_for_a_configured_vision_slot(
         {"data_dir": tmp_path, "embedding": embedding, "vision": {"provider": "openai"}}
     )
 
-    assert eval_module._description_cache_path(arguments, None) is None
-    assert eval_module._description_cache_path(arguments, without) is None
+    assert eval_config_module._description_cache_path(arguments, None) is None
+    assert eval_config_module._description_cache_path(arguments, without) is None
     # Shared across units in this run, but a later repeat must execute the same model workload.
-    assert eval_module._description_cache_path(arguments, described) == (
+    assert eval_config_module._description_cache_path(arguments, described) == (
         tmp_path / "cache" / "run-one" / "descriptions.db"
     )
     no_response_cache = cast(
         Any, SimpleNamespace(data_root=tmp_path, use_cache=None, run_id="run-two")
     )
-    assert eval_module._description_cache_path(no_response_cache, described) == (
+    assert eval_config_module._description_cache_path(no_response_cache, described) == (
         tmp_path / "cache" / "run-two" / "descriptions.db"
     )
 

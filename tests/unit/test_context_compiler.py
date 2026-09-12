@@ -57,7 +57,7 @@ from mindbridge.context import (
     provisional_actor_cost,
 )
 from mindbridge.infrastructure.local.store import StoredAsset
-from mindbridge.memory import _PreparedContent
+from mindbridge.kernel.content import PreparedContent
 
 REFERENCE = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
 DAYS_10 = timedelta(days=10)
@@ -939,8 +939,8 @@ def test_goal_media_the_embedder_cannot_take_natively_is_reported(tmp_path: Path
         created_at=REFERENCE,
     )
     with Memory(tmp_path, embedder=TextOnly(), minimum_relevance=0) as memory:
-        unknowns = memory._request_unknowns(
-            _PreparedContent(
+        unknowns = memory._compilation._request_unknowns(
+            PreparedContent(
                 text="what do you know",
                 assets=(audio,),
                 modality=Modality.OMNI,
@@ -1245,21 +1245,21 @@ def test_compile_completes_a_low_ranked_competing_state_before_delivery(
         berlin = next(
             record for record in states if record.context and record.context.value == "berlin"
         )
-        berlin_stored = memory._store.read_memory(berlin.id)
+        berlin_stored = memory._store.records.read_memory(berlin.id)
         assert berlin_stored is not None
-        original_search = memory._search_prepared
+        original_search = memory._retrieval.search_prepared
 
         def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(
-                hits=(memory._search_hit(berlin_stored, 0.9),),
+                hits=(memory._hydrator.search_hit(berlin_stored, 0.9),),
                 matched_dense_index_ids={},
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_berlin)
         complete = memory.compile("where is the user", budget=ContextBudget(max_items=4))
         tight = memory.compile("where is the user", budget=ContextBudget(max_items=3))
-        monkeypatch.setattr(memory, "_search_prepared", original_search)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", original_search)
 
     assert {hit.context.value for hit in complete.scene if hit.context} == {"berlin", "paris"}
     assert len(complete.conflicts) == 1
@@ -1285,17 +1285,17 @@ def test_compile_does_not_invent_a_conflict_for_the_same_functional_value(
             for record in memory.list(limit=20).items
             if record.context is not None and record.context.kind is MemoryKind.STATE
         )
-        berlin_stored = memory._store.read_memory(berlin.id)
+        berlin_stored = memory._store.records.read_memory(berlin.id)
         assert berlin_stored is not None
 
         def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(
-                hits=(memory._search_hit(berlin_stored, 0.9),),
+                hits=(memory._hydrator.search_hit(berlin_stored, 0.9),),
                 matched_dense_index_ids={},
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_berlin)
         bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
 
     assert [hit.context.value for hit in bundle.scene if hit.context] == ["berlin"]
@@ -1332,16 +1332,16 @@ def test_competing_lineage_uses_a_confident_copy_of_a_ranked_value(
             and record.context.confidence < 0.5
         )
         ranked = tuple(
-            memory._search_hit(stored, score)
+            memory._hydrator.search_hit(stored, score)
             for record, score in ((berlin, 0.9), (weak_paris, 0.1))
-            if (stored := memory._store.read_memory(record.id)) is not None
+            if (stored := memory._store.records.read_memory(record.id)) is not None
         )
 
         def ranked_weak_copy(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(hits=ranked, matched_dense_index_ids={})
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_weak_copy)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_weak_copy)
         bundle = memory.compile(
             "where is the user",
             budget=ContextBudget(max_items=4, min_confidence=0.5),
@@ -1386,9 +1386,9 @@ def test_competing_lineage_uses_a_supported_copy_of_a_ranked_value(
                 matched_dense_index_ids={},
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_unsupported_copy)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_unsupported_copy)
         monkeypatch.setattr(
-            memory,
+            memory._compilation,
             "_competing_lineage_hits",
             lambda *args, **kwargs: ((supported_paris,), frozenset()),
         )
@@ -1434,13 +1434,13 @@ def test_competing_lineage_uses_a_consented_copy_of_a_ranked_value(
             del named, observed_identity_ids
             return tuple(hit for hit in hits if hit.id != withheld_paris.id), {}, (), frozenset()
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_withheld_copy)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_withheld_copy)
         monkeypatch.setattr(
-            memory,
+            memory._compilation,
             "_competing_lineage_hits",
             lambda *args, **kwargs: ((permitted_paris,), frozenset()),
         )
-        monkeypatch.setattr(memory, "_consented_actors", withhold_one_copy)
+        monkeypatch.setattr(memory._compilation, "_consented_actors", withhold_one_copy)
         bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
 
     assert [hit.id for hit in bundle.scene] == ["berlin", "permitted-paris"]
@@ -1474,17 +1474,17 @@ def test_competing_lineage_completion_obeys_the_requested_valid_time(
             and record.context.kind is MemoryKind.STATE
             and record.context.value == "berlin"
         )
-        berlin_stored = memory._store.read_memory(berlin.id)
+        berlin_stored = memory._store.records.read_memory(berlin.id)
         assert berlin_stored is not None
 
         def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(
-                hits=(memory._search_hit(berlin_stored, 0.9),),
+                hits=(memory._hydrator.search_hit(berlin_stored, 0.9),),
                 matched_dense_index_ids={},
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_berlin)
         bundle = memory.compile(
             "where was the user",
             scope=RetrievalScope(valid_at=january),
@@ -1514,17 +1514,17 @@ def test_competing_lineage_completion_ignores_repeated_same_value_rows(
             and record.context.kind is MemoryKind.STATE
             and record.context.value == "berlin"
         )
-        berlin_stored = memory._store.read_memory(berlin.id)
+        berlin_stored = memory._store.records.read_memory(berlin.id)
         assert berlin_stored is not None
 
         def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(
-                hits=(memory._search_hit(berlin_stored, 0.9),),
+                hits=(memory._hydrator.search_hit(berlin_stored, 0.9),),
                 matched_dense_index_ids={},
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_berlin)
         bundle = memory.compile("where is the user", budget=ContextBudget(max_items=20))
 
     assert {hit.context.value for hit in bundle.scene if hit.context} == {"berlin", "paris"}
@@ -1550,17 +1550,17 @@ def test_competing_lineage_completion_keeps_more_than_256_same_value_rows(
             and record.context.kind is MemoryKind.STATE
             and record.context.value == "berlin"
         )
-        berlin_stored = memory._store.read_memory(berlin.id)
+        berlin_stored = memory._store.records.read_memory(berlin.id)
         assert berlin_stored is not None
 
         def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(
-                hits=(memory._search_hit(berlin_stored, 0.9),),
+                hits=(memory._hydrator.search_hit(berlin_stored, 0.9),),
                 matched_dense_index_ids={},
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_berlin)
         bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
 
     assert [hit.context.value for hit in bundle.scene if hit.context] == ["berlin"]
@@ -1591,17 +1591,17 @@ def test_competing_lineage_completion_ignores_superseded_history(
             and record.context.kind is MemoryKind.STATE
             and record.context.retired_at is None
         )
-        berlin_stored = memory._store.read_memory(berlin.id)
+        berlin_stored = memory._store.records.read_memory(berlin.id)
         assert berlin_stored is not None
 
         def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(
-                hits=(memory._search_hit(berlin_stored, 0.9),),
+                hits=(memory._hydrator.search_hit(berlin_stored, 0.9),),
                 matched_dense_index_ids={},
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_berlin)
         bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
 
     assert [hit.context.value for hit in bundle.scene if hit.context] == ["berlin"]
@@ -1626,17 +1626,17 @@ def test_competing_lineage_completion_refuses_more_than_its_bounded_values(
             and record.context.kind is MemoryKind.STATE
             and record.context.value == "city-0"
         )
-        first_stored = memory._store.read_memory(first.id)
+        first_stored = memory._store.records.read_memory(first.id)
         assert first_stored is not None
 
         def ranked_first(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(
-                hits=(memory._search_hit(first_stored, 0.9),),
+                hits=(memory._hydrator.search_hit(first_stored, 0.9),),
                 matched_dense_index_ids={},
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_first)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_first)
         bundle = memory.compile("where is the user", budget=ContextBudget(max_items=20))
 
     assert bundle.scene == ()
@@ -1667,9 +1667,9 @@ def test_competing_lineage_refusal_does_not_leak_through_a_derived_closure(
             and record.context.kind is MemoryKind.STATE
             and record.context.value == "city-0"
         )
-        first_stored = memory._store.read_memory(first.id)
+        first_stored = memory._store.records.read_memory(first.id)
         assert first_stored is not None
-        state = memory._search_hit(first_stored, 0.9)
+        state = memory._hydrator.search_hit(first_stored, 0.9)
         derived = _hit(
             "derived-trait",
             score=0.8,
@@ -1692,8 +1692,8 @@ def test_competing_lineage_refusal_does_not_leak_through_a_derived_closure(
             del anchors, kwargs
             return (EvidenceClosure(derived, (derived, state)),), ()
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_state_and_derived)
-        monkeypatch.setattr(memory, "_evidence_closures", derived_closure)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_state_and_derived)
+        monkeypatch.setattr(memory._compilation, "_evidence_closures", derived_closure)
         bundle = memory.compile("what do you know", budget=ContextBudget(max_items=4))
 
     assert bundle.hits == ()
@@ -1720,13 +1720,13 @@ def test_competing_lineage_completion_rechecks_after_consent_filtering(
             and record.context.kind is MemoryKind.STATE
             and record.context.value == "berlin"
         )
-        berlin_stored = memory._store.read_memory(berlin.id)
+        berlin_stored = memory._store.records.read_memory(berlin.id)
         assert berlin_stored is not None
 
         def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
             del args, kwargs
             return SimpleNamespace(
-                hits=(memory._search_hit(berlin_stored, 0.9),),
+                hits=(memory._hydrator.search_hit(berlin_stored, 0.9),),
                 matched_dense_index_ids={},
             )
 
@@ -1746,8 +1746,8 @@ def test_competing_lineage_completion_rechecks_after_consent_filtering(
                 frozenset(),
             )
 
-        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
-        monkeypatch.setattr(memory, "_consented_actors", withhold_competitor)
+        monkeypatch.setattr(memory._retrieval, "search_prepared", ranked_berlin)
+        monkeypatch.setattr(memory._compilation, "_consented_actors", withhold_competitor)
         bundle = memory.compile("where is the user", budget=ContextBudget(max_items=4))
 
     assert bundle.scene == ()
@@ -1826,7 +1826,7 @@ def test_compile_evidence_cycles_fail_closed(
         for identifier, evidence_ids in edges.items()
     )
     with _memory(tmp_path) as memory:
-        closures, unknowns = memory._evidence_closures(
+        closures, unknowns = memory._compilation._evidence_closures(
             hits,
             budget=ContextBudget(),
             reference_at=REFERENCE,
@@ -1846,7 +1846,7 @@ def test_compile_evidence_diamond_reuses_a_shared_source_without_a_cycle(tmp_pat
     right = _hit("right", kind=MemoryKind.STATE, evidence_ids=("leaf",))
     leaf = _hit("leaf")
     with _memory(tmp_path) as memory:
-        closures, unknowns = memory._evidence_closures(
+        closures, unknowns = memory._compilation._evidence_closures(
             (root, left, right, leaf),
             budget=ContextBudget(),
             reference_at=REFERENCE,
@@ -1864,7 +1864,7 @@ def test_compile_deadline_keeps_a_complete_raw_anchor_while_refusing_unresolved_
     raw = _hit("raw")
     derived = _hit("derived", kind=MemoryKind.STATE, evidence_ids=("not-hydrated",))
     with _memory(tmp_path) as memory:
-        closures, unknowns = memory._evidence_closures(
+        closures, unknowns = memory._compilation._evidence_closures(
             (raw, derived),
             budget=ContextBudget(max_latency_ms=1),
             reference_at=REFERENCE,
@@ -1886,7 +1886,7 @@ def test_a_type_only_budget_reaches_past_the_window_the_common_types_fill(
     window, and the bundle came back empty with only a `candidates_exhausted` unknown to explain
     it. The narrowed rerank window here is what a real store reaches with more records.
     """
-    monkeypatch.setattr("mindbridge.memory._RERANK_CANDIDATES", 4)
+    monkeypatch.setattr("mindbridge.kernel.retrieval.RERANK_CANDIDATES", 4)
     with _memory(tmp_path) as memory:
         memory.add_many(
             [f"we walked to the harbour on day {index}" for index in range(60)],
@@ -1921,7 +1921,7 @@ def test_a_forgotten_record_never_reaches_a_bundle(tmp_path: Path) -> None:
         gone = memory.add("the blue hammer is on the bench")
         # Forgetting has no public verb yet; the control plane owns it. This exercises the
         # read-path rule the compiler inherits from the shared retrieval kernel.
-        assert memory._store.set_forgotten((gone.id,), forgotten_at=REFERENCE) == (gone.id,)
+        assert memory._store.records.set_forgotten((gone.id,), forgotten_at=REFERENCE) == (gone.id,)
 
         bundle = memory.compile("what is on the bench", reference_at=REFERENCE)
 

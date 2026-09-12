@@ -85,7 +85,7 @@ def _write_clip(
     modality: str = "video",
 ) -> StoredAsset:
     asset = _asset(label, modality=modality, created_at=created_at)
-    store.write_memory(
+    store.records.write_memory(
         StoredMemory(
             memory_id=label,
             content="",
@@ -100,7 +100,7 @@ def _write_clip(
 
 
 def _face(store: LocalStore, asset: StoredAsset, vector: tuple[float, ...]) -> str:
-    return store.write_faces(
+    return store.media.write_faces(
         asset.asset_id,
         FaceAnalysis((FaceEmbedding("face-0", vector, (0.1, 0.1, 0.4, 0.5)),)),
         model_id="sface",
@@ -110,7 +110,7 @@ def _face(store: LocalStore, asset: StoredAsset, vector: tuple[float, ...]) -> s
 
 
 def _voice(store: LocalStore, asset: StoredAsset, vector: tuple[float, ...]) -> str:
-    speaker_id = store.write_speech(
+    speaker_id = store.media.write_speech(
         asset.asset_id,
         SpeechAnalysis(
             turns=(SpeechTurn(0, 500, "the kettle is on", "0"),),
@@ -133,11 +133,11 @@ def _person(store: LocalStore, label: str, seed: int) -> tuple[str, tuple[str, .
     second = _write_clip(store, f"{label}-second")
     face_id = _face(store, first, _distinctive(seed))
     voice_id = _voice(store, first, _distinctive(seed + 100))
-    merged = store.link_identities(face_id, voice_id)
+    merged = store.identities.link_identities(face_id, voice_id)
     assert merged is not None
     # A second voice fragment re-absorbed, exactly as `Memory._link_asset_identity` does it.
     extra_voice = _voice(store, second, _distinctive(seed + 200))
-    merged = store.link_identities(merged, extra_voice, allow_shared_modality=True)
+    merged = store.identities.link_identities(merged, extra_voice, allow_shared_modality=True)
     assert merged is not None
     return merged, (first.asset_id, second.asset_id)
 
@@ -164,13 +164,15 @@ def test_forgetting_an_identity_removes_the_whole_cluster_and_keeps_the_memories
 ) -> None:
     with LocalStore(tmp_path) as store:
         forgotten, forgotten_assets = _person(store, "alice", 1)
-        assert store.register_identity(forgotten, "Alice", relationship="neighbour") is True
+        assert (
+            store.identities.register_identity(forgotten, "Alice", relationship="neighbour") is True
+        )
         kept, _kept_assets = _person(store, "bob", 2)
-        aliases = store.identity_equivalence_class(forgotten)
+        aliases = store.identities.identity_equivalence_class(forgotten)
         assert aliases is not None and len(aliases) == 3 and aliases[0] == forgotten
         before = _counts(store)
 
-        erased = store.forget_identity(forgotten)
+        erased = store.identities.forget_identity(forgotten)
 
         assert erased is not None
         erasure, _unreferenced = erased
@@ -182,12 +184,12 @@ def test_forgetting_an_identity_removes_the_whole_cluster_and_keeps_the_memories
         assert erasure.speech_segments == 2
         # Every entrance to the forgotten person is closed, including each merged alias.
         for member in aliases:
-            assert store.resolve_identity_id(member) is None
-            assert store.identity_profile(member) is None
-            assert store.identity_memory_ids(member) is None
-            assert store.identity_equivalence_class(member) is None
+            assert store.identities.resolve_identity_id(member) is None
+            assert store.identities.identity_profile(member) is None
+            assert store.identities.identity_memory_ids(member) is None
+            assert store.identities.identity_equivalence_class(member) is None
         # The other person in the house is untouched.
-        assert store.identity_profile(kept) is not None
+        assert store.identities.identity_profile(kept) is not None
         after = _counts(store)
         assert after["identities"] == before["identities"] - 1
         assert after["identity_aliases"] == before["identity_aliases"] - 2
@@ -198,10 +200,10 @@ def test_forgetting_an_identity_removes_the_whole_cluster_and_keeps_the_memories
         assert after["media_assets"] == before["media_assets"]
         assert after["speech_segments"] == before["speech_segments"]
         # Only the first clip was face-analysed; the second carried voice alone.
-        assert store.read_faces(forgotten_assets[0], space_id=_FACE_SPACE) == ()
-        assert store.read_faces(forgotten_assets[1], space_id=_FACE_SPACE) is None
+        assert store.media.read_faces(forgotten_assets[0], space_id=_FACE_SPACE) == ()
+        assert store.media.read_faces(forgotten_assets[1], space_id=_FACE_SPACE) is None
         for asset_id in forgotten_assets:
-            speech = store.read_speech(asset_id, space_id=_VOICE_SPACE)
+            speech = store.media.read_speech(asset_id, space_id=_VOICE_SPACE)
             assert speech is not None
             # The transcript is evidence and stays; only the attribution is scrubbed.
             assert [segment.text for segment in speech] == ["the kettle is on"]
@@ -227,7 +229,7 @@ def test_forgotten_exemplar_vectors_are_not_recoverable_from_the_database_files(
         clip = _write_clip(store, "clip")
         face_id = _face(store, clip, face_vector)
         voice_id = _voice(store, clip, voice_vector)
-        merged = store.link_identities(face_id, voice_id)
+        merged = store.identities.link_identities(face_id, voice_id)
         assert merged is not None
         with closing(sqlite3.connect(store.database_path)) as reader:
             reader.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -236,7 +238,7 @@ def test_forgotten_exemplar_vectors_are_not_recoverable_from_the_database_files(
             }
             assert present, "the face exemplar was never durable, so this proves nothing"
 
-            store.forget_identity(merged)
+            store.identities.forget_identity(merged)
 
             for probe, label in ((face_bytes, "face"), (voice_bytes, "voice")):
                 leaked = {
@@ -252,19 +254,19 @@ def test_forgetting_an_unknown_identity_reports_nothing_and_changes_nothing(
         kept, _assets = _person(store, "alice", 3)
         before = _counts(store)
 
-        assert store.forget_identity("identity_never_existed") is None
+        assert store.identities.forget_identity("identity_never_existed") is None
 
         assert _counts(store) == before
-        assert store.identity_profile(kept) is not None
+        assert store.identities.identity_profile(kept) is not None
         with pytest.raises(ValueError, match="identity_id"):
-            store.forget_identity("   ")
+            store.identities.forget_identity("   ")
 
 
 def test_forgetting_replaces_the_indexed_memories_in_the_same_commit(tmp_path: Path) -> None:
     """The indexed document carries the person's name, so erasure must re-index atomically."""
     with LocalStore(tmp_path) as store:
         forgotten, _assets = _person(store, "alice", 4)
-        assert store.register_identity(forgotten, "Alice") is True
+        assert store.identities.register_identity(forgotten, "Alice") is True
         named = StoredMemory(
             memory_id="alice-first",
             content="Alice: the kettle is on",
@@ -283,8 +285,8 @@ def test_forgetting_replaces_the_indexed_memories_in_the_same_commit(tmp_path: P
             task="retrieval.passage",
             created_at=_NOW,
         )
-        store.write_memories((named,), (embedding,))
-        assert store.acknowledge_index_operations(store.pending_index_operations()) > 0
+        store.records.write_memories((named,), (embedding,))
+        assert store.index.acknowledge_index_operations(store.index.pending_index_operations()) > 0
         scrubbed = StoredMemory(
             memory_id="alice-first",
             content="Speaker 1: the kettle is on",
@@ -295,21 +297,21 @@ def test_forgetting_replaces_the_indexed_memories_in_the_same_commit(tmp_path: P
             assets=(_asset("alice-first"),),
         )
 
-        erased = store.forget_identity(
+        erased = store.identities.forget_identity(
             forgotten,
             memories=(scrubbed,),
             embeddings=(embedding,),
         )
 
         assert erased is not None
-        stored = store.read_memory("alice-first")
+        stored = store.records.read_memory("alice-first")
         assert stored is not None and "Alice" not in stored.content
-        document = store.read_index_document("alice-first:0")
+        document = store.index.read_index_document("alice-first:0")
         assert document is not None and "Alice" not in document.content
         # The projection is only told after SQLite committed, through the durable outbox. Three
         # entries: the erasure re-enqueues the memory whose indexed identity projection named
         # the forgotten person, then the caller's replacement deletes and re-adds the vector.
-        assert [operation.embedding_id for operation in store.pending_index_operations()] == [
+        assert [operation.embedding_id for operation in store.index.pending_index_operations()] == [
             "alice-first:0",
             "alice-first:0",
             "alice-first:0",
@@ -324,11 +326,11 @@ def test_re_analysing_a_stored_asset_does_not_re_mint_a_forgotten_identity(
         clip = _write_clip(store, "clip")
         vector = _distinctive(5)
         face_id = _face(store, clip, vector)
-        assert store.forget_identity(face_id) is not None
+        assert store.identities.forget_identity(face_id) is not None
 
         assert _face_analysis_is_cached(store, clip.asset_id)
         assert (
-            store.write_faces(
+            store.media.write_faces(
                 clip.asset_id,
                 FaceAnalysis((FaceEmbedding("face-0", vector, (0.1, 0.1, 0.4, 0.5)),)),
                 model_id="sface",
@@ -354,16 +356,16 @@ def test_equivalence_class_resolves_from_any_member_and_is_none_when_unknown(
     with LocalStore(tmp_path) as store:
         clip = _write_clip(store, "clip")
         face_id = _face(store, clip, _one_hot(0))
-        assert store.identity_equivalence_class(face_id) == (face_id,)
+        assert store.identities.identity_equivalence_class(face_id) == (face_id,)
         voice_id = _voice(store, clip, _one_hot(1))
-        merged = store.link_identities(face_id, voice_id)
+        merged = store.identities.link_identities(face_id, voice_id)
         assert merged is not None
         expected = (merged, *sorted({face_id, voice_id} - {merged}))
 
-        assert store.identity_equivalence_class(merged) == expected
-        assert store.identity_equivalence_class(face_id) == expected
-        assert store.identity_equivalence_class(voice_id) == expected
-        assert store.identity_equivalence_class("identity_never_existed") is None
+        assert store.identities.identity_equivalence_class(merged) == expected
+        assert store.identities.identity_equivalence_class(face_id) == expected
+        assert store.identities.identity_equivalence_class(voice_id) == expected
+        assert store.identities.identity_equivalence_class("identity_never_existed") is None
 
 
 def test_asset_retention_candidates_are_oldest_first_and_filter_by_age(tmp_path: Path) -> None:
@@ -373,16 +375,18 @@ def test_asset_retention_candidates_are_oldest_first_and_filter_by_age(tmp_path:
         recent = _write_clip(store, "recent", created_at=_NOW)
         # The descriptor's own created_at is what a retention window must read, not the
         # memory's: an asset outlives the memory that first referenced it.
-        assert [asset.asset_id for asset in store.asset_retention_candidates()] == [
+        assert [asset.asset_id for asset in store.media.asset_retention_candidates()] == [
             old.asset_id,
             middle.asset_id,
             recent.asset_id,
         ]
         assert [
             asset.asset_id
-            for asset in store.asset_retention_candidates(created_before=_NOW - timedelta(days=90))
+            for asset in store.media.asset_retention_candidates(
+                created_before=_NOW - timedelta(days=90)
+            )
         ] == [old.asset_id]
-        assert [asset.asset_id for asset in store.asset_retention_candidates(limit=1)] == [
+        assert [asset.asset_id for asset in store.media.asset_retention_candidates(limit=1)] == [
             old.asset_id
         ]
         # Stored timestamps are normalised to UTC text, so the boundary must be too. An
@@ -390,15 +394,16 @@ def test_asset_retention_candidates_are_oldest_first_and_filter_by_age(tmp_path:
         # sweeps in nine extra hours -- here, the asset stored at exactly the boundary.
         elsewhere = _NOW.astimezone(timezone(timedelta(hours=9)))
         assert [
-            asset.asset_id for asset in store.asset_retention_candidates(created_before=elsewhere)
+            asset.asset_id
+            for asset in store.media.asset_retention_candidates(created_before=elsewhere)
         ] == [old.asset_id, middle.asset_id]
-        assert store.asset_storage_bytes() == sum(
+        assert store.media.asset_storage_bytes() == sum(
             asset.size_bytes for asset in (old, middle, recent)
         )
         with pytest.raises(ValueError, match="limit"):
-            store.asset_retention_candidates(limit=0)
+            store.media.asset_retention_candidates(limit=0)
         with pytest.raises(ValueError, match="created_before"):
-            store.asset_retention_candidates(created_before=_NOW.replace(tzinfo=None))
+            store.media.asset_retention_candidates(created_before=_NOW.replace(tzinfo=None))
 
 
 def _semantic_memory(
@@ -427,7 +432,7 @@ def test_erasing_a_person_reconciles_the_claims_that_cited_their_naming_assertio
     """
     with LocalStore(tmp_path) as store:
         forgotten, _assets = _person(store, "alice", 6)
-        store.write_memories(
+        store.records.write_memories(
             (
                 _semantic_memory(
                     "naming-1",
@@ -447,7 +452,7 @@ def test_erasing_a_person_reconciles_the_claims_that_cited_their_naming_assertio
                 ),
             )
         )
-        store.write_memories(
+        store.records.write_memories(
             (
                 _semantic_memory(
                     "trait-1",
@@ -488,6 +493,6 @@ def test_erasing_a_person_reconciles_the_claims_that_cited_their_naming_assertio
         # Two independent groups is what makes an inferred trait visible in the first place.
         assert _projection() == (2, 1)
 
-        assert store.forget_identity(forgotten) is not None
+        assert store.identities.forget_identity(forgotten) is not None
 
         assert _projection() == (1, 0)

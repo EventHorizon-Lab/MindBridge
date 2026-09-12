@@ -595,6 +595,21 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   exact-`limit` window. The setting's calibration note in `plugins.py` records the measurement,
   including the 8,000-character point (+0.055 / +0.063 on LoCoMo at 2.1x the tokens, half a row
   on LongMemEval).
+- The kernel is one module per plane instead of one `memory.py`. `Memory` and `AsyncMemory` stay
+  in `memory.py` as facades that validate, wire, and forward; the write, retrieval, answering,
+  compilation, identity, control, records, perception, and projection planes live in
+  `mindbridge.kernel`, each a class whose constructor names every store, index, backend, setting,
+  and sibling plane it uses, so the wiring in `Memory.__init__` is the dependency graph. The
+  async observation streams moved to `mindbridge.streams` and are still exported from
+  `mindbridge`; `declared_capabilities`, which only the CLI and tests reached through
+  `mindbridge.memory`, now lives in `mindbridge.kernel.contracts`.
+  `LocalStore` is likewise one connection pool with one attribute per table family --
+  `records`, `captures`, `semantics`, `control`, `identities`, `media`, `index`, `recall` -- in
+  `mindbridge.infrastructure.local.store`, a package whose top-level imports are unchanged.
+  No on-disk schema, public signature, response type, endpoint, tool, or error changed; the
+  [architecture guide](docs/architecture.md#code-layout) owns the layout. Kernel warnings now
+  log under `mindbridge.kernel.<plane>` rather than `mindbridge.memory`; configure the
+  `mindbridge` logger to keep receiving all of them.
 - **Breaking:** `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` declare
   a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
   `isinstance` checks the method name rather than its signature, so a custom backend written
@@ -950,6 +965,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Benchmark speech look-ahead stops accepting work, cancels queued analysis, and waits for
+  running analysis before the pool closes its model backends, including when ingest fails.
+- A recall step whose anchor has no usable date is reported as incomplete rather than as an
+  empty complete set. Time windows derived from several point events include the last point.
+- Paired replay hashes the frozen source package recursively, so splitting the kernel and
+  storage into modules neither breaks worker startup nor omits moved behavior from its identity.
 - `mindbridge-bench eval` gives MM-Lifelong memories an event time. Each prepared clip carried
   its `start_seconds`/`end_seconds` as metadata only, so every memory reached the store with no
   `occurred_at` and the answerer was told to resolve "before"/"after" against `created_at` -- the

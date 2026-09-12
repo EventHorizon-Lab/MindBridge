@@ -61,7 +61,7 @@ def test_a_refused_formation_proposal_is_logged_with_its_reason(
 ) -> None:
     with (
         Memory(tmp_path, embedder=TinyEmbedder(), former=_AudibleAffectFormer()) as memory,
-        caplog.at_level(logging.WARNING, logger="mindbridge.memory"),
+        caplog.at_level(logging.WARNING, logger="mindbridge.kernel.formation"),
     ):
         record = memory.add("I waited for the call")
 

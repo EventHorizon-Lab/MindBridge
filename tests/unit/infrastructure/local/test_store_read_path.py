@@ -28,6 +28,7 @@ import pytest
 from mindbridge import Memory
 from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local import LocalStore, StoredEmbedding, StoredMemory
+from mindbridge.infrastructure.local.store.records import MemoryRecords
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import Modality
 
@@ -66,8 +67,8 @@ def _embedding(
 def _store_one(store: LocalStore, suffix: str, content: str) -> tuple[str, str]:
     memory_id = f"memory-{suffix}"
     embedding_id = f"embedding-{suffix}"
-    store.write_memory(_memory(memory_id, content))
-    store.write_embedding(_embedding(embedding_id, memory_id))
+    store.records.write_memory(_memory(memory_id, content))
+    store.index.write_embedding(_embedding(embedding_id, memory_id))
     return memory_id, embedding_id
 
 
@@ -91,7 +92,7 @@ def test_hydration_does_not_re_validate_a_stored_vector(tmp_path: Path) -> None:
         )
         connection.commit()
     with LocalStore(directory) as store:
-        documents = store.read_index_documents((embedding_id,))
+        documents = store.index.read_index_documents((embedding_id,))
         assert len(documents) == 1
         assert documents[0].content == "the kitchen at dusk"
         assert documents[0].embedding.embedding_id == embedding_id
@@ -102,7 +103,7 @@ def test_writing_an_embedding_still_refuses_a_vector_it_must_not_store(tmp_path:
     directory = tmp_path / "data"
     directory.mkdir()
     with LocalStore(directory) as store:
-        store.write_memory(_memory("memory-guard", "the garden at noon"))
+        store.records.write_memory(_memory("memory-guard", "the garden at noon"))
         non_finite = _embedding(
             "embedding-non-finite",
             "memory-guard",
@@ -110,11 +111,11 @@ def test_writing_an_embedding_still_refuses_a_vector_it_must_not_store(tmp_path:
             normalized=False,
         )
         with pytest.raises(ValueError, match="finite"):
-            store.write_embedding(non_finite)
+            store.index.write_embedding(non_finite)
 
         empty_dimension = _embedding("embedding-empty", "memory-guard", values=(), normalized=False)
         with pytest.raises(ValueError, match="non-empty"):
-            store.write_embedding(empty_dimension)
+            store.index.write_embedding(empty_dimension)
 
         not_unit_length = _embedding(
             "embedding-not-unit",
@@ -123,11 +124,11 @@ def test_writing_an_embedding_still_refuses_a_vector_it_must_not_store(tmp_path:
             normalized=True,
         )
         with pytest.raises(ValueError, match="unit length"):
-            store.write_embedding(not_unit_length)
+            store.index.write_embedding(not_unit_length)
 
         # Nothing partial was left behind, so the refusal is a refusal and not a rollback bug.
         assert (
-            store.read_index_documents(
+            store.index.read_index_documents(
                 ("embedding-non-finite", "embedding-empty", "embedding-not-unit")
             )
             == ()
@@ -144,18 +145,18 @@ def test_hydration_drops_index_ids_sqlite_no_longer_knows(tmp_path: Path) -> Non
 
         assert [
             document.embedding.embedding_id
-            for document in store.read_index_documents((live, stale))
+            for document in store.index.read_index_documents((live, stale))
         ] == [live, stale]
 
-        assert store.delete_memory(stale_memory) is True
+        assert store.records.delete_memory(stale_memory) is True
 
         # Order is still the caller's order, and the vanished ID is simply absent rather than
         # raising or shifting a neighbour into its place.
-        hydrated = store.read_index_documents((stale, live, "embedding-never-existed"))
+        hydrated = store.index.read_index_documents((stale, live, "embedding-never-existed"))
         assert [document.embedding.embedding_id for document in hydrated] == [live]
-        assert store.read_index_document(stale) is None
-        assert store.read_memory_index_documents((stale_memory, live_memory)) == (
-            store.read_index_document(live),
+        assert store.index.read_index_document(stale) is None
+        assert store.index.read_memory_index_documents((stale_memory, live_memory)) == (
+            store.index.read_index_document(live),
         )
 
 
@@ -233,7 +234,7 @@ def test_a_search_that_cannot_widen_does_not_count_survivors(
     the decision and the pass is pure cost -- on every search such a store ever serves.
     """
     counted: list[int] = []
-    real_count = LocalStore.count_memories
+    real_count = MemoryRecords.count_memories
 
     def counting(store: LocalStore, memory_ids: Sequence[str], **scope: object) -> int:
         counted.append(len(memory_ids))
@@ -242,7 +243,7 @@ def test_a_search_that_cannot_widen_does_not_count_survivors(
     with Memory(tmp_path, embedder=_CountingEmbedder()) as memory:
         kitchen = memory.add("the kitchen at dusk")
         memory.add("the garden at noon")
-        monkeypatch.setattr(LocalStore, "count_memories", counting)
+        monkeypatch.setattr(MemoryRecords, "count_memories", counting)
         results = memory.search("the kitchen at dusk", limit=2)
 
     assert kitchen.id in {result.id for result in results}

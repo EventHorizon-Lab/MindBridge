@@ -24,10 +24,7 @@ from typing import Literal, NamedTuple, Protocol, TypeVar, cast
 
 # The store's own bounds on one primitive read. Imported rather than restated so a plan can never
 # ask for more rows than the read will return, nor for a term the read will refuse.
-from mindbridge.infrastructure.local.store import _RECALL_MAX_ROWS as RECALL_MAX_ROWS
-from mindbridge.infrastructure.local.store import (
-    _RECALL_MAX_TERM_CHARS as RECALL_MAX_TERM_CHARS,
-)
+from mindbridge.infrastructure.local.store import RECALL_MAX_ROWS, RECALL_MAX_TERM_CHARS
 from mindbridge.types import MemoryType, Modality, SearchHit
 
 RecallShape = Literal["point", "set", "sequence", "entity", "composite"]
@@ -323,8 +320,12 @@ def execute(
     for step in plan.steps:
         bound = step.k if step.op == "similar" else step.max_rows
         span: tuple[datetime | None, datetime | None] | None = None
+        unread = False
         try:
             span = _step_span(step, reader, by_step, derived_spans)
+            # No span from a named anchor means the dependent predicate could not be evaluated.
+            # It must read no rows without licensing a count or list as complete.
+            unread = step.time_of is not None and span is None
             rows, selected = _run(step, reader, by_step, span)
         except (ValueError, OverflowError):
             # A primitive rejecting its own arguments is a read that did not happen. Every field
@@ -342,7 +343,7 @@ def execute(
             RecallStepResult(
                 op=step.op,
                 rows=len(rows),
-                bounded=selected >= bound,
+                bounded=unread or selected >= bound,
                 non_selective=non_selective,
                 occurred_from=None if span is None else span[0],
                 occurred_until=None if span is None else span[1],

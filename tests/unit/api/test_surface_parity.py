@@ -34,7 +34,7 @@ from mindbridge.exceptions import (
     StorageError,
     ValidationError,
 )
-from mindbridge.memory import declared_capabilities
+from mindbridge.kernel.contracts import declared_capabilities
 from mindbridge.types import (
     AffectCue,
     AssetRef,

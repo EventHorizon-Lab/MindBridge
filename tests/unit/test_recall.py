@@ -7,7 +7,7 @@ from typing import cast
 
 import pytest
 
-from mindbridge.infrastructure.local.store import _RECALL_MAX_TERM_CHARS
+from mindbridge.infrastructure.local.store import RECALL_MAX_TERM_CHARS
 from mindbridge.recall import (
     _MAX_NEIGHBOR_ANCHORS,
     DEFAULT_MAX_ROWS,
@@ -400,7 +400,8 @@ def test_a_match_bound_to_a_step_that_read_no_dated_rows_reads_nothing() -> None
         ("window", 0),
         ("match", 0),
     ]
-    assert result.complete is True
+    assert result.complete is False
+    assert "do not state a total" in recall_note(result)
 
 
 def test_a_derived_span_is_read_once_per_anchor_and_a_bad_date_reads_nothing() -> None:
@@ -536,13 +537,13 @@ def test_a_step_whose_anchor_read_nothing_reads_nothing_itself() -> None:
 def test_a_term_the_store_accepts_at_its_limit_still_plans() -> None:
     """The cap is the store's own, so the longest term it takes is still a runnable plan."""
     payload = json.dumps(
-        {"shape": "set", "steps": [{"op": "match", "terms": ["x" * _RECALL_MAX_TERM_CHARS]}]}
+        {"shape": "set", "steps": [{"op": "match", "terms": ["x" * RECALL_MAX_TERM_CHARS]}]}
     )
 
     plan = parse_recall_plan(payload, reference_at=NOW)
 
     assert plan is not None
-    assert plan.steps[0].terms == ("x" * _RECALL_MAX_TERM_CHARS,)
+    assert plan.steps[0].terms == ("x" * RECALL_MAX_TERM_CHARS,)
 
 
 def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen() -> None:
