@@ -43,7 +43,6 @@ from mindbridge.kernel.tracing import Traced
 from mindbridge.kernel.validation import (
     validated_identifier,
     validated_identity_name,
-    validated_identity_relationship,
 )
 from mindbridge.kernel.vision import Vision
 from mindbridge.models.base import FaceBackend, SpeechBackend
@@ -470,7 +469,9 @@ class Identities(Traced):
         requested_id = validated_identifier(identity_id, id_label)
         normalized_name = validated_identity_name(name)
         normalized_relationship = (
-            None if relationship is None else validated_identity_relationship(relationship)
+            None
+            if relationship is None
+            else validated_identity_name(relationship, "identity relationship")
         )
         operation_name = "register_speaker" if speaker else "register_identity"
         with (

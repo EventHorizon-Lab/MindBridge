@@ -10,11 +10,13 @@ from __future__ import annotations
 import builtins
 import logging
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Protocol
 
 from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.kernel.content import PreparedContent, prepared_modalities
+from mindbridge.kernel.validation import positive_int
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -225,7 +227,7 @@ def _embedding_contract(
         _modalities(embedder.embedding_capabilities, "embedding"),
         _model_text(embedder.embedding_model, "embedding model"),
         _embedding_space(embedder.embedding_space),
-        positive_dimension(embedder.embedding_dimension, "embedder.embedding_dimension"),
+        positive_int(embedder.embedding_dimension, "embedder.embedding_dimension"),
     )
 
 
@@ -242,12 +244,6 @@ def _model_text(value: object, name: str) -> str:
     return value.strip()
 
 
-def positive_dimension(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValidationError(f"{name} must be a positive integer")
-    return value
-
-
 def unique_resources(resources: Sequence[Closable]) -> tuple[Closable, ...]:
     seen: set[int] = set()
     unique: builtins.list[Closable] = []
@@ -262,6 +258,13 @@ def unique_resources(resources: Sequence[Closable]) -> tuple[Closable, ...]:
 
 def present_resources(*resources: Closable | None) -> tuple[Closable, ...]:
     return tuple(resource for resource in resources if resource is not None)
+
+
+def close_quietly(*resources: Closable | None) -> None:
+    """Close each distinct present resource once, swallowing whatever `close()` raises."""
+    for resource in unique_resources(present_resources(*resources)):
+        with suppress(Exception):
+            resource.close()
 
 
 def declared_capabilities(

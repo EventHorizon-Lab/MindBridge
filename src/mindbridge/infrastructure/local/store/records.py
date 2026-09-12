@@ -38,7 +38,7 @@ from mindbridge.infrastructure.local.store._lineage import (
     version_retired,
     write_memory_context,
 )
-from mindbridge.infrastructure.local.store._outbox import queue_memory_embeddings
+from mindbridge.infrastructure.local.store._outbox import enqueue_capture, queue_memory_embeddings
 from mindbridge.infrastructure.local.store._selection import (
     identity_scope,
     memory_in_scope,
@@ -517,13 +517,7 @@ class MemoryRecords:
                 )
                 transaction_memory_ids.add(memory.memory_id)
                 if formation_pending_at is not None:
-                    connection.execute(
-                        """
-                        INSERT INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)
-                        ON CONFLICT (memory_id) DO NOTHING
-                        """,
-                        (memory.memory_id, datetime_text(formation_pending_at)),
-                    )
+                    enqueue_capture(connection, memory.memory_id, formation_pending_at)
             for embedding in supplied_embeddings:
                 write_embedding(connection, embedding)
             reproject_named_identities(

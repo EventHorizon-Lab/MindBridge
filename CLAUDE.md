@@ -21,7 +21,8 @@ correction into several pages.
 
 ## Working rules
 
-- Keep `Memory` as the execution plane; REST, MCP, and CLI translate inputs and outputs only.
+- Keep `Memory` as the single entry point that forwards to the kernel planes; REST, MCP, and CLI
+  translate inputs and outputs only.
 - Route models by declared capability and inject provider clients explicitly.
 - Keep SQLite authoritative and Zvec rebuildable. One physical `data_dir` has one live owner.
 - Keep product modules independent of benchmark modules; behavior benchmarks use the public SDK.

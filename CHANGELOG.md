@@ -532,7 +532,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `records`, `captures`, `semantics`, `control`, `identities`, `media`, `index`, `recall` -- in
   `mindbridge.infrastructure.local.store`, a package whose top-level imports are unchanged.
   No on-disk schema, public signature, response type, endpoint, tool, or error changed; the
-  [architecture guide](docs/architecture.md#code-layout) owns the layout.
+  [architecture guide](docs/architecture.md#code-layout) owns the layout. Kernel warnings now
+  log under `mindbridge.kernel.<plane>` rather than `mindbridge.memory`; configure the
+  `mindbridge` logger to keep receiving all of them.
 - **Breaking:** `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` declare
   a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
   `isinstance` checks the method name rather than its signature, so a custom backend written

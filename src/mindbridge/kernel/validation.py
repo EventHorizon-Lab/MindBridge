@@ -115,14 +115,6 @@ def pushed_memory_types(
     return None if pushed >= frozenset(MemoryType) else pushed
 
 
-def validated_evidence_budget(value: int | None) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValidationError("evidence_budget_chars must be a positive integer")
-    return value
-
-
 def validated_decay_half_life(days: float | None) -> timedelta | None:
     if days is None:
         return None
@@ -152,13 +144,6 @@ def strict_bool(value: object, name: str) -> bool:
     return value
 
 
-def capture_flag(capture: object) -> bool:
-    """Read `capture` as the mode it is, so a truthy value is a mistake and not a silent yes."""
-    if not isinstance(capture, bool):
-        raise ValidationError("capture must be a boolean")
-    return capture
-
-
 def memory_id_filter(memory_ids: Sequence[str] | None) -> tuple[str, ...] | None:
     """Normalize an optional `memory_ids` filter the way `forget()` normalizes its argument."""
     if memory_ids is None:
@@ -171,17 +156,11 @@ def memory_id_filter(memory_ids: Sequence[str] | None) -> tuple[str, ...] | None
         raise ValidationError("memory_ids must be a sequence of memory IDs") from None
 
 
-def validated_identity_relationship(value: object) -> str:
-    relationship = validated_text(value, "identity relationship")
-    if len(relationship) > 255 or not relationship.isprintable():
-        raise ValidationError("identity relationship must be at most 255 printable characters")
-    return relationship
-
-
-def validated_identity_name(value: object) -> str:
-    name = validated_text(value, "identity name")
+def validated_identity_name(value: object, label: str = "identity name") -> str:
+    """Validate an identity's name or, with `label="identity relationship"`, its relationship."""
+    name = validated_text(value, label)
     if len(name) > 255 or not name.isprintable():
-        raise ValidationError("identity name must be at most 255 printable characters")
+        raise ValidationError(f"{label} must be at most 255 printable characters")
     return name
 
 

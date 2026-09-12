@@ -52,10 +52,9 @@ from mindbridge.kernel.answering import ASYNC_QUEUE_TIME_MS, Answering
 from mindbridge.kernel.compilation import Compilation
 from mindbridge.kernel.contracts import (
     STORE_METADATA_KEYS,
-    Closable,
+    close_quietly,
     declared_capabilities,
     known_metadata_upgrade,
-    present_resources,
     resolve_backends,
     unique_resources,
 )
@@ -73,7 +72,7 @@ from mindbridge.kernel.retrieval import Retrieval
 from mindbridge.kernel.runtime import Index, Storage, open_store, translate_storage_errors
 from mindbridge.kernel.settings import resolve_settings
 from mindbridge.kernel.speech import Speech
-from mindbridge.kernel.validation import capture_flag
+from mindbridge.kernel.validation import strict_bool
 from mindbridge.kernel.vision import Vision
 from mindbridge.models.base import (
     ConsolidationBackend,
@@ -166,7 +165,7 @@ class Memory:
         tracer: Tracer | None = None,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
-        self._tracer = trace.get_tracer(TRACER_NAME) if tracer is None else tracer
+        tracer = trace.get_tracer(TRACER_NAME) if tracer is None else tracer
         self._settings = resolve_settings(
             index_speech=index_speech,
             index_quantization=index_quantization,
@@ -230,10 +229,10 @@ class Memory:
                 )
             except ValueError as error:
                 raise ValidationError(str(error)) from None
-            self._assets = AssetStore(self.data_dir)
+            assets = AssetStore(self.data_dir)
             self._storage = Storage(
                 store=self._store,
-                assets=self._assets,
+                assets=assets,
                 write_lock=RLock(),
                 formation_lock=RLock(),
                 settle_lock=RLock(),
@@ -247,24 +246,24 @@ class Memory:
             self._hydrator = Hydrator(
                 storage=self._storage,
             )
-            self._materializer = Materializer(
+            materializer = Materializer(
                 storage=self._storage,
                 lifecycle=self._lifecycle,
             )
-            self._speech = Speech(
-                tracer=self._tracer,
+            speech = Speech(
+                tracer=tracer,
                 storage=self._storage,
                 backends=self._backends,
                 settings=self._settings,
                 hydrator=self._hydrator,
             )
-            self._embedding = Embedding(
-                tracer=self._tracer,
+            embedding = Embedding(
+                tracer=tracer,
                 storage=self._storage,
                 backends=self._backends,
                 settings=self._settings,
                 hydrator=self._hydrator,
-                speech=self._speech,
+                speech=speech,
             )
             self._lifecycle.collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
@@ -274,7 +273,7 @@ class Memory:
                 _LOGGER.warning(
                     "re-embedding stored memories for space %s", self._backends.space_id
                 )
-                self._embedding.reembed_memories()
+                embedding.reembed_memories()
                 self._store.set_metadata(STORE_METADATA_KEYS["space"], self._backends.space_id)
                 self._store.set_metadata(STORE_METADATA_KEYS["index"], self._settings.index_recipe)
             if index_missing or index_rebuild:
@@ -286,7 +285,7 @@ class Memory:
                 with translate_storage_errors("checkpoint a missing search index"):
                     self._store.index.queue_all_embeddings()
         except BaseException:
-            _close_quietly(*injected, self._store)
+            close_quietly(*injected, self._store)
             raise
 
         try:
@@ -296,114 +295,114 @@ class Memory:
                 quantization=self._settings.index_quantization,
             )
         except Exception as error:
-            _close_quietly(*injected, self._store)
+            close_quietly(*injected, self._store)
             raise IndexUnavailableError(
                 "failed to open the local search index", stage="open", reason="index_missing"
             ) from error
 
         self._projection = Projection(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             index=self._index,
             lifecycle=self._lifecycle,
         )
         self._vision = Vision(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             backends=self._backends,
             settings=self._settings,
             lifecycle=self._lifecycle,
             hydrator=self._hydrator,
-            materializer=self._materializer,
-            speech=self._speech,
-            embedding=self._embedding,
+            materializer=materializer,
+            speech=speech,
+            embedding=embedding,
             projection=self._projection,
         )
         self._retrieval = Retrieval(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             index=self._index,
             backends=self._backends,
             settings=self._settings,
             lifecycle=self._lifecycle,
             hydrator=self._hydrator,
-            materializer=self._materializer,
-            speech=self._speech,
-            embedding=self._embedding,
+            materializer=materializer,
+            speech=speech,
+            embedding=embedding,
             projection=self._projection,
         )
         self._formation = Formation(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             backends=self._backends,
-            materializer=self._materializer,
-            embedding=self._embedding,
+            materializer=materializer,
+            embedding=embedding,
             projection=self._projection,
         )
         self._identities = Identities(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             backends=self._backends,
             lifecycle=self._lifecycle,
-            materializer=self._materializer,
-            speech=self._speech,
-            embedding=self._embedding,
+            materializer=materializer,
+            speech=speech,
+            embedding=embedding,
             projection=self._projection,
             vision=self._vision,
             formation=self._formation,
         )
         self._ingestion = Ingestion(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             backends=self._backends,
             settings=self._settings,
             lifecycle=self._lifecycle,
             hydrator=self._hydrator,
-            materializer=self._materializer,
-            speech=self._speech,
-            embedding=self._embedding,
+            materializer=materializer,
+            speech=speech,
+            embedding=embedding,
             projection=self._projection,
             vision=self._vision,
             formation=self._formation,
             identities=self._identities,
         )
         self._answering = Answering(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             backends=self._backends,
             settings=self._settings,
             lifecycle=self._lifecycle,
             hydrator=self._hydrator,
-            materializer=self._materializer,
-            speech=self._speech,
+            materializer=materializer,
+            speech=speech,
             vision=self._vision,
             retrieval=self._retrieval,
         )
         self._compilation = Compilation(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             backends=self._backends,
             lifecycle=self._lifecycle,
             hydrator=self._hydrator,
-            materializer=self._materializer,
-            speech=self._speech,
+            materializer=materializer,
+            speech=speech,
             retrieval=self._retrieval,
         )
         self._control = ControlPlane(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             backends=self._backends,
             settings=self._settings,
             lifecycle=self._lifecycle,
             hydrator=self._hydrator,
-            materializer=self._materializer,
+            materializer=materializer,
             projection=self._projection,
             retrieval=self._retrieval,
             formation=self._formation,
             identities=self._identities,
         )
         self._records = Records(
-            tracer=self._tracer,
+            tracer=tracer,
             storage=self._storage,
             settings=self._settings,
             lifecycle=self._lifecycle,
@@ -1118,9 +1117,6 @@ class Memory:
                     )
         return rebuild_index, rebuild_embeddings
 
-    def _require_open(self) -> None:
-        self._lifecycle.require_open()
-
     def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
         return self._ingestion.add_stream_input(item)
 
@@ -1165,12 +1161,6 @@ class Memory:
         return failures
 
 
-def _close_quietly(*resources: Closable | None) -> None:
-    for resource in unique_resources(present_resources(*resources)):
-        with suppress(Exception):
-            resource.close()
-
-
 class AsyncMemory:
     """Async facade over one open synchronous `Memory`, which it owns and closes."""
 
@@ -1202,7 +1192,7 @@ class AsyncMemory:
         return cls(Memory.from_config(config, tracer=tracer))
 
     async def __aenter__(self) -> AsyncMemory:
-        self._memory._require_open()
+        self._memory._lifecycle.require_open()
         return self
 
     async def __aexit__(self, *_error: object) -> None:
@@ -1310,7 +1300,7 @@ class AsyncMemory:
         """
         if not isinstance(contents, AsyncIterable):
             raise ValidationError("contents must be an async iterable of memory inputs")
-        capture = capture_flag(capture)
+        capture = strict_bool(capture, "capture")
         iterator = aiter(contents)
         index = 0
         while True:

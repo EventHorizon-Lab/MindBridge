@@ -77,7 +77,6 @@ from mindbridge.kernel.ranking import (
 )
 from mindbridge.kernel.runtime import translate_index_errors
 from mindbridge.kernel.temporal import parse_temporal_range
-from mindbridge.kernel.validation import validated_evidence_budget
 from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     EmbedTask,
@@ -2040,11 +2039,12 @@ def test_evidence_budget_charges_media_far_above_its_record_text(tmp_path: Path)
     assert len(media_hits) == 6
 
 
-def test_evidence_budget_rejects_values_that_cannot_bound_anything() -> None:
+def test_evidence_budget_rejects_values_that_cannot_bound_anything(tmp_path: Path) -> None:
     for value in (0, -1, True):
         with pytest.raises(ValidationError, match="evidence_budget_chars"):
-            validated_evidence_budget(value)
-    assert validated_evidence_budget(None) is None
+            Memory(tmp_path, embedder=_FakeModels(), evidence_budget_chars=value)
+    with Memory(tmp_path, embedder=_FakeModels(), evidence_budget_chars=None) as memory:
+        assert memory._settings.evidence_budget is None
 
 
 def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) -> None:

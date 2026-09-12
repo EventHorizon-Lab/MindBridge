@@ -1,8 +1,8 @@
 """SQLite source of truth for the local MindBridge runtime.
 
 `LocalStore` is the one entry point; the row values and errors here are what its families
-accept and return. Everything else in this package is a connection-level function behind one
-family and is not imported outside the package.
+accept and return. The family modules are classes over the connection-level functions in the
+private modules, and product code outside this package imports none of them directly.
 """
 
 from mindbridge.infrastructure.local.store._codec import datetime_text, optional_datetime_text

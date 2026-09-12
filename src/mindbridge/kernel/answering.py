@@ -158,7 +158,7 @@ class _RecallReads:
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
                 modality=None if modality is None else modality.value,
-                memory_type=self.validated_memory_type(memory_type),
+                memory_type=self._memory_type(memory_type),
                 max_rows=max_rows,
                 valid_at=scope.valid_at,
                 known_at=scope.known_at,
@@ -184,7 +184,7 @@ class _RecallReads:
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
                 modality=None if modality is None else modality.value,
-                memory_type=self.validated_memory_type(memory_type),
+                memory_type=self._memory_type(memory_type),
                 max_rows=max_rows,
                 valid_at=scope.valid_at,
                 known_at=scope.known_at,
@@ -237,7 +237,7 @@ class _RecallReads:
             identity_id=identity_id,
         )
 
-    def validated_memory_type(self, requested: MemoryType | None) -> str | None:
+    def _memory_type(self, requested: MemoryType | None) -> str | None:
         """The caller's own `memory_type` wins: a plan may not widen the question's scope."""
         chosen = self._context.memory_type or requested
         return None if chosen is None else chosen.value

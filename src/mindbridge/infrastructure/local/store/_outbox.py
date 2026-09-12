@@ -9,6 +9,17 @@ from mindbridge.infrastructure.local.store._codec import datetime_text, row_text
 from mindbridge.infrastructure.local.store._membership import IDENTITY_MEMORIES_SQL
 
 
+def enqueue_capture(connection: sqlite3.Connection, memory_id: str, enqueued_at: datetime) -> None:
+    """Queue a captured memory for settlement; one already waiting keeps its earlier slot."""
+    connection.execute(
+        """
+        INSERT INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)
+        ON CONFLICT (memory_id) DO NOTHING
+        """,
+        (memory_id, datetime_text(enqueued_at)),
+    )
+
+
 def queue_asset_identity_projection(connection: sqlite3.Connection, asset_id: str) -> None:
     """Re-enqueue the memories that already reference an asset whose people just became known.
 

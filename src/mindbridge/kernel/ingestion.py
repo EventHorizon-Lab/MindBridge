@@ -49,8 +49,8 @@ from mindbridge.kernel.speech import Speech
 from mindbridge.kernel.tracing import Traced
 from mindbridge.kernel.validation import (
     MAX_TEXT_CHARACTERS,
-    capture_flag,
     memory_id_filter,
+    strict_bool,
     validate_limit,
     validated_memory_type,
 )
@@ -486,7 +486,7 @@ class Ingestion(Traced):
     ) -> Iterator[MemoryRecord]:
         if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
             raise ValidationError("contents must be an iterable of memory inputs")
-        capture = capture_flag(capture)
+        capture = strict_bool(capture, "capture")
         try:
             iterator = iter(contents)
         except TypeError:

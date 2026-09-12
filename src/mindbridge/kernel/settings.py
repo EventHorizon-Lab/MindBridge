@@ -13,7 +13,6 @@ from mindbridge.kernel.validation import (
     strict_bool,
     unit_interval,
     validated_decay_half_life,
-    validated_evidence_budget,
     validated_retrieval_mode,
 )
 from mindbridge.types import IndexQuantization, RetentionPolicy, RetrievalMode
@@ -87,7 +86,9 @@ def resolve_settings(
         index_speech=strict_bool(index_speech, "index_speech"),
         minimum_relevance=unit_interval(minimum_relevance, "minimum_relevance"),
         ambiguity_margin=unit_interval(ambiguity_margin, "ambiguity_margin"),
-        evidence_budget=validated_evidence_budget(evidence_budget_chars),
+        evidence_budget=None
+        if evidence_budget_chars is None
+        else positive_int(evidence_budget_chars, "evidence_budget_chars"),
         recall_planning=strict_bool(recall_planning, "recall_planning"),
         recall_set_budget=positive_int(recall_set_budget_chars, "recall_set_budget_chars"),
         recall_set_max_rows=positive_int(recall_set_max_rows, "recall_set_max_rows"),

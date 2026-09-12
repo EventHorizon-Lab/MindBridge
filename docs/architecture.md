@@ -51,18 +51,22 @@ not handed.
 The pure modules beside them -- `content.py` for what the caller gave, `derived.py` for what a
 model derived, `temporal.py`, `ranking.py`, `contracts.py`, `validation.py`, `settings.py` --
 read no storage and call no model; they are the functions the planes agree on, and they are
-where a rule about identity, ranking, or derived text lives exactly once. `streams.py` holds the
-async observation streams over `AsyncMemory`.
+where a rule about identity, ranking, or derived text lives exactly once. Two small shared
+modules complete the kernel: `runtime.py` holds the `Storage` bundle, the `Index` protocol, and
+the boundary error translation every plane uses, and `tracing.py` holds the `Traced` base class
+that gives each plane its spans. The top-level `streams.py` holds the async observation streams
+over `AsyncMemory`.
 
 `infrastructure/local/store/` mirrors the same discipline for SQLite. `LocalStore` owns one
 `Connections` pool and one directory lock and exposes eight families -- `records`, `captures`,
 `semantics`, `control`, `identities`, `media`, `index`, `recall` -- each the writer of its own
 tables. A transaction that spans families, such as a formation commit, lives in the family that
 owns the primary write and calls the other families' connection-level functions inside it. The
-private modules (`_lineage.py`, `_selection.py`, `_identity.py`, `_membership.py`,
-`_candidates.py`, `_operations.py`, `_recall.py`, `_outbox.py`, `_codec.py`, `_schema.py`) are
-those connection-level functions, grouped by the invariant they keep, and are not imported
-outside the package.
+private modules (`_connections.py`, `_lineage.py`, `_selection.py`, `_identity.py`,
+`_membership.py`, `_candidates.py`, `_operations.py`, `_recall.py`, `_outbox.py`, `_codec.py`,
+`_schema.py`) are the pool and those connection-level functions, grouped by the invariant they
+keep; product code outside the package imports only `LocalStore` and the row values, while
+white-box tests may reach the private modules directly.
 
 ## Durable state
 

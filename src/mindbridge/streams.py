@@ -12,9 +12,8 @@ from datetime import datetime, timedelta
 
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.kernel.content import content_atoms, declared_atom_modality, snapshot_content
-from mindbridge.kernel.contracts import positive_dimension
 from mindbridge.kernel.temporal import resolved_reference_at, search_occurrence_range
-from mindbridge.kernel.validation import optional_memory_type, validate_limit
+from mindbridge.kernel.validation import optional_memory_type, positive_int, validate_limit
 from mindbridge.memory import AsyncMemory
 from mindbridge.types import (
     AcousticBoundary,
@@ -80,9 +79,9 @@ class AsyncOmniPrefetch:
             occurred_until,
         )
         self._memory = memory
-        self.validate_limit = limit
-        self.validated_memory_type = optional_memory_type(memory_type)
-        self.resolved_reference_at = resolved_reference_at(reference_at)
+        self._limit = limit
+        self._memory_type = optional_memory_type(memory_type)
+        self._reference_at = resolved_reference_at(reference_at)
         self._occurred_from = occurred_from
         self._occurred_until = occurred_until
         self._revision = 0
@@ -153,9 +152,9 @@ class AsyncOmniPrefetch:
                 try:
                     hits = await self._memory.search(
                         query,
-                        limit=self.validate_limit,
-                        memory_type=self.validated_memory_type,
-                        reference_at=self.resolved_reference_at,
+                        limit=self._limit,
+                        memory_type=self._memory_type,
+                        reference_at=self._reference_at,
                         occurred_from=self._occurred_from,
                         occurred_until=self._occurred_until,
                     )
@@ -191,10 +190,10 @@ class AsyncCaptureStream:
         if not isinstance(capture, bool):
             raise ValidationError("capture must be a boolean")
         self._memory = memory
-        self.validate_limit = limit
-        self.validated_memory_type = optional_memory_type(memory_type)
-        self.resolved_reference_at = resolved_reference_at(reference_at)
-        self._max_streams = positive_dimension(max_streams, "max_streams")
+        self._limit = limit
+        self._memory_type = optional_memory_type(memory_type)
+        self._reference_at = resolved_reference_at(reference_at)
+        self._max_streams = positive_int(max_streams, "max_streams")
         self._capture = capture
 
     async def consume(  # noqa: C901 - the three-state reducer is intentionally inline
@@ -326,9 +325,9 @@ class AsyncCaptureStream:
     def _new_prefetch(self) -> AsyncOmniPrefetch:
         return AsyncOmniPrefetch(
             self._memory,
-            limit=self.validate_limit,
-            memory_type=self.validated_memory_type,
-            reference_at=self.resolved_reference_at,
+            limit=self._limit,
+            memory_type=self._memory_type,
+            reference_at=self._reference_at,
         )
 
     async def _add_final(self, item: ContentInput | StreamInput) -> MemoryRecord:
@@ -381,7 +380,7 @@ class AsyncAudioStream:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
         self._memory = memory
-        self._max_streams = positive_dimension(max_streams, "max_streams")
+        self._max_streams = positive_int(max_streams, "max_streams")
         self._written_type = optional_memory_type(memory_type) or MemoryType.SEMANTIC
         self._context = _stream_context(context)
         capabilities = memory._memory._backends.embedding_capabilities
@@ -546,7 +545,7 @@ class AsyncVisionStream:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
         self._memory = memory
-        self._max_streams = positive_dimension(max_streams, "max_streams")
+        self._max_streams = positive_int(max_streams, "max_streams")
         self._written_type = optional_memory_type(memory_type) or MemoryType.SEMANTIC
         self._context = _stream_context(context)
         capabilities = memory._memory._backends.embedding_capabilities

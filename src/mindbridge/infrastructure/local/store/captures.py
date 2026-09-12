@@ -7,12 +7,12 @@ from datetime import datetime
 
 from mindbridge.infrastructure.local.store._codec import (
     SQLITE_PARAMETER_BATCH,
-    datetime_text,
     parse_datetime,
     prepare_write_batch,
     row_text,
 )
 from mindbridge.infrastructure.local.store._connections import Connections
+from mindbridge.infrastructure.local.store._outbox import enqueue_capture
 from mindbridge.infrastructure.local.store.records import write_embedding, write_memory
 from mindbridge.infrastructure.local.store.rows import (
     StoredEmbedding,
@@ -68,10 +68,7 @@ class CaptureQueue:
                     transaction_memory_ids=transaction_memory_ids,
                 )
                 transaction_memory_ids.add(memory.memory_id)
-                connection.execute(
-                    "INSERT INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)",
-                    (memory.memory_id, datetime_text(enqueued_at)),
-                )
+                enqueue_capture(connection, memory.memory_id, enqueued_at)
                 enqueued.append(memory.memory_id)
         return tuple(enqueued)
 
