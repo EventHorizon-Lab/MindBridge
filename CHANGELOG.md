@@ -10,6 +10,20 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- A recall plan's `match` or `window` step may take `"time": "step:<index>"` and read inside the
+  span an earlier step's rows cover. A row's stated dates win over its event time -- ISO days,
+  `Month YYYY`, `Month D, YYYY`, `D Month YYYY`, `D-D` ranges, and a year-less day joined to a
+  dated one as in `June 23 - July 2, 2022`; never a bare year or a relative phrase -- and a row
+  that states none, or whose stated dates spread over more than a year (a booking beside its
+  terms revision), contributes its event time instead. This is the read ATM-Bench-Hard's trip
+  questions need and a one-shot plan could not express: the dates of a stay are in a booking
+  email's text, weeks after the day the email arrived, so a window on the email's own event
+  time held none of the trip. A step bound to rows that carry no time reads nothing rather than
+  the whole corpus, a stored date the calendar cannot hold is the same non-read rather than an
+  exception, a forward or malformed reference is not a plan, several steps bound to one anchor
+  derive its span once, and the executed step carries the bounds it resolved so the answer
+  prompt states the span it read. `RecallReader` gains `time_span`; `RecallStepResult` gains
+  `occurred_from` and `occurred_until`.
 - `ask()` can plan how to retrieve before it retrieves, behind `recall_planning` (default
   `False`). Similarity answers "what is most like this"; it has no way to express what a count, a
   list of "all", an adjacency, or "everything about this person" asks for, and measured on the
@@ -875,6 +889,30 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- A question that states its own clock as `Today is July, 1 2025` -- a comma between the month
+  and the day -- or as `Today is 1 July 2025` now anchors the reference time. Only `July 1, 2025`
+  and the ISO form did, so the comma spelling was read against the real wall clock and its "past
+  two years" became the wrong two years: on ATM-Bench-Hard that question retrieved none of its
+  eight evidence records and abstained. Rolling spans now resolve in every calendar unit, not
+  just days: "past two years", "last 3 months", "recent two weeks", "过去两年", "最近三个月" are
+  windows ending at the clock, with a month or year shift clamped to the target month's length.
+  The count is required except for the bare `past <unit>`, so "in recent years" and "my recent
+  day trips" stay unbounded, and every rolling phrase in a question is tried in order so a vague
+  "past few days" does not hide a precise "last 3 days" after it. A bare "last year" or "last
+  month" remains the calendar phrase it was, and "Today is July 2025" or "Today is 2 decades"
+  anchors nothing: a month name ends at a word boundary and a day is not the first digits of a
+  year.
+- The answer request numbers each attached media asset `attachment 1`, `attachment 2` -- by
+  order of first appearance, one number per distinct asset -- under the key `media`, instead of
+  listing asset IDs under `assets`, and the grounded prompt's identifier sentence now names
+  image, video, and memory IDs explicitly. Those asset IDs are content hashes, and a reader
+  asked for "the image ids" returned them as the answer: 2 of 12 ATM-Bench-Hard list questions
+  whose retrieval was otherwise complete scored zero that way, and labelled `image 1` the
+  reader returned the labels instead. A numbered attachment still says which media belongs to
+  which memory and which memories share one, and matches neither the question's words nor the
+  shape of an identifier. The same label is written as a text part immediately before the
+  asset's own media parts, so the number is defined where the media is: a short video that
+  arrives as several stills no longer shifts every later attachment by the extra frames.
 - `recall_planning` now actually plans under `mindbridge-bench eval`. The harness lends one
   answerer to every isolated store through a forwarding proxy, and `Memory` probes the optional
   `RecallPlanningBackend` capability with `isinstance` against a `runtime_checkable` protocol --
