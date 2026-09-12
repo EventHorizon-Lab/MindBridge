@@ -102,6 +102,13 @@ class _Reader:
         self.calls.append(("entity", (name, max_rows)))
         return self._answer("entity")
 
+    def time_span(self, rows: Sequence[SearchHit]) -> tuple[datetime, datetime] | None:
+        self.calls.append(("time_span", tuple(hit.id for hit in rows)))
+        times = [hit.occurred_at for hit in rows if hit.occurred_at is not None]
+        if not times:
+            return None
+        return min(times), max(times) + timedelta(minutes=1)
+
 
 def test_the_fallback_plan_is_todays_behaviour() -> None:
     """Every failure lands here, so this plan has to be one plain similarity search."""
@@ -325,6 +332,133 @@ def test_execute_unions_the_ops_with_exhaustive_rows_in_time_order_first() -> No
         ("similar", 2),
     ]
     assert result.complete is True
+
+
+def test_a_window_bound_to_an_earlier_step_reads_the_span_of_its_rows() -> None:
+    """`"time": "step:0"` is resolved after step 0 has run, and the note states what it became.
+
+    The plan text cannot name the bounds -- they are whatever the anchor rows turn out to cover
+    -- so the executed step carries them and the reader is told the span it is looking at.
+    """
+    reader = _Reader(
+        match=(_hit("m-late", minutes=30), _hit("m-early", minutes=-30)),
+        window=(_hit("w-1", minutes=0),),
+    )
+    plan = parse_recall_plan(
+        json.dumps(
+            {
+                "shape": "set",
+                "steps": [
+                    {"op": "match", "terms": ["booking"]},
+                    {"op": "window", "time": "step:0", "modality": "image"},
+                ],
+            }
+        ),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    assert plan.steps[1].time_of == 0
+    assert plan.steps[1].occurred_from is None and plan.steps[1].occurred_until is None
+    result = execute(plan, reader, limit=12, active_records=1_000)
+
+    start, until = NOW - timedelta(minutes=30), NOW + timedelta(minutes=31)
+    assert reader.calls[1] == ("time_span", ("m-late", "m-early"))
+    assert reader.calls[2] == ("window", (start, until, Modality.IMAGE, DEFAULT_MAX_ROWS))
+    assert (result.executed[1].occurred_from, result.executed[1].occurred_until) == (start, until)
+    assert [hit.id for hit in result.exhaustive] == ["m-early", "w-1", "m-late"]
+    note = recall_note(result)
+    assert f"records in the time span between {start.isoformat()} and {until.isoformat()} (1)" in (
+        note
+    )
+
+
+def test_a_match_bound_to_a_step_that_read_no_dated_rows_reads_nothing() -> None:
+    """No span to derive means no read, never an unbounded one over the whole corpus."""
+    undated = SearchHit(id="u-1", content="record", score=0.5, created_at=NOW)
+    reader = _Reader(match=(undated,), window=(_hit("w-1"),))
+    plan = parse_recall_plan(
+        json.dumps(
+            {
+                "shape": "set",
+                "steps": [
+                    {"op": "match", "terms": ["booking"]},
+                    {"op": "window", "time": "step:0"},
+                    {"op": "match", "terms": ["photo"], "time": "step:1"},
+                ],
+            }
+        ),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    result = execute(plan, reader, limit=12, active_records=1_000)
+
+    assert [call[0] for call in reader.calls] == ["match", "time_span", "time_span"]
+    assert [(step.op, step.rows) for step in result.executed] == [
+        ("match", 1),
+        ("window", 0),
+        ("match", 0),
+    ]
+    assert result.complete is True
+
+
+def test_a_derived_span_is_read_once_per_anchor_and_a_bad_date_reads_nothing() -> None:
+    """Two steps bound to one anchor share one scan, and a span the calendar rejects is no read.
+
+    The span comes from stored record text, so a value the reader cannot turn into a date is
+    the same kind of data failure as a plan the store refuses: the step reports that its
+    records were never read instead of `ask()` raising.
+    """
+
+    class _Overflowing(_Reader):
+        def time_span(self, rows: Sequence[SearchHit]) -> tuple[datetime, datetime] | None:
+            super().time_span(rows)
+            raise OverflowError("date value out of range")
+
+    reader = _Overflowing(match=(_hit("m-1"),), window=(_hit("w-1"),))
+    plan = parse_recall_plan(
+        json.dumps(
+            {
+                "shape": "set",
+                "steps": [
+                    {"op": "match", "terms": ["booking"]},
+                    {"op": "window", "time": "step:0"},
+                    {"op": "window", "time": "step:0", "modality": "image"},
+                ],
+            }
+        ),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    result = execute(plan, reader, limit=12, active_records=1_000)
+
+    assert [call[0] for call in reader.calls] == ["match", "time_span"]
+    assert [(step.op, step.rows, step.bounded) for step in result.executed] == [
+        ("match", 1, False),
+        ("window", 0, True),
+        ("window", 0, True),
+    ]
+    assert result.complete is False
+
+
+@pytest.mark.parametrize(
+    "time",
+    ("step:1", "step:9", "step:x", "step", "0", "step:-1"),
+)
+def test_a_time_bound_that_names_no_earlier_step_is_not_a_plan(time: str) -> None:
+    payload = json.dumps(
+        {
+            "shape": "set",
+            "steps": [
+                {"op": "match", "terms": ["a"]},
+                {"op": "window", "time": time},
+            ],
+        }
+    )
+
+    assert parse_recall_plan(payload, reference_at=NOW) is None
 
 
 def test_a_read_that_returned_its_whole_bound_is_not_complete() -> None:
