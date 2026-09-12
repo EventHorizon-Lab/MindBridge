@@ -54,7 +54,19 @@ _HNSW_M = 50
 _HNSW_EF_CONSTRUCTION = 500
 _RABITQ_TOTAL_BITS = 7
 _RABITQ_NUM_CLUSTERS = 16
-_DEFAULT_EF_SEARCH = 300
+# Zvec's native HNSW refuses a larger candidate list outright ("ef_search must be greater than 0
+# and less than or equal to 2048"), and the refusal surfaces as a Gandiva execution error from the
+# query rather than as a validation error, so every `ef` this module sends is clamped here.
+_MAX_EF_SEARCH = 2048
+# Searching at a smaller candidate list silently loses true nearest neighbours, and nothing in the
+# index reports it: `doc_count` and `index_completeness` both read healthy. Measured on the shipped
+# benchmark stores (r0913b D1, 50 queries, exhaustive fp32 cosine as truth): at ef 300 a collection
+# whose vectors sit in an HNSW graph returned 0.48 of the true top-100 on 24,271 WeMM-2048 video
+# keys and 0.71 on 50,642; at this bound it returns 0.95 and 0.94, for a p50 of 7.4 ms rather than
+# 1.8 ms. Collections small enough that no graph was ever built answer every query by brute force
+# and are unaffected either way -- 217-, 689- and 1,359-vector stores measured recall 1.000 and the
+# same p50 at both values -- so the cost is paid only where the loss is.
+_DEFAULT_EF_SEARCH = _MAX_EF_SEARCH
 _LEXICAL_RANK_CONSTANT = 60
 _DEFAULT_REBUILD_BATCH_SIZE = 1_024
 # Zvec's native writer refuses a batch above this many documents, and does not expose the limit as
@@ -250,8 +262,8 @@ class ZvecIndex:
         quantization: IndexQuantization = IndexQuantization.NONE,
     ) -> None:
         validate_index_configuration(dimension, quantization)
-        if isinstance(ef_search, bool) or ef_search <= 0:
-            raise ValueError("ef_search must be a positive integer")
+        if isinstance(ef_search, bool) or not 1 <= ef_search <= _MAX_EF_SEARCH:
+            raise ValueError(f"ef_search must be between 1 and {_MAX_EF_SEARCH}")
 
         self.path = Path(path).expanduser().resolve()
         self.dimension = dimension
@@ -733,7 +745,7 @@ class ZvecIndex:
         query = self._zvec.Query(
             field_name=_VECTOR_FIELD,
             vector=list(values),
-            param=self._query_param(ef=max(selected_ef, limit), exact=exact),
+            param=self._query_param(ef=min(_MAX_EF_SEARCH, max(selected_ef, limit)), exact=exact),
         )
         filter_expression = _filter_expression(
             space_id=space_id,

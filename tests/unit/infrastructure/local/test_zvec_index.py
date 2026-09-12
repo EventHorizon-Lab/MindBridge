@@ -273,6 +273,45 @@ def test_group_by_falls_back_until_it_has_distinct_parent_memories() -> None:
     assert collection.output_fields == [["memory_id"]]
 
 
+def test_dense_search_asks_for_the_largest_candidate_list_zvec_accepts() -> None:
+    # A collection whose vectors sit in an HNSW graph silently drops true nearest neighbours when
+    # the candidate list is small, and reports full health while doing it: measured on the shipped
+    # 24,271-vector benchmark store (r0913b D1), ef 300 returned 0.48 of the exhaustive cosine
+    # top-100 against 0.95 at the bound below, with `doc_count` and `index_completeness` unchanged.
+    # Zvec refuses anything above that bound outright -- a `limit` past it used to reach the native
+    # layer unclamped and fail the whole query -- so both ends are pinned here.
+    parent = _QueryDocument("parent_best", 0.0, memory_id="parent")
+    collection = _GroupedCollection(
+        groups=(_Group("parent", (parent,)),),
+        documents=(parent, _QueryDocument("neighbor", 0.5, memory_id="neighbor")),
+    )
+    index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
+    index.dimension = 2
+    index.ef_search = zvec_index_module._DEFAULT_EF_SEARCH
+    index.quantization = IndexQuantization.NONE
+    index._zvec = _DenseZvec
+    index._collection = collection
+
+    # Zvec's own bound, spelled out: the module constant must not be able to drift away from it.
+    for limit in (2, 4096):
+        index._dense_query(
+            (1.0, 0.0),
+            limit=limit,
+            space_id=None,
+            task=None,
+            memory_type=None,
+            occurred_from=None,
+            occurred_until=None,
+            place_id=None,
+            identity_id=None,
+            ef=None,
+            exact=False,
+        )
+
+    assert set(collection.efs) == {2048}
+
+
 def test_create_search_flush_close_and_reopen(tmp_path: Path) -> None:
     _require_zvec()
     path = tmp_path / "index"
@@ -987,13 +1026,16 @@ class _GroupedCollection:
         self.group_counts: list[int] = []
         self.topks: list[int] = []
         self.output_fields: list[list[str]] = []
+        self.efs: list[int] = []
 
     def group_by_query(self, **options: object) -> tuple[_Group, ...]:
         self.group_counts.append(cast(int, options["group_count"]))
+        self.efs.append(_asked_ef(options))
         return self.groups
 
     def query(self, **options: object) -> list[_QueryDocument]:
         self.topks.append(cast(int, options["topk"]))
+        self.efs.append(_asked_ef(options))
         self.output_fields.append(cast(list[str], options["output_fields"]))
         return list(self.documents)
 
@@ -1017,6 +1059,12 @@ class _QueryZvec:
 class _DenseZvec:
     Query = dict
     HnswQueryParam = dict
+
+
+def _asked_ef(options: object) -> int:
+    payload = cast(dict[str, Any], options)
+    query = cast(dict[str, Any], payload.get("queries") or payload["query"])
+    return cast(int, cast(dict[str, Any], query["param"])["ef"])
 
 
 def test_native_writes_wait_for_in_flight_queries_and_reenter_their_own_gate() -> None:
