@@ -903,8 +903,24 @@ def test_compile_arm_sends_query_and_evidence_images_on_the_final_provider_wire(
         "data:image/png;base64,ZXZpZGVuY2UtaW1hZ2U=",
     ]
     assert "The evidence shows a robot." in cast(str, content[0]["text"])
+    # Each JSON binding is followed by the product's attachment marker and then the media it
+    # announces, so the wire reads: context, query binding, marker, image, memory binding,
+    # marker, image.
+    assert [part["type"] for part in content] == [
+        "text",
+        "text",
+        "text",
+        "image_url",
+        "text",
+        "text",
+        "image_url",
+    ]
+    assert [cast(str, content[index]["text"]) for index in (2, 5)] == [
+        "attachment 1",
+        "attachment 2",
+    ]
     question_binding = json.loads(cast(str, content[1]["text"]))
-    evidence_binding = json.loads(cast(str, content[3]["text"]))["memory_assets"]
+    evidence_binding = json.loads(cast(str, content[4]["text"]))["memory_assets"]
     assert question_binding == {
         "query_assets": [hashlib.sha256(b"query-image").hexdigest()],
     }

@@ -976,11 +976,17 @@ class _BaselineGenerator:
     def _native_media_groups(
         content: Sequence[dict[str, object]],
     ) -> tuple[tuple[dict[str, object], ...], ...]:
-        """Split product-prepared native parts at their existing JSON text labels."""
+        """Split product-prepared native parts at their existing JSON text labels.
+
+        Only a JSON label -- the question or a memory payload -- opens a group. The product also
+        writes a plain-text attachment marker right before each asset's media parts; that marker
+        belongs with the media it announces and travels inside the group, so the rebuilt request
+        keeps the same label beside the same picture.
+        """
         groups: list[tuple[dict[str, object], ...]] = []
         media: list[dict[str, object]] | None = None
         for part in content:
-            if part.get("type") == "text":
+            if part.get("type") == "text" and str(part.get("text", "")).startswith("{"):
                 if media is not None:
                     groups.append(tuple(media))
                 media = []
