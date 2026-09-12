@@ -13,6 +13,7 @@ wherever the suite runs.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -36,7 +37,7 @@ from mindbridge._telemetry import (
     VISION_BATCHES_FAILED,
     VISION_BATCHES_RETRIED,
 )
-from mindbridge.exceptions import ModelError
+from mindbridge.exceptions import IndexUnavailableError, ModelError
 from mindbridge.infrastructure.local.store.index import IndexOutbox
 from mindbridge.infrastructure.local.zvec_index import ZvecIndex
 from mindbridge.kernel.derived import (
@@ -625,13 +626,55 @@ def test_close_merges_the_segments_a_session_leaves_behind(
 def test_close_does_not_optimize_a_session_that_flushed_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`open -> add -> close` in a loop must not pay a merge per record it wrote."""
+    """A first session below the flush bound leaves one segment, so it must not merge it."""
     optimizations = _counted_optimizations(monkeypatch)
     with Memory(tmp_path, embedder=_Embedder()) as memory:
         memory.add("the kitchen at dusk")
 
     assert optimizations == []
     assert _vector_segments(tmp_path) == 1
+
+
+def test_repeated_short_sessions_do_not_grow_the_index(tmp_path: Path) -> None:
+    """`open -> add one record -> close` in a loop must not accrue a segment per session.
+
+    The flush counter is seeded from the files on disk, so every session after the first inherits
+    the previous one's segment and merges it back down. Without that, five one-record sessions
+    over a real 481 MB store left it at 511 MB in seven segments; with it the store stayed at
+    481 MB in one, for about 1.4 s of close each.
+    """
+    for index in range(4):
+        with Memory(tmp_path, embedder=_Embedder()) as memory:
+            memory.add(f"the kitchen at dusk, visit {index}")
+
+    assert _vector_segments(tmp_path) == 1
+
+
+def test_close_reports_a_failed_merge_and_still_releases_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A merge that cannot run must not cost the caller the close: it is derived state.
+
+    `close()` collects failures rather than raising at the first one, so the native collection is
+    closed and its file lock released whatever the merge did, and the failure is still raised.
+    """
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        kitchen = memory.add("the kitchen at dusk")
+        memory.add("the garden at noon")
+        memory.delete(kitchen.id)
+        memory.add("the hallway at dawn")
+
+        def refuse(self: ZvecIndex, *, concurrency: int = 0) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(ZvecIndex, "optimize", refuse)
+        with pytest.raises(IndexUnavailableError, match="optimize the search index"):
+            memory.close()
+        memory.close()
+
+    monkeypatch.undo()
+    with Memory(tmp_path, embedder=_Embedder()) as reopened:
+        assert {hit.id for hit in reopened.search("dawn", limit=10)}
 
 
 def test_reindexing_leaves_the_index_merged(tmp_path: Path) -> None:
@@ -1003,6 +1046,7 @@ def test_a_narrow_limit_returns_the_prefix_of_a_wide_one_with_the_same_scores(
 
 
 _TRACE_ORDER_PROBE = '''
+import errno
 import hashlib
 import json
 import math
