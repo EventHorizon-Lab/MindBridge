@@ -352,7 +352,7 @@ def test_an_add_that_crashed_before_forming_is_completed_by_the_next_settle(
     former = CountingFormer()
     embedder = CountingEmbedder()
     with Memory(tmp_path, embedder=embedder, former=former, minimum_relevance=0) as memory:
-        memory._form_sources = crash  # type: ignore[method-assign]
+        memory._formation.form_sources = crash  # type: ignore[method-assign]
         with pytest.raises(RuntimeError):
             memory.add("the fuse box is behind the coats")
 
@@ -364,7 +364,7 @@ def test_an_add_that_crashed_before_forming_is_completed_by_the_next_settle(
         assert [row.memory_id for row in memory.pending_captures()] == [queued[0]]
         # Settling an already-embedded row owes formation only; re-running the model stages would
         # buy the same vectors twice.
-        memory._enrich_row = crash  # type: ignore[method-assign]
+        memory._ingestion._enrich_row = crash  # type: ignore[method-assign]
         assert memory.settle() == 1
 
         # Formation ran exactly once. The single extra embed is the record it proposed.
@@ -760,7 +760,7 @@ def test_settle_counts_only_the_rows_it_actually_settled(tmp_path: Path) -> None
         memory.capture("the spare key is in the blue toolbox")
         # What losing the race looks like from inside: the row is gone by the time this pass
         # claims it, so `_enrich_row` returns None and nothing was embedded or completed.
-        memory._store.settle_capture = lambda *args, **kwargs: False  # type: ignore[method-assign]
+        memory._store.captures.settle_capture = lambda *args, **kwargs: False  # type: ignore[method-assign]
 
         assert memory.settle() == 0
         assert len(memory.pending_captures()) == 1

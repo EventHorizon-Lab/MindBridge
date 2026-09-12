@@ -6,8 +6,13 @@ MindBridge is a Python package under `src/mindbridge/`.
 
 - Keep public values and exceptions in small top-level modules such as `types.py` and
   `exceptions.py`.
-- Keep the developer-facing orchestration in `memory.py`.
-- Keep durable local storage and search adapters in `infrastructure/local/`.
+- Keep the public facades, `Memory` and `AsyncMemory`, in `memory.py`; it validates, wires, and
+  forwards, and decides nothing else.
+- Keep the kernel in `kernel/`: one module per plane, each a class whose constructor names every
+  store, index, backend, setting, and sibling plane it uses, beside pure modules that read no
+  storage and call no model. A behavior belongs to exactly one plane.
+- Keep durable local storage and search adapters in `infrastructure/local/`; `store/` is one
+  `LocalStore` over one connection pool with one attribute per table family.
 - Keep model clients in `models/` and protocol adapters in `api/`.
 - Keep benchmark harnesses in `benchmarks/` or `src/mindbridge/benchmarks/`.
 - Keep tests in `tests/unit/`, `tests/contracts/`, `tests/integration/`, and

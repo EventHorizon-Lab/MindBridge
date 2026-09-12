@@ -31,6 +31,24 @@ generation:
     chat_template_kwargs:
       enable_thinking: false
 
+# The raw ATM-Bench archive is 4,292 images and videos whose only caller-written text is a
+# 15-character source ID. Without this slot an image memory's full-text document is empty, so the
+# lexical route, a `match` recall step, and the reader's own view of the record cannot reach it,
+# and every media question rests on cross-modal cosine alone. The describer is one chat
+# completion per write batch on the same VLM the answerer uses; the caption is unioned into the
+# indexed document and the asset is still embedded natively.
+vision:
+  provider: openai
+  base_url: http://xyrobot-vl.xyrobot.com/v1
+  model: Qwen3.8-27B
+  api_key: EMPTY
+  modalities: [image, video]
+  timeout: 300.0
+  max_retries: 0
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+
 settings:
   index_speech: true
 

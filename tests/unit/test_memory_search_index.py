@@ -37,18 +37,20 @@ from mindbridge._telemetry import (
     VISION_BATCHES_RETRIED,
 )
 from mindbridge.exceptions import ModelError
-from mindbridge.infrastructure.local.store import LocalStore
-from mindbridge.memory import (
-    _LEXICAL_FULL_COVERAGE,
-    _LEXICAL_FULL_COVERAGE_RELEVANCE,
-    _MAX_DESCRIBE_CONTEXT_CHARACTERS,
-    _MAX_TEXT_CHARACTERS,
-    _lexical_query_terms,
-    _lexical_relevance,
-    _speaker_labels,
-    _speech_evidence,
-    _speech_retrieval_text,
+from mindbridge.infrastructure.local.store.index import IndexOutbox
+from mindbridge.kernel.derived import (
+    MAX_DESCRIBE_CONTEXT_CHARACTERS,
+    speaker_labels,
+    speech_evidence,
+    speech_retrieval_text,
 )
+from mindbridge.kernel.ranking import (
+    LEXICAL_FULL_COVERAGE,
+    LEXICAL_FULL_COVERAGE_RELEVANCE,
+    lexical_query_terms,
+    lexical_relevance,
+)
+from mindbridge.kernel.validation import MAX_TEXT_CHARACTERS
 from mindbridge.models.base import (
     EmbedTask,
     ModelInput,
@@ -400,10 +402,10 @@ def test_partial_lexical_candidate_outside_the_ann_window_gets_its_persisted_sco
 ) -> None:
     embedder = _DirectionalEmbedder({"distractor": 0.81, "rescue-target": 0.8})
     requested: list[tuple[str, ...]] = []
-    original_read = LocalStore.iter_memory_embedding_vectors
+    original_read = IndexOutbox.iter_memory_embedding_vectors
 
     def observed_read(
-        store: LocalStore,
+        store: IndexOutbox,
         memory_ids: Sequence[str],
         *,
         space_id: str,
@@ -412,12 +414,12 @@ def test_partial_lexical_candidate_outside_the_ann_window_gets_its_persisted_sco
         requested.append(tuple(memory_ids))
         return original_read(store, memory_ids, space_id=space_id, task=task)
 
-    monkeypatch.setattr(LocalStore, "iter_memory_embedding_vectors", observed_read)
+    monkeypatch.setattr(IndexOutbox, "iter_memory_embedding_vectors", observed_read)
     with Memory(tmp_path, embedder=embedder, minimum_relevance=0.1) as memory:
         memory.add_many([f"distractor ordinary weather note {index}" for index in range(100)])
         known_before_target = datetime.now(timezone.utc)
         target = memory.add("rescue-target zibaldone drift")
-        target_index_id = memory._store.read_memory_index_documents((target.id,))[
+        target_index_id = memory._store.index.read_memory_index_documents((target.id,))[
             0
         ].embedding.embedding_id
 
@@ -468,7 +470,7 @@ def test_dense_candidates_keep_the_index_score_without_completion(
     ) -> Iterator[tuple[str, tuple[float, ...]]]:
         raise AssertionError("a parent already scored by the dense route was completed again")
 
-    monkeypatch.setattr(LocalStore, "iter_memory_embedding_vectors", unexpected_read)
+    monkeypatch.setattr(IndexOutbox, "iter_memory_embedding_vectors", unexpected_read)
     with Memory(tmp_path, embedder=embedder, minimum_relevance=0.1) as memory:
         target = memory.add("target zibaldone drift")
         memory.add("other weather note")
@@ -618,13 +620,13 @@ def test_a_description_that_does_not_fit_is_omitted_not_fatal(tmp_path: Path) ->
     """A derived description must never cost the caller the write it was decorating.
 
     The description is convenience, not content: the asset is stored and embedded either way. So a
-    memory whose own text nearly fills `_MAX_TEXT_CHARACTERS` still stores, minus the description,
+    memory whose own text nearly fills `MAX_TEXT_CHARACTERS` still stores, minus the description,
     rather than failing and leaving the caller no option but to drop the describer entirely.
     """
     describer = _Describer()
     # Inside the limit on its own, but with no room left for a description plus its separator.
-    long_text = ("kitchen " * 8_192)[: _MAX_TEXT_CHARACTERS - 32]
-    assert len(long_text) < _MAX_TEXT_CHARACTERS
+    long_text = ("kitchen " * 8_192)[: MAX_TEXT_CHARACTERS - 32]
+    assert len(long_text) < MAX_TEXT_CHARACTERS
     with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
         record = memory.add((long_text, Blob(b"kitchen-photo", "image/png", "kitchen.png")))
 
@@ -648,7 +650,7 @@ def test_indexed_speech_is_prose_and_not_a_json_blob(tmp_path: Path) -> None:
     Stored content keeps the JSON: the answering model reads it as structured evidence, and only
     the derived index and embedding projections are prose.
     """
-    projected = _speech_retrieval_text(
+    projected = speech_retrieval_text(
         json.dumps(
             {
                 "asset_id": "asset-1",
@@ -780,7 +782,7 @@ def test_a_chinese_question_can_reach_full_lexical_coverage(tmp_path: Path) -> N
 
     `\\w+` matched an entire Chinese sentence as one token, so every multi-character Chinese
     query carried a term that is by construction the rarest in the corpus and can never match.
-    It took the largest IDF weight into the coverage ratio, which put `_LEXICAL_FULL_COVERAGE`
+    It took the largest IDF weight into the coverage ratio, which put `LEXICAL_FULL_COVERAGE`
     permanently out of reach -- and that lift is the only term that performs cross-route fusion.
     Chinese retrieval was therefore stuck on the demoted rank proxy and lost to any mediocre
     dense neighbour, in the product's largest market.
@@ -810,18 +812,16 @@ def test_a_chinese_question_can_reach_full_lexical_coverage(tmp_path: Path) -> N
 
         # The full-coverage floor, not the rank proxy: the answer covers every distinctive term
         # of the question, so its lexical contribution is the near-certain one.
-        assert scored[answer.id].lexical_relevance == pytest.approx(
-            _LEXICAL_FULL_COVERAGE_RELEVANCE
-        )
+        assert scored[answer.id].lexical_relevance == pytest.approx(LEXICAL_FULL_COVERAGE_RELEVANCE)
         # Same characters, different words: a match, but not a complete one. Read the coverage
         # ratio itself, because the score the rank proxy carries it into is also small.
         assert scored[shuffled.id].lexical_match
-        coverage = _lexical_relevance(
+        coverage = lexical_relevance(
             "用户最喜欢的饮料是什么",
-            memory._store.read_memories([answer.id, shuffled.id]),
+            memory._store.records.read_memories([answer.id, shuffled.id]),
         )
         assert coverage[answer.id] == pytest.approx(1.0)
-        assert coverage[shuffled.id] < _LEXICAL_FULL_COVERAGE
+        assert coverage[shuffled.id] < LEXICAL_FULL_COVERAGE
         assert [hit.content for hit in traced.hits] == [_ANSWER, _DECOY, _SHUFFLED]
 
 
@@ -833,10 +833,10 @@ def test_query_terms_mirror_what_the_index_can_actually_match() -> None:
     fragments whose boundaries no index term shares. The unsegmented-script list that would have
     routed it to bigrams did not include Thai, or Lao, Khmer or Myanmar. And every run emitted its
     single characters beside its bigrams, which the index cannot produce at `ngram_min` 2 and
-    which made the term count -- the denominator `_LEXICAL_FULL_COVERAGE` is measured against --
+    which made the term count -- the denominator `LEXICAL_FULL_COVERAGE` is measured against --
     a property of the language rather than of the question.
     """
-    thai = _lexical_query_terms("ร้านเบเกอรี่")
+    thai = lexical_query_terms("ร้านเบเกอรี่")
     assert thai
     assert all(len(term) == 2 for term in thai)
     # The index breaks its ngrams at the mark, so a bigram may not span one: measured against
@@ -845,16 +845,16 @@ def test_query_terms_mirror_what_the_index_can_actually_match() -> None:
     assert "รย" not in thai
 
     for text in ("ອາຫານລາວ", "អាហារខ្មែរ", "ထမင်းဟင်း"):
-        assert _lexical_query_terms(text), text
+        assert lexical_query_terms(text), text
 
     # No single-character terms, in any script, and a Chinese question no longer carries several
     # times the terms of the English one it translates.
-    chinese = _lexical_query_terms("爱丽丝面包店")
+    chinese = lexical_query_terms("爱丽丝面包店")
     assert all(len(term) == 2 for term in chinese)
-    assert len(chinese) <= 2 * len(_lexical_query_terms("Alice bakery Tuesday"))
+    assert len(chinese) <= 2 * len(lexical_query_terms("Alice bakery Tuesday"))
     # A lone character yields nothing rather than a term the index can never answer, which drops
     # the lexical route instead of running it to guaranteed emptiness.
-    assert _lexical_query_terms("猫") == frozenset()
+    assert lexical_query_terms("猫") == frozenset()
 
 
 def test_temporal_factor_boosts_overlap_and_never_penalises() -> None:
@@ -864,16 +864,16 @@ def test_temporal_factor_boosts_overlap_and_never_penalises() -> None:
     under merely well-timed ones and, inside the gate, could delete it; replay showed the penalty
     recovered no gold on 810 paired questions while the boost alone won or tied on all of them.
     """
-    from mindbridge.memory import _RANK_CEILING, _temporal_factor
+    from mindbridge.kernel.ranking import RANK_CEILING, temporal_relevance
 
     start = datetime(2024, 3, 1, tzinfo=timezone.utc)
     until = datetime(2024, 4, 1, tzinfo=timezone.utc)
     inside = datetime(2024, 3, 15, tzinfo=timezone.utc)
     far_before = datetime(2019, 1, 1, tzinfo=timezone.utc)
 
-    assert _temporal_factor(inside, None, (start, until)) == _RANK_CEILING
-    assert _temporal_factor(far_before, None, (start, until)) == 1.0
-    assert _temporal_factor(None, None, (start, until)) == 1.0
+    assert temporal_relevance(inside, None, (start, until)) == RANK_CEILING
+    assert temporal_relevance(far_before, None, (start, until)) == 1.0
+    assert temporal_relevance(None, None, (start, until)) == 1.0
 
 
 class _HashedDense:
@@ -908,7 +908,7 @@ def test_a_narrow_limit_returns_the_prefix_of_a_wide_one_with_the_same_scores(
 
     Both mechanisms that used to break this are in play here. Every index route was truncated
     to `max(_RERANK_CANDIDATES, limit * 3)`, so a memory's dense relevance -- the maximum over
-    the routes that reached it -- depended on the depth; and `_lexical_relevance` counted its
+    the routes that reached it -- depended on the depth; and `lexical_relevance` counted its
     document frequencies over the candidate pool that depth produced, so the rerank bonus moved
     with `limit` even for a memory both runs found. With 200 records, limit 5 read 100 documents
     per route and limit 100 read 300.
@@ -1027,7 +1027,7 @@ def test_the_candidate_trace_order_does_not_depend_on_the_process_hash_seed(
 
 def test_the_modality_floor_never_evicts_the_top_hit(tmp_path: Path) -> None:
     """A floor promotes into spare slots; it does not rebuild the window out of last places."""
-    from mindbridge.memory import _grounding_hits
+    from mindbridge.kernel.answering import grounding_hits
     from mindbridge.types import SearchHit
 
     created = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
@@ -1073,7 +1073,7 @@ def test_the_modality_floor_never_evicts_the_top_hit(tmp_path: Path) -> None:
         )
     )
 
-    grounded = {limit: [hit.id for hit in _grounding_hits(ranking, limit)] for limit in range(1, 6)}
+    grounded = {limit: [hit.id for hit in grounding_hits(ranking, limit)] for limit in range(1, 6)}
 
     assert grounded == {
         1: ["t1"],
@@ -1085,7 +1085,7 @@ def test_the_modality_floor_never_evicts_the_top_hit(tmp_path: Path) -> None:
     # The floor it promises: every modality the ranking holds is present once the window has a
     # slot for each of them, and the ranking's own first hit is in every window.
     for limit in range(4, 6):
-        assert {hit.modality for hit in _grounding_hits(ranking, limit)} == {
+        assert {hit.modality for hit in grounding_hits(ranking, limit)} == {
             Modality.TEXT,
             Modality.IMAGE,
             Modality.VIDEO,
@@ -1096,7 +1096,7 @@ def test_the_modality_floor_never_evicts_the_top_hit(tmp_path: Path) -> None:
 def test_evidence_budget_skips_an_oversized_extra_and_keeps_a_later_fit() -> None:
     """The optional budget extension is not closed by one expensive lower-ranked record."""
     from mindbridge.context import evidence_cost
-    from mindbridge.memory import _grounding_hits
+    from mindbridge.kernel.answering import grounding_hits
     from mindbridge.types import SearchHit
 
     created = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
@@ -1109,7 +1109,7 @@ def test_evidence_budget_skips_an_oversized_extra_and_keeps_a_later_fit() -> Non
         )
     )
 
-    grounded = _grounding_hits(ranking, limit=1, budget_chars=3)
+    grounded = grounding_hits(ranking, limit=1, budget_chars=3)
 
     assert [hit.id for hit in grounded] == ["required", "fits"]
     # This is the live ask budget's unit: text characters plus any text-equivalent media cost.
@@ -1308,7 +1308,7 @@ def test_a_described_clip_is_shown_the_transcript_under_the_indexed_labels(tmp_p
     ) as memory:
         record = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
         asset_id = record.assets[0].id
-        projected = _speech_retrieval_text(
+        projected = speech_retrieval_text(
             _section(memory.get(record.id).content, f"[speech identities:{asset_id}]"),
             asset_id,
         )
@@ -1324,7 +1324,7 @@ def test_a_long_transcript_shown_to_the_describer_is_capped_at_a_line_boundary(
 ) -> None:
     """One long clip's own words must not dominate the token budget every visual in it pays.
 
-    Cut at `_MAX_DESCRIBE_CONTEXT_CHARACTERS`, and at a line boundary -- each line is one
+    Cut at `MAX_DESCRIBE_CONTEXT_CHARACTERS`, and at a line boundary -- each line is one
     speaker turn -- so the cut context still ends on a whole turn.
     """
     describer = _StructuredDescriber("Shown: a long conversation")
@@ -1338,7 +1338,7 @@ def test_a_long_transcript_shown_to_the_describer_is_capped_at_a_line_boundary(
 
     assert len(describer.context) == 1
     shown = describer.context[0]
-    assert len(shown) <= _MAX_DESCRIBE_CONTEXT_CHARACTERS
+    assert len(shown) <= MAX_DESCRIBE_CONTEXT_CHARACTERS
     assert shown, "some context should still survive the cap"
     assert all(line == f"speaker_1: {_LONG_TURN_TEXT}" for line in shown.split("\n"))
 
@@ -1380,7 +1380,7 @@ def test_a_media_memory_derives_no_section_at_all_without_a_describer(tmp_path: 
 
 
 def test_a_speaker_label_shown_to_the_describer_is_the_label_the_index_prints() -> None:
-    """`_speaker_labels` resolves a fact's label, so it must not drift from the projection.
+    """`speaker_labels` resolves a fact's label, so it must not drift from the projection.
 
     The projection is what writes `speaker_2` into a searchable document; the label map is what
     turns a distilled `speaker_2 is called Lily` back into a person. Two rules would silently
@@ -1392,8 +1392,8 @@ def test_a_speaker_label_shown_to_the_describer_is_the_label_the_index_prints() 
         SpeakerSegment(asset_id, 900, 1800, "hi", speaker_id="identity_first"),
         SpeakerSegment(asset_id, 1800, 2700, "again", speaker_id="identity_second"),
     )
-    labels = _speaker_labels(segments)
-    projected = _speech_retrieval_text(json.dumps(_speech_evidence(asset_id, segments)), asset_id)
+    labels = speaker_labels(segments)
+    projected = speech_retrieval_text(json.dumps(speech_evidence(asset_id, segments)), asset_id)
 
     assert labels == {"identity_second": "speaker_1", "identity_first": "speaker_2"}
     assert projected == "speaker_1: hello\nspeaker_2: hi\nspeaker_1: again"
@@ -1402,7 +1402,7 @@ def test_a_speaker_label_shown_to_the_describer_is_the_label_the_index_prints() 
 def _speaker_identity(memory: Memory, memory_id: str, label: str) -> str:
     """Resolve the identity behind one `speaker_N` label of a stored memory's own clip."""
     segments = memory.speech(memory_id)
-    labels = _speaker_labels(segments)
+    labels = speaker_labels(segments)
     return next(identity for identity, alias in labels.items() if alias == label)
 
 
@@ -1432,7 +1432,7 @@ def test_a_stated_name_carries_to_every_later_clip_of_the_same_voice(tmp_path: P
         describer.lines = ("Shown: the same table, later",)
         anonymous = memory.add(Blob(b"kitchen-clip-two", "video/mp4", "later.mp4"))
         asset_id = anonymous.assets[0].id
-        projected = _speech_retrieval_text(
+        projected = speech_retrieval_text(
             _section(memory.get(anonymous.id).content, f"[speech identities:{asset_id}]"),
             asset_id,
         )
@@ -1681,7 +1681,7 @@ def test_a_throttled_describe_is_retried_before_the_caption_is_given_up(
     so without a wait every asset in the burst is stored with no caption behind one log line. A
     5xx is not in the closed retryable vocabulary and has to be recognized by its status code.
     """
-    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("mindbridge.kernel.vision.VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
     describer = _ThrottledDescriber(2, failure())
     with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
         record = memory.add(Blob(b"bicycle-frame", "image/png"))
@@ -1698,7 +1698,7 @@ def test_a_permanent_describe_refusal_is_not_retried_and_still_fails_open(
     The memory is the caller's; the caption is derived convenience. So the write still lands with
     an empty document, uncached, and a later ingest retries the description.
     """
-    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("mindbridge.kernel.vision.VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
     describer = _ThrottledDescriber(
         4, ModelError("no quota", reason="quota_exhausted", stage="describe")
     )
@@ -1718,7 +1718,7 @@ def test_an_ordinary_400_is_still_not_retried(
     is not going to describe successfully on a second try, so this must still fail open on
     attempt one, the way it did before the aborted-generation case was recognized.
     """
-    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
+    monkeypatch.setattr("mindbridge.kernel.vision.VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
     describer = _ThrottledDescriber(4, _rejected_image())
     with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
         record = memory.add(Blob(b"bicycle-frame", "image/png"))
@@ -1730,7 +1730,7 @@ def test_an_ordinary_400_is_still_not_retried(
 def test_a_sustained_refusal_gives_up_after_a_bounded_number_of_waits(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0))
+    monkeypatch.setattr("mindbridge.kernel.vision.VISION_RETRY_BACKOFF", (0.0, 0.0))
     describer = _ThrottledDescriber(99, _rate_limited())
     with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
         record = memory.add(Blob(b"bicycle-frame", "image/png"))
@@ -1748,7 +1748,7 @@ def test_waiting_out_a_throttled_describe_is_counted_apart_from_losing_the_capti
     sums attempts cannot tell a provider that throttled an ingest from one that ate it. The
     attempts are still worth counting -- they are what a long ingest pays -- under their own name.
     """
-    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0))
+    monkeypatch.setattr("mindbridge.kernel.vision.VISION_RETRY_BACKOFF", (0.0, 0.0))
     cases = (
         (_ThrottledDescriber(2, _rate_limited()), 0, 2),
         (_ThrottledDescriber(99, _rate_limited()), 1, 2),

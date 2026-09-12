@@ -9,7 +9,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, TypeAlias, TypeVar, cast
 
@@ -868,6 +868,13 @@ def _memlens(
             for turn in session.turns
         )
         prompt = MEMLENS_QUERY_PROMPT.text.format(question=question.question)
+        # The release labels the answer at session level only, and one memory here is one
+        # turn, so the gold label is a group of stored turn IDs per answer session: a session
+        # is retrieved when any turn of it is ranked. Refusal rows name no answer session
+        # and so carry no gold, which is correct -- there is nothing to retrieve.
+        answer_sessions = tuple(
+            session for session in question.sessions if session.is_answer_session
+        )
         units.append(
             EvalUnit(
                 question.question_id,
@@ -881,6 +888,14 @@ def _memlens(
                             "question_type": question.question_type,
                             "question_subtype": question.question_subtype,
                             "old_answer": question.old_answer,
+                            "answer_session_ids": tuple(
+                                session.session_id for session in answer_sessions
+                            ),
+                            "evidence_groups": tuple(
+                                tuple(turn.turn_id for turn in session.turns)
+                                for session in answer_sessions
+                                if session.turns
+                            ),
                         },
                         reference_at=question.question_date,
                         source_question=question.question,
@@ -910,6 +925,11 @@ def _present_images(root: Path | None, names: Sequence[str]) -> tuple[Path, ...]
     )
 
 
+# A fixed, timezone-aware origin for media whose only clock is its own timeline. Any instant
+# works as long as it is the same one for every clip in a unit and every replay of the run.
+_MEDIA_EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
 def _mm_lifelong(
     spec: TaskSpec,
     dataset: Path,
@@ -922,7 +942,22 @@ def _mm_lifelong(
 
     split = cast(MMLifelongSplit, spec.variant)
     questions = _selected(load_mm_lifelong(dataset, split), limit, offset)
-    memories = media.parts(split, allow_all=True)
+    # The split's only clock is the video timeline; the offsets alone reached the store as
+    # metadata, so every memory had no `occurred_at` and the answerer resolved "before"/"after"
+    # against the ingest wall clock. ponytail: only this adapter anchors offsets; lift it into
+    # `_memory_part` once the other media tasks' causal cutoffs are checked against it.
+    memories = tuple(
+        replace(
+            item,
+            occurred_at=_MEDIA_EPOCH + timedelta(seconds=item.start_seconds),
+            occurred_end=(
+                None
+                if item.end_seconds is None
+                else _MEDIA_EPOCH + timedelta(seconds=item.end_seconds)
+            ),
+        )
+        for item in media.parts(split, allow_all=True)
+    )
     return (
         EvalUnit(
             split,
@@ -1151,7 +1186,7 @@ def _query_parts(template: str, question: str, **values: str) -> tuple[str, ...]
 
 
 # MindBridge caps one memory or query part at 65,536 characters
-# (`mindbridge.memory._MAX_TEXT_CHARACTERS`). CL-Bench reference documents run
+# (`mindbridge.kernel.validation.MAX_TEXT_CHARACTERS`). CL-Bench reference documents run
 # past 150,000, so a task's corpus has to be split before it can be stored at
 # all. Blocks are built well under the cap so that each one is also a usable
 # retrieval unit rather than one opaque record per task.

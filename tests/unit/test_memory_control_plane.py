@@ -62,6 +62,8 @@ from mindbridge import (
 from mindbridge.control import dump_operation, load_operation, operation_key
 from mindbridge.infrastructure.local import LocalStore
 from mindbridge.infrastructure.local.store import StoredOperation
+from mindbridge.infrastructure.local.store.control import OperationLog
+from mindbridge.infrastructure.local.store.semantics import Semantics
 
 OCCURRED = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
 
@@ -1673,11 +1675,11 @@ def test_a_target_forgotten_between_validation_and_apply_is_stale(
     consolidator = ScriptedConsolidator()
     with _memory(tmp_path / "stale-target", consolidator) as memory:
         first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
-        original = LocalStore.apply_control_operation
+        original = OperationLog.apply_control_operation
         interleaved: list[str] = []
 
         def forget_first(
-            self: LocalStore,
+            self: OperationLog,
             operation: StoredOperation,
             **effects: object,
         ) -> StoredOperation | None:
@@ -1690,7 +1692,7 @@ def test_a_target_forgotten_between_validation_and_apply_is_stale(
                 )
             return cast("StoredOperation | None", cast(Any, original)(self, operation, **effects))
 
-        monkeypatch.setattr(LocalStore, "apply_control_operation", forget_first)
+        monkeypatch.setattr(OperationLog, "apply_control_operation", forget_first)
         consolidator._scripts.append(
             (MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id, second.id)),)
         )
@@ -1712,13 +1714,13 @@ def test_evidence_forgotten_between_validation_and_apply_is_stale(
     consolidator = ScriptedConsolidator()
     with _memory(tmp_path / "stale-evidence", consolidator) as memory:
         first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
-        original = LocalStore.apply_formation
+        original = Semantics.apply_formation
         interleaved: list[str] = []
 
-        def forget_first(self: LocalStore, *args: object, **kwargs: object) -> bool:
+        def forget_first(self: Semantics, *args: object, **kwargs: object) -> bool:
             if not interleaved:
                 interleaved.append(first.id)
-                self.apply_control_operation(
+                memory._store.control.apply_control_operation(
                     StoredOperation(
                         operation_key="interleaved-forget",
                         intent="forget",
@@ -1730,7 +1732,7 @@ def test_evidence_forgotten_between_validation_and_apply_is_stale(
                 )
             return cast(bool, cast(Any, original)(self, *args, **kwargs))
 
-        monkeypatch.setattr(LocalStore, "apply_formation", forget_first)
+        monkeypatch.setattr(Semantics, "apply_formation", forget_first)
         consolidator._scripts.append(
             (
                 MemoryOperation(
@@ -1744,7 +1746,7 @@ def test_evidence_forgotten_between_validation_and_apply_is_stale(
 
         assert report.operations == ()
         assert [reason for _operation, reason in report.rejected] == ["stale"]
-        assert [row.operation_key for row in memory._store.read_operations()] == [
+        assert [row.operation_key for row in memory._store.control.read_operations()] == [
             "interleaved-forget"
         ]
 
@@ -2177,7 +2179,7 @@ def test_a_concurrent_duplicate_is_refused_inside_the_transaction(tmp_path: Path
     )
     with LocalStore(tmp_path / "race") as store:
         assert (
-            store.apply_formation(
+            store.semantics.apply_formation(
                 (),
                 (),
                 evidence=(),
@@ -2189,7 +2191,7 @@ def test_a_concurrent_duplicate_is_refused_inside_the_transaction(tmp_path: Path
             is True
         )
         assert (
-            store.apply_formation(
+            store.semantics.apply_formation(
                 (),
                 (),
                 evidence=(),
@@ -2200,7 +2202,7 @@ def test_a_concurrent_duplicate_is_refused_inside_the_transaction(tmp_path: Path
             )
             is False
         )
-        assert len(store.read_operations()) == 1
+        assert len(store.control.read_operations()) == 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2487,11 +2489,11 @@ def test_a_reinforce_target_corrected_between_validation_and_apply_is_stale(
             )
         )
         derived_id = memory.consolidate(evidence_ids=(first.id,)).operations[0].created_ids[0]
-        original = LocalStore.apply_control_operation
+        original = OperationLog.apply_control_operation
         interleaved: list[str] = []
 
         def correct_first(
-            self: LocalStore,
+            self: OperationLog,
             operation: StoredOperation,
             **effects: object,
         ) -> StoredOperation | None:
@@ -2504,7 +2506,7 @@ def test_a_reinforce_target_corrected_between_validation_and_apply_is_stale(
                 )
             return cast("StoredOperation | None", cast(Any, original)(self, operation, **effects))
 
-        monkeypatch.setattr(LocalStore, "apply_control_operation", correct_first)
+        monkeypatch.setattr(OperationLog, "apply_control_operation", correct_first)
         consolidator._scripts.append(
             (
                 MemoryOperation(
@@ -2518,7 +2520,7 @@ def test_a_reinforce_target_corrected_between_validation_and_apply_is_stale(
 
         assert report.operations == ()
         assert [reason for _operation, reason in report.rejected] == ["stale"]
-        assert memory._store.read_operations()[0].operation_key == "interleaved-correct"
+        assert memory._store.control.read_operations()[0].operation_key == "interleaved-correct"
         # Two rows: the first consolidation and the interleaved correction. The refused
         # reinforcement wrote nothing at all.
         assert len(memory.operations()) == 2
@@ -2994,7 +2996,7 @@ def test_an_identity_merge_does_not_commit_while_a_consolidate_apply_pass_holds_
             except BaseException as error:  # pragma: no cover - reported below
                 errors.append(error)
 
-        memory._formation_lock.acquire()
+        memory._storage.formation_lock.acquire()
         try:
             thread = threading.Thread(target=merging)
             thread.start()
@@ -3004,7 +3006,7 @@ def test_an_identity_merge_does_not_commit_while_a_consolidate_apply_pass_holds_
             assert thread.is_alive()
             assert memory.operations() == ()
         finally:
-            memory._formation_lock.release()
+            memory._storage.formation_lock.release()
         thread.join(timeout=30)
         assert not thread.is_alive()
         assert errors == []

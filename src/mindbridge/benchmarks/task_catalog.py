@@ -432,7 +432,14 @@ TASKS: dict[str, TaskSpec] = {
 GROUPS: dict[str, tuple[str, ...]] = {
     "m3-bench": ("m3-bench-robot", "m3-bench-web"),
     "memlens": tuple(name for name in TASKS if name.startswith("memlens-")),
-    "mm-lifelong": tuple(name for name in TASKS if name.startswith("mm-lifelong-")),
+    # The evaluation splits. `month_train` is the released training split and it is cut from the
+    # same 105 h of video as `month_val`, so including it ingested that video twice (about 10 h
+    # each on the 2026-09-11 baseline); it stays selectable by name.
+    "mm-lifelong": tuple(
+        name
+        for name in TASKS
+        if name.startswith("mm-lifelong-") and name != "mm-lifelong-month-train"
+    ),
     "atm-bench": tuple(name for name in TASKS if name.startswith("atm-bench-")),
     "beam": tuple(name for name in TASKS if name.startswith("beam-")),
     "openeqa": tuple(name for name in TASKS if name.startswith("openeqa-")),

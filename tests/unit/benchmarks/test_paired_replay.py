@@ -17,7 +17,8 @@ from types import ModuleType
 import httpx
 import pytest
 
-from mindbridge.benchmarks.eval import _BaselineGenerator, _load_memory_config
+from mindbridge.benchmarks.eval_arms import _BaselineGenerator
+from mindbridge.benchmarks.eval_config import _load_memory_config
 from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.types import SearchHit
 
@@ -30,6 +31,39 @@ def _driver() -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize(
+    "changed_module",
+    ["kernel/retrieval.py", "infrastructure/local/store/records.py", "benchmarks/eval_arms.py"],
+)
+def test_import_identity_tracks_modules_in_a_frozen_refactored_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, changed_module: str
+) -> None:
+    import mindbridge
+
+    package = tmp_path / "mindbridge"
+    for relative in (
+        "__init__.py",
+        "memory.py",
+        "context.py",
+        "benchmarks/eval.py",
+        changed_module,
+    ):
+        path = package / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# frozen source\n", encoding="utf-8")
+    monkeypatch.setattr(mindbridge, "__file__", str(package / "__init__.py"))
+    driver = _driver()
+
+    original = driver._import_identity(tmp_path)
+    assert driver._import_identity(tmp_path) == original
+    assert changed_module in {entry["path"] for entry in original["files"]}
+    (package / changed_module).write_text("# changed behavior\n", encoding="utf-8")
+
+    assert (
+        driver._import_identity(tmp_path)["import_clock_sha256"] != original["import_clock_sha256"]
+    )
 
 
 def test_driver_refuses_to_clone_a_store_with_a_live_owner(tmp_path: Path) -> None:

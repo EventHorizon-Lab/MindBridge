@@ -366,9 +366,9 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `retrieval_mode` | `hybrid` | Instance candidate policy: `hybrid`, `dense`, or lexical-only `lexical`; lexical ranks by native normalized full-text relevance (RRF when both text fields apply); use physically isolated stores when comparing modes |
 | `minimum_relevance` | `0.10` | Floor on query-relevant evidence before retention and reinforcement ranking |
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
-| `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
+| `evidence_budget_chars` | `24000` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
 | `recall_planning` | `False` | Ask the answerer for a recall plan before retrieving, and ground on the set, sequence or entity it names; off means `ask` runs the one search it always has. An answerer without `plan_recall` cannot plan: the store logs one warning when it opens and every question runs that same search |
-| `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may add to the ranked window, never more than `evidence_budget_chars` when that is set; a point plan keeps `limit`. Read only when `recall_planning` is on |
+| `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may add to the ranked window, never more than `evidence_budget_chars` when that is set (so `24000` under the defaults); a point plan keeps `limit`. Read only when `recall_planning` is on |
 | `recall_set_max_rows` | `60` | Matched rows a set, sequence or entity plan may add at all, whatever the character budget leaves room for; the rows past it are reported as not shown, so the set is declared incomplete. Bounds the matched set only. Read only when `recall_planning` is on |
 | `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; the second runs only when the first answer was a low-confidence guess under `answer_policy="best_effort"`. `1` disables it. Read only when `recall_planning` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
@@ -421,8 +421,12 @@ positive when set. `evidence_budget_chars` keeps the `limit` hits unconditionall
 further ranked memories while the evidence fits, charging each media asset its modality's text
 equivalent because a media part costs a model far more than its record's text. Because the `limit`
 hits are never dropped, this setting can only enlarge a prompt: to bound one, lower `limit` and
-leave the budget at `None`. Setting it also removes `limit`'s effect on prompt size, since the
-budget refills the window to the same width whatever `limit` was.
+set the budget to `None`. Setting it also removes `limit`'s effect on prompt size, since the
+budget refills the window to the same width whatever `limit` was. The default of `24000` widens a
+short-turn corpus to the whole 100-record rerank pool and a long-turn one to about two dozen
+records, at a proportionally larger answer prompt; the measurement behind it is recorded beside
+the field in `plugins.py` and in the
+[loss decomposition](research/2026-09-12-baseline-loss-decomposition.md).
 
 A set, sequence or entity recall plan grounds on its own matched set *in addition to* the ranked
 window -- the same `limit` hits and modality floor the unplanned path grounds -- and

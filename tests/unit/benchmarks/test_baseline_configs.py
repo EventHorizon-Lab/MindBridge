@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge.benchmarks.eval import _load_memory_config
+from mindbridge.benchmarks.eval_config import _load_memory_config
 from mindbridge.benchmarks.task_catalog import TASKS, expand
 
 _ROOT = Path(__file__).resolve().parents[3]

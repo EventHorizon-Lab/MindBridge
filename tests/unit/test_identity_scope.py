@@ -30,10 +30,10 @@ from mindbridge import (
     SpeechTurn,
     ValidationError,
 )
-from mindbridge.infrastructure.local.store import (
-    _IDENTITY_MEMORIES_SQL,
-    _IDENTITY_MEMORY_SQL,
-    _IDENTITY_SCOPE_CLAUSE,
+from mindbridge.infrastructure.local.store._membership import (
+    IDENTITY_MEMORIES_SQL,
+    IDENTITY_MEMORY_SQL,
+    IDENTITY_SCOPE_CLAUSE,
 )
 
 
@@ -244,16 +244,16 @@ def test_identity_membership_sql_agrees_in_both_directions(tmp_path: Path) -> No
         memory.register_identity(alice, "Alice")
         memory.speech(clip.id)
 
-        with memory._store._read_transaction() as connection:
+        with memory._store._connections.read_transaction() as connection:
             per_document = {
                 (row["memory_id"], row["identity_id"])
-                for row in connection.execute(_IDENTITY_MEMORY_SQL.format(predicate="1"))
+                for row in connection.execute(IDENTITY_MEMORY_SQL.format(predicate="1"))
             }
             per_identity = {
                 (row["memory_id"], identity)
                 for identity in {identity for _memory_id, identity in per_document}
                 for row in connection.execute(
-                    _IDENTITY_MEMORIES_SQL,
+                    IDENTITY_MEMORIES_SQL,
                     (identity, identity, identity),
                 )
             }
@@ -261,7 +261,7 @@ def test_identity_membership_sql_agrees_in_both_directions(tmp_path: Path) -> No
                 str(row["detail"])
                 for row in connection.execute(
                     "EXPLAIN QUERY PLAN "
-                    f"SELECT memory_id FROM memory_records WHERE 1 {_IDENTITY_SCOPE_CLAUSE}",
+                    f"SELECT memory_id FROM memory_records WHERE 1 {IDENTITY_SCOPE_CLAUSE}",
                     (alice, alice, alice),
                 )
             )

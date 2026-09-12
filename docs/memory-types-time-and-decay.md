@@ -81,10 +81,16 @@ bounded parser recognizes:
 - English month-years, Chinese year-months, and calendar years from 1900 through 2199;
 - today, yesterday, tomorrow, and the adjacent two-day phrases in English and Chinese;
 - last, this, next, and rolling weeks; last, this, and next months or years;
-- `N days ago` and rolling past or recent `N` days in English and Chinese.
+- `N days ago`, and rolling spans ending at the clock -- past, recent, previous, or last `N`
+  days, weeks, months, or years, with `N` as a digit or a number word (one through twelve), in
+  English and Chinese, plus the bare `past week`, `past month`, and `past year`. The count is
+  otherwise required, so `recent years` and `my recent day trips` carry no window. A rolling
+  month or year is a calendar shift with the day clamped, not a day count.
 
 `reference_at` supplies the timezone-aware clock for relative phrases. Without it, the current UTC
-time is used. When no explicit reference is passed, `Today is <date>` may anchor the query. `ask()`
+time is used. When no explicit reference is passed, `Today is <date>` may anchor the query, with
+the date written as ISO, `Month D, YYYY`, `Month, D YYYY`, `D Month YYYY`, or `the Dth of Month
+YYYY`. `ask()`
 appends the resolved reference to the generation input of every question the answerer reads as
 text, whether or not the parser recognized a phrase in it: "how long ago did grandpa visit" narrows
 no retrieval window yet still needs the answering clock. It is appended after routing, so a spoken

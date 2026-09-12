@@ -16,7 +16,10 @@ import pytest
 
 from mindbridge import AnswerPolicy, AnswerResult, AsyncMemory, DeliberationReport
 from mindbridge.benchmarks import eval as eval_module
-from mindbridge.benchmarks.eval import MemoryFactory, run_loaded_task
+from mindbridge.benchmarks.eval import (
+    MemoryFactory,
+    run_loaded_task,
+)
 from mindbridge.benchmarks.eval_adapters import (
     EvalQuestion,
     EvalUnit,

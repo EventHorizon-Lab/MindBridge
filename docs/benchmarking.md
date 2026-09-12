@@ -267,14 +267,23 @@ repository rather than the process directory; `--data-root` defaults to
 `<benchmarks-root>/data`. Run `mindbridge-bench eval --help` for the full concurrency, cache,
 generation, and comparison options.
 
-Unless `--quiet` is set, `eval` reports sample and judge progress to stderr. On a terminal that
-is a live progress bar with an ETA. While a sample is still rebuilding, ingesting, deliberating,
-or answering, the bar keeps its honest completed-sample count but refreshes its elapsed time and
-labels the active phase. Concurrent units are summarized by phase rather than letting a completed
-unit leave a stale label behind. When stderr is a file or a pipe, where a redrawn bar is
-unreadable, the same counts and ETA are written as one line at most once a minute, plus the first
-and the last completion, so a stalled run says so immediately and the log always ends on the
-final count.
+Unless `--quiet` is set, `eval` reports ingest, sample, and judge progress to stderr. On a
+terminal those are live progress bars with an ETA. While a sample is still rebuilding, ingesting,
+deliberating, or answering, the sample bar keeps its honest completed-sample count but refreshes
+its elapsed time and labels the active phase. Concurrent units are summarized by phase rather than
+letting a completed unit leave a stale label behind.
+
+A unit writes every memory a question is allowed to have seen before it answers that question, so
+a task whose questions carry no cutoff writes its whole corpus first and the sample bar honestly
+reads zero for as long as that takes -- hours, on a video task. The ingest bar beneath it is what
+shows those hours moving: it counts memories written across every unit of the task, against the
+number those units will reach at their latest cutoff. A resumed run starts it at the checkpoint
+rather than at zero, and a unit answered entirely from the response cache completes its share
+without writing, so the bar still finishes.
+
+When stderr is a file or a pipe, where a redrawn bar is unreadable, the same counts and ETA are
+written as one line at most once a minute, plus the first and the last completion, so a stalled
+run says so immediately and the log always ends on the final count.
 
 `--verbosity` sets the log level for the run and claims the root handler before an imported
 dependency can raise it: `funasr`, `modelscope`, `numba` and others each turn their own logging
@@ -348,7 +357,7 @@ mindbridge-bench eval \
 
 | Arm | Answers from | Retrieval | Reports |
 | --- | --- | --- | --- |
-| `mindbridge` | `Memory.ask` over retrieved evidence | the product's | every metric |
+| `mindbridge` | `Memory.ask` over retrieved evidence, or -- on the tasks `task_answer_surface` maps to `compile`, today `personamem-v3` -- the generator over `Memory.compile`'s bundle | the product's | every metric |
 | `blind` | the generator's prior, with no evidence | none | answer metrics only |
 | `full-context` | the corpus stuffed into one prompt, oldest first, under `--full-context-chars` | none | answer metrics only |
 | `random` | nothing; it generates no answer | a seeded shuffle of an independently fetched top-100 pool for gold-labelled questions (`recall_limit` otherwise) | retrieval metrics only |
@@ -443,7 +452,7 @@ adapter version, so response caches from the earlier source-ID scheme are not re
 
 | Benchmark and selector | What it measures and when to use it | Primary result and scoring requirement | Data requirement |
 | --- | --- | --- | --- |
-| ATM-Bench (`atm-bench`: main/hard, raw/SGM) | Email, image, and video memory; needle-in-a-haystack, number/list, open-ended answers, and exact evidence-ID retrieval; use for personal archives | `accuracy`; `open_end` uses judge `gpt-5-mini`, number/list rows are deterministic | Pinned Hugging Face QA, email, media, and SGM artifacts; automatic; SGM variants use processed text instead of runtime media |
+| ATM-Bench (`atm-bench`: main/hard, raw/SGM) | Email, image, and video memory; needle-in-a-haystack, number/list, open-ended answers, and exact evidence-ID retrieval; use for personal archives | `accuracy`; `open_end` uses judge `gpt-5-mini`, number/list rows are deterministic | Pinned Hugging Face QA, email, media, and SGM artifacts; automatic; SGM variants use processed text instead of runtime media; raw variants need a `vision:` slot so image and video memories carry a text document, otherwise their only indexed text is the source ID |
 | Mem-Gallery (`mem-gallery`) | Multi-session persona dialogue, image-grounded QA, temporal/knowledge/recall points, and exact clue-round retrieval; use for conversational image memory | `f1`; deterministic; optional official `llm_judge` uses `qwen2.5-72b-instruct` | Pinned Hugging Face dialogue JSON and images; automatic |
 
 ### Embodied, video, and spatial memory
@@ -452,7 +461,7 @@ adapter version, so response caches from the earlier source-ID scheme are not re
 | --- | --- | --- | --- |
 | WorldMemArena (`worldmemarena`) | Causal multimodal agent and lifelong sessions with checkpoint QA, updates, temporal reasoning, visual recall/search, and cross-modal reasoning | `correct_ratio`; the official configurable Correct/Hallucination/Omission judge, plus `answer_f1` and `answer_bleu1` | Pinned Hugging Face JSON and images; automatic |
 | EgoTempo (`egotempo`) | Open-ended temporal QA over Ego4D clips; use for temporal grounding rather than multi-session retrieval | `accuracy`; judge `gemini-1.5-flash` | Pinned GitHub annotations; media needs Ego4D authorization and AWS credentials |
-| MM-Lifelong (`mm-lifelong`: day/week/month) | Day-to-month video memory, multi-interval clues, temporal localization, and open-ended answers; use for duration scaling | `answer_accuracy`; judge `gpt-5` | Pinned Hugging Face annotations and split media; automatic |
+| MM-Lifelong (`mm-lifelong`: day/week/month-val; `mm-lifelong-month-train` by name) | Day-to-month video memory, multi-interval clues, temporal localization, and open-ended answers; use for duration scaling | `answer_accuracy`; judge `gpt-5` | Pinned Hugging Face annotations and split media; automatic |
 | SuperMemory-VQA (`supermemory-vqa`) | Causal multi-video memory, skill breakdowns, answerability, and unanswerable cases; use for lifelong video QA | `qa_accuracy`; deterministic choice scorer | Pinned Hugging Face annotations, transcripts, and video; automatic |
 | M3-Bench (`m3-bench`: robot/web) | Causal long-video memory and open-ended QA; use for robot and web-video histories | `accuracy`; judge `gpt-4o-2024-11-20` | Pinned GitHub annotations; robot media from Hugging Face, web media through `yt-dlp` |
 | Video-MME-v2 (`video-mme-v2`) | Four-question relevance/logic groups with level and reasoning-head breakdowns; use when grouped consistency matters | `rating` and auxiliary `accuracy` (both 0--100); deterministic grouped scorer | Pinned Hugging Face Parquet and media volumes; automatic |
@@ -576,7 +585,9 @@ Protocol boundaries that affect interpretation are explicit rather than approxim
   `final_score`. As in upstream `report_results.py`, its category result uses `tau_norm`.
 - PersonaMem-v3 reads the released fields and causally masks future events. Task families requiring
   structured actions, response-threaded clusters, or paired-row deltas carry no official headline;
-  `profile.json` is scorer-side ground truth and is never ingested as memory.
+  `profile.json` is scorer-side ground truth and is never ingested as memory. Its product arm
+  answers through `Memory.compile` and the configured generator rather than `Memory.ask`; see the
+  note "One task answers through `Memory.compile`" under "Results and reproducibility" below.
 - SuperMemory-VQA reports `qa_accuracy`; `qa_mrr` is unavailable because the answer backend does
   not expose answer-option scores.
 - OpenEQA reports 0--100 `llm_match` plus `llm_match_score_1_5`. Its fixed-history adapter is
@@ -763,7 +774,7 @@ gaps do not inflate the denominator. TTFT and token-per-call distributions also 
 | Block | Boundary and quantities |
 | --- | --- |
 | `duration_seconds` | Gap-free active wall-time unions for the product and judge phases. Its average denominator is the union of sample IDs measured in either phase, so a cached product answer judged by an uncached call is counted once. |
-| `ingest` | Attempt, success, and error counts; attempted and accepted items; durable/searchable batch latency; compute and active-wall throughput. |
+| `ingest` | Attempt, success, and error counts; attempted and accepted items; durable/searchable batch latency; compute and active-wall throughput. Speech analysis for a chunk usually ran ahead of it on the lent speech backend while the previous chunk was embedding, so a batch's durable latency excludes most of that model time; the transcription spans still carry it. |
 | `search_e2e` | Run-global, post-answer warm-store replay of public `Memory.search(limit=recall_limit)`. The second pass starts only after every selected task has finished its formal answers. Its caller span starts before request admission and `sdk_operation` is the nested SDK boundary. Replay nodes and tokens remain isolated under `diagnostic`. |
 | `ask_retrieval_core` | The complete retrieval prerequisite inside `Memory.ask`: content preparation, temporal/scope handling, query speech, embedding, index lookup, and ranking. |
 | `answer` | Caller end-to-end completion latency and TTFT, plus nested SDK operation latency, generation TTFT, generation first-chunk time, and throughput. |
@@ -904,7 +915,8 @@ because the judge omitted usage on some requests; the cost axis needs the produc
 measured. Recall scores the ranked candidate list that `Memory.ask` already produced before
 grounding, never the narrower evidence the generator saw and never a second search. That list is
 captured against the same causal store state as the answer. Its configured depth is 100 when
-`evidence_budget_chars` is set and otherwise `min(100, recall_limit * 3)`; both the configured depth
+`evidence_budget_chars` is set, which it is by default, and otherwise `min(100, recall_limit * 3)`;
+both the configured depth
 and the returned count are recorded. The random arm requests 100 for gold-labelled questions and
 `recall_limit` otherwise. New response-cache entries preserve the ranked IDs; a legacy cache entry
 without one is counted in
@@ -926,9 +938,9 @@ which is the honest state and not a defect to paper over.
 | `mem-gallery` | `clue_ids`, the clue round IDs | Exact |
 | `worldmemarena` | Gold `image_id` and scorer-authored `memory_id` points | Exact for image IDs; `mp_*` memory points are unresolved rather than leaked into memory |
 | `mm-lifelong` | `total_intervals`, and `clue_intervals[].video_id` on the week and month splits | Interval-level only, and already reported as the official `ref_at_300`. The clue video IDs cannot be joined: prepared clips are keyed by file stem, not by release video ID |
-| `supermemory-vqa` | `question_evidence.time_spans[].video_id`, kept as `source_video_ids` | Source-video level only. The join exists — `prepare_media` writes `<video_id>-video-#####` — but scoring it needs a group recall ("any clip of each gold video"), a different operator from the exact set recall above. Not implemented |
+| `supermemory-vqa` | `question_evidence.time_spans[].video_id`, kept as `source_video_ids` | Source-video level only. The join exists — `prepare_media` writes `<video_id>-video-#####` — and the group operator ("any clip of each gold video") now exists as `evidence_groups`, but the adapter does not yet emit the clip groups. Not wired |
 | `m3-bench` | `timestamp` and `before_clip` | Not derivable: both say when the question is asked, not where the answer is |
-| `memlens` | Nothing beyond the answer | Not derivable |
+| `memlens` | `answer_session_ids`, the sessions holding the answer, on every row; refusal rows list none | Exact at session level. One memory is one turn, so each answer session is one group of stored turn IDs (`evidence_groups`) and counts as retrieved when any of them is ranked; the random-ranker row uses the matching hypergeometric expectation |
 | `clbench` | `context_id`, which names the whole unit | Not derivable: a label equal to the unit cannot separate rankers |
 | `beam` | Rubrics and reference answers; `turns[].id` is a turn's own index and no question refers to one | Not derivable |
 | `personamem-v3` | Slate-internal `_origin` and `_held_out_persona_item` | Unresolved. Those fields are deliberately excluded from the rendered slate because they are the answer; whether `_origin` names a `source_object_id` that matches an `event_id` needs a check against the corpus |
@@ -936,7 +948,7 @@ which is the honest state and not a defect to paper over.
 | `openeqa` | `episode_history`, which is the unit | Not derivable |
 | `video-mme-v2` | Nothing beyond the answer | Not derivable |
 
-So exact retrieval quality is measurable on five families in the catalog, plus the image-labelled
+So exact retrieval quality is measurable on six families in the catalog, plus the image-labelled
 subset of WorldMemArena. Its `recall_at_20` remains a diagnostic for those compatible source-ID
 labels, not a universal benchmark metric.
 
@@ -1041,7 +1053,7 @@ optional model-server counter deltas split around each judge pass, so judge work
 the product measurement window. `--stream-results` remains accepted as an explicit spelling of the
 default.
 
-Three result fields carry a caveat that decides whether they can be quoted:
+Several result fields carry a caveat that decides whether they can be quoted:
 
 - **`official_metric` means the pinned upstream protocol publishes that metric and, for a judged
   one, that the required judge produced it.** The retrieval and joint diagnostics -- `retrieval_*`
@@ -1053,11 +1065,12 @@ Three result fields carry a caveat that decides whether they can be quoted:
   none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
   reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
   read the predictions before drawing a conclusion about refusal rates.
-- **One task asks the product for a committed answer rather than a refusal.**
+- **Two benchmarks ask the product for a committed answer rather than a refusal.**
   `mindbridge.benchmarks.prompts.task_answer_policy` maps each task to the `answer_policy` the
-  runner passes into `Memory.ask`, and one is `best_effort`: `m3-bench-robot`. This is protocol
-  alignment on the request side, not a scorer change -- its official evaluation gives no credit
-  for "unknown" (it is judged against a reference answer with no abstention class) and it ships
+  runner passes into `Memory.ask`, and `m3-bench-robot` and the four `mm-lifelong-*` splits are
+  `best_effort`. This is protocol alignment on the request side, not a scorer change -- their
+  official evaluations give no credit for "unknown" (both are judged against a reference answer
+  with no abstention class; MM-Lifelong's judge grades semantic similarity on 0--5) and they ship
   no genuinely unanswerable item, so an abstention there is a lost point rather than a correct
   report. Every other task keeps the product default `strict`,
   because abstaining is part of what they measure: LongMemEval and MEMLENS carry abstention
@@ -1070,6 +1083,28 @@ Three result fields carry a caveat that decides whether they can be quoted:
   silently comparable with an earlier `strict` run of the same task. `--answer-policy`, or
   `benchmark.run.answer_policy`, overrides the whole table for one run when the policy itself is
   what is being measured; the resolved `config.yaml` records it as `answer_policy_override`.
+- **One task answers through `Memory.compile` rather than `Memory.ask`.**
+  `mindbridge.benchmarks.prompts.task_answer_surface` maps each task to the product surface the
+  `mindbridge` arm answers through, and one is `compile`: `personamem-v3`. `Memory.ask` answers
+  only from retrieved hits, uses no outside knowledge, and abstains when they are thin -- the
+  contract for a question whose answer is in memory. PersonaMem-v3's chatbot, agentic, and
+  proactive families instead ask for an assistant's response -- write a post in the user's
+  voice, answer a how-to question, decide whether to nudge -- and are judged as one. Measured on
+  the 2026-09-11 baseline run under `ask`, abstention was 84 % on `proactive_actions`, 46 % on
+  `chatbot_response`, 42 % on `agentic`, and every abstained row on a personalize or agentic
+  task type scored zero (on `over_personalization` a refusal scores above an answer, which is a
+  quirk of that family's rubric, not evidence the surface fits). On a `compile` task the product
+  arm calls `Memory.compile` under the `--compile-max-*` budget, renders the bundle, and hands it
+  to the configured generator under a harness-owned assistant prompt, versioned
+  `mindbridge_compile_surface_v1`: general knowledge allowed, no facts about the user the
+  memories do not support. It is the same generator the baselines use, but not the same prompt
+  -- the `compile` baseline keeps the full-context wording. Such a task row and its sample rows
+  carry `answer_policy: null`, since no `ask` request was made, and `arms.definitions.mindbridge`
+  records the `answer_surface` table for the run's tasks. Retrieval metrics need the ranked list
+  `ask` exposes and `Memory.compile` exposes none, so on a `compile` task the product rows carry
+  no ranked list and are neither flagged nor scored for retrieval (PersonaMem-v3 carries no gold
+  source IDs in any case). The surface table is part of the response-cache namespace, so
+  widening it cannot replay a task's older `ask` answers.
 - **A task whose query prompt mandates a format or a refusal wording puts that wording into
   retrieval, not only into generation.** `EvalQuestion.content` is what the runner passes to
   `Memory.ask`, and `ask` takes one content input for both legs, so the instruction is matched
@@ -1080,8 +1115,8 @@ Three result fields carry a caveat that decides whether they can be quoted:
   question. The bare question is preserved as `EvalQuestion.source_question` and is what the
   scorers and judges read, but no public surface routes it to retrieval while keeping the template
   for generation. Read any retrieval-side result on a templated task as measuring the template
-  too, the same way the `[source_id: ...]` marker the runner prefixes to every stored memory is
-  part of what the full-text index sees.
+  too, the same way the `[source_id: ...]` marker the runner prefixes to every stored text
+  memory is part of what the full-text index sees.
 - **`retrieval_*` scores the retriever's ranked candidate list, not the answer's evidence.** The
   runner observes the list already produced inside `Memory.ask`, before grounding and generation;
   it issues no scoring search. The artifact records that answer's configured candidate depth, and

@@ -48,7 +48,7 @@ from mindbridge import (
 from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL, VISION_BATCHES_FAILED
 from mindbridge.configuration import resolve_memory_config
 from mindbridge.exceptions import ValidationError
-from mindbridge.memory import declared_capabilities
+from mindbridge.kernel.contracts import declared_capabilities
 from mindbridge.models.base import (
     FormationBackend,
     GenerationBackend,
@@ -179,7 +179,7 @@ def test_local_policy_defaults_stay_pinned_to_their_recorded_provenance() -> Non
         retrieval_mode=RetrievalMode.HYBRID,
         minimum_relevance=0.10,
         ambiguity_margin=0.01,
-        evidence_budget_chars=None,
+        evidence_budget_chars=24_000,
         decay_half_life_days=None,
         reinforce_on_answer=True,
         speaker_similarity=0.78,

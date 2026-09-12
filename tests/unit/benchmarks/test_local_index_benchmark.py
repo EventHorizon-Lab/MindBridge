@@ -75,7 +75,7 @@ def test_small_benchmark_reports_valid_metrics(tmp_path: Path) -> None:
     json.dumps(result)
 
     with LocalStore(tmp_path) as store:
-        assert store.pending_index_operations() == ()
+        assert store.index.pending_index_operations() == ()
 
 
 def test_cli_prints_one_json_document(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

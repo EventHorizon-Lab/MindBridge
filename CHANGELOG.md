@@ -10,6 +10,37 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- A recall plan's `match` or `window` step may take `"time": "step:<index>"` and read inside the
+  span an earlier step's rows cover. A row's stated dates win over its event time -- ISO days,
+  `Month YYYY`, `Month D, YYYY`, `D Month YYYY`, `D-D` ranges, and a year-less day joined to a
+  dated one as in `June 23 - July 2, 2022`; never a bare year or a relative phrase -- and a row
+  that states none, or whose stated dates spread over more than a year (a booking beside its
+  terms revision), contributes its event time instead. This is the read ATM-Bench-Hard's trip
+  questions need and a one-shot plan could not express: the dates of a stay are in a booking
+  email's text, weeks after the day the email arrived, so a window on the email's own event
+  time held none of the trip. A step bound to rows that carry no time reads nothing rather than
+  the whole corpus, a stored date the calendar cannot hold is the same non-read rather than an
+  exception, a forward or malformed reference is not a plan, several steps bound to one anchor
+  derive its span once, and the executed step carries the bounds it resolved so the answer
+  prompt states the span it read. `RecallReader` gains `time_span`; `RecallStepResult` gains
+  `occurred_from` and `occurred_until`.
+- `mindbridge-bench eval` answers `personamem-v3` through `Memory.compile` and the configured
+  generator instead of `Memory.ask`. `mindbridge.benchmarks.prompts.task_answer_surface` owns the
+  per-task mapping, next to `task_answer_policy`. `ask` answers only from retrieved hits with no
+  outside knowledge and abstains on thin evidence; PersonaMem-v3's chatbot, agentic, and proactive
+  families ask for an assistant's response and are judged as one. Measured on the 2026-09-11
+  baseline, `ask` abstained on 84 % of `proactive_actions`, 46 % of `chatbot_response` and 42 % of
+  `agentic` rows, every abstained personalize or agentic row scoring zero. The compiled bundle is
+  handed to the generator under a harness-owned assistant prompt, `mindbridge_compile_surface_v1`;
+  such rows carry `answer_policy: null`, the arm definition records the `answer_surface` table,
+  and the table is part of the response-cache namespace.
+- The MEMLENS adapter reads the release's `answer_session_ids` -- present on every row, empty on
+  refusal rows -- as `MemLensSession.is_answer_session` and emits them as `evidence_groups`: one
+  group of stored turn IDs per answer session, retrieved when any member is ranked. The retrieval
+  block scores group labels with that operator and a hypergeometric random-ranker row; a flat
+  `evidence_ids` label is the singleton case and keeps its numbers. MEMLENS retrieval quality was
+  reported as unmeasurable before this, and the benchmarking guide said the release published
+  no label.
 - `ask()` can plan how to retrieve before it retrieves, behind `recall_planning` (default
   `False`). Similarity answers "what is most like this"; it has no way to express what a count, a
   list of "all", an adjacency, or "everything about this person" asks for, and measured on the
@@ -81,9 +112,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   of returning early, and is still reported as abstained with `AbstentionReason.NO_EVIDENCE`.
   `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` take the same
   keyword-only argument, defaulted, so a custom backend only needs it once a caller opts in. The
-  benchmark harness sets `"best_effort"` for exactly `m3-bench-robot`, whose official evaluation
-  credits no abstention and whose question set holds no unanswerable item; every other task keeps
-  `"strict"`. `--answer-policy` and `benchmark.run.answer_policy` override that table for one run,
+  benchmark harness sets `"best_effort"` for exactly `m3-bench-robot` and the four `mm-lifelong-*`
+  splits, whose official evaluations credit no abstention and whose question sets hold no
+  unanswerable item; every other task keeps `"strict"`. `--answer-policy` and `benchmark.run.answer_policy` override that table for one run,
   and both the task and the sample rows record the policy the request carried.
 - Local storage advances to schema v18. Evidence is stored as clauses: a `CONSOLIDATE` operation's
   cited set is one conjunction, separate operations are alternatives, and withdrawing a source
@@ -520,6 +551,65 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- Identity matching scores one observation against the whole exemplar bank as a matrix instead
+  of unpacking and re-normalising every stored exemplar into Python tuples on every call.
+  Measured on a 46,360-exemplar store the per-row scan cost 1.3 s per speaker label and grew
+  with every clip; the matrix costs about 0.16 s, most of it the read. Results are unchanged:
+  the best identity by its highest exemplar, ties broken by identity id, refused below
+  `speaker_similarity` or inside `speaker_margin`. `numpy` is now a core dependency; it was
+  already installed through `zvec`.
+- Speech recognition enrols only the speaker centroids a transcribed turn is labelled with. A
+  centroid no turn uses carries no speech, so all it did was mint an identity and an exemplar
+  that every later asset was matched against and nothing cited: 27,056 of 44,857 identities on
+  one 12,684-clip ingest. The rule lives in the store, where every `SpeechBackend` converges.
+- `mindbridge-bench eval` analyses the next ingest chunk's speech while the store embeds and
+  writes the current one. The store runs speech, then embedding, then the write for each chunk,
+  so the GPU idled during the embedding request and the network idled during speech -- measured
+  at about 5 s and 3.7 s of a 10 s batch. The lent speech backend now takes a look-ahead: one
+  background thread analyses the next chunk's clips, keyed by content digest (the store's asset
+  id), and the store's own call for those clips finds the result. Chunks still commit in order,
+  so corpus order and every stored row are unchanged; only the analysis starts early.
+- The `mm-lifelong` task group is the evaluation splits: `mm-lifelong-day-test`,
+  `mm-lifelong-week-test`, and `mm-lifelong-month-val`. `mm-lifelong-month-train` is the released
+  training split, cut from the same 105 h of video as `month_val`, so the group ingested that
+  video twice; it stays selectable by name.
+- `mindbridge-bench eval` no longer writes a `[source_id: …]` text line into media-only
+  memories. The id is already metadata, which is what evidence and retrieval scoring read; as
+  content it was a third retrieval key and made the aggregate key differ from the clip's own
+  key even when the clip had no speech, so every clip was uploaded to the embedder twice; a clip
+  with a transcript still is, since its aggregate key carries the transcript. Text memories keep
+  the label.
+- `MemoryConfig.evidence_budget_chars` defaults to `24_000` instead of `None`, so `ask()` grounds
+  on the `limit` hits and then on as many further ranked records as fit 24,000 characters of
+  evidence (media charged at its text equivalent), up to the 100-record rerank pool. A record
+  count was the wrong unit for the grounding window: record size is the caller's, so `limit=12`
+  was 2.5 k characters on a dialogue corpus and 12 k on a chat-assistant one. Measured paired
+  against a same-code control on the 2026-09-11 baseline reader, the default widened
+  LoCoMo-Refined's window from 12 to ~100 turns for +0.090 [+0.042, +0.110] on three development
+  conversations and +0.076 [+0.054, +0.098] on four held-out ones, cutting refusals from 70 to 24
+  of 592; widened LongMemEval-S from 12 to ~26 turns for +0.067 [+0.017, +0.117]; and widened
+  MemLens from 12 to ~17 turns for no change. The cost is the answer prompt: 4.8x the tokens and
+  2x the latency on the short-turn corpus, unchanged where records were already long.
+  `AnswerResult.hits`, `/v1/ask`, and `ask_memory` therefore report more than `limit` hits by
+  default; lower the budget to trade evidence for tokens, or set it to `None` to restore the
+  exact-`limit` window. The setting's calibration note in `plugins.py` records the measurement,
+  including the 8,000-character point (+0.055 / +0.063 on LoCoMo at 2.1x the tokens, half a row
+  on LongMemEval).
+- The kernel is one module per plane instead of one `memory.py`. `Memory` and `AsyncMemory` stay
+  in `memory.py` as facades that validate, wire, and forward; the write, retrieval, answering,
+  compilation, identity, control, records, perception, and projection planes live in
+  `mindbridge.kernel`, each a class whose constructor names every store, index, backend, setting,
+  and sibling plane it uses, so the wiring in `Memory.__init__` is the dependency graph. The
+  async observation streams moved to `mindbridge.streams` and are still exported from
+  `mindbridge`; `declared_capabilities`, which only the CLI and tests reached through
+  `mindbridge.memory`, now lives in `mindbridge.kernel.contracts`.
+  `LocalStore` is likewise one connection pool with one attribute per table family --
+  `records`, `captures`, `semantics`, `control`, `identities`, `media`, `index`, `recall` -- in
+  `mindbridge.infrastructure.local.store`, a package whose top-level imports are unchanged.
+  No on-disk schema, public signature, response type, endpoint, tool, or error changed; the
+  [architecture guide](docs/architecture.md#code-layout) owns the layout. Kernel warnings now
+  log under `mindbridge.kernel.<plane>` rather than `mindbridge.memory`; configure the
+  `mindbridge` logger to keep receiving all of them.
 - **Breaking:** `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` declare
   a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
   `isinstance` checks the method name rather than its signature, so a custom backend written
@@ -875,6 +965,49 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Benchmark speech look-ahead stops accepting work, cancels queued analysis, and waits for
+  running analysis before the pool closes its model backends, including when ingest fails.
+- A recall step whose anchor has no usable date is reported as incomplete rather than as an
+  empty complete set. Time windows derived from several point events include the last point.
+- Paired replay hashes the frozen source package recursively, so splitting the kernel and
+  storage into modules neither breaks worker startup nor omits moved behavior from its identity.
+- `mindbridge-bench eval` gives MM-Lifelong memories an event time. Each prepared clip carried
+  its `start_seconds`/`end_seconds` as metadata only, so every memory reached the store with no
+  `occurred_at` and the answerer was told to resolve "before"/"after" against `created_at` -- the
+  ingest wall clock, identical across a batch and unrelated to the video. The adapter now anchors
+  the offsets on one fixed epoch, so the store has a chronology and the questions are anchored at
+  the corpus end rather than at the run's wall clock. The `ref_at_300` offsets are unchanged.
+- A question that states its own clock as `Today is July, 1 2025` -- a comma between the month
+  and the day -- or as `Today is 1 July 2025` now anchors the reference time. Only `July 1, 2025`
+  and the ISO form did, so the comma spelling was read against the real wall clock and its "past
+  two years" became the wrong two years: on ATM-Bench-Hard that question retrieved none of its
+  eight evidence records and abstained. Rolling spans now resolve in every calendar unit, not
+  just days: "past two years", "last 3 months", "recent two weeks", "过去两年", "最近三个月" are
+  windows ending at the clock, with a month or year shift clamped to the target month's length.
+  The count is required except for the bare `past <unit>`, so "in recent years" and "my recent
+  day trips" stay unbounded, and every rolling phrase in a question is tried in order so a vague
+  "past few days" does not hide a precise "last 3 days" after it. A bare "last year" or "last
+  month" remains the calendar phrase it was, and "Today is July 2025" or "Today is 2 decades"
+  anchors nothing: a month name ends at a word boundary and a day is not the first digits of a
+  year.
+- The answer request numbers each attached media asset `attachment 1`, `attachment 2` -- by
+  order of first appearance, one number per distinct asset -- under the key `media`, instead of
+  listing asset IDs under `assets`, and the grounded prompt's identifier sentence now names
+  image, video, and memory IDs explicitly. Those asset IDs are content hashes, and a reader
+  asked for "the image ids" returned them as the answer: 2 of 12 ATM-Bench-Hard list questions
+  whose retrieval was otherwise complete scored zero that way, and labelled `image 1` the
+  reader returned the labels instead. A numbered attachment still says which media belongs to
+  which memory and which memories share one, and matches neither the question's words nor the
+  shape of an identifier. The same label is written as a text part immediately before the
+  asset's own media parts, so the number is defined where the media is: a short video that
+  arrives as several stills no longer shifts every later attachment by the extra frames.
+- `mindbridge-bench eval` reports the settings it ran with. The effective-config `config.yaml`,
+  the `memory_config` block of `results.jsonl`, and the resume checkpoints echoed the parsed
+  file's `reinforce_on_answer: true` while every product arm ran with it pinned to `false`; they
+  now carry the pinned value, so a run interrupted under the previous code cannot be `--resume`d
+  by the new one and re-ingests instead. `arms.definitions.*.retrieval_candidate_limit` and its
+  `_basis` also read the product default budget when the run has no config file, instead of
+  reporting `min(100, recall_limit * 3)` for a window `ask` actually ranked 100 deep.
 - `recall_planning` now actually plans under `mindbridge-bench eval`. The harness lends one
   answerer to every isolated store through a forwarding proxy, and `Memory` probes the optional
   `RecallPlanningBackend` capability with `isinstance` against a `runtime_checkable` protocol --

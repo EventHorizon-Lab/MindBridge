@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated, Literal, cast
@@ -23,6 +23,7 @@ from pydantic import (
 
 import mindbridge.recipes as recipes
 from mindbridge.exceptions import ValidationError
+from mindbridge.kernel.contracts import close_quietly
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -288,8 +289,7 @@ class MemoryComposition:
     settings: MemoryConfig
 
     def close(self) -> None:
-        seen: set[int] = set()
-        resources = (
+        close_quietly(
             self.plugins.face_analyzer,
             self.plugins.vision_describer,
             self.plugins.transcriber,
@@ -298,12 +298,6 @@ class MemoryComposition:
             self.plugins.answerer,
             self.plugins.embedder,
         )
-        for resource in resources:
-            if resource is None or id(resource) in seen:
-                continue
-            seen.add(id(resource))
-            with suppress(Exception):
-                resource.close()
 
 
 def resolve_memory_config(
