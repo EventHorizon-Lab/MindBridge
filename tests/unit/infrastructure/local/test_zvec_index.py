@@ -275,9 +275,9 @@ def test_group_by_falls_back_until_it_has_distinct_parent_memories() -> None:
 
 def test_dense_search_asks_for_the_largest_candidate_list_zvec_accepts() -> None:
     # A collection whose vectors sit in an HNSW graph silently drops true nearest neighbours when
-    # the candidate list is small, and reports full health while doing it: measured on the shipped
-    # 24,271-vector benchmark store (r0913b D1), ef 300 returned 0.48 of the exhaustive cosine
-    # top-100 against 0.95 at the bound below, with `doc_count` and `index_completeness` unchanged.
+    # the candidate list is small, and reports full health while doing it: measured on a shipped
+    # 24,271-vector 2048-dimension store, ef 300 returned 0.53 of the exhaustive cosine top-100
+    # against 0.95 at the bound below, with `doc_count` and `index_completeness` unchanged.
     # Zvec refuses anything above that bound outright -- a `limit` past it used to reach the native
     # layer unclamped and fail the whole query -- so both ends are pinned here.
     parent = _QueryDocument("parent_best", 0.0, memory_id="parent")
@@ -310,6 +310,15 @@ def test_dense_search_asks_for_the_largest_candidate_list_zvec_accepts() -> None
         )
 
     assert set(collection.efs) == {2048}
+
+
+def test_ef_search_is_rejected_outside_the_range_zvec_accepts() -> None:
+    # The constructor is the only place a caller can choose the candidate list, and Zvec refuses a
+    # value above its bound from inside the query rather than at validation -- so a store built
+    # with one would open cleanly and fail every search once it grew a graph.
+    for value in (0, -1, 2049, True):
+        with pytest.raises(ValueError, match="ef_search must be between 1 and 2048"):
+            ZvecIndex(Path("unused"), dimension=2, ef_search=value)
 
 
 def test_create_search_flush_close_and_reopen(tmp_path: Path) -> None:

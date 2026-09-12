@@ -93,6 +93,14 @@ committed during its scan. `optimize()` drains and acknowledges pending work, me
 vectors, and flushes the collection. Neither operation repairs missing media or converts an
 incompatible embedding space.
 
+Once a collection holds enough vectors for Zvec to build a graph, dense search is approximate and
+nothing in the index reports the neighbours it missed. MindBridge therefore searches at the
+largest candidate list Zvec accepts. That is chosen per query rather than stored, so it is not
+part of the index recipe and changing it neither rebuilds nor invalidates a store. It costs
+roughly 6 ms of `search()` p50 on a 24,271-vector 2048-dimension store, and the index-only part
+of that grows with the corpus: about 21 ms more per dense route at 100,000 vectors. It costs
+nothing on a store small enough that every query is already an exhaustive scan.
+
 If Zvec cannot open or appears corrupt:
 
 1. Stop the owner and retain a tested backup.

@@ -59,13 +59,17 @@ _RABITQ_NUM_CLUSTERS = 16
 # query rather than as a validation error, so every `ef` this module sends is clamped here.
 _MAX_EF_SEARCH = 2048
 # Searching at a smaller candidate list silently loses true nearest neighbours, and nothing in the
-# index reports it: `doc_count` and `index_completeness` both read healthy. Measured on the shipped
-# benchmark stores (r0913b D1, 50 queries, exhaustive fp32 cosine as truth): at ef 300 a collection
-# whose vectors sit in an HNSW graph returned 0.48 of the true top-100 on 24,271 WeMM-2048 video
-# keys and 0.71 on 50,642; at this bound it returns 0.95 and 0.94, for a p50 of 7.4 ms rather than
-# 1.8 ms. Collections small enough that no graph was ever built answer every query by brute force
-# and are unaffected either way -- 217-, 689- and 1,359-vector stores measured recall 1.000 and the
-# same p50 at both values -- so the cost is paid only where the loss is.
+# index reports it: `doc_count` and `index_completeness` both read healthy. Measured on two shipped
+# 2048-dimension video stores (50 queries, exhaustive fp32 cosine as truth): at ef 300 a collection
+# whose vectors sit in an HNSW graph returned 0.53 of the true top-100 on 24,271 keys and 0.71 on
+# 50,642; at this bound it returns 0.95 and 0.94. Ranking the first store's 200 recorded questions
+# through `Memory.search(limit=100)` moves the share that retrieve a gold clip in the top twelve
+# 0.235 -> 0.400, against 0.430 for an exhaustive scan, and its search p50 24.1 ms -> 30.7 ms. The
+# index-only cost grows with the corpus: on a 2048-dimension synthetic graph, p50 6.3 -> 14.4 ms at
+# 20,000 documents and 8.0 -> 29.0 ms at 100,000, with resident memory unchanged. Collections small
+# enough that no graph was ever built answer every query by brute force and are unaffected either
+# way -- three such stores reproduced their rankings exactly at the same p50 -- so the cost is paid
+# only where the loss is.
 _DEFAULT_EF_SEARCH = _MAX_EF_SEARCH
 _LEXICAL_RANK_CONSTANT = 60
 _DEFAULT_REBUILD_BATCH_SIZE = 1_024
