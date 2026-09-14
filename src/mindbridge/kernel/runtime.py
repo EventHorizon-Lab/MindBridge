@@ -144,6 +144,19 @@ class Storage:
     settle_lock: RLock
 
 
+def _ensure_evidence_recipe(store: LocalStore, settings: Settings) -> None:
+    key = "evidence.projection_recipe"
+    recipe = "independent-v1" if settings.independent_evidence else "legacy-v1"
+    stored = store.get_metadata(key)
+    if stored is None and store.records.list_memories(limit=1):
+        stored = "legacy-v1"
+    if stored is not None and stored != recipe:
+        raise StorageError(
+            f"local store metadata mismatch for {key}: expected {recipe!r}, found {stored!r}"
+        )
+    store.set_metadata(key, recipe)
+
+
 def ensure_store_metadata(
     store: LocalStore,
     backends: Backends,
@@ -174,6 +187,7 @@ def ensure_store_metadata(
         getattr(backends.embedder, "_legacy_embedding_spaces", frozenset()),
     )
     with translate_storage_errors("validate local store metadata"):
+        _ensure_evidence_recipe(store, settings)
         for key, value in expected.items():
             stored = store.get_metadata(key)
             if stored is None:
