@@ -551,6 +551,26 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- Dense search asks the vector index for the largest candidate list Zvec accepts instead of 300.
+  Once a collection holds enough vectors for Zvec to build a graph its search is approximate, and
+  nothing in the index reports the neighbours it missed: `doc_count` and `index_completeness` both
+  read healthy. Measured on two shipped 2048-dimension video stores against an exhaustive fp32
+  cosine (50 queries), ef 300 returned 0.53 of the true top-100 on 24,271 keys and 0.71 on 50,642;
+  at the new bound it returns 0.95 and 0.94, and the share of the first store's 200 recorded
+  questions retrieving a gold clip in the top twelve moves 0.235 -> 0.400, against 0.430 for an
+  exhaustive scan. The candidate list is chosen per query rather than stored, so it is not part of
+  the index recipe and changing it neither rebuilds nor invalidates a store. It costs about 6 ms of
+  `search()` p50 on the 24,271-vector store and about 21 ms more per dense route at 100,000
+  vectors; a collection small enough that no graph was ever built answers by brute force and is
+  unaffected either way, so the cost is paid only where the loss is.
+- A session that wrote merges the Zvec segments it leaves behind when it closes, and a rebuild
+  merges the checkpoint replay it writes over itself. Every durable segment is a cost every later
+  search pays, and the write-side merge bound is 64 flushes, so a store under roughly 65,000 rows
+  per session used to be handed to its next owner segmented: merging five real stores recovered
+  24-47 % of their Zvec bytes and 14-45 pp of search p50 without changing a result. A session that
+  never flushed does not merge, even on a store already carrying that debt -- opening someone
+  else's store to read it must hand back the bytes it was given, and the next writer pays the debt
+  anyway, which is what bounds the growth. `Index.optimize_if_needed` gains `minimum_flushes`.
 - Identity matching scores one observation against the whole exemplar bank as a matrix instead
   of unpacking and re-normalising every stored exemplar into Python tuples on every call.
   Measured on a 46,360-exemplar store the per-row scan cost 1.3 s per speaker label and grew
@@ -965,6 +985,14 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- A scoped search no longer fails once its candidate widening passes 2,048. A predicate that
+  filters out most candidates -- `near`, a place, an identity, a validity window -- doubles the
+  route depth up to `limit * 129`, and the depth used to be sent to Zvec as the candidate list
+  too. Zvec's native HNSW refuses one above 2,048 and surfaces the refusal as a Gandiva execution
+  error from the query rather than as a validation error, so on any collection large enough to
+  hold a graph the widened search raised `IndexUnavailableError`. Every candidate list the index
+  sends is now clamped to that bound, and `ZvecIndex(ef_search=...)` rejects a value outside it up
+  front.
 - Benchmark speech look-ahead stops accepting work, cancels queued analysis, and waits for
   running analysis before the pool closes its model backends, including when ingest fails.
 - A recall step whose anchor has no usable date is reported as incomplete rather than as an
