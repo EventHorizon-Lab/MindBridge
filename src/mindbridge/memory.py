@@ -277,13 +277,18 @@ class Memory:
                 self._store.set_metadata(STORE_METADATA_KEYS["space"], self._backends.space_id)
                 self._store.set_metadata(STORE_METADATA_KEYS["index"], self._settings.index_recipe)
             if index_missing or index_rebuild:
-                _LOGGER.info(
-                    "rebuilding the search index (missing=%s, recipe changed=%s)",
-                    index_missing,
-                    index_rebuild,
-                )
                 with translate_storage_errors("checkpoint a missing search index"):
-                    self._store.index.queue_all_embeddings()
+                    queued = self._store.index.queue_all_embeddings()
+                # A store with nothing to project is the ordinary first open, not a rebuild:
+                # the index directory is always absent before `ZvecIndex` creates it below.
+                if queued:
+                    _LOGGER.info(
+                        "rebuilding the search index for %d embeddings "
+                        "(missing=%s, recipe changed=%s)",
+                        queued,
+                        index_missing,
+                        index_rebuild,
+                    )
         except BaseException:
             close_quietly(*injected, self._store)
             raise
