@@ -64,6 +64,11 @@ class Projection(Traced):
         self._index = index
         self._lifecycle = lifecycle
         self._unflushed_operations: set[IndexOperation] = set()
+        # Whether this session ever made Zvec durable, which is also whether it can have left a
+        # segment behind. The index's own flush counter cannot answer that: it is seeded from the
+        # files on disk at open, so it reports the previous owner's debt as if this session had
+        # incurred it, and a session that only searched would merge on the strength of it.
+        self._flushed = False
         # Whether *this* thread is inside an `add_stream` item write, so a concurrent `add` on
         # another thread keeps flushing before it returns. Thread-local rather than one shared
         # slot: two threads streaming at once saved and restored each other's value, so the second
@@ -72,10 +77,23 @@ class Projection(Traced):
         self._deferral = local()
 
     def flush_pending(self) -> None:
-        """Flush applied-but-unacknowledged rows, if any; `close()` calls this last."""
+        """Flush applied rows and merge what a writing session leaves; `close()` calls this last."""
         if self._unflushed_operations:
             with self._trace("mindbridge.index.sync", kind="stage"):
                 self.flush()
+        # Every durable segment is a cost every later search pays, and the write-side merge bound
+        # is 64 flushes, so a store under roughly 65 000 rows per session was handed to its next
+        # owner segmented: merging five real stores recovered 24-47 % of their Zvec bytes and
+        # 14-45 pp of search p50 without changing a result. Close is the one moment no writer is
+        # waiting, so a session that flushed merges here when two or more segments are persisted.
+        # A session that never flushed does not, even on a store that is carrying debt: opening
+        # someone else's store to read it must hand back the bytes it was given, and the debt is
+        # paid by the next writer anyway -- which is what bounds the growth, because otherwise one
+        # record per session grew a 481 MB store by a segment and 5 MB every time it was closed.
+        if not self._flushed:
+            return
+        with translate_index_errors("optimize the search index"):
+            self._index.optimize_if_needed(minimum_flushes=2)
 
     def drain(self, *, force: bool = False) -> None:
         """Apply current SQLite truth to Zvec; flush and acknowledge once enough has been applied.
@@ -181,6 +199,7 @@ class Projection(Traced):
             translate_index_errors("update the search index"),
         ):
             self._index.flush()
+        self._flushed = True
         # A failed flush above keeps the set, so the next drain retries without re-applying. Cleared
         # here, before optimize and acknowledge: if either fails the rows are re-applied (idempotent
         # upsert or delete) and acknowledged by the next drain, and a compaction inside
@@ -288,6 +307,11 @@ class Projection(Traced):
             # blindly acknowledging so records committed after its SQLite scan cannot be lost.
             self.drain()
             self.flush()
+            # That replay writes the whole checkpoint a second time, one durable segment per
+            # flush-sized page, over the merged collection `rebuild` just wrote -- measured on a
+            # 578 MB store as Zvec +143 % and search p50 7.8x. Merge them, or the repair the
+            # operations guide recommends leaves the index worse than doing nothing.
+            self._merge_segments()
             return memory_count
 
     def optimize(self) -> None:
@@ -298,6 +322,9 @@ class Projection(Traced):
         ):
             self.drain()
             self.flush()
-            with translate_index_errors("optimize the search index"):
-                self._index.optimize()
-                self._index.flush()
+            self._merge_segments()
+
+    def _merge_segments(self) -> None:
+        with translate_index_errors("optimize the search index"):
+            self._index.optimize()
+            self._index.flush()

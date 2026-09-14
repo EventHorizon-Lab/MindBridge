@@ -498,8 +498,10 @@ class _FakeIndex:
         del concurrency
         self.optimize_calls += 1
 
-    def optimize_if_needed(self, *, minimum_unindexed: int = 100_000) -> bool:
-        del minimum_unindexed
+    def optimize_if_needed(
+        self, *, minimum_unindexed: int = 100_000, minimum_flushes: int = 64
+    ) -> bool:
+        del minimum_unindexed, minimum_flushes
         self.optimize_if_needed_calls += 1
         return False
 
@@ -4584,10 +4586,13 @@ def test_keyset_pages_reindex_optimize_and_missing_index_recovery(tmp_path: Path
             break
     assert len(seen) == len(set(seen)) == len(records)
     assert memory.reindex() == len(records)
+    # A rebuild merges the segments its own outbox replay leaves behind, so the explicit
+    # `optimize()` below is the second merge rather than the first.
+    assert _FakeIndex.instances[-1].optimize_calls == 1
     memory.optimize()
     assert _FakeIndex.instances[-1].rebuild_calls == 1
     assert _FakeIndex.instances[-1].rebuild_batch_sizes == [256]
-    assert _FakeIndex.instances[-1].optimize_calls == 1
+    assert _FakeIndex.instances[-1].optimize_calls == 2
     memory.close()
 
     embed_calls = len(models.embed_batches)

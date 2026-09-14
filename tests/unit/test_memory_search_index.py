@@ -13,6 +13,7 @@ wherever the suite runs.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -36,8 +37,9 @@ from mindbridge._telemetry import (
     VISION_BATCHES_FAILED,
     VISION_BATCHES_RETRIED,
 )
-from mindbridge.exceptions import ModelError
+from mindbridge.exceptions import IndexUnavailableError, ModelError
 from mindbridge.infrastructure.local.store.index import IndexOutbox
+from mindbridge.infrastructure.local.zvec_index import ZvecIndex
 from mindbridge.kernel.derived import (
     MAX_DESCRIBE_CONTEXT_CHARACTERS,
     speaker_labels,
@@ -582,6 +584,185 @@ def test_reindexing_does_not_re_describe_stored_visuals(tmp_path: Path) -> None:
         assert _caption(memory.get(record.id).content) == caption
 
 
+def _vector_segments(data_dir: Path) -> int:
+    """Count the durable Zvec segments on disk; every later search pays for each of them."""
+    return len(list((data_dir / "zvec").rglob("*.proxima")))
+
+
+def _counted_optimizations(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record every merge the index runs, so "did not optimize" is also assertable."""
+    calls: list[int] = []
+    original = ZvecIndex.optimize
+
+    def counted(self: ZvecIndex, *, concurrency: int = 0) -> None:
+        calls.append(concurrency)
+        original(self, concurrency=concurrency)
+
+    monkeypatch.setattr(ZvecIndex, "optimize", counted)
+    return calls
+
+
+def test_close_merges_the_segments_a_session_leaves_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store below the automatic merge bound is handed to its next owner in one segment.
+
+    The write-side bound is 64 flushes, so every store under roughly 65 000 rows written in a
+    session used to be closed segmented: measured on five real stores, merging them recovered
+    24-47 % of the Zvec bytes and 14-45 pp of search p50, and changed no result.
+    """
+    optimizations = _counted_optimizations(monkeypatch)
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        kitchen = memory.add("the kitchen at dusk")
+        memory.add("the garden at noon")
+        # A deletion is made durable at once, so this session flushes twice: here, and at close.
+        memory.delete(kitchen.id)
+        memory.add("the hallway at dawn")
+
+    assert optimizations == [0]
+    assert _vector_segments(tmp_path) == 1
+
+
+def test_close_does_not_optimize_a_session_that_flushed_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first session below the flush bound leaves one segment, so it must not merge it."""
+    optimizations = _counted_optimizations(monkeypatch)
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        memory.add("the kitchen at dusk")
+
+    assert optimizations == []
+    assert _vector_segments(tmp_path) == 1
+
+
+def _segment_files(data_dir: Path) -> dict[str, int]:
+    """The durable segments by name and size; a merge rewrites this map, a read must not.
+
+    Not every file under `zvec/`: MindBridge has no read-only open, so the embedded RocksDB stores
+    behind the scalar, full-text and id-map fields write a fresh log, MANIFEST and OPTIONS whenever
+    the collection is opened at all. That churn belongs to the open, not the close, and no policy
+    here can remove it. The three suffixes below are the durable segments -- exactly what
+    `_persisted_segment_count` counts, what a merge rewrites, and what a reader must hand back
+    unchanged.
+    """
+    zvec = data_dir / "zvec"
+    return {
+        str(file.relative_to(zvec)): file.stat().st_size
+        for file in sorted(zvec.rglob("*"))
+        if file.is_file() and file.suffix in {".proxima", ".ipc", ".sst"}
+    }
+
+
+def _segmented_store(data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave a store in two durable segments, the state an earlier owner hands over.
+
+    The merge under test is what stops a store reaching this state, so the fixture has to write
+    with it disabled rather than by writing more.
+    """
+    monkeypatch.setattr(ZvecIndex, "optimize", lambda self, *, concurrency=0: None)
+    with Memory(data_dir, embedder=_Embedder()) as memory:
+        kitchen = memory.add("the kitchen at dusk")
+        memory.add("the garden at noon")
+        memory.delete(kitchen.id)
+        memory.add("the hallway at dawn")
+    monkeypatch.undo()
+    assert _vector_segments(data_dir) == 2
+
+
+def test_a_session_that_only_reads_leaves_a_segmented_store_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening a store to read it must not rewrite it, however much compaction debt it carries.
+
+    An eval harness, a backup tool, or an operator checking a result opens someone else's store
+    and is entitled to hand back the bytes it was given. Paying the debt needs a writer, and one
+    will come: every writing session ends compacted, which is what bounds the growth.
+    """
+    _segmented_store(tmp_path, monkeypatch)
+    before = _segment_files(tmp_path)
+    optimizations = _counted_optimizations(monkeypatch)
+
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        assert memory.search("dawn", limit=10)
+
+    assert optimizations == []
+    assert _segment_files(tmp_path) == before
+
+
+def test_a_session_that_writes_one_record_merges_an_inherited_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One record is enough to make a session the one that pays the inherited debt."""
+    _segmented_store(tmp_path, monkeypatch)
+    optimizations = _counted_optimizations(monkeypatch)
+
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        memory.add("the balcony at midnight")
+
+    assert optimizations == [0]
+    assert _vector_segments(tmp_path) == 1
+
+
+def test_repeated_short_sessions_do_not_grow_the_index(tmp_path: Path) -> None:
+    """`open -> add one record -> close` in a loop must not accrue a segment per session.
+
+    The flush counter is seeded from the files on disk, so every session after the first inherits
+    the previous one's segment and merges it back down. Without that, five one-record sessions
+    over a real 481 MB store left it at 511 MB in seven segments; with it the store stayed at
+    481 MB in one, for about 1.4 s of close each.
+    """
+    for index in range(4):
+        with Memory(tmp_path, embedder=_Embedder()) as memory:
+            memory.add(f"the kitchen at dusk, visit {index}")
+
+    assert _vector_segments(tmp_path) == 1
+
+
+def test_close_reports_a_failed_merge_and_still_releases_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A merge that cannot run must not cost the caller the close: it is derived state.
+
+    `close()` collects failures rather than raising at the first one, so the native collection is
+    closed and its file lock released whatever the merge did, and the failure is still raised.
+    """
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        kitchen = memory.add("the kitchen at dusk")
+        memory.add("the garden at noon")
+        memory.delete(kitchen.id)
+        memory.add("the hallway at dawn")
+
+        def refuse(self: ZvecIndex, *, concurrency: int = 0) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(ZvecIndex, "optimize", refuse)
+        with pytest.raises(IndexUnavailableError, match="optimize the search index"):
+            memory.close()
+        memory.close()
+
+    monkeypatch.undo()
+    with Memory(tmp_path, embedder=_Embedder()) as reopened:
+        assert {hit.id for hit in reopened.search("dawn", limit=10)}
+
+
+def test_reindexing_leaves_the_index_merged(tmp_path: Path) -> None:
+    """The rebuild checkpoints every embedding in the outbox and then replays it over itself.
+
+    That replay writes the corpus a second time in flush-sized pages, one durable segment each,
+    on top of the merged collection `rebuild` just wrote -- measured on a 578 MB store as Zvec
+    +143 % and search p50 7.8x, in the operation the troubleshooting guide recommends for repair.
+    """
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        for text in ("the kitchen at dusk", "the garden at noon", "the hallway at dawn"):
+            memory.add(text)
+
+        assert memory.reindex() == 3
+
+        assert _vector_segments(tmp_path) == 1
+        # One text memory keys one embedding, so the rebuilt index holds every stored row.
+        assert cast(ZvecIndex, memory._index).doc_count == 3
+
+
 def test_decay_demotes_an_old_memory_without_evicting_it(tmp_path: Path) -> None:
     """`minimum_relevance` gates evidence quality, not the recency priors applied after it.
 
@@ -933,6 +1114,7 @@ def test_a_narrow_limit_returns_the_prefix_of_a_wide_one_with_the_same_scores(
 
 
 _TRACE_ORDER_PROBE = '''
+import errno
 import hashlib
 import json
 import math
