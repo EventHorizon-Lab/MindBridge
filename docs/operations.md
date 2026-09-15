@@ -104,6 +104,68 @@ If Zvec cannot open or appears corrupt:
 Never edit `search_index_queue`, replace `zvec/`, or move authoritative files while a `Memory` is
 live.
 
+A merge is not always a merge in place. Zvec 0.7 merges a collection that still holds a *dead
+row* — a document it stores but no longer serves, left by a delete or by a second write of an id
+it already held — by writing the surviving vectors densely while the ids keep their pre-merge
+positions, so every document from the first dead row onwards is then served its neighbour's
+vector. MindBridge therefore merges such a collection by copying its live documents into a fresh
+one, which costs about 4 s per 100 MB instead of a merge in place. A session that closes a
+collection it knows to be clean records that in `zvec/.mindbridge-clean` so the next owner can
+merge in place; a session that deleted anything, or that was killed, leaves none, and the next
+owner copies. The marker lives inside the collection, so a `zvec/` restored from a backup carries
+its own claim or none. Deleting it is always safe and never wrong — it only costs one copy.
+
+**Which stores are affected.** Any store whose index was merged while it held a dead row. Every
+merge route can do it: a drain that crossed the 64-flush maintenance bound, an explicit
+`optimize()` or `reindex()`, and the file-descriptor pressure path. In practice a store is
+suspect when it deleted a record or re-embedded one — `delete()`, `forget()`, retention, a
+speaker rebinding, or a `settle()` that replaced a capture's embeddings — and then went on
+writing or was optimized. The defect is as old as the merge itself, not new in one release, so
+age alone does not clear a store. SQLite is untouched in every case: nothing is lost and no
+re-ingest is needed.
+
+An index merged over a dead row cannot be told from a healthy one by `doc_count`,
+`index_completeness`, or the number of hits a search returns: only the ranking is wrong. Check a
+store by asking the index for the vectors it already holds — each one must find its own document
+first:
+
+```python
+import sqlite3
+
+import numpy as np
+
+from mindbridge.infrastructure.local.zvec_index import ZvecIndex
+
+connection = sqlite3.connect("file:state.sqlite3?immutable=1", uri=True)
+sample = connection.execute(
+    "SELECT embedding_id, dimension, vector FROM embeddings "
+    "WHERE object_part = 0 ORDER BY RANDOM() LIMIT 200"
+).fetchall()
+with ZvecIndex("zvec", sample[0][1]) as index:
+    hits = sum(
+        index.search(tuple(np.frombuffer(vector, dtype="<f4", count=dimension)), limit=1)[0].id
+        == embedding_id
+        for embedding_id, dimension, vector in sample
+    )
+print(f"self-hit {hits / len(sample):.3f}")
+```
+
+Only aggregate vectors are sampled because a dense search returns one embedding per parent memory,
+so on a multi-part record a part whose vector ties its sibling's is answered by the sibling and
+scores as a miss on a healthy store. Open the index the way the owner does: pass the store's
+`IndexQuantization` if it is not `NONE`, or the schema check refuses the collection, and run the
+check once per embedding dimension if the store holds more than one.
+
+A healthy store scores 1.000. A store whose index was merged over a dead row scores close to
+zero — the shipped store this was found on scored 0.060. Repair it by rebuilding from SQLite,
+with `reindex()` or with the `zvec/` procedure above: merging it again cannot repair it, because
+the wrong vector is what the collection now stores.
+
+Copying the collection needs room for a second copy of `zvec/` and takes the temporary directory
+beside it. A session killed in the middle leaves `.zvec.compact-*` behind, which the next open
+removes, and can leave the canonical `zvec/` absent for the width of a rename, which the next open
+rebuilds from SQLite.
+
 `capture_queue` is deferred enrichment rather than index work, and no operation drains it
 implicitly. A host that uses `capture()` owns the loop that calls `settle()`, and
 `pending_captures()` is what to alarm on: it returns up to `limit` queued records oldest first,
