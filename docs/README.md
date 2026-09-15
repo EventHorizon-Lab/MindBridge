@@ -27,6 +27,7 @@ have one place to stay current.
 | Review live formation and context delivery | [Fourth-round results](research/2026-09-13-live-context-results.md) | [Fourth-round protocol](research/2026-09-13-live-context-protocol.md) |
 | Review historical witnesses and explicit proofs | [Identity formation results](research/2026-09-13-identity-witness-results.md) | [Proof delivery results](research/2026-09-13-proof-envelope-results.md) and [fifth-round protocol](research/2026-09-13-identity-proof-protocol.md) |
 | Review the end-to-end integration decision | [End-to-end results](research/2026-09-14-end-to-end-results.md) | [Frozen end-to-end protocol](research/2026-09-14-end-to-end-protocol.md) |
+| Review the 2026-09-14 memory-dynamics round | [Memory dynamics round](research/2026-09-14-memory-dynamics-round.md) | [Pre-registered protocol](research/2026-09-14-memory-dynamics-protocol.md) and [Benchmarking](benchmarking.md) |
 | Review companion evidence obligations | [Companion evidence obligations](research/2026-09-09-companion-evidence-obligations-zh.md) | [Affective memory](affective-memory.md) and [Context compilation](context-compilation.md) |
 | Understand or extend the design | [Design principles](design-principles.md) | [Plugin architecture](plugin-architecture.md) |
 | Follow where the product is going | [Context OS direction](context-os.md) | [Design principles](design-principles.md) |

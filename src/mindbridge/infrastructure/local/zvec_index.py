@@ -55,7 +55,23 @@ _HNSW_M = 50
 _HNSW_EF_CONSTRUCTION = 500
 _RABITQ_TOTAL_BITS = 7
 _RABITQ_NUM_CLUSTERS = 16
-_DEFAULT_EF_SEARCH = 300
+# Zvec's native HNSW refuses a larger candidate list outright ("ef_search must be greater than 0
+# and less than or equal to 2048"), and the refusal surfaces as a Gandiva execution error from the
+# query rather than as a validation error, so every `ef` this module sends is clamped here.
+_MAX_EF_SEARCH = 2048
+# Searching at a smaller candidate list silently loses true nearest neighbours, and nothing in the
+# index reports it: `doc_count` and `index_completeness` both read healthy. Measured on two shipped
+# 2048-dimension video stores (50 queries, exhaustive fp32 cosine as truth): at ef 300 a collection
+# whose vectors sit in an HNSW graph returned 0.53 of the true top-100 on 24,271 keys and 0.71 on
+# 50,642; at this bound it returns 0.95 and 0.94. Ranking the first store's 200 recorded questions
+# through `Memory.search(limit=100)` moves the share that retrieve a gold clip in the top twelve
+# 0.235 -> 0.400, against 0.430 for an exhaustive scan, and its search p50 24.1 ms -> 30.7 ms. The
+# index-only cost grows with the corpus: on a 2048-dimension synthetic graph, p50 6.3 -> 14.4 ms at
+# 20,000 documents and 8.0 -> 29.0 ms at 100,000, with resident memory unchanged. Collections small
+# enough that no graph was ever built answer every query by brute force and are unaffected either
+# way -- three such stores reproduced their rankings exactly at the same p50 -- so the cost is paid
+# only where the loss is.
+_DEFAULT_EF_SEARCH = _MAX_EF_SEARCH
 _LEXICAL_RANK_CONSTANT = 60
 _DEFAULT_REBUILD_BATCH_SIZE = 1_024
 # Zvec's native writer refuses a batch above this many documents, and does not expose the limit as
@@ -255,8 +271,8 @@ class ZvecIndex:
         quantization: IndexQuantization = IndexQuantization.NONE,
     ) -> None:
         validate_index_configuration(dimension, quantization)
-        if isinstance(ef_search, bool) or ef_search <= 0:
-            raise ValueError("ef_search must be a positive integer")
+        if isinstance(ef_search, bool) or not 1 <= ef_search <= _MAX_EF_SEARCH:
+            raise ValueError(f"ef_search must be between 1 and {_MAX_EF_SEARCH}")
 
         self.path = Path(path).expanduser().resolve()
         self.dimension = dimension
@@ -538,9 +554,11 @@ class ZvecIndex:
         self,
         *,
         minimum_unindexed: int = _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS,
+        minimum_flushes: int = _AUTO_OPTIMIZE_FLUSHES,
     ) -> bool:
         """Run maintenance after a meaningful flat-buffer or durable-segment buildup."""
         _require_positive(minimum_unindexed, "minimum_unindexed")
+        _require_positive(minimum_flushes, "minimum_flushes")
         # Every collection shares one process FD table. Serializing maintenance prevents several
         # otherwise-isolated stores from all opening replacement segments at the same pressure
         # boundary. Reads of other collections remain independent.
@@ -567,7 +585,7 @@ class ZvecIndex:
             self._optimization_watermark = min(self._optimization_watermark, document_count)
             indexed = _indexed_document_count(stats)
             if (
-                self._flushes_since_optimization < _AUTO_OPTIMIZE_FLUSHES
+                self._flushes_since_optimization < minimum_flushes
                 and document_count - max(indexed, self._optimization_watermark) < minimum_unindexed
             ):
                 return False
@@ -819,7 +837,7 @@ class ZvecIndex:
         query = self._zvec.Query(
             field_name=_VECTOR_FIELD,
             vector=list(values),
-            param=self._query_param(ef=max(selected_ef, limit), exact=exact),
+            param=self._query_param(ef=min(_MAX_EF_SEARCH, max(selected_ef, limit)), exact=exact),
         )
         filter_expression = _filter_expression(
             space_id=space_id,

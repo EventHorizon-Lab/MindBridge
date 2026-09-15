@@ -325,9 +325,11 @@ concurrent flush is freeing (alibaba/zvec#714), which surfaced as a bus error in
 `reindex()` reads authoritative SQLite pages, replaces the Zvec collection, then replays the
 outbox so writes committed during the scan are retained. `close()` rejects new work, waits for
 active operations, releases asset leases, flushes and acknowledges the applied index work, and
-closes each unique backend and storage resource once. `AsyncMemory` delegates to this same
-synchronous core with `asyncio.to_thread`; it does not
-create a service or a second consistency model.
+closes each unique backend and storage resource once. A session that flushed also merges the
+durable segments there when two or more are persisted, so a writer hands over a compacted index; a
+session that only read one changes nothing on disk. A merge that fails still closes the store and
+releases its lock, and is reported. `AsyncMemory` delegates to this same synchronous core with
+`asyncio.to_thread`; it does not create a service or a second consistency model.
 
 ## Model boundary
 
