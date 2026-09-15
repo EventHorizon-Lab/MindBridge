@@ -39,6 +39,8 @@ class Settings:
     recall_set_budget: int
     recall_set_max_rows: int
     recall_rounds: int
+    evidence_expansion: bool
+    evidence_expansion_max_rows: int
     decay_half_life: timedelta | None
     reinforce_on_answer: bool
     memory_budget_records: int | None
@@ -60,6 +62,8 @@ def resolve_settings(
     recall_set_budget_chars: int,
     recall_set_max_rows: int,
     recall_rounds: int,
+    evidence_expansion: bool,
+    evidence_expansion_max_rows: int,
     decay_half_life_days: float | None,
     reinforce_on_answer: bool,
     speaker_similarity: float,
@@ -94,6 +98,10 @@ def resolve_settings(
         recall_set_budget=positive_int(recall_set_budget_chars, "recall_set_budget_chars"),
         recall_set_max_rows=positive_int(recall_set_max_rows, "recall_set_max_rows"),
         recall_rounds=positive_int(recall_rounds, "recall_rounds"),
+        evidence_expansion=strict_bool(evidence_expansion, "evidence_expansion"),
+        evidence_expansion_max_rows=positive_int(
+            evidence_expansion_max_rows, "evidence_expansion_max_rows"
+        ),
         decay_half_life=validated_decay_half_life(decay_half_life_days),
         reinforce_on_answer=strict_bool(reinforce_on_answer, "reinforce_on_answer"),
         memory_budget_records=(

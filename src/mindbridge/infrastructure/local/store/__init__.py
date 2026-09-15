@@ -8,7 +8,11 @@ private modules, and product code outside this package imports none of them dire
 from mindbridge.infrastructure.local.store._codec import datetime_text, optional_datetime_text
 from mindbridge.infrastructure.local.store._identity import CONSENT_PREDICATE, canonical_subject
 from mindbridge.infrastructure.local.store._naming_projection import NamingProjectionFactory
-from mindbridge.infrastructure.local.store._recall import RECALL_MAX_ROWS, RECALL_MAX_TERM_CHARS
+from mindbridge.infrastructure.local.store._recall import (
+    RECALL_MAX_ROWS,
+    RECALL_MAX_TERM_CHARS,
+    RELATED_EDGES,
+)
 from mindbridge.infrastructure.local.store._schema import SCHEMA_VERSION
 from mindbridge.infrastructure.local.store.errors import (
     LocalStoreClosedError,
@@ -23,6 +27,7 @@ from mindbridge.infrastructure.local.store.rows import (
     IndexOperation,
     RecallDigest,
     RecallRead,
+    RelatedRead,
     SpeechRollback,
     StoredAsset,
     StoredCandidate,
@@ -40,6 +45,7 @@ __all__ = [
     "CONSENT_PREDICATE",
     "RECALL_MAX_ROWS",
     "RECALL_MAX_TERM_CHARS",
+    "RELATED_EDGES",
     "SCHEMA_VERSION",
     "IdentityLink",
     "IndexCandidate",
@@ -50,6 +56,7 @@ __all__ = [
     "NamingProjectionFactory",
     "RecallDigest",
     "RecallRead",
+    "RelatedRead",
     "SpeechRollback",
     "StaleOperationError",
     "StoredAsset",

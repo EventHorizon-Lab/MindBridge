@@ -53,6 +53,12 @@ RECALL_COMPLETE = "mindbridge.recall.complete"
 RECALL_REPLAN = "mindbridge.recall.replan"
 RECALL_FALLBACK = "mindbridge.recall.fallback"
 RECALL_NON_SELECTIVE_STEPS = "mindbridge.recall.non_selective_steps"
+# Evidence expansion reports which structural edge linked the rows it added and which edge was
+# dropped for selecting too much of the corpus. Two expansions of the same size are different
+# claims about the store when one came from a capture and the other from a place.
+EXPANSION_ROWS = "mindbridge.expansion.rows"
+EXPANSION_EDGES = "mindbridge.expansion.edges"
+EXPANSION_DROPPED_EDGES = "mindbridge.expansion.dropped_edges"
 EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
