@@ -872,16 +872,24 @@ def test_rebuild_replaces_all_documents_and_delete_is_idempotent(tmp_path: Path)
         assert index.doc_count == 0
 
 
-def test_a_merge_after_a_delete_keeps_every_vector_bound_to_its_own_id(tmp_path: Path) -> None:
+@pytest.mark.parametrize("dead_row", ("delete", "replace", "duplicate"))
+def test_a_merge_over_a_dead_row_keeps_every_vector_bound_to_its_own_id(
+    tmp_path: Path,
+    dead_row: str,
+) -> None:
     """A merged index must answer with the vectors it was given, not its neighbours'.
 
-    Zvec 0.7 merges a collection that still holds a dead row -- a deleted document, or the
-    superseded copy of one that was upserted again -- by writing the surviving vectors densely
-    while the ids keep their pre-merge positions, so every document from the first dead row
-    onwards is served its neighbour's vector. Nothing reports it: the scalar fields, `doc_count`
-    and the number of hits all stay right, and only the ranking is wrong. A 2,847-record ingest
-    that deleted during the run and merged when it closed agreed with an exhaustive cosine over
-    its own stored vectors on 0.15 of its top 100 instead of 0.99.
+    Zvec 0.7 merges a collection that still holds a dead row -- a document it stores but no
+    longer serves -- by writing the surviving vectors densely while the ids keep their pre-merge
+    positions, so every document from the first dead row onwards is served its neighbour's
+    vector. Nothing reports it: the scalar fields, `doc_count` and the number of hits all stay
+    right, and only the ranking is wrong. A 2,847-record ingest that deleted during the run and
+    merged when it closed agreed with an exhaustive cosine over its own stored vectors on 0.15 of
+    its top 100 instead of 0.99.
+
+    All three sources are parametrized because each is detected differently: a delete is known at
+    the call, while a replacement and a repeat inside one batch are known only from a document
+    count that grew by less than the batch written.
     """
     _require_zvec()
     path = tmp_path / "index"
@@ -889,21 +897,40 @@ def test_a_merge_after_a_delete_keeps_every_vector_bound_to_its_own_id(tmp_path:
     # exhaustive ranking is total and a vector served one position off is a different answer.
     step = math.pi / 128
     angles = {f"embedding_{number:02d}": number * step for number in range(32)}
-    vectors = {name: (math.cos(angle), math.sin(angle)) for name, angle in angles.items()}
-    documents = [_document(name, f"note {name}", values) for name, values in vectors.items()]
+
+    def place(name: str, angle: float) -> IndexDocument:
+        angles[name] = angle
+        return _document(name, f"note {name}", (math.cos(angle), math.sin(angle)))
+
+    documents = [place(name, angle) for name, angle in dict(angles).items()]
 
     with ZvecIndex(path, dimension=2) as index:
         # One flush per batch, the way a drain applies the outbox.
         for start in range(0, len(documents), 8):
             index.upsert(documents[start : start + 8])
             index.flush()
-        index.delete(["embedding_00"])
+        if dead_row == "delete":
+            index.delete(["embedding_00"])
+            del angles["embedding_00"]
+        elif dead_row == "replace":
+            # Five ids written a second time: each first copy is now a dead row.
+            index.upsert(
+                [place(f"embedding_{number:02d}", (32 + number) * step) for number in range(5)]
+            )
+        else:
+            # The same new id twice inside one batch, so its first copy never lives.
+            index.upsert(
+                [
+                    _document("embedding_40", "note first", (math.cos(0.1), math.sin(0.1))),
+                    place("embedding_40", 40 * step),
+                ]
+            )
         index.flush()
-        del vectors["embedding_00"]
         # What the projection does for a session that wrote, when it closes.
         index.optimize()
         index.flush()
 
+    vectors = {name: (math.cos(angle), math.sin(angle)) for name, angle in angles.items()}
     with ZvecIndex(path, dimension=2) as reopened:
         assert reopened.doc_count == len(vectors)
         for name, values in vectors.items():
@@ -919,6 +946,83 @@ def test_a_merge_after_a_delete_keeps_every_vector_bound_to_its_own_id(tmp_path:
             )
             ranked = [hit.id for hit in reopened.search(query, limit=5, exact=True)]
             assert ranked == exhaustive[:5]
+
+
+def test_only_a_collection_left_clean_is_merged_in_place_by_its_next_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copying the collection is the price of a dead row, not of having been written before.
+
+    Nothing on disk says whether an inherited collection holds one, so a session that closes a
+    collection it knows to be clean says so with a marker beside it, and a session that finds no
+    marker -- because the last one deleted something, or was killed -- copies. Without that, one
+    added record rewrote the whole collection at every close, forever: 2.13 s against 0.54 s on a
+    48 MB store, and about 21 s on the 481 MB store the close-time merge was written for.
+    """
+    _require_zvec()
+    path = tmp_path / "index"
+    marker = tmp_path / ".index.clean"
+    compactions = 0
+    original = ZvecIndex._compact
+
+    def counted(self: ZvecIndex, **options: int) -> None:
+        nonlocal compactions
+        compactions += 1
+        original(self, **options)
+
+    monkeypatch.setattr(ZvecIndex, "_compact", counted)
+
+    with ZvecIndex(path, dimension=2) as index:
+        index.upsert(
+            [_document(f"embedding_{n:02d}", f"note {n}", (1.0, float(n))) for n in range(8)]
+        )
+        index.flush()
+        index.delete(["embedding_00"])
+        index.flush()
+        index.optimize()
+    assert compactions == 1
+    assert marker.exists()
+
+    with ZvecIndex(path, dimension=2) as reopened:
+        # The claim is consumed at open: a crash from here on must not leave it standing.
+        assert not marker.exists()
+        assert reopened._dead_rows is False
+        reopened.upsert([_document("embedding_08", "note 8", (1.0, 8.0))])
+        reopened.flush()
+        reopened.optimize()
+        assert reopened._dead_rows is False
+    assert compactions == 1
+    assert marker.exists()
+
+    marker.unlink()
+    with ZvecIndex(path, dimension=2) as inherited:
+        assert inherited._dead_rows is True
+        inherited.optimize()
+    assert compactions == 2
+    assert marker.exists()
+
+    with ZvecIndex(path, dimension=2) as verified:
+        assert verified.doc_count == 8
+        for number in (1, 4, 8):
+            name = f"embedding_{number:02d}"
+            assert verified.search((1.0, float(number)), limit=1, exact=True)[0].id == name
+
+
+def test_open_sweeps_the_debris_a_killed_compaction_leaves(tmp_path: Path) -> None:
+    """A killed compaction leaves a full second copy of the index and nothing else removes it."""
+    _require_zvec()
+    path = tmp_path / "index"
+    with ZvecIndex(path, dimension=2) as index:
+        index.upsert([_document("embedding", "note", (1.0, 0.0))])
+        index.flush()
+    debris = tmp_path / ".index.compact-abc123"
+    (debris / "old" / "0").mkdir(parents=True)
+    (debris / "old" / "0" / "segment").write_bytes(b"stale")
+
+    with ZvecIndex(path, dimension=2) as reopened:
+        assert reopened.doc_count == 1
+    assert not debris.exists()
 
 
 def test_a_write_batch_above_the_native_limit_is_chunked_rather_than_refused(

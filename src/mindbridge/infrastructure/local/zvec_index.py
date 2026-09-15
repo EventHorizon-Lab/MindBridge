@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from shutil import rmtree
 from tempfile import TemporaryDirectory
 from threading import Condition, RLock, get_ident
 from types import ModuleType
@@ -280,10 +281,19 @@ class ZvecIndex:
         self._gate = _CollectionGate()
         self._zvec: Any = _load_zvec()
         self._schema = self._build_schema()
+        # Until the collection has been opened and read, assume the worst of it, so a
+        # constructor that fails part way through cannot leave a clean marker behind.
+        self._dead_rows = True
+        # A compaction that was killed leaves behind a complete second copy of the collection,
+        # and this path has one live owner, so anything left here is debris from a dead session.
+        for debris in self.path.parent.glob(f".{self.path.name}.compact-*"):
+            with suppress(OSError):
+                rmtree(debris)
         with _INDEX_MAINTENANCE_LOCK:
             _require_file_descriptor_headroom(_persisted_index_file_count(self.path))
             option = self._zvec.CollectionOption(read_only=False, enable_mmap=True)
-            if self.path.exists():
+            inherited = self.path.exists()
+            if inherited:
                 self._collection: object | None = self._zvec.open(str(self.path), option=option)
             else:
                 self._collection = self._zvec.create_and_open(
@@ -299,14 +309,15 @@ class ZvecIndex:
             persisted_segments = _persisted_segment_count(self.path)
             self._flushes_since_optimization = persisted_segments
             self._flushes_since_compaction = persisted_segments
-            # A collection someone else wrote can already hold dead rows -- it could have been
-            # killed between a delete and the merge that would have cleared them -- and nothing
-            # on disk says whether it does, so an inherited one is merged the safe way. See
-            # `optimize`.
-            # ponytail: that costs one full rewrite per writing session on an existing store
-            # (2.8 s per 100 MB measured). Record a clean marker beside the collection when a
-            # session ends having only added documents, if that ever shows up in a close.
-            self._dead_rows = persisted_segments > 0
+            # A collection someone else wrote can hold dead rows, and Zvec does not report
+            # whether it does, so what stands in for that is a marker the previous owner leaves
+            # only when it closed a collection it knew to be clean. No marker means a session
+            # that deleted, replaced, or was killed, so an inherited collection is merged the
+            # safe way. The marker goes now rather than at the first write: this session is the
+            # one live owner, and a crash before its own close must not leave a stale claim.
+            self._dead_rows = inherited and not self._clean_marker.exists()
+            with suppress(OSError):
+                self._clean_marker.unlink()
         except BaseException:
             self.close()
             raise
@@ -530,7 +541,7 @@ class ZvecIndex:
             raise ValueError("concurrency must be a non-negative integer")
         with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
             if self._dead_rows:
-                self._compact()
+                self._compact(concurrency=concurrency)
                 return
             collection = cast(Any, self._require_collection())
             collection.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
@@ -558,9 +569,11 @@ class ZvecIndex:
             # A fixed flush threshold cannot protect concurrent collections: four collections can
             # exhaust a 1024-FD process after roughly 32 flushes each, before any one reaches the
             # old 64-flush optimization boundary. Use the shared resource itself as the early
-            # signal. Mature collections optimize first because merging reclaims most segment
-            # descriptors without copying the collection; young collections replace directly
-            # because opening their full optimized index would increase pressure.
+            # signal. Mature collections optimize first because merging a clean collection
+            # reclaims most segment descriptors without copying it; young collections replace
+            # directly because opening their full optimized index would increase pressure. A
+            # collection carrying a dead row has no cheap branch -- `optimize` copies it too --
+            # so the two differ only in how much they release for the copy they both pay.
             if self._maintain_under_pressure():
                 return True
 
@@ -593,7 +606,7 @@ class ZvecIndex:
             return True
         return maintained
 
-    def _compact(self) -> None:
+    def _compact(self, *, concurrency: int = 0) -> None:
         """Copy visible documents into one flushed collection, then atomically replace it."""
         _require_file_descriptor_headroom()
         with TemporaryDirectory(
@@ -610,6 +623,7 @@ class ZvecIndex:
                     schema=self._schema,
                     option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
                 )
+                copied = 0
                 with self._gate.read():
                     source = cast(Any, self._require_collection())
                     batch = []
@@ -618,11 +632,23 @@ class ZvecIndex:
                             batch.append(document)
                             if len(batch) == _DEFAULT_REBUILD_BATCH_SIZE:
                                 self._upsert_native(target, batch, action="compact")
+                                copied += len(batch)
                                 batch.clear()
                     if batch:
                         self._upsert_native(target, batch, action="compact")
-                if int(target.stats.doc_count):
-                    target.optimize(self._zvec.OptimizeOption(concurrency=0))
+                        copied += len(batch)
+                written = int(target.stats.doc_count)
+                if written != copied:
+                    # The replacement is about to be merged and then declared clean, so a
+                    # duplicate among the copied documents would be a dead row nothing could
+                    # detect afterwards. `iter_docs` does not produce one on 0.7; refuse rather
+                    # than inherit the very defect this path exists to avoid.
+                    raise ZvecWriteError(
+                        f"compaction copied {copied} documents into a collection holding "
+                        f"{written}; refusing to merge it"
+                    )
+                if written:
+                    target.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
                 target.flush()
                 target.close()
                 target = None
@@ -760,6 +786,11 @@ class ZvecIndex:
         self.flush()
         return count
 
+    @property
+    def _clean_marker(self) -> Path:
+        """Where the last owner records that it left no dead row behind; see `optimize`."""
+        return self.path.parent / f".{self.path.name}.clean"
+
     def close(self) -> None:
         """Close and release Zvec's native file lock; repeated calls are safe."""
         with self._gate.write():
@@ -768,6 +799,11 @@ class ZvecIndex:
             collection = cast(Any, self._collection)
             self._collection = None
             collection.close()
+            # Written last, so only an orderly close of a collection with nothing dead in it
+            # hands the next owner the cheap in-place merge.
+            if not self._dead_rows:
+                with suppress(OSError):
+                    self._clean_marker.touch()
 
     def _dense_query(
         self,
