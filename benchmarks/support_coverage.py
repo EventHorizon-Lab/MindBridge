@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from openai import OpenAI
+from openai import APIError, OpenAI
 
 from mindbridge import (
     AnswerPolicy,
@@ -59,6 +59,7 @@ from mindbridge.benchmarks._official.longmemeval_prompts import (
     parse_answer_check,
 )
 from mindbridge.benchmarks.longmemeval import load_longmemeval
+from mindbridge.exceptions import ModelError
 from mindbridge.models.openai_sdk import OpenAIModels
 
 RECALL_LIMIT = 12
@@ -279,6 +280,14 @@ def _turn_ids(hits: Sequence[SearchHit]) -> frozenset[str]:
     return frozenset(str(hit.metadata["source_id"]) for hit in hits if "source_id" in hit.metadata)
 
 
+# A shared gateway returns the occasional 502, and one of them threw away 53 minutes of a 120
+# question run at question 78. The retry unit is the whole question, not the request: a failure
+# part way through leaves some arms scored and some not, and a question is cheap to redo while a
+# run is not.
+_RETRY_ATTEMPTS = 4
+_RETRY_BACKOFF_SECONDS = 5.0
+
+
 def _question_outcomes(
     question: object,
     *,
@@ -453,34 +462,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     client = _generation_client(settings)
     done = threading.Lock()
     finished = 0
+    abandoned: list[tuple[str, str]] = []
     started = time.perf_counter()
     collected: list[tuple[Outcome, ...]] = []
     with tempfile.TemporaryDirectory(prefix="support-coverage-") as root:
 
         def run(question: object) -> tuple[Outcome, ...]:
-            nonlocal finished
-            outcomes = _question_outcomes(
-                question,
-                root=Path(root),
-                arms=arms,
-                settings=settings,
-                client=client,
-                capture_context=not args.no_capture_context,
-            )
+            nonlocal finished, abandoned
+            question_id = str(question.question_id)  # type: ignore[attr-defined]
+            outcomes: tuple[Outcome, ...] = ()
+            reason = ""
+            for attempt in range(_RETRY_ATTEMPTS):
+                try:
+                    outcomes = _question_outcomes(
+                        question,
+                        root=Path(root),
+                        arms=arms,
+                        settings=settings,
+                        client=client,
+                        capture_context=not args.no_capture_context,
+                    )
+                    break
+                except (APIError, ModelError) as error:
+                    reason = f"{type(error).__name__}: {error}"
+                    if attempt + 1 == _RETRY_ATTEMPTS:
+                        break
+                    time.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
             with done:
                 finished += 1
-                shown = " ".join(
-                    f"{o.arm}={o.support[:8]}/{'y' if o.correct > 0.5 else 'n'}" for o in outcomes
-                )
+                if outcomes:
+                    shown = " ".join(
+                        f"{o.arm}={o.support[:8]}/{'y' if o.correct > 0.5 else 'n'}"
+                        for o in outcomes
+                    )
+                else:
+                    abandoned.append((question_id, reason))
+                    shown = f"ABANDONED {reason[:120]}"
                 print(
-                    f"[{finished}/{len(questions)}] {outcomes[0].question_id} {shown}",
+                    f"[{finished}/{len(questions)}] {question_id} {shown}",
                     file=sys.stderr,
                     flush=True,
                 )
             return outcomes
 
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            collected = list(pool.map(run, questions))
+            collected = [rows for rows in pool.map(run, questions) if rows]
 
     by_arm = {
         arm.name: [row for rows in collected for row in rows if row.arm == arm.name] for arm in arms
@@ -489,6 +515,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = {
         "dataset": str(args.dataset),
         "questions": len(questions),
+        "scored_questions": len(collected),
+        # Named, not silently dropped: a report whose denominator moved has to say so.
+        "abandoned": [{"question_id": qid, "reason": why} for qid, why in abandoned],
         "offset": args.offset,
         "recall_limit": RECALL_LIMIT,
         "evidence_budget_chars": args.evidence_budget_chars,
@@ -507,7 +536,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "accuracy_by_support": _accuracy_by_support(
             [row for rows in collected for row in rows],
         ),
-        "paired_against_window": {arm.name: _paired(control, by_arm[arm.name]) for arm in arms[1:]},
+        "paired_against_window": {
+            arm.name: _paired(
+                control,
+                by_arm[arm.name],
+                same_budget=arm.budget == arms[0].budget,
+            )
+            for arm in arms[1:]
+        },
         "samples": [
             {row.arm: {k: v for k, v in asdict(row).items() if k != "window_ids"} for row in rows}
             for rows in collected
