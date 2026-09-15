@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -580,6 +582,31 @@ def test_reindexing_does_not_re_describe_stored_visuals(tmp_path: Path) -> None:
 
         assert describer.calls == 1
         assert _caption(memory.get(record.id).content) == caption
+
+
+def test_only_a_store_with_embeddings_announces_a_rebuild(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`data_dir/zvec` is absent until the index creates it, so "missing" alone means nothing.
+
+    Every first open therefore looked like a rebuild in the log. What separates the two is the
+    store: only embeddings that have to be projected again are a rebuild.
+    """
+    with (
+        caplog.at_level(logging.INFO, logger="mindbridge.memory"),
+        Memory(tmp_path, embedder=_Embedder()) as memory,
+    ):
+        record = memory.add("a kite over the harbour")
+    assert "rebuilding the search index" not in caplog.text
+
+    shutil.rmtree(tmp_path / "zvec")
+    caplog.clear()
+    with (
+        caplog.at_level(logging.INFO, logger="mindbridge.memory"),
+        Memory(tmp_path, embedder=_Embedder()) as memory,
+    ):
+        assert [hit.id for hit in memory.search("kite over the harbour")] == [record.id]
+    assert "rebuilding the search index for" in caplog.text
 
 
 def test_decay_demotes_an_old_memory_without_evicting_it(tmp_path: Path) -> None:
