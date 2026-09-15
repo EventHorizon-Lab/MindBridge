@@ -468,7 +468,9 @@ identical to baseline -- because a rerank pool a hundred candidates deep fills a
 expansion is reached. On a text corpus whose captures the ranking already covers, the capture edge
 has nothing left to add; the setting is off by default for that reason, and the edges that a
 ranking cannot cover -- a person, a room, a claim's lineage -- are the ones a measurement on an
-embodied corpus still has to decide.
+embodied corpus still has to decide. The actionable consequence: with a character budget set the
+setting changes nothing, so it is worth enabling only where `evidence_budget_chars` is `None` and
+the window is `limit` rows that linked rows can follow.
 
 What expansion adds is reported to the reader as records linked to the evidence rather than records
 a predicate matched, so nothing it adds licenses a count, and the count is the number of rows
