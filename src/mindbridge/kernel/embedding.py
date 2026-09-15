@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import math
 from collections.abc import (
+    Mapping,
     Sequence,
 )
 from dataclasses import replace
@@ -28,6 +29,7 @@ from mindbridge.kernel.content import (
 from mindbridge.kernel.contracts import Backends, fallback_unsupported, require_audio_transcription
 from mindbridge.kernel.derived import (
     derived_text,
+    has_indexed_speech,
     has_stream_description,
     has_stream_transcript,
     retrieval_content,
@@ -336,6 +338,39 @@ class Embedding(Traced):
         previous_speaker_id: str | None = None,
         update_operation: bool = True,
     ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        return self._refresh_speech_memories(
+            memories,
+            speakers={
+                speaker_id: (speaker_id, speaker_name),
+                previous_speaker_id: (speaker_id, speaker_name),
+            },
+            operation=operation,
+            update_operation=update_operation,
+        )
+
+    def refresh_naming_memories(
+        self,
+        names: Mapping[str, str | None],
+        memories: Sequence[StoredMemory],
+        *,
+        operation: OperationAssets,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        """Repaint all changed names together, including shared speech documents."""
+        return self._refresh_speech_memories(
+            tuple(memory for memory in memories if has_indexed_speech(memory)),
+            speakers={identity_id: (identity_id, name) for identity_id, name in names.items()},
+            operation=operation,
+            update_operation=True,
+        )
+
+    def _refresh_speech_memories(
+        self,
+        memories: Sequence[StoredMemory],
+        *,
+        speakers: Mapping[str | None, tuple[str, str | None]],
+        operation: OperationAssets,
+        update_operation: bool,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
         prepared: list[tuple[StoredMemory, PreparedContent]] = []
         for memory in memories:
             segments_by_asset: dict[str, tuple[SpeakerSegment, ...]] = {}
@@ -353,10 +388,10 @@ class Embedding(Traced):
                     refreshed = tuple(
                         replace(
                             segment,
-                            speaker_id=speaker_id,
-                            speaker_name=speaker_name,
+                            speaker_id=identity[0],
+                            speaker_name=identity[1],
                         )
-                        if segment.speaker_id in {speaker_id, previous_speaker_id}
+                        if (identity := speakers.get(segment.speaker_id)) is not None
                         else segment
                         for segment in segments
                     )

@@ -37,6 +37,11 @@ from mindbridge.infrastructure.local.store._lineage import (
     set_forgotten,
     version_retired,
 )
+from mindbridge.infrastructure.local.store._naming_projection import (
+    NamingProjectionFactory,
+    naming_snapshot,
+    refresh_naming_documents,
+)
 from mindbridge.infrastructure.local.store._operations import (
     active_operation_id,
     insert_operation,
@@ -266,6 +271,7 @@ class OperationLog:
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        naming_projection_factory: NamingProjectionFactory | None = None,
     ) -> StoredOperation | None:
         """Apply one already-validated operation and its log row in one transaction.
 
@@ -291,6 +297,10 @@ class OperationLog:
                 return None
             require_active_memories(connection, require_active)
             require_unretired_memories(connection, require_unretired)
+            naming_before = naming_snapshot(
+                connection,
+                (*(memory_id for memory_id, _source in reinforce), *correct_ids, *forget_ids),
+            )
             changed: list[str] = []
             linked: list[tuple[str, str]] = []
             clause_changes: list[StoredEvidenceClauseChange] = []
@@ -323,7 +333,9 @@ class OperationLog:
                 linked=tuple(linked),
                 clause_changes=tuple(clause_changes),
             )
-            return replace(applied, operation_id=insert_operation(connection, applied))
+            logged = replace(applied, operation_id=insert_operation(connection, applied))
+            refresh_naming_documents(connection, naming_before, naming_projection_factory)
+            return logged
 
     def rollback_operation(
         self,
@@ -341,6 +353,7 @@ class OperationLog:
         split_identity: str | None = None,
         merge_identities: tuple[str, str] | None = None,
         require_no_later_dependencies: Sequence[str] = (),
+        naming_projection_factory: NamingProjectionFactory | None = None,
     ) -> tuple[bool, tuple[StoredAsset, ...]]:
         """Apply the caller's reversal and mark one operation rolled back, atomically.
 
@@ -393,6 +406,18 @@ class OperationLog:
                 return False, ()
             if not evidence_clause_changes_are_current(connection, reverse_clause_changes):
                 return False, ()
+            naming_before = naming_snapshot(
+                connection,
+                (
+                    *delete_memory_ids,
+                    *(memory_id for memory_id, _source in retire_evidence),
+                    *(memory_id for memory_id, _clause in retire_clauses),
+                    *(change.memory_id for change in reverse_clause_changes),
+                    *retire_versions,
+                    *(entry if isinstance(entry, str) else entry[0] for entry in restore_versions),
+                    *clear_forgotten,
+                ),
+            )
             # Both identity reversals refuse before they write, so a refusal here leaves the
             # transaction with nothing to undo. The merge plan is checked rather than trusted:
             # re-merging under the wrong survivor would silently rename a person.
@@ -433,6 +458,7 @@ class OperationLog:
                 (
                     *(memory_id for memory_id, _source in retire_evidence),
                     *(memory_id for memory_id, _clause in retire_clauses),
+                    *(change.memory_id for change in reverse_clause_changes),
                     *retire_versions,
                     *(entry if isinstance(entry, str) else entry[0] for entry in restore_versions),
                     *clear_forgotten,
@@ -442,6 +468,7 @@ class OperationLog:
                 "UPDATE memory_operations SET rolled_back_at = ? WHERE operation_id = ?",
                 (datetime_text(reverted_at), operation_id),
             )
+            refresh_naming_documents(connection, naming_before, naming_projection_factory)
         return True, tuple({asset.asset_id: asset for asset in unreferenced}.values())
 
     def read_operations(

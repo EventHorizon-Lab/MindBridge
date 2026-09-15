@@ -10,6 +10,23 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- An opt-in independent evidence projection. `MemoryConfig.independent_evidence` (default
+  `False`, also a `Memory(...)` keyword) replaces the capture-group noisy-OR summary with a
+  bounded AND/OR proof search over the evidence graph: two disjoint joint assessments corroborate
+  a derived memory, while repeated captures of one moment and overlapping intermediate summaries
+  cannot corroborate one another. On a fixed-proposal structural harness over thirteen graph
+  families it recovered legitimate corroboration in 6/6 families rather than 4/6 and produced
+  false corroboration in 0/7 rather than 3/7; it was not shown to improve natural interaction or
+  multimodal recall, and the end-to-end prototype built on it was rejected, so the mechanism
+  ships off by default. Support saturates at two and confidence is maximized separately, and a
+  projection reads at most 256 records, 4,096 clause members, 64 retained proofs per node and
+  4,096 steps -- past any of those it reports a lower bound and logs that it did, and adding
+  evidence can change the retained subset. The policy is pinned in store metadata as
+  `evidence.projection_recipe`: an unmarked non-empty store is `legacy-v1`, so enabling the
+  projection needs a fresh `data_dir` and a replay, and reopening a store under the other policy
+  raises `StorageError`. A binary older than this release does not enforce the marker and must
+  not open an `independent-v1` store. `python -m mindbridge.benchmarks.corroboration` runs the
+  structural harness through the public SDK.
 - A recall plan's `match` or `window` step may take `"time": "step:<index>"` and read inside the
   span an earlier step's rows cover. A row's stated dates win over its event time -- ISO days,
   `Month YYYY`, `Month D, YYYY`, `D Month YYYY`, `D-D` ranges, and a year-less day joined to a
@@ -571,6 +588,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   never flushed does not merge, even on a store already carrying that debt -- opening someone
   else's store to read it must hand back the bytes it was given, and the next writer pays the debt
   anyway, which is what bounds the growth. `Index.optimize_if_needed` gains `minimum_flushes`.
+- A merge of a collection that can hold a dead row copies the collection instead of merging it in
+  place, at about 4 s per 100 MB. A session that closes a collection it knows to be clean records
+  that in a `zvec/.mindbridge-clean` marker inside it, so the next owner merges in place again; a
+  session that deleted anything, or that was killed, leaves no marker and the next owner copies
+  once. The marker is part of the collection directory, so a restored backup carries its own.
+  `.zvec.compact-*` debris from a killed copy is removed at the next open.
 - Identity matching scores one observation against the whole exemplar bank as a matrix instead
   of unpacking and re-normalising every stored exemplar into Python tuples on every call.
   Measured on a 46,360-exemplar store the per-row scan cost 1.3 s per speaker label and grew
@@ -993,6 +1016,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   hold a graph the widened search raised `IndexUnavailableError`. Every candidate list the index
   sends is now clamped to that bound, and `ZvecIndex(ef_search=...)` rejects a value outside it up
   front.
+- The search index no longer merges a Zvec collection that still holds a *dead row* -- a document
+  Zvec stores but no longer serves, left by a delete or by a second write of an id it already
+  held -- in place. Zvec 0.7 merges such a collection by writing the surviving vectors densely
+  while the ids keep their pre-merge positions, so every document from the first dead row onwards
+  was served its neighbour's vector, with `doc_count`, `index_completeness`, the scalar fields and
+  the hit count all still correct and only the ranking wrong. One delete in a 1,000-record ingest
+  moved the dense ranking from 1.00 to 0.10 agreement with an exhaustive cosine over the store's
+  own vectors; a 2,847-record store shipped at 0.15 overlap@100. Such a collection is now merged
+  by copying its live documents into a fresh one, which has nothing dead to skip.
 - Benchmark speech look-ahead stops accepting work, cancels queued analysis, and waits for
   running analysis before the pool closes its model backends, including when ingest fails.
 - A recall step whose anchor has no usable date is reported as incomplete rather than as an
@@ -1388,6 +1420,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Upgrade notes
 
+- A store built from source before the dead-row merge fix may hold an index whose vectors are
+  bound to the wrong records: any store whose index was merged while it held a deleted or
+  re-embedded document. Run the self-check in [operations](docs/operations.md) and repair an
+  affected store with `reindex()`; SQLite is authoritative and unaffected, so nothing is lost.
 - Existing PostgreSQL data is not converted automatically. Export the source text, metadata,
   event time, and source media, then ingest into a new local directory.
 - Old Python signatures, REST routes, MCP tools, CLI commands, and environment variables are not
