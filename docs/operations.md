@@ -120,6 +120,45 @@ If Zvec cannot open or appears corrupt:
 Never edit `search_index_queue`, replace `zvec/`, or move authoritative files while a `Memory` is
 live.
 
+A merge is not always a merge in place. Zvec 0.7 merges a collection that still holds a *dead
+row* — a document it stores but no longer serves, left by a delete or by a second write of an id
+it already held — by writing the surviving vectors densely while the ids keep their pre-merge
+positions, so every document from the first dead row onwards is then served its neighbour's
+vector. MindBridge therefore merges such a collection by copying its live documents into a fresh
+one, which costs about 2.8 s per 100 MB instead of a merge in place, and a session that opened a
+store somebody else wrote takes that route once because nothing on disk says whether the
+collection it inherited is carrying one.
+
+An index merged with that defect present cannot be told from a healthy one by `doc_count`,
+`index_completeness`, or the number of hits a search returns: only the ranking is wrong. Check a
+store by asking the index for the vectors it already holds — each one must find its own document
+first:
+
+```python
+import sqlite3
+
+import numpy as np
+
+from mindbridge.infrastructure.local.zvec_index import ZvecIndex
+
+connection = sqlite3.connect("file:state.sqlite3?immutable=1", uri=True)
+sample = connection.execute(
+    "SELECT embedding_id, dimension, vector FROM embeddings ORDER BY RANDOM() LIMIT 200"
+).fetchall()
+with ZvecIndex("zvec", sample[0][1]) as index:
+    hits = sum(
+        index.search(tuple(np.frombuffer(vector, dtype="<f4", count=dimension)), limit=1)[0].id
+        == embedding_id
+        for embedding_id, dimension, vector in sample
+    )
+print(f"self-hit {hits / len(sample):.3f}")
+```
+
+A healthy store scores 1.000. A store whose index was merged over a dead row scores close to
+zero — the shipped store this was found on scored 0.060. Repair it by rebuilding from SQLite,
+with `reindex()` or with the `zvec/` procedure above: merging it again cannot repair it, because
+the wrong vector is what the collection now stores.
+
 `capture_queue` is deferred enrichment rather than index work, and no operation drains it
 implicitly. A host that uses `capture()` owns the loop that calls `settle()`, and
 `pending_captures()` is what to alarm on: it returns up to `limit` queued records oldest first,

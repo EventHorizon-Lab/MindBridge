@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import math
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -88,6 +89,8 @@ def test_native_writes_are_serialized_across_collections() -> None:
     calls_lock = Lock()
 
     class BlockingCollection:
+        stats = SimpleNamespace(doc_count=0)
+
         def upsert(self, _documents: Sequence[object]) -> list[_Status]:
             nonlocal calls
             with calls_lock:
@@ -869,6 +872,55 @@ def test_rebuild_replaces_all_documents_and_delete_is_idempotent(tmp_path: Path)
         assert index.doc_count == 0
 
 
+def test_a_merge_after_a_delete_keeps_every_vector_bound_to_its_own_id(tmp_path: Path) -> None:
+    """A merged index must answer with the vectors it was given, not its neighbours'.
+
+    Zvec 0.7 merges a collection that still holds a dead row -- a deleted document, or the
+    superseded copy of one that was upserted again -- by writing the surviving vectors densely
+    while the ids keep their pre-merge positions, so every document from the first dead row
+    onwards is served its neighbour's vector. Nothing reports it: the scalar fields, `doc_count`
+    and the number of hits all stay right, and only the ranking is wrong. A 2,847-record ingest
+    that deleted during the run and merged when it closed agreed with an exhaustive cosine over
+    its own stored vectors on 0.15 of its top 100 instead of 0.99.
+    """
+    _require_zvec()
+    path = tmp_path / "index"
+    # Distinct angles over a quadrant: every cosine between two of them differs, so an
+    # exhaustive ranking is total and a vector served one position off is a different answer.
+    step = math.pi / 128
+    angles = {f"embedding_{number:02d}": number * step for number in range(32)}
+    vectors = {name: (math.cos(angle), math.sin(angle)) for name, angle in angles.items()}
+    documents = [_document(name, f"note {name}", values) for name, values in vectors.items()]
+
+    with ZvecIndex(path, dimension=2) as index:
+        # One flush per batch, the way a drain applies the outbox.
+        for start in range(0, len(documents), 8):
+            index.upsert(documents[start : start + 8])
+            index.flush()
+        index.delete(["embedding_00"])
+        index.flush()
+        del vectors["embedding_00"]
+        # What the projection does for a session that wrote, when it closes.
+        index.optimize()
+        index.flush()
+
+    with ZvecIndex(path, dimension=2) as reopened:
+        assert reopened.doc_count == len(vectors)
+        for name, values in vectors.items():
+            # Query with a stored vector: the document it belongs to must come back first.
+            assert reopened.search(values, limit=1, exact=True)[0].id == name
+        for name in vectors:
+            # Off every stored angle, so the exhaustive ranking is strict and has no tie to break.
+            offset = angles[name] + step / 3
+            query = (math.cos(offset), math.sin(offset))
+            exhaustive = sorted(
+                vectors,
+                key=lambda other: -(query[0] * vectors[other][0] + query[1] * vectors[other][1]),
+            )
+            ranked = [hit.id for hit in reopened.search(query, limit=5, exact=True)]
+            assert ranked == exhaustive[:5]
+
+
 def test_a_write_batch_above_the_native_limit_is_chunked_rather_than_refused(
     tmp_path: Path,
 ) -> None:
@@ -969,12 +1021,16 @@ class _FakeZvec:
 
 
 class _FailingCollection:
+    stats = SimpleNamespace(doc_count=0)
+
     @staticmethod
     def upsert(_documents: Sequence[object]) -> list[_Status]:
         return [_Status(_StatusCode.INTERNAL_ERROR, "disk full")]
 
 
 class _FileDescriptorFailingCollection:
+    stats = SimpleNamespace(doc_count=0)
+
     @staticmethod
     def upsert(_documents: Sequence[object]) -> list[_Status]:
         return [
@@ -986,6 +1042,8 @@ class _FileDescriptorFailingCollection:
 
 
 class _CapturingCollection:
+    stats = SimpleNamespace(doc_count=0)
+
     def __init__(self) -> None:
         self.documents: list[dict[str, object]] = []
 
