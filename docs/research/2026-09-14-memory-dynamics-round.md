@@ -39,10 +39,12 @@ Method rules, frozen before any number was read:
   must report the loss on never-rehearsed gold. A gain that vanishes under this guard is a benchmark
   artefact.
 
-Six hypotheses were registered and all six are closed in Phase 0: H-A, H-B, H-C and H-D in section
+Six hypotheses were registered for Phase 0 and all six are closed: H-A, H-B, H-C and H-D in section
 3, and H-F and H-E — registered later, in Amendments 5 and 3, and resolved last — in section 6. Five
 are kills by their own pre-registered rules; H-F is a post-hoc decision not to build, and section 6
-says so plainly.
+says so plainly. A seventh, H-G, was registered afterwards out of the one positive Phase-0
+measurement and is the round's only Phase 1 (section 7); it was built, reviewed, measured and closed
+on its holdout.
 
 After the round closed, an independent reviewer re-ran every `--selfcheck` and every primary script
 from a scratch copy and re-derived three headline metrics with separate code: `p0_hb`, `p0_hc`,
@@ -51,7 +53,7 @@ from a scratch copy and re-derived three headline metrics with separate code: `p
 1e-5. The arithmetic of this round is sound. What the review changed is what the numbers are allowed
 to mean, and those corrections are carried inline below rather than appended — the caption effect at
 full coverage (section 6), the transcript key on the second split (section 4), H-F's verdict status
-(section 6), the week proxy and the pre-registration integrity (section 7).
+(section 6), the week proxy and the pre-registration integrity (section 9).
 
 Source: `autoresearch/orchestrator-260914/PROTOCOL.md`.
 
@@ -635,12 +637,277 @@ captions; the two must not be compressed into one figure.
 
 Source: `autoresearch/orchestrator-260914/reports/p0-he.md`.
 
-With H-E the round closed (Amendment 7). Its result is the ceiling map of section 4, **five
-pre-registered kills and one post-hoc no-build** (H-F, below), and one write-path measurement that
+With H-E, Phase 0 closed (Amendment 7). Its result is the ceiling map of section 4, **five
+pre-registered kills and one post-hoc no-build** (H-F, above), and one write-path measurement that
 survived independent re-running: enrichment placed in a record's aggregate key costs, and the same
-text placed beside it as a separate key gains.
+text placed beside it as a separate key gains. That last one became the round's only Phase 1, H-G,
+in section 7 — where it failed its holdout.
 
-## 7. What this round establishes for future rounds
+## 7. H-G — write-path key composition (Phase 1)
+
+The one positive measurement of Phase 0 was registered as its own hypothesis in Amendment 9, built
+on the branch `r0914/aggregate-key-composition`, and measured against a rule written before any
+holdout number was read. It failed that rule.
+
+**The registered acceptance rule, verbatim from Amendment 9:**
+
+> - Dev (already read): day graft +3.00 pp hit@12 [+1.0,+5.5] p=0.031. - Holdouts (offline graft,
+> zero model calls, same tooling he_extract/he_mech): memlens-32k, memlens-256k, m3-bench-robot, and
+> mm-lifelong week when available. Metric = the corpus's retrieval hit@12 / cov@12 against its gold
+> evidence ids (if a corpus has no gold ids it is NOT a holdout — say so). Rule: pooled holdout
+> hit@12 delta > 0 with paired bootstrap CI excluding 0, AND no single holdout < −1.0 pp with CI
+> excluding 0. Report every split regardless. - Transfer check: product re-ingest of the day unit
+> with the patched kernel (cached captions, ~18 vision calls), then the 200 questions through the
+> REAL ranking (`search_with_trace`, limit 100) vs the existing captioned day store: hit@12 ≥
+> +1.0 pp with the same sign as the proxy; if the product delta is ≤ 0 the proxy result does not
+> transfer and H-G is not adopted. - Cost rule: embedding calls and rows per observation unchanged
+> (verified by key count); ingest wall-clock within +5 %. - Adversarial review of the patch and of
+> the holdout numbers by a separate agent before the verdict is written.
+
+**The change, in two sentences.** A record's aggregate key (`object_part 0`) now embeds only the
+observation its caller supplied, so the `[visual description:` and `[facts:` sections written by the
+kernel's own describers no longer move the record in embedding space; those sections keep their own
+retrieval keys and stay in the lexical document, and transcripts are untouched. The index recipe
+goes v12 → v13, which means an existing store re-embeds itself when it is opened.
+
+### What the patch review found
+
+Reviewed independently at `631704fa` before any verdict, with `pytest tests/unit -W error` (2,180
+passed), `ruff format --check`, `ruff check` and `mypy` all clean in a detached worktree.
+
+- **F1 — a caption containing a blank line leaked back into the aggregate.**
+  `without_visual_descriptions` split the document on `"\n\n"` and dropped only the chunk that
+  started with a marker, so a two-paragraph caption left its second paragraph in exactly the text
+  the commit exists to remove — reachable from the public API today through
+  `StreamInput.description`. Blast radius was measured, not assumed: across all three description
+  caches on disk, **0 of 34,564 real captions contain a blank line**, so the numbers already read
+  are uncontaminated. Resolved in `5a03d0cc` by ending a section at the next marker rather than the
+  next blank line, which is what the sibling `stored_canonical_parts` helper already did.
+- **F2 — the "key count per observation is unchanged" claim was false.** For a record whose whole
+  text is its caption sections, stripping leaves the aggregate equal to its sole asset key and the
+  duplicate is dropped: a described visual with no caller text goes from 4 keys to 3. Stored content
+  is byte-identical either way and the surviving vector is the asset vector, so it is not a
+  retrieval loss — but it contradicted the commit message, the CHANGELOG, the architecture page and
+  Amendment 9's own cost rule. Resolved in `5f4e576c` by correcting the prose at every site; the
+  transfer check then measured the effect as **−6.6 % vectors**, so the change is cheaper than the
+  baseline rather than more expensive.
+- **F3 — operational, and it would have destroyed the round's own controls.** The v12 → v13 bump is
+  a legacy recipe, so `Memory.__init__` re-embeds a store in place on first open, and the harness
+  opens every unit store through `Memory`. Opening an existing captioned store with the patched
+  kernel would have silently converted arm C into arm G and collapsed the delta to noise. Resolved
+  operationally rather than in code: control stores were snapshotted and read either with the
+  unpatched kernel (`631704fa^`, pinned at `.benchmarks/worktrees/r0914-hg-v12`) or with raw
+  `sqlite3`, and the transfer tooling refuses to open a store whose stored recipe does not match the
+  kernel it is running.
+
+### Holdout — the rule fails
+
+| corpus | status | A | C | G | G − A hit@12 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| memlens-32k (n = 173) | measured | 0.9884 | 1.0000 | 0.9884 | **0.00** [0.00, 0.00], 0/0/173 |
+| memlens-256k (n = 173) | measured | 0.9480 | 0.9538 | 0.9538 | **+0.58** [0.00, +1.73], 1/0/172 |
+| **mm-lifelong week (n = 200)** | measured | — | — | — | **−0.50** [−2.5, +1.0], W/L/T 1/2/197, McNemar 1.000 |
+| **pooled, three holdouts, clustered by question (n = 546)** | — | — | — | — | **0.00 [−0.74, +0.73]**, 2/2/542 |
+| m3-bench-robot | **not a holdout** — the adapter attaches no evidence ids of any kind | — | — | — | — |
+
+The pooled delta is not positive and its CI straddles zero, so **clause 1 fails**; the worst split
+is week at −0.50 pp with a CI including zero, so clause 2 holds.
+
+The two memlens splits are inert, and the reason is in the corpus: arm A is already at 0.9884 and
+0.9480 before anything is applied, captions sit on 11 % of records, the dataset's own
+`Image <file>: <caption>` line is already inside every captioned record's text, and the
+model-written caption key is the argmax for 0.52 % of captioned records. Week is the split that
+actually exercises the mechanism — 99.87 % of its 6,266 clips are captioned and a video record's
+aggregate is a vector plus a few characters of ASR, the same shape as day — and there the caption
+key re-orders the top-12 of **75 of 200** questions and moves gold on **three**, one in and two out,
+for a net −0.50 pp. Its caption key is the argmax for **0.30 %** of pairs, the same 0.3–0.5 % band
+measured on day and on memlens. The product's own recorded rankings put the captioned week store at
+**0.00 pp** `hit@12` against the no-caption store (W/L 33/33), so the day observation that a caption
+*inside* the aggregate hurts does not recur on week either. **The day dev result does not
+generalise.**
+
+### Transfer check — same sign, a quarter of the size, every interval crossing zero
+
+A fresh product ingest of the day unit with the patched kernel, then the 200 questions through the
+real ranking (`search_with_trace`, limit 100) against snapshots of the two existing stores.
+
+| store | hit@12 | hit@36 | cov@12 | all@12 |
+| --- | ---: | ---: | ---: | ---: |
+| **NEW** — patched kernel, fresh ingest | **0.415** | 0.605 | 0.1695 | 0.070 |
+| **C** — caption inside the aggregate | 0.400 | 0.585 | 0.1681 | 0.075 |
+| **A** — no captions | 0.405 | 0.580 | 0.1819 | 0.095 |
+
+| contrast | Δ hit@12 | CI95 | W/L/T | McNemar p |
+| --- | ---: | --- | --- | ---: |
+| NEW − C | **+1.50** | [−3.50, +6.50] | 13/10/177 | 0.68 |
+| NEW − A | **+1.00** | [−4.00, +6.00] | 14/12/174 | 0.85 |
+
+The proxy agrees in sign on every `hit@k` comparison and is **2–4× larger** (proxy NEW − C +6.00 pp,
+NEW − A +3.00 pp), which is expected: the graft changes exactly one key on the control's own record,
+while NEW is an independent ingest carrying its own ASR output, its own speaker clustering and its
+own identity UUIDs. Cost: ingest **41 min** with a warm caption cache and **47 vision requests**,
+and **10,014 stored vectors against C's 10,725 = −6.6 %** — the F2 silent-clip dedup, so the
+registered "unchanged key count" is wrong in the cheap direction. The transfer number is also
+measured on a reindexed copy, for the reason in section 8.
+
+### Verdict
+
+**H-G fails its pre-registered holdout and is closed for this round.** The merge condition — holdout
+and transfer both passing — is not met: the transfer check is met on its point estimate and on
+nothing stronger, and the holdout rule's first clause fails outright.
+`r0914/aggregate-key-composition` (tip `5f4e576c`) stays unmerged and nothing is adopted as a
+default. What survives is narrower than the hypothesis: the day number as a single-split,
+single-video result; the finding on all three corpora that the caption key is the argmax part for
+only 0.3–0.5 % of (query, clip) pairs; and the cost fact that the graft is free where it is inert.
+
+Source: `autoresearch/orchestrator-260914/reports/hg-feasibility.md`, `hg-review.md`,
+`hg-holdout.md`, `hg-transfer.md`, `hg-holdout-week.md`, and `PROTOCOL.md` Amendments 9–12.
+
+## 8. Blocking defect found during the transfer check
+
+Found while validating the transfer measurement, not looked for, and not H-G's.
+
+**Symptom.** A store this branch ingests from scratch gets a Zvec index whose vectors are associated
+with the wrong records. The first hybrid run on the fresh store returned `hit@12` **0.255** against
+the captioned store's 0.400, and its dense ranking overlapped its own exhaustive-cosine ranking by
+**0.15@100**. Deleting `zvec/` and reopening the same SQLite file gives **0.994** overlap and
+`hit@12` **0.415**. Comparing the score the product reports for a memory with that memory's true
+max-over-parts cosine, over the first five hits of the first fifty queries: mean absolute error
+**0.0908** and p95 **0.1818** as ingested, against 0.0004 and 0.0011 after a rebuild. The index
+returns a score belonging to a different vector — a vector-to-id association failure, not a recall
+shortfall. The vectors in SQLite are correct: dumping them and ranking exhaustively in numpy
+reproduces `hit@12` 0.415 exactly.
+
+It is deterministic across runs, present in the store as written by `mindbridge-bench` rather than
+only in a copy, and it survives process restarts. Stores written by pre-branch kernels are
+unaffected — the no-caption and captioned day stores from 09-11 and 09-12 measure **0.990** and
+**0.994** overlap, and their `zvec/0` holds 26 and 40 unmerged segments where the fresh store holds
+one merged 89 MB segment. The defect is present on both `631704fa` and its parent `8b3483e1`, so it
+belongs to the branch lineage and not to the H-G patch, which only changes which text is handed to
+the embedder. The current suspect is the incremental index write path and its interaction with the
+close-time segment merge introduced by r0913b; a reindex-from-SQLite on the same branch also
+produces one merged segment and is correct, so compaction alone does not explain it.
+
+Everything the transfer check reports was therefore measured on a reindexed copy, which is the
+ranking the patched write path is entitled to. Any product run on this branch is invalid until this
+is fixed.
+
+### Root cause
+
+**Zvec 0.7.0 `Collection.optimize()` re-binds vectors to ids whenever the collection still holds a
+dead row.** A *dead row* is a document Zvec stores but no longer serves: one that was deleted, or
+the superseded copy of an id that was upserted a second time. The merge writes the surviving vectors
+densely while the ids keep their pre-merge positions, so every document from the first dead row
+onwards is served its neighbour's vector, and the last one is served nothing at all — the native
+layer logs a read failure past the end of the file. Scalar fields, `memory_id`, `doc_count` and the
+number of hits returned all stay correct, which is why nothing in the store reports it.
+
+It is not the outbox, not multi-part records, not the `ef_search` clamp and not `_compact`. On the
+shipped day store, fetching documents by id and comparing each one's vector with the `embeddings`
+row of the same `embedding_id` gives a different unit vector for **41 of 50** sampled ids, at cosine
+0.33–0.82 — both vectors unit-norm, neither garbage, the document simply carrying someone else's. A
+25-line MindBridge-free reproducer against zvec 0.7.0 shows the whole thing: insert five ids, flush,
+delete the first, flush, `optimize()`, fetch — every vector has shifted by one position and the last
+read runs off the end of the file. The defect belongs upstream.
+
+**The four pre-registered hypotheses.** H1 (the merge re-ids documents) is **confirmed**, and
+sharper than it was stated: it is a re-bind rather than a re-id, it needs no segment merge at all,
+and its condition is the dead row rather than the merge. H2 (the outbox writes stale or duplicate
+ids across flush boundaries) is **falsified as a cause** — a collection that is never merged is
+exact at every size tested; a duplicate id is only a trigger, because the superseded copy is a dead
+row. H3 (delete plus re-upsert leaves both vectors and the merge picks the wrong one) is **half
+right**: both leave a dead row, but the merge does not pick, it shifts every later document
+including ones never touched. H4 (the `ef` clamp) is **falsified**, as predicted — the wrong vector
+comes back from `fetch()` by id, which runs no query and reads no `ef`.
+
+### Bisect, and what r0913b actually did
+
+One product-level reproducer — 1,000 `add()` calls, some deletes, `close()`, reopen, 50 query
+vectors against an exhaustive cosine over the `embeddings` table — run from a detached worktree per
+commit:
+
+| commit | | overlap@100 |
+| --- | --- | ---: |
+| `599ae4b8` | pre-r0913b base | **1.000** |
+| `53e18e05` | Merge Zvec segments at close | **0.104** |
+| `7c1d0c50` | Merge at close only for a session that wrote | 0.104 |
+| `cf6aec4a` | r0913b/ann-completeness merged | 0.104 |
+| `8b3483e1` | this round's base | 0.104 |
+| `8b3483e1` + fix | | **1.000** |
+
+`53e18e05` is where it starts, and it is exactly the commit that added
+`optimize_if_needed(minimum_flushes=2)` at `kernel/projection.py:96`, in the `flush_pending` that
+`Memory.close()` calls last. Before it the only merge was the write-side one at 64 flushes, which a
+day ingest of about 40 flushes never reached — which is also why the two older day stores are
+healthy with 26 and 40 unmerged segments while the fresh one has a single merged 89 MB segment.
+
+**But `53e18e05` is the exposure, not the bug.** On `599ae4b8`, 70 deletes in the same ingest — each
+delete forces a flush, so 70 of them cross the old 64-flush bound — give overlap **0.107**. Any
+store that ever crossed that bound with a dead row present was already corruptible, so the fix
+belongs in `ZvecIndex.optimize()`, the one function every merge routes through, and not in the close
+path. Upstream included.
+
+**The smallest condition is one deleted record.** 1,000 records with 0 deletes gives overlap 1.000;
+1,000 records with **one** `memory.delete()`, then close and reopen, gives **0.104@100**. Nothing
+else about the day store's shape matters — not its 3.52 keys per record, not `object_part`, not
+media, not size. Deleting the *first* document shifts everything after it; one re-upserted id
+corrupts exactly that document and nothing else.
+
+### Fix — `r0914/index-binding-fix` at `1337a01a` (reviewed: PENDING)
+
+Branched from `8b3483e1`; +139 / −1 across three files. `optimize()` merges by copying live
+documents into a fresh collection — the existing `_compact()`, which was already the FD-pressure and
+256-flush path and which is correct because it runs on a collection with nothing dead in it —
+whenever the collection may be carrying a dead row, and keeps the native in-place merge otherwise.
+`_dead_rows` is set where a dead row is created: in `delete()`, and in `upsert()` when the
+collection's document count grew by less than the batch, which is exactly when an id was replaced
+rather than added; it is assumed until the counts say otherwise, so a write that fails part way
+through is assumed to have left one. It starts `True` for a collection that already had persisted
+segments at open, because a previous session could have been killed between a delete and the merge
+that would have cleared it and nothing on disk says whether it was; it is cleared only by the two
+paths that leave the collection provably clean.
+
+Cost: a merge that has to copy runs **2.8 s per 100 MB** — measured on the 10,014-vector,
+2,048-dimension day collection — against roughly zero for an in-place merge of an already-merged
+collection. A bulk ingest into a fresh store pays it once, at close; a session that opens an
+existing store and writes pays it once, at close.
+
+The regression test is
+`tests/unit/infrastructure/local/test_zvec_index.py::test_a_merge_after_a_delete_keeps_every_vector_bound_to_its_own_id`.
+It writes 32 documents at distinct angles in 8-document batches with a flush each — the drain's own
+write path — deletes one, merges, closes, reopens, and asserts both that every stored vector finds
+its own document first and that a query off every stored angle ranks the same as an exhaustive
+cosine over those vectors. Before the fix it fails on `assert 'embedding_01' == 'embedding_02'`,
+which is the shift itself; after it, it passes in 1.2 s. Gates on the fix branch:
+`ruff format --check` and `ruff check` clean, `mypy` clean over 215 files, `pytest -W error` **2,197
+passed**, `git diff --check` clean.
+
+**Reviewed: PENDING** — the fix has not yet been confirmed by the lead.
+
+### What operators have to do
+
+**The fix prevents; it does not repair.** A copy of the shipped `zvec/` opened by the fixed kernel,
+with no rebuild, scores self-hit@1 **0.060** over 200 sampled stored vectors, and **0.060** again
+after the fixed kernel's own merge — the collection now *stores* the wrong vector, so copying it
+forward preserves it. The older, never-merged store scores **1.000**.
+
+So **every store written by a kernel between `53e18e05` and this fix that deleted a record or
+re-wrote an embedding must be reindexed**: `memory.reindex()`, or stop the owner, move `zvec/` aside
+and let startup rebuild it. SQLite is untouched by this defect, so no data is lost and nothing has
+to be re-ingested.
+
+Detection, now written into `docs/operations.md` under index maintenance and repair, is that same
+self-check: sample 200 rows of `embeddings`, query the index with each stored vector, and expect its
+own `embedding_id` at rank 1. A healthy store scores 1.000 and a damaged one near zero, and the gap
+is wide enough that 200 samples settle it. No metric already exported distinguishes the two —
+`doc_count`, `index_completeness` and the hit count are all correct on a corrupted index. Of the
+stores on this machine, the fresh day store is damaged, its rebuilt copy is clean, and the two older
+day stores predate the close-time merge and are clean; anything a benchmark harness wrote from 09-13
+onwards should be checked before its numbers are used.
+
+Source: `autoresearch/orchestrator-260914/reports/index-binding-defect.md`.
+
+## 9. What this round establishes for future rounds
 
 Do not re-test the following on these corpora.
 
@@ -685,34 +952,35 @@ Open design directions the data actually supports.
   people the way users do, by role, kinship or pronoun, which needs an alias-to-identity step no
   benchmark exercises; and a measurement on scores rather than ranks, since a bounded multiplicative
   prior cannot be simulated on rank-only dumps. H-C is closed on evidence, not on principle.
-- **Enrichment as a separate key, with the aggregate untouched — registered as H-G, tested, closed.**
-  The round's one positive measurement was the day graft: at 99.4 % caption coverage, adding the
-  caption as its own retrieval key and leaving the record's aggregate alone is **+3.00 pp `hit@12`
-  [+1.0, +5.5] p = 0.031, W/L 6/0**, confound-free by construction (the control's own record, one
-  extra key, the same speaker ids). Amendment 9 registered it as H-G with a pooled-holdout rule and a
-  product-level transfer check; Amendments 10–12 record the outcome.
-  *Holdouts* (offline graft, zero model calls): memlens-32k 0.00 pp and memlens-256k +0.58 pp are
-  inert — captions sit on 11 % of records and the dataset's own caption is already in every such
-  record's text. **mm-lifelong week, the only holdout that exercises the mechanism at day's coverage
-  (99.87 % of 6,266 clips captioned), is −0.50 pp `hit@12` [−2.5, +1.0], W/L/T 1/2/197.** Pooled
-  over the three holdouts, clustered by question (n = 546): **0.00 pp [−0.74, +0.73]** — the rule's
-  first clause (positive with a CI excluding zero) fails and its second (no split below −1.0 pp)
-  holds. On week the caption key re-orders 75 of 200 top-12 sets and moves gold on three questions,
-  one in and two out; the product's own recorded rankings put the captioned week store at 0.00 pp
-  `hit@12` against the no-caption store (W/L 33/33), so the day observation that a caption inside
-  the aggregate hurts does not recur either.
-  *Transfer*: a product re-ingest of the day unit under the patched kernel is **+1.50 pp `hit@12`
-  against the captioned store [−3.5, +6.5], p = 0.68** — the registered bar met on the point estimate
-  and on nothing stronger, and only on a reindexed copy: the check found that a store ingested from
-  scratch on this branch lineage gets a Zvec index whose vectors are bound to the wrong records (0.15
-  overlap with its own exhaustive ranking, 0.994 after a plain reindex), a blocking defect
-  independent of H-G that is registered for its own root cause and fix.
-  **H-G is closed for this round.** The merge condition — holdout and transfer both passing — is not
-  met, and `r0914/aggregate-key-composition` stays unmerged. What survives: the day number as a
-  single-split, single-video result; the finding on all three corpora that the caption key is the
-  argmax part for only 0.3–0.5 % of (query, clip) pairs; and the cost fact that the graft is free
-  where it is inert (−6.6 % embed keys on day, from the silent-clip dedup). Every week number here
-  is a replay-proxy number (see the proxy caveat below) except the product-level C − A.
+- **Enrichment as a separate key, with the aggregate untouched — registered as H-G, tested, closed**
+  (section 7 carries the patch review, the full holdout and transfer tables and the cost). The
+  round's one positive measurement was the day graft: at 99.4 % caption coverage, adding the caption
+  as its own retrieval key and leaving the record's aggregate alone is **+3.00 pp `hit@12` [+1.0,
+  +5.5] p = 0.031, W/L 6/0**, confound-free by construction (the control's own record, one extra
+  key, the same speaker ids). Amendment 9 registered it as H-G with a pooled-holdout rule and a
+  product-level transfer check; Amendments 10–12 record the outcome. *Holdouts* (offline graft, zero
+  model calls): memlens-32k 0.00 pp and memlens-256k +0.58 pp are inert — captions sit on 11 % of
+  records and the dataset's own caption is already in every such record's text. **mm-lifelong week,
+  the only holdout that exercises the mechanism at day's coverage (99.87 % of 6,266 clips
+  captioned), is −0.50 pp `hit@12` [−2.5, +1.0], W/L/T 1/2/197.** Pooled over the three holdouts,
+  clustered by question (n = 546): **0.00 pp [−0.74, +0.73]** — the rule's first clause (positive
+  with a CI excluding zero) fails and its second (no split below −1.0 pp) holds. On week the caption
+  key re-orders 75 of 200 top-12 sets and moves gold on three questions, one in and two out; the
+  product's own recorded rankings put the captioned week store at 0.00 pp `hit@12` against the
+  no-caption store (W/L 33/33), so the day observation that a caption inside the aggregate hurts
+  does not recur either. *Transfer*: a product re-ingest of the day unit under the patched kernel is
+  **+1.50 pp `hit@12` against the captioned store [−3.5, +6.5], p = 0.68** — the registered bar met
+  on the point estimate and on nothing stronger, and only on a reindexed copy: the check found that
+  a store ingested from scratch on this branch lineage gets a Zvec index whose vectors are bound to
+  the wrong records (0.15 overlap with its own exhaustive ranking, 0.994 after a plain reindex), a
+  blocking defect independent of H-G, which section 8 states in full and which is registered for its
+  own root cause and fix. **H-G is closed for this round.** The merge condition — holdout and
+  transfer both passing — is not met, and `r0914/aggregate-key-composition` stays unmerged. What
+  survives: the day number as a single-split, single-video result; the finding on all three corpora
+  that the caption key is the argmax part for only 0.3–0.5 % of (query, clip) pairs; and the cost
+  fact that the graft is free where it is inert (−6.6 % embed keys on day, from the silent-clip
+  dedup). Every week number here is a replay-proxy number (see the proxy caveat below) except the
+  product-level C − A.
 - **Exposure on video, if the floor is to be bounded.** The reader's window is fixed at 12 clips by
   a 12,000-char-per-asset charge, and the guaranteed `hits[:limit]` prefix is 6.2× the evidence
   budget while `_budgeted_hits` adds zero. That is the documented contract, so the open work is
@@ -727,6 +995,11 @@ replays are dense-only proxies of a hybrid ranking (mean top-12 overlap 81.7 % /
 product's stored order). No answer was scored by a judge in this round. The only product-code
 change, H-G's key-composition patch, lives on an unmerged branch, and its one harness run was the
 transfer check.
+
+**One earlier round's results are now in question.** r0913b's compaction and `ef` gains were
+measured before the index-binding defect of section 8 was known, on stores written by the very
+commits that expose it, so they should be re-verified with the binding self-check on the stores they
+used.
 
 **The mm-lifelong week proxy is not the product, and it is stronger than the product.** Week replay
 overlap@12 is **0.630** and replay `hit@12` is **0.605** against the product's recorded **0.415** —
@@ -765,7 +1038,7 @@ same applies to the H-F exploratory box-filter control and split files; the revi
 box filter independently and matched it exactly, so the numbers are right and only the provenance is
 missing.
 
-## 8. Reproduction
+## 10. Reproduction
 
 Round directory layout, all under `autoresearch/orchestrator-260914/`:
 
@@ -784,25 +1057,35 @@ review-receipts/    tool receipts for the adversarial reviews
 
 Scripts, by hypothesis: `ha_common.py` / `ha_run.py` / `ha_explore.py` (H-A), `p0_hb.py` (H-B),
 `p0_hc.py` (H-C), `p0_hd.py` (H-D), `he_extract.py` / `he_common.py` / `he_endpoints.py` /
-`he_run.py` / `he_diag.py` / `he_mech.py` (H-E), `hf_common.py` / `hf_run.py` (H-F),
-`hg_common.py` / `hg_run.py` / `hg_pool.py` / `hg_week.py` / `hg_transfer_search.py` /
-`hg_transfer_score.py` (H-G),
-`autopsy_common.py` / `autopsy_day.py` / `autopsy_locomo.py` / `autopsy_routes.py` /
+`he_run.py` / `he_diag.py` / `he_mech.py` (H-E), `hf_common.py` / `hf_run.py` (H-F), `hg_common.py`
+/ `hg_run.py` / `hg_pool.py` / `hg_week.py` / `hg_transfer_search.py` / `hg_transfer_score.py`
+(H-G), `autopsy_common.py` / `autopsy_day.py` / `autopsy_locomo.py` / `autopsy_routes.py` /
 `autopsy_examples.py` (the autopsy), `qf_run.py` / `qf_day.py` (query form). Each runs under
 `/home/yons/thomas/MindBridge/.venv/bin/python` with `PYTHONPATH` pointing at this worktree's `src`
 where product code is imported, and each carries a `--selfcheck` that must pass before its report's
 numbers are read. Bootstraps are seeded (seed 42, 10,000 resamples); everything else is
 deterministic.
 
+H-G's Phase 1 additionally pins two detached worktrees and one data root, all left in place:
+`.benchmarks/worktrees/r0914-hg` at `631704fa` (the patched kernel, recipe v13) and
+`.benchmarks/worktrees/r0914-hg-v12` at `631704fa^` = `8b3483e1` (recipe v12, used for every control
+open, because the patched kernel would re-embed a v12 store on open — review finding F3). The fresh
+ingest and the four store copies it was measured against live under `.benchmarks/data/r0914-hg-day`,
+and `hg_transfer_search.py` refuses to open a store whose stored recipe does not match the kernel it
+is running. The branch is `r0914/aggregate-key-composition`, tip `5f4e576c`: `631704fa` carries the
+aggregate rule and the v12 → v13 recipe bump, `5a03d0cc` the marker-aware section helper that closes
+review finding F1, and `5f4e576c` the prose, key-count and migration-cost corrections for F2. It is
+not merged.
+
 `PROTOCOL.sha256` holds fourteen appended lines with thirteen distinct digests — the
 pre-registration plus Amendments 1–12 — and the last line, `26d45f1d…`, is the digest of the file as
-it stands. Reports name the digest they were registered against: `69086e1f…` for H-A's start, `c4b8299c…` for Amendment
-1 as H-A finished, `c3240ee7…` for H-D and the query-form ablation, `3f715e72…` for H-F, and
-`dbac7b7e…` for H-E, `fe193294…` for the H-G memlens holdout, `7500bbe0…` for the H-G week holdout
-and transfer check, and `7f52ed10…` / `26d45f1d…` for Amendments 11 and 12 as written. That
-ordering is internally consistent with each hypothesis being registered before its numbers were
-read, and no amendment edits a prior hypothesis's kill-rule text — but read
-the integrity paragraph in section 7 before treating the chain as an audit trail, because it is
+it stands. Reports name the digest they were registered against: `69086e1f…` for H-A's start,
+`c4b8299c…` for Amendment 1 as H-A finished, `c3240ee7…` for H-D and the query-form ablation,
+`3f715e72…` for H-F, and `dbac7b7e…` for H-E, `fe193294…` for the H-G memlens holdout, `7500bbe0…`
+for the H-G week holdout and transfer check, and `7f52ed10…` / `26d45f1d…` for Amendments 11 and 12
+as written. That ordering is internally consistent with each hypothesis being registered before its
+numbers were read, and no amendment edits a prior hypothesis's kill-rule text — but read the
+integrity paragraph in section 9 before treating the chain as an audit trail, because it is
 hand-appended inside a directory the repository does not track. The protocol itself is reproduced
 byte for byte, inside a fenced block so that nothing is reformatted, at [the r0914 pre-registered
 protocol](2026-09-14-memory-dynamics-protocol.md); it is the only copy of it inside this repository.
