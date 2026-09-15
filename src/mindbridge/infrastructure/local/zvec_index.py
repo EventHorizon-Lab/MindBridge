@@ -284,8 +284,10 @@ class ZvecIndex:
         # Until the collection has been opened and read, assume the worst of it, so a
         # constructor that fails part way through cannot leave a clean marker behind.
         self._dead_rows = True
-        # A compaction that was killed leaves behind a complete second copy of the collection,
-        # and this path has one live owner, so anything left here is debris from a dead session.
+        # A compaction that was killed leaves behind a complete second copy of the collection.
+        # Removing it rests on the storage invariant that one physical `data_dir` has one live
+        # owner -- held by the store's `.mindbridge.lock` -- so no live compaction can own a
+        # workspace here; the glob is scoped to this collection's own name regardless.
         for debris in self.path.parent.glob(f".{self.path.name}.compact-*"):
             with suppress(OSError):
                 rmtree(debris)
@@ -788,8 +790,15 @@ class ZvecIndex:
 
     @property
     def _clean_marker(self) -> Path:
-        """Where the last owner records that it left no dead row behind; see `optimize`."""
-        return self.path.parent / f".{self.path.name}.clean"
+        """Where the last owner records that it left no dead row behind; see `optimize`.
+
+        Inside the collection rather than beside it, so the claim travels with what it describes:
+        a `zvec/` restored from a backup brings its own marker or none, where a marker one
+        directory up would have spoken for whatever was put under it. `_compact` and `rebuild`
+        replace the directory, which drops the claim exactly when it would have to be re-earned,
+        and the leading dot keeps the file out of both persisted-file counts.
+        """
+        return self.path / ".mindbridge-clean"
 
     def close(self) -> None:
         """Close and release Zvec's native file lock; repeated calls are safe."""

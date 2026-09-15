@@ -126,9 +126,10 @@ it already held — by writing the surviving vectors densely while the ids keep 
 positions, so every document from the first dead row onwards is then served its neighbour's
 vector. MindBridge therefore merges such a collection by copying its live documents into a fresh
 one, which costs about 4 s per 100 MB instead of a merge in place. A session that closes a
-collection it knows to be clean leaves a `.zvec.clean` marker beside it so the next owner can
+collection it knows to be clean records that in `zvec/.mindbridge-clean` so the next owner can
 merge in place; a session that deleted anything, or that was killed, leaves none, and the next
-owner copies. Deleting the marker is always safe and never wrong — it only costs one copy.
+owner copies. The marker lives inside the collection, so a `zvec/` restored from a backup carries
+its own claim or none. Deleting it is always safe and never wrong — it only costs one copy.
 
 **Which stores are affected.** Any store whose index was merged while it held a dead row, which
 in practice means: a store written on or after 2026-09-13, when a writing session began merging

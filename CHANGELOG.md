@@ -553,8 +553,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 - A merge of a collection that can hold a dead row copies the collection instead of merging it in
   place, at about 4 s per 100 MB. A session that closes a collection it knows to be clean records
-  that in a `.zvec.clean` marker beside it, so the next owner merges in place again; a session
-  that deleted anything, or that was killed, leaves no marker and the next owner copies once.
+  that in a `zvec/.mindbridge-clean` marker inside it, so the next owner merges in place again; a
+  session that deleted anything, or that was killed, leaves no marker and the next owner copies
+  once. The marker is part of the collection directory, so a restored backup carries its own.
   `.zvec.compact-*` debris from a killed copy is removed at the next open.
 - Identity matching scores one observation against the whole exemplar bank as a matrix instead
   of unpacking and re-normalising every stored exemplar into Python tuples on every call.

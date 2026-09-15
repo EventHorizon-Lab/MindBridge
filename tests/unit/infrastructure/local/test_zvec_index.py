@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from shutil import copytree, rmtree
 from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 from typing import Any, NoReturn, cast
@@ -962,7 +963,7 @@ def test_only_a_collection_left_clean_is_merged_in_place_by_its_next_owner(
     """
     _require_zvec()
     path = tmp_path / "index"
-    marker = tmp_path / ".index.clean"
+    marker = path / ".mindbridge-clean"
     compactions = 0
     original = ZvecIndex._compact
 
@@ -1007,6 +1008,30 @@ def test_only_a_collection_left_clean_is_merged_in_place_by_its_next_owner(
         for number in (1, 4, 8):
             name = f"embedding_{number:02d}"
             assert verified.search((1.0, float(number)), limit=1, exact=True)[0].id == name
+
+
+def test_a_restored_collection_is_judged_by_its_own_marker(tmp_path: Path) -> None:
+    """The claim lives inside the collection, so restoring one cannot inherit another's."""
+    _require_zvec()
+    path = tmp_path / "index"
+    with ZvecIndex(path, dimension=2) as index:
+        index.upsert(
+            [_document(f"embedding_{n:02d}", f"note {n}", (1.0, float(n))) for n in range(4)]
+        )
+        index.flush()
+    assert (path / ".mindbridge-clean").exists()
+    backup = tmp_path / "dirty"
+    copytree(path, backup)
+    with ZvecIndex(backup, dimension=2) as dirty:
+        dirty.delete(["embedding_00"])
+        dirty.flush()
+    assert not (backup / ".mindbridge-clean").exists()
+
+    # The clean collection's marker must not speak for the dirty collection put in its place.
+    rmtree(path)
+    copytree(backup, path)
+    with ZvecIndex(path, dimension=2) as restored:
+        assert restored._dead_rows is True
 
 
 def test_open_sweeps_the_debris_a_killed_compaction_leaves(tmp_path: Path) -> None:
