@@ -323,15 +323,17 @@ def _packed_grounding(
     ranked: Sequence[SearchHit],
     budget_chars: int | None,
 ) -> tuple[SearchHit, ...]:
-    """Fill one budget with the window, then its linked rows, then the rest of the ranking.
+    """Fill one budget with the window, then the rest of the ranking, then its linked rows.
 
-    Admission order is the whole claim expansion makes. The window the ranking earned is
-    mandatory and first, so expansion can never cost a question the evidence it already had.
-    What expansion competes with is the *tail* -- the rows `evidence_budget_chars` buys by
-    walking further down the ranking -- and putting linked rows ahead of that tail is what asks
-    the question worth asking: at one prompt size, is the record this evidence is linked to worth
-    more than the next-best record by cosine. With no budget there is no tail to compete for and
-    the linked rows are simply appended.
+    Admission order is the whole claim expansion makes, and this order is the one the measurement
+    chose. Putting linked rows *ahead* of the budget's ranked tail asked the sharp question -- at
+    one prompt size, is a structurally linked record worth more than the next-best record by
+    cosine -- and on LongMemEval-S at 24 000 characters the answer was no: complete support fell
+    from 0.8917 to 0.8583, three questions won and seven lost, with 11.13 linked rows per question
+    displacing the tail that had been finding the rest of the support. So expansion goes last and
+    spends only what the ranking left unspent, which restores the invariant the recall-program
+    path already keeps: nothing MindBridge adds to a window may cost that window evidence it
+    already had. With no budget there is no tail, and the linked rows are simply appended.
     """
     selected = list(required)
     taken = {hit.id for hit in selected}
@@ -339,7 +341,7 @@ def _packed_grounding(
     # Without a budget the window is `limit` hits and there is no tail: walking the ranking here
     # would hand the reader the whole rerank pool, which is not what either path ever grounded.
     tail = ranked if budget_chars is not None else ()
-    for source in (expansion, tail):
+    for source in (tail, expansion):
         for hit in source:
             if hit.id in taken:
                 continue
