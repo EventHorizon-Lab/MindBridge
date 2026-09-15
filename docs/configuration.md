@@ -465,12 +465,22 @@ record is worth more than the next-best record by cosine; on 120 LongMemEval-S q
 the tail that had been finding the rest of the support. Linked rows therefore go last, and
 the same 120 questions then tie exactly -- 120 of 120, with the grounded rows and characters
 identical to baseline -- because a rerank pool a hundred candidates deep fills any budget before
-expansion is reached. On a text corpus whose captures the ranking already covers, the capture edge
-has nothing left to add; the setting is off by default for that reason, and the edges that a
-ranking cannot cover -- a person, a room, a claim's lineage -- are the ones a measurement on an
-embodied corpus still has to decide. The actionable consequence: with a character budget set the
-setting changes nothing, so it is worth enabling only where `evidence_budget_chars` is `None` and
-the window is `limit` rows that linked rows can follow.
+expansion is reached. So the setting changes a window only where `evidence_budget_chars` is `None`
+and the window is `limit` rows that linked rows can follow; with a budget set it does nothing.
+
+Whether it is worth enabling there depends on the corpus, and the two measured corpora disagree.
+On LongMemEval-S a capture is a dialogue session whose turns the ranked tail already reaches, so
+linked rows duplicated it: 12 rows plus linked rows scored 0.7373 against 0.7203 for a comparable
+budget of ranked tail, at 62 % more prompt -- 0.301 accuracy points per 1,000 characters against
+the tail's 0.585. On ATM-Bench raw media, where a capture is a day of photographs and no query can
+name it, the order reverses: 0.5517 against 0.5259, at under half the characters and the same media
+rows, which is 0.796 points per 1,000 characters against 0.188. Both widenings rescue about the
+same few questions from incomplete support on either corpus; what differs is that a window padded
+with the rest of one afternoon reads better than one padded with twenty-two further ranked rows,
+while a window padded with more of a conversation the ranking already covered reads worse. Where a
+capture groups evidence a query cannot name, enable it; where the ranking already spans the
+capture, leave it off. It is off by default because a caller who has not measured their corpus
+should not pay for it.
 
 What expansion adds is reported to the reader as records linked to the evidence rather than records
 a predicate matched, so nothing it adds licenses a count, and the count is the number of rows
