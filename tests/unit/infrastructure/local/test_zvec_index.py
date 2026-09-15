@@ -927,7 +927,8 @@ def test_a_merge_over_a_dead_row_keeps_every_vector_bound_to_its_own_id(
                 ]
             )
         index.flush()
-        # What the projection does for a session that wrote, when it closes.
+        # The merge every maintenance path routes through, including the close of a session
+        # that wrote.
         index.optimize()
         index.flush()
 
@@ -956,7 +957,7 @@ def test_only_a_collection_left_clean_is_merged_in_place_by_its_next_owner(
     """Copying the collection is the price of a dead row, not of having been written before.
 
     Nothing on disk says whether an inherited collection holds one, so a session that closes a
-    collection it knows to be clean says so with a marker beside it, and a session that finds no
+    collection it knows to be clean says so with a marker inside it, and a session that finds no
     marker -- because the last one deleted something, or was killed -- copies. Without that, one
     added record rewrote the whole collection at every close, forever: 2.13 s against 0.54 s on a
     48 MB store, and about 21 s on the 481 MB store the close-time merge was written for.

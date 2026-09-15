@@ -131,12 +131,15 @@ merge in place; a session that deleted anything, or that was killed, leaves none
 owner copies. The marker lives inside the collection, so a `zvec/` restored from a backup carries
 its own claim or none. Deleting it is always safe and never wrong — it only costs one copy.
 
-**Which stores are affected.** Any store whose index was merged while it held a dead row, which
-in practice means: a store written on or after 2026-09-13, when a writing session began merging
-at `close()`, that deleted a record or re-embedded one during that session; and any older store
-whose writes crossed the 64-flush write-side merge bound with a delete or a re-embedding
-outstanding. The defect is as old as the merge itself, not new in one release, so age alone does
-not clear a store. SQLite is untouched in every case: nothing is lost and no re-ingest is needed.
+**Which stores are affected.** Any store whose index was merged while it held a dead row. Every
+merge route can do it: a drain that crossed the 64-flush maintenance bound, the merge a writing
+session makes at `close()` — which a store written on or after 2026-09-13 does — an explicit
+`optimize()` or `reindex()`, and the file-descriptor pressure path. In practice a store is
+suspect when it deleted a record or re-embedded one — `delete()`, `forget()`, retention, a
+speaker rebinding, or a `settle()` that replaced a capture's embeddings — and then went on
+writing, closed, or was optimized. The defect is as old as the merge itself, not new in one
+release, so age alone does not clear a store. SQLite is untouched in every case: nothing is lost
+and no re-ingest is needed.
 
 An index merged over a dead row cannot be told from a healthy one by `doc_count`,
 `index_completeness`, or the number of hits a search returns: only the ranking is wrong. Check a
