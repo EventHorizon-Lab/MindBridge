@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 import tempfile
@@ -49,6 +50,11 @@ from mindbridge.models.openai_sdk import OpenAIModels
 RECALL_LIMIT = 12
 EMBEDDING_DIMENSION = 2048
 INGEST_BATCH = 64
+# How many rows expansion put in the window, read from the note the kernel writes into the prompt.
+# Inferring it from the row count instead is wrong in the direction that hides the effect: a linked
+# row is long and the ranked rows it displaces are short, so an expansion that fired can leave the
+# window *smaller*. That proxy is what made a confounded first run look like a clean loss.
+_EXPANSION_NOTE = re.compile(r"(\d+) further records linked to the evidence above")
 
 
 class _StubAnswerer:
@@ -64,6 +70,7 @@ class _StubAnswerer:
     def __init__(self) -> None:
         self.grounded: tuple[SearchHit, ...] = ()
         self.prompt_chars = 0
+        self.expansion_rows = 0
 
     def answer(
         self,
@@ -75,7 +82,10 @@ class _StubAnswerer:
     ) -> AnswerResult:
         del answer_policy, exhaustive
         self.grounded = tuple(hits)
-        self.prompt_chars = len(question.text or "")
+        text = question.text or ""
+        self.prompt_chars = len(text)
+        note = _EXPANSION_NOTE.search(text)
+        self.expansion_rows = 0 if note is None else int(note.group(1))
         return AnswerResult(answer="recorded", hits=self.grounded)
 
     def close(self) -> None:
@@ -93,6 +103,8 @@ class Outcome:
     window_rows: int
     window_chars: int
     expansion_rows: int
+    # The window's own IDs, so a run can prove the two arms saw one index rather than assume it.
+    window_ids: tuple[str, ...]
 
 
 def _support_class(gold: frozenset[str], window: frozenset[str], pool: frozenset[str]) -> str:
@@ -179,7 +191,6 @@ def _run_arm(
     answerer: _StubAnswerer,
     question: object,
     gold: frozenset[str],
-    baseline_rows: int | None,
 ) -> Outcome:
     memory.ask(question.question, limit=RECALL_LIMIT)  # type: ignore[attr-defined]
     window = _turn_ids(answerer.grounded)
@@ -192,7 +203,8 @@ def _run_arm(
         found=len(gold & window),
         window_rows=rows,
         window_chars=sum(len(hit.content) for hit in answerer.grounded),
-        expansion_rows=0 if baseline_rows is None else max(0, rows - baseline_rows),
+        expansion_rows=answerer.expansion_rows,
+        window_ids=tuple(hit.id for hit in answerer.grounded),
     )
 
 
@@ -221,16 +233,28 @@ def _paired(base: Sequence[Outcome], arm: Sequence[Outcome]) -> dict[str, object
     """Win, loss and tie on complete support, question by question on the same store."""
     by_id = {outcome.question_id: outcome for outcome in base}
     wins = losses = ties = 0
+    # The self-check that says the pairing held: with no row added, the two arms must have
+    # grounded the identical window. Any disagreement here is index state leaking into the
+    # comparison, and the arms are not measuring the setting.
+    unexplained = 0
     for outcome in arm:
-        before = by_id[outcome.question_id].support == "complete_in_window"
-        after = outcome.support == "complete_in_window"
-        if after and not before:
+        before = by_id[outcome.question_id]
+        if outcome.expansion_rows == 0 and outcome.window_ids != before.window_ids:
+            unexplained += 1
+        was = before.support == "complete_in_window"
+        now = outcome.support == "complete_in_window"
+        if now and not was:
             wins += 1
-        elif before and not after:
+        elif was and not now:
             losses += 1
         else:
             ties += 1
-    return {"won": wins, "lost": losses, "tied": ties}
+    return {
+        "won": wins,
+        "lost": losses,
+        "tied": ties,
+        "unexplained_window_changes": unexplained,
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -259,6 +283,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         for index, question in enumerate(questions, start=1):
             data_dir = Path(root) / question.question_id
             answerer = _StubAnswerer()
+            # Three opens, not two. A session that wrote merges its Zvec segments at close, and
+            # segment layout moves what an approximate search returns -- so an arm that reads the
+            # store it just wrote is reading a different index from the arm that opens it after.
+            # Measured that way, five of seven apparent expansion losses were questions where
+            # expansion added no row at all: index state, not the setting under test. Ingest
+            # therefore closes before any arm reads, and both arms then open one settled index.
             with _open(
                 data_dir,
                 embedder,
@@ -267,15 +297,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 budget=args.evidence_budget_chars,
             ) as memory:
                 gold = _ingest(memory, question, capture_context=not args.no_capture_context)
-                base.append(_run_arm(memory, answerer, question, gold, None))
-            with _open(
-                data_dir,
-                embedder,
-                answerer,
-                expansion=True,
-                budget=args.evidence_budget_chars,
-            ) as memory:
-                expanded.append(_run_arm(memory, answerer, question, gold, base[-1].window_rows))
+            for expansion, outcomes in ((False, base), (True, expanded)):
+                with _open(
+                    data_dir,
+                    embedder,
+                    answerer,
+                    expansion=expansion,
+                    budget=args.evidence_budget_chars,
+                ) as memory:
+                    outcomes.append(_run_arm(memory, answerer, question, gold))
             print(
                 f"[{index}/{len(questions)}] {question.question_id} "
                 f"base={base[-1].support} expand={expanded[-1].support}",
@@ -295,7 +325,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "arms": {"baseline": _summarize(base), "expansion": _summarize(expanded)},
         "paired_complete_support": _paired(base, expanded),
         "samples": [
-            {"baseline": asdict(before), "expansion": asdict(after)}
+            {
+                "baseline": {k: v for k, v in asdict(before).items() if k != "window_ids"},
+                "expansion": {k: v for k, v in asdict(after).items() if k != "window_ids"},
+            }
             for before, after in zip(base, expanded, strict=True)
         ],
     }
