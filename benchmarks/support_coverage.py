@@ -217,7 +217,8 @@ def _embedder(settings: Mapping[str, str]) -> OpenAIModels:
             base_url=settings["MINDBRIDGE_EMBEDDING_BASE_URL"],
             api_key=settings.get("MINDBRIDGE_EMBEDDING_API_KEY", "local"),
             max_retries=3,
-            timeout=600.0,
+            # The embedder is local and answers in well under a second.
+            timeout=120.0,
         ),
         embedding_model=settings["MINDBRIDGE_EMBEDDING_MODEL"],
         embedding_dimension=EMBEDDING_DIMENSION,
@@ -231,11 +232,19 @@ def _embedder(settings: Mapping[str, str]) -> OpenAIModels:
 
 
 def _generation_client(settings: Mapping[str, str]) -> OpenAI:
+    """The reader and judge endpoint, with a deadline a hung request cannot outlive.
+
+    A 600-second timeout with four client retries lets one hung request hold a worker for over
+    three hours, which is what happened at question 120 of an ATM arm: no answer, no failure, and
+    a run that would have spent longer waiting on it than on the other 119 together. An answer
+    over a 72,000-character window with images returns in tens of seconds, so the deadline is
+    generous at 180 and the question-level retry above is what recovers a genuine blip.
+    """
     return OpenAI(
         base_url=settings["MINDBRIDGE_GENERATION_BASE_URL"],
         api_key=settings["MINDBRIDGE_GENERATION_API_KEY"],
-        max_retries=4,
-        timeout=600.0,
+        max_retries=2,
+        timeout=180.0,
     )
 
 
