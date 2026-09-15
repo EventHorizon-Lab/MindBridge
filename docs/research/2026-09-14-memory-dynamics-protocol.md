@@ -1,8 +1,8 @@
 # Round r0914 pre-registered protocol (verbatim copy)
 
-This is `autoresearch/orchestrator-260914/PROTOCOL.md`, the pre-registration and Amendments 1-12
+This is `autoresearch/orchestrator-260914/PROTOCOL.md`, the pre-registration and Amendments 1-14
 of the 2026-09-14 memory-dynamics round, copied here byte for byte at sha256
-`26d45f1d9723aacea3ff87c9ae0fae2b6c1d99bc3c56d1f5b3e5898a0d55cf78`.
+`8577c7e1222fe602f8b05784025ba859e6892eef1dc7d5c5361c490d3f7bff4d`.
 
 It is published in the documentation set because the round directory is excluded from the
 repository by `.gitignore`, so without this copy no record of the protocol exists inside the
@@ -263,4 +263,27 @@ covers 2 813/2 831 day clips. Change = aggregate key (object_part 0) embeds only
   (video key A↔C min 0.991). memlens records carry no speech section; Amendment 10's numbers are unaffected (0 mismatches there).
 - Chain note: this worker briefly appended a duplicate `7f52ed10… PROTOCOL.md` line to PROTOCOL.sha256 (a guard that stopped the
   amendment did not stop the hash line) and removed it two minutes later; the chain below line 13 is otherwise untouched.
+
+## Amendment 13 (2026-09-15, index-binding defect root-caused; reports/index-binding-defect.md)
+- Root cause: zvec 0.7.0 `Collection.optimize()` re-binds vectors to ids whenever a dead row (deleted doc or superseded upsert)
+  exists — survivors written densely, ids keep pre-merge positions → each doc from the first dead row serves its neighbour's vector;
+  scalar fields / memory_id / counts stay correct. Bisect: clean 599ae4b8 (1.000), broken from 53e18e05 (r0913b close-time merge,
+  0.104) — exposure, not cause: 599ae4b8 with 70 deletes across the 64-flush bound also 0.107 → upstream affected wherever
+  `ZvecIndex.optimize()` runs with a dead row. Smallest condition: 1000 records + one delete + close + reopen.
+- Fix `r0914/index-binding-fix` @ 1337a01a: copy-compact via `_compact()` whenever `_dead_rows` may be set (delete; upsert whose doc
+  count grew by less than the batch; open of a collection with persisted segments); native merge otherwise. Regression test fails
+  before / passes after; 2197 tests. Prevents, does not repair: affected stores must `reindex()`. Detection = self-hit@1 over 200
+  sampled stored vectors (healthy 1.000, damaged ≈0). Independent review of the fix pending before merge.
+- Consequence for prior rounds: r0913b compaction/ef gains and any measurement on a store that merged with dead rows present must be
+  re-verified with the self-hit check. H-G's transfer numbers were taken on a rebuilt (clean) index and stand.
+
+## Amendment 14 (2026-09-15, round closed)
+- Index-binding fix reviewed twice (reports/index-binding-fix-review.md): fix-first on 1337a01a (every writing session re-copied the
+  collection; two triggers untested; docs silent on affected stores) → 763458e4 (clean marker, tests delete/replace/duplicate +
+  marker lifecycle + debris sweep, docs/CHANGELOG) merge-ready with N1 (marker beside, not inside, the collection → stale marker on a
+  restored dirty backup re-exposes the defect) → e82d5015 (marker at `zvec/.mindbridge-clean`, restored-backup test). 2 202 tests.
+  Close-time merge cost: inherited unproven 2.0 s → once; steady state 0.40 s (baseline 0.45–0.54). **Merged into the session branch.**
+- Final state: H-A/H-B/H-C/H-D/H-E killed at pre-registered Phase 0; H-F post-hoc no-build; H-G killed on pre-registered holdout
+  (week/pooled 0.00), branch `r0914/aggregate-key-composition` @ 5f4e576c kept unmerged; defect fix merged. Research note
+  docs/research/2026-09-14-memory-dynamics-round.md.
 ````

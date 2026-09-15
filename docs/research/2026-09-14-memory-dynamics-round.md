@@ -40,11 +40,12 @@ Method rules, frozen before any number was read:
   artefact.
 
 Six hypotheses were registered for Phase 0 and all six are closed: H-A, H-B, H-C and H-D in section
-3, and H-F and H-E — registered later, in Amendments 5 and 3, and resolved last — in section 6. Five
-are kills by their own pre-registered rules; H-F is a post-hoc decision not to build, and section 6
-says so plainly. A seventh, H-G, was registered afterwards out of the one positive Phase-0
-measurement and is the round's only Phase 1 (section 7); it was built, reviewed, measured and closed
-on its holdout.
+3, and H-F and H-E — registered later, in Amendments 5 and 3, and resolved last — in section 6. A
+seventh, H-G, was registered afterwards out of the one positive Phase-0 measurement and is the
+round's only Phase 1 (section 7). **The final tally: five Phase-0 kills by their own pre-registered
+rules, one post-hoc no-build (H-F), H-G killed on its pre-registered holdout with its branch kept
+unmerged, and one product defect found and fixed** — the index-binding defect of section 8, which is
+the only thing this round merged.
 
 After the round closed, an independent reviewer re-ran every `--selfcheck` and every primary script
 from a scratch copy and re-derived three headline metrics with separate code: `p0_hb`, `p0_hc`,
@@ -853,24 +854,25 @@ else about the day store's shape matters — not its 3.52 keys per record, not `
 media, not size. Deleting the *first* document shifts everything after it; one re-upserted id
 corrupts exactly that document and nothing else.
 
-### Fix — `r0914/index-binding-fix` at `1337a01a` (reviewed: PENDING)
+### Fix — `r0914/index-binding-fix`, reviewed twice and merged
 
-Branched from `8b3483e1`; +139 / −1 across three files. `optimize()` merges by copying live
-documents into a fresh collection — the existing `_compact()`, which was already the FD-pressure and
-256-flush path and which is correct because it runs on a collection with nothing dead in it —
-whenever the collection may be carrying a dead row, and keeps the native in-place merge otherwise.
-`_dead_rows` is set where a dead row is created: in `delete()`, and in `upsert()` when the
-collection's document count grew by less than the batch, which is exactly when an id was replaced
-rather than added; it is assumed until the counts say otherwise, so a write that fails part way
-through is assumed to have left one. It starts `True` for a collection that already had persisted
-segments at open, because a previous session could have been killed between a delete and the merge
-that would have cleared it and nothing on disk says whether it was; it is cleared only by the two
-paths that leave the collection provably clean.
+Branched from `8b3483e1`. The first commit, `1337a01a`, was +139 / −1 across three files:
+`optimize()` merges by copying live documents into a fresh collection — the existing `_compact()`,
+which was already the FD-pressure and 256-flush path and which is correct because it runs on a
+collection with nothing dead in it — whenever the collection may be carrying a dead row, and keeps
+the native in-place merge otherwise. `_dead_rows` is set where a dead row is created: in `delete()`,
+and in `upsert()` when the collection's document count grew by less than the batch, which is exactly
+when an id was replaced rather than added; it is assumed until the counts say otherwise, so a write
+that fails part way through is assumed to have left one. It starts `True` for a collection that
+already had persisted segments at open, because a previous session could have been killed between a
+delete and the merge that would have cleared it and nothing on disk says whether it was; it is
+cleared only by the two paths that leave the collection provably clean.
 
-Cost: a merge that has to copy runs **2.8 s per 100 MB** — measured on the 10,014-vector,
-2,048-dimension day collection — against roughly zero for an in-place merge of an already-merged
-collection. A bulk ingest into a fresh store pays it once, at close; a session that opens an
-existing store and writes pays it once, at close.
+That last clause is what the first review round rejected on cost, and the number the commit message
+carried — 2.8 s per 100 MB, measured on the 10,014-vector day collection — was itself optimistic:
+re-measured at 48 MB it is about 4.4 s per 100 MB, and under `1337a01a` it recurred every writing
+session rather than once. The shipped design pays it only when a collection's cleanliness is
+genuinely unknown; see the review below for the final cost.
 
 The regression test is
 `tests/unit/infrastructure/local/test_zvec_index.py::test_a_merge_after_a_delete_keeps_every_vector_bound_to_its_own_id`.
@@ -882,7 +884,29 @@ which is the shift itself; after it, it passes in 1.2 s. Gates on the fix branch
 `ruff format --check` and `ruff check` clean, `mypy` clean over 215 files, `pytest -W error` **2,197
 passed**, `git diff --check` clean.
 
-**Reviewed: PENDING** — the fix has not yet been confirmed by the lead.
+**Two review rounds, both adversarial, both by a separate agent.** The first read `1337a01a` and
+returned **fix-first**: the diagnosis and the mechanism were right and the reviewer could not
+reproduce the corruption on any dead-row path, but the open-time `_dead_rows = True` turned a
+per-session merge that had cost about half a second into a full rewrite of the collection on
+**every** writing session, permanently — measured at 48 MB, one `add`, close-time merge: **0.54 s →
+2.13 s**, and never converging, because the session after a compaction sees persisted segments again
+and copies the whole thing again. Two of the three triggers had no test, and the operations guide
+never told an operator their store was probably affected.
+
+`763458e4` answered all of that — a clean marker so a session that leaves nothing dead hands the
+next owner the in-place merge, tests for delete, replace and duplicate-in-batch plus the marker
+lifecycle and the debris sweep, and the guide and CHANGELOG — and came back **merge-ready with one
+new finding, N1**: the marker sat *beside* the collection rather than inside it, so restoring a
+`zvec/` directory from a backup next to a marker left by a later clean close makes the claim false.
+Reproduced: a dirty collection restored beside a stale marker opens believing itself clean, merges
+in place, and comes back **62 of 63 wrong-bound** — the original defect, silently. `e82d5015` moved
+the marker to `zvec/.mindbridge-clean`, inside the directory it speaks for, so `_compact` and
+`rebuild` drop it exactly when the claim would need re-earning, and added the restored-backup test.
+
+Final state: branch tip **`e82d5015`**, **+360 / −8** across four files against `8b3483e1`, **2,202
+tests** passing, and the close-time merge costs **2.0 s once** on an inherited collection whose
+cleanliness is unproven and **0.40 s** in steady state thereafter — at or below the 0.45–0.54 s
+baseline it replaces. Merged into the session branch as `c4e10575`.
 
 ### What operators have to do
 
@@ -908,6 +932,11 @@ onwards should be checked before its numbers are used.
 Source: `autoresearch/orchestrator-260914/reports/index-binding-defect.md`.
 
 ## 9. What this round establishes for future rounds
+
+The round's ledger: **five Phase-0 hypotheses killed by their own pre-registered rules, one post-hoc
+no-build, H-G killed on its pre-registered holdout with `r0914/aggregate-key-composition` kept
+unmerged, and one product defect found and fixed.** The defect fix is the only change this round
+merged.
 
 Do not re-test the following on these corpora.
 
@@ -1077,15 +1106,16 @@ aggregate rule and the v12 → v13 recipe bump, `5a03d0cc` the marker-aware sect
 review finding F1, and `5f4e576c` the prose, key-count and migration-cost corrections for F2. It is
 not merged.
 
-`PROTOCOL.sha256` holds fourteen appended lines with thirteen distinct digests — the
-pre-registration plus Amendments 1–12 — and the last line, `26d45f1d…`, is the digest of the file as
-it stands. Reports name the digest they were registered against: `69086e1f…` for H-A's start,
-`c4b8299c…` for Amendment 1 as H-A finished, `c3240ee7…` for H-D and the query-form ablation,
-`3f715e72…` for H-F, and `dbac7b7e…` for H-E, `fe193294…` for the H-G memlens holdout, `7500bbe0…`
-for the H-G week holdout and transfer check, and `7f52ed10…` / `26d45f1d…` for Amendments 11 and 12
-as written. That ordering is internally consistent with each hypothesis being registered before its
-numbers were read, and no amendment edits a prior hypothesis's kill-rule text — but read the
-integrity paragraph in section 9 before treating the chain as an audit trail, because it is
-hand-appended inside a directory the repository does not track. The protocol itself is reproduced
-byte for byte, inside a fenced block so that nothing is reformatted, at [the r0914 pre-registered
+`PROTOCOL.sha256` holds sixteen appended lines with fifteen distinct digests — the pre-registration
+plus Amendments 1–14 — and the last line, `8577c7e1…`, is the digest of the file as it stands.
+Reports name the digest they were registered against: `69086e1f…` for H-A's start, `c4b8299c…` for
+Amendment 1 as H-A finished, `c3240ee7…` for H-D and the query-form ablation, `3f715e72…` for H-F,
+and `dbac7b7e…` for H-E, `fe193294…` for the H-G memlens holdout, `7500bbe0…` for the H-G week
+holdout and transfer check, and `7f52ed10…` / `26d45f1d…` for Amendments 11 and 12 as written, the
+last two lines covering the index-binding root cause and the closing amendment. That ordering is
+internally consistent with each hypothesis being registered before its numbers were read, and no
+amendment edits a prior hypothesis's kill-rule text — but read the integrity paragraph in section 9
+before treating the chain as an audit trail, because it is hand-appended inside a directory the
+repository does not track. The protocol itself is reproduced byte for byte, inside a fenced block so
+that nothing is reformatted, at [the r0914 pre-registered
 protocol](2026-09-14-memory-dynamics-protocol.md); it is the only copy of it inside this repository.
