@@ -1,32 +1,44 @@
 #!/usr/bin/env python3
-"""Measure where a question's gold support sits, with and without evidence expansion.
+"""Measure where a question's gold support sits, and whether the reader can use it.
 
-No generation model is involved. The answerer is a stub that reports the evidence it was handed,
-so every arm runs the real `ask()` path -- ranking, grounding window, budget, expansion -- and is
-scored on the *window*, not on an answer. That is the quantity the loss decomposition in
-`docs/research/2026-09-12-baseline-loss-decomposition.md` showed predicts the answer: complete
-support in the window scored 0.83, partial support 0.40.
+Three arms share one ingest per question, so they differ only in how the grounding window was
+filled and never in the store or its embeddings:
 
-Both arms read one store per unit. The store is ingested once, closed, and reopened with the arm's
-setting, so the arms differ in exactly one boolean and share their embeddings byte for byte.
+* ``window`` -- ``limit`` rows, no character budget. What ``ask`` grounds with nothing set.
+* ``window+linked`` -- the same window plus the records it is structurally linked to. This is the
+  only configuration in which after-tail expansion fires at all: a 100-candidate rerank pool runs
+  to roughly 89 000 characters on this corpus, so any practical ``evidence_budget_chars`` is
+  saturated by the ranked tail and leaves expansion nothing to spend.
+* ``budget`` -- ``limit`` rows plus ranked tail up to ``--evidence-budget-chars``. The project's
+  adopted default, and the size-matched control for the arm above: it spends a comparable prompt
+  on more *ranked* rows instead of on linked ones.
 
-    uv run --locked python benchmarks/support_coverage.py \\
-        --dataset ~/.cache/huggingface/hub/datasets--xiaowu0162--longmemeval/snapshots/<rev>/longmemeval_s \\
-        --limit 60 --output .benchmarks/support-coverage.json
+Each arm is scored twice. On the **window**, by where the release's turn-level ``has_answer``
+labels sit relative to it -- the decomposition the 2026-09-12 loss analysis is stated in. And on
+the **answer**, by the official LongMemEval answer-check prompt and parser. The judge is a proxy:
+upstream's is ``gpt-4o-2024-08-06`` and this runs the same model that answers, exactly as the
+project's own baseline did, so no number here is comparable to a published row.
+
+Generation and embedding endpoints come from ``~/.config/mindbridge-eval.env`` (override with
+``MINDBRIDGE_EVAL_ENV``), because a run executes a committed snapshot and a credential must not
+live in the tree that snapshot is taken from.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from openai import OpenAI
@@ -34,6 +46,7 @@ from openai import OpenAI
 from mindbridge import (
     AnswerPolicy,
     AnswerResult,
+    GenerationBackend,
     Memory,
     MemoryType,
     Modality,
@@ -41,12 +54,13 @@ from mindbridge import (
     ObservationContext,
     SearchHit,
 )
+from mindbridge.benchmarks._official.longmemeval_prompts import (
+    build_answer_check_prompt,
+    parse_answer_check,
+)
 from mindbridge.benchmarks.longmemeval import load_longmemeval
 from mindbridge.models.openai_sdk import OpenAIModels
 
-# The window the reader is grounded on, and the depth the ranking is allowed to reach. Both are
-# the baseline run's own settings, so a decomposition here is comparable to the one that motivated
-# this measurement rather than to a differently-tuned retrieval.
 RECALL_LIMIT = 12
 EMBEDDING_DIMENSION = 2048
 INGEST_BATCH = 64
@@ -55,19 +69,49 @@ INGEST_BATCH = 64
 # row is long and the ranked rows it displaces are short, so an expansion that fired can leave the
 # window *smaller*. That proxy is what made a confounded first run look like a clean loss.
 _EXPANSION_NOTE = re.compile(r"(\d+) further records linked to the evidence above")
+_ENV_PATH = Path(os.environ.get("MINDBRIDGE_EVAL_ENV", "~/.config/mindbridge-eval.env"))
 
 
-class _StubAnswerer:
-    """Reports the grounded window instead of answering from it.
+@dataclass(frozen=True, slots=True)
+class Arm:
+    """One way of filling the grounding window, named so the report can be read."""
 
-    A real reader would decide the score; this measures what the reader would have been given,
-    which is the half of the loss this change acts on and the half that needs no generation model.
+    name: str
+    budget: int | None
+    expansion: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Outcome:
+    """What one arm gave one question, on the window and on the answer."""
+
+    question_id: str
+    arm: str
+    support: str
+    gold: int
+    found: int
+    window_rows: int
+    window_chars: int
+    expansion_rows: int
+    prompt_chars: int
+    correct: float
+    abstained: bool
+    # The window's own IDs, so a run can prove two arms saw one index rather than assume it.
+    window_ids: tuple[str, ...] = field(default=(), repr=False)
+
+
+class _Recorder:
+    """Delegates to the real reader and keeps the window and prompt it was handed.
+
+    ``AnswerResult.hits`` is the evidence the backend reports having used, which is a subset of
+    what it was grounded on. The decomposition is a claim about the window, so the window has to
+    be captured on the way in rather than reconstructed from the way out.
     """
 
-    generation_capabilities = frozenset({Modality.TEXT})
-    generation_model = "stub-window-recorder"
-
-    def __init__(self) -> None:
+    def __init__(self, backend: GenerationBackend) -> None:
+        self._backend = backend
+        self.generation_capabilities = backend.generation_capabilities
+        self.generation_model = backend.generation_model
         self.grounded: tuple[SearchHit, ...] = ()
         self.prompt_chars = 0
         self.expansion_rows = 0
@@ -80,31 +124,35 @@ class _StubAnswerer:
         answer_policy: AnswerPolicy = "strict",
         exhaustive: bool = False,
     ) -> AnswerResult:
-        del answer_policy, exhaustive
         self.grounded = tuple(hits)
         text = question.text or ""
-        self.prompt_chars = len(text)
+        self.prompt_chars = len(text) + sum(len(hit.content) for hit in self.grounded)
         note = _EXPANSION_NOTE.search(text)
         self.expansion_rows = 0 if note is None else int(note.group(1))
-        return AnswerResult(answer="recorded", hits=self.grounded)
+        return self._backend.answer(
+            question,
+            hits,
+            answer_policy=answer_policy,
+            exhaustive=exhaustive,
+        )
 
     def close(self) -> None:
-        return None
+        self._backend.close()
 
 
-@dataclass(frozen=True, slots=True)
-class Outcome:
-    """What one question's window held, in the terms the decomposition is stated in."""
-
-    question_id: str
-    support: str
-    gold: int
-    found: int
-    window_rows: int
-    window_chars: int
-    expansion_rows: int
-    # The window's own IDs, so a run can prove the two arms saw one index rather than assume it.
-    window_ids: tuple[str, ...]
+def _env() -> Mapping[str, str]:
+    """Endpoint settings from the out-of-tree env file, with the process environment winning."""
+    values: dict[str, str] = {}
+    path = _ENV_PATH.expanduser()
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            name, _, value = stripped.partition("=")
+            values[name.strip()] = value.strip()
+    values.update({k: v for k, v in os.environ.items() if k.startswith("MINDBRIDGE_")})
+    return values
 
 
 def _support_class(gold: frozenset[str], window: frozenset[str], pool: frozenset[str]) -> str:
@@ -116,22 +164,67 @@ def _support_class(gold: frozenset[str], window: frozenset[str], pool: frozenset
     return "beyond_window" if gold & pool else "outside_candidates"
 
 
-def _models(base_url: str, api_key: str, model: str) -> OpenAIModels:
+def _embedder(settings: Mapping[str, str]) -> OpenAIModels:
     return OpenAIModels(
-        embedding_client=OpenAI(base_url=base_url, api_key=api_key, max_retries=3),
-        embedding_model=model,
+        embedding_client=OpenAI(
+            base_url=settings["MINDBRIDGE_EMBEDDING_BASE_URL"],
+            api_key=settings.get("MINDBRIDGE_EMBEDDING_API_KEY", "local"),
+            max_retries=3,
+            timeout=600.0,
+        ),
+        embedding_model=settings["MINDBRIDGE_EMBEDDING_MODEL"],
         embedding_dimension=EMBEDDING_DIMENSION,
         embedding_capabilities=frozenset({Modality.TEXT}),
     )
 
 
+def _generation_client(settings: Mapping[str, str]) -> OpenAI:
+    return OpenAI(
+        base_url=settings["MINDBRIDGE_GENERATION_BASE_URL"],
+        api_key=settings["MINDBRIDGE_GENERATION_API_KEY"],
+        max_retries=4,
+        timeout=600.0,
+    )
+
+
+def _reader(settings: Mapping[str, str], client: OpenAI) -> OpenAIModels:
+    return OpenAIModels(
+        generation_client=client,
+        generation_model=settings["MINDBRIDGE_GENERATION_MODEL"],
+        generation_capabilities=frozenset({Modality.TEXT}),
+        generation_temperature=0.0,
+        generation_seed=42,
+    )
+
+
+def _judge(
+    client: OpenAI,
+    model: str,
+    question: object,
+    prediction: str,
+) -> float:
+    """Score one answer with the official answer-check prompt and parser."""
+    prompt = build_answer_check_prompt(
+        question.question_type,  # type: ignore[attr-defined]
+        question.question,  # type: ignore[attr-defined]
+        question.reference_answer,  # type: ignore[attr-defined]
+        prediction,
+        abstention=bool(question.abstention),  # type: ignore[attr-defined]
+    )
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=64,
+    )
+    return float(parse_answer_check(response.choices[0].message.content or ""))
+
+
 def _open(
     data_dir: Path,
     embedder: OpenAIModels,
-    answerer: _StubAnswerer,
-    *,
-    expansion: bool,
-    budget: int | None,
+    answerer: _Recorder | None,
+    arm: Arm,
 ) -> Memory:
     return Memory(
         data_dir,
@@ -141,8 +234,8 @@ def _open(
         ambiguity_margin=0.0,
         reinforce_on_answer=False,
         recall_planning=False,
-        evidence_budget_chars=budget,
-        evidence_expansion=expansion,
+        evidence_budget_chars=arm.budget,
+        evidence_expansion=arm.expansion,
     )
 
 
@@ -186,26 +279,61 @@ def _turn_ids(hits: Sequence[SearchHit]) -> frozenset[str]:
     return frozenset(str(hit.metadata["source_id"]) for hit in hits if "source_id" in hit.metadata)
 
 
-def _run_arm(
-    memory: Memory,
-    answerer: _StubAnswerer,
+def _question_outcomes(
     question: object,
-    gold: frozenset[str],
-) -> Outcome:
-    memory.ask(question.question, limit=RECALL_LIMIT)  # type: ignore[attr-defined]
-    window = _turn_ids(answerer.grounded)
-    pool = _turn_ids(memory.search(question.question, limit=100))  # type: ignore[attr-defined]
-    rows = len(answerer.grounded)
-    return Outcome(
-        question_id=question.question_id,  # type: ignore[attr-defined]
-        support=_support_class(gold, window, pool | window),
-        gold=len(gold),
-        found=len(gold & window),
-        window_rows=rows,
-        window_chars=sum(len(hit.content) for hit in answerer.grounded),
-        expansion_rows=answerer.expansion_rows,
-        window_ids=tuple(hit.id for hit in answerer.grounded),
-    )
+    *,
+    root: Path,
+    arms: Sequence[Arm],
+    settings: Mapping[str, str],
+    client: OpenAI,
+    capture_context: bool,
+) -> tuple[Outcome, ...]:
+    """Ingest one question's store once, then read it once per arm."""
+    data_dir = root / str(question.question_id)  # type: ignore[attr-defined]
+    embedder = _embedder(settings)
+    outcomes: list[Outcome] = []
+    try:
+        # Ingest closes before any arm reads. A session that wrote merges its Zvec segments at
+        # close, and segment layout moves what an approximate search returns, so an arm reading
+        # the store it just wrote reads a different index from one that opens it afterwards.
+        # Measured that way, five of seven apparent expansion losses were questions where
+        # expansion had added no row at all: index state, not the setting under test.
+        with _open(data_dir, embedder, None, arms[0]) as memory:
+            gold = _ingest(memory, question, capture_context=capture_context)
+        for arm in arms:
+            recorder = _Recorder(_reader(settings, client))
+            with _open(data_dir, embedder, recorder, arm) as memory:
+                result = memory.ask(
+                    "Answer concisely using only the memories.\n"
+                    f"Question: {question.question}\nAnswer:",  # type: ignore[attr-defined]
+                    limit=RECALL_LIMIT,
+                )
+                pool = _turn_ids(memory.search(question.question, limit=100))  # type: ignore[attr-defined]
+            window = _turn_ids(recorder.grounded)
+            outcomes.append(
+                Outcome(
+                    question_id=str(question.question_id),  # type: ignore[attr-defined]
+                    arm=arm.name,
+                    support=_support_class(gold, window, pool | window),
+                    gold=len(gold),
+                    found=len(gold & window),
+                    window_rows=len(recorder.grounded),
+                    window_chars=sum(len(hit.content) for hit in recorder.grounded),
+                    expansion_rows=recorder.expansion_rows,
+                    prompt_chars=recorder.prompt_chars,
+                    correct=_judge(
+                        client,
+                        settings["MINDBRIDGE_GENERATION_MODEL"],
+                        question,
+                        result.answer,
+                    ),
+                    abstained=result.abstained,
+                    window_ids=tuple(hit.id for hit in recorder.grounded),
+                )
+            )
+    finally:
+        embedder.close()
+    return tuple(outcomes)
 
 
 def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
@@ -213,9 +341,12 @@ def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
     total = len(outcomes) or 1
     return {
         "questions": len(outcomes),
-        "counts": dict(sorted(counts.items())),
-        "shares": {name: round(count / total, 4) for name, count in sorted(counts.items())},
+        "accuracy": round(statistics.fmean(outcome.correct for outcome in outcomes), 4),
+        "abstention_rate": round(
+            statistics.fmean(float(outcome.abstained) for outcome in outcomes), 4
+        ),
         "complete_support": round(counts["complete_in_window"] / total, 4),
+        "support_counts": dict(sorted(counts.items())),
         "mean_group_recall": round(
             statistics.fmean(outcome.found / max(outcome.gold, 1) for outcome in outcomes), 4
         ),
@@ -223,37 +354,63 @@ def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
         "mean_window_chars": round(
             statistics.fmean(outcome.window_chars for outcome in outcomes), 1
         ),
+        "mean_prompt_chars": round(
+            statistics.fmean(outcome.prompt_chars for outcome in outcomes), 1
+        ),
         "mean_expansion_rows": round(
             statistics.fmean(outcome.expansion_rows for outcome in outcomes), 2
         ),
     }
 
 
-def _paired(base: Sequence[Outcome], arm: Sequence[Outcome]) -> dict[str, object]:
-    """Win, loss and tie on complete support, question by question on the same store."""
+def _accuracy_by_support(outcomes: Sequence[Outcome]) -> dict[str, object]:
+    """The instrument's own premise: does complete support in the window predict the answer."""
+    grouped: dict[str, list[Outcome]] = {}
+    for outcome in outcomes:
+        grouped.setdefault(outcome.support, []).append(outcome)
+    return {
+        name: {
+            "windows": len(rows),
+            "accuracy": round(statistics.fmean(row.correct for row in rows), 4),
+            "abstention_rate": round(statistics.fmean(float(row.abstained) for row in rows), 4),
+        }
+        for name, rows in sorted(grouped.items())
+    }
+
+
+def _paired(
+    base: Sequence[Outcome],
+    arm: Sequence[Outcome],
+    *,
+    same_budget: bool,
+) -> dict[str, object]:
+    """Win, loss and tie against one control, question by question on the same store."""
     by_id = {outcome.question_id: outcome for outcome in base}
-    wins = losses = ties = 0
-    # The self-check that says the pairing held: with no row added, the two arms must have
-    # grounded the identical window. Any disagreement here is index state leaking into the
-    # comparison, and the arms are not measuring the setting.
+    support = Counter[str]()
+    answer = Counter[str]()
     unexplained = 0
     for outcome in arm:
         before = by_id[outcome.question_id]
-        if outcome.expansion_rows == 0 and outcome.window_ids != before.window_ids:
+        # The self-check that says the pairing held: an arm on the control's own budget that
+        # added no linked row must have grounded the identical window, because nothing else
+        # differs. A disagreement is index state leaking into the comparison. An arm on a
+        # different budget is expected to differ, so the check does not apply to it.
+        if same_budget and outcome.expansion_rows == 0 and outcome.window_ids != before.window_ids:
             unexplained += 1
-        was = before.support == "complete_in_window"
-        now = outcome.support == "complete_in_window"
-        if now and not was:
-            wins += 1
-        elif was and not now:
-            losses += 1
-        else:
-            ties += 1
+        for label, was, now in (
+            (
+                "support",
+                before.support == "complete_in_window",
+                outcome.support == "complete_in_window",
+            ),
+            ("answer", before.correct > 0.5, outcome.correct > 0.5),
+        ):
+            counter = support if label == "support" else answer
+            counter["won" if now and not was else "lost" if was and not now else "tied"] += 1
     return {
-        "won": wins,
-        "lost": losses,
-        "tied": ties,
-        "unexplained_window_changes": unexplained,
+        "complete_support": dict(support),
+        "answer": dict(answer),
+        "unexplained_window_changes": unexplained if same_budget else None,
     }
 
 
@@ -262,10 +419,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=60)
     parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--base-url", default="http://localhost:8000/v1")
-    parser.add_argument("--api-key", default="local")
-    parser.add_argument("--model", default="tencent/WeMM-Embedding-2B")
-    parser.add_argument("--evidence-budget-chars", type=int, default=None)
+    parser.add_argument("--evidence-budget-chars", type=int, default=24_000)
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument(
         "--no-capture-context",
         action="store_true",
@@ -274,46 +429,63 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    questions = load_longmemeval(args.dataset)[args.offset : args.offset + args.limit]
-    embedder = _models(args.base_url, args.api_key, args.model)
-    base: list[Outcome] = []
-    expanded: list[Outcome] = []
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory(prefix="support-coverage-") as root:
-        for index, question in enumerate(questions, start=1):
-            data_dir = Path(root) / question.question_id
-            answerer = _StubAnswerer()
-            # Three opens, not two. A session that wrote merges its Zvec segments at close, and
-            # segment layout moves what an approximate search returns -- so an arm that reads the
-            # store it just wrote is reading a different index from the arm that opens it after.
-            # Measured that way, five of seven apparent expansion losses were questions where
-            # expansion added no row at all: index state, not the setting under test. Ingest
-            # therefore closes before any arm reads, and both arms then open one settled index.
-            with _open(
-                data_dir,
-                embedder,
-                answerer,
-                expansion=False,
-                budget=args.evidence_budget_chars,
-            ) as memory:
-                gold = _ingest(memory, question, capture_context=not args.no_capture_context)
-            for expansion, outcomes in ((False, base), (True, expanded)):
-                with _open(
-                    data_dir,
-                    embedder,
-                    answerer,
-                    expansion=expansion,
-                    budget=args.evidence_budget_chars,
-                ) as memory:
-                    outcomes.append(_run_arm(memory, answerer, question, gold))
-            print(
-                f"[{index}/{len(questions)}] {question.question_id} "
-                f"base={base[-1].support} expand={expanded[-1].support}",
-                file=sys.stderr,
-                flush=True,
-            )
-    embedder.close()
+    settings = _env()
+    missing = [
+        name
+        for name in (
+            "MINDBRIDGE_EMBEDDING_BASE_URL",
+            "MINDBRIDGE_EMBEDDING_MODEL",
+            "MINDBRIDGE_GENERATION_BASE_URL",
+            "MINDBRIDGE_GENERATION_API_KEY",
+            "MINDBRIDGE_GENERATION_MODEL",
+        )
+        if not settings.get(name)
+    ]
+    if missing:
+        parser.error(f"{_ENV_PATH} is missing {', '.join(missing)}")
 
+    arms = (
+        Arm("window", budget=None, expansion=False),
+        Arm("window+linked", budget=None, expansion=True),
+        Arm("budget", budget=args.evidence_budget_chars, expansion=False),
+    )
+    questions = load_longmemeval(args.dataset)[args.offset : args.offset + args.limit]
+    client = _generation_client(settings)
+    done = threading.Lock()
+    finished = 0
+    started = time.perf_counter()
+    collected: list[tuple[Outcome, ...]] = []
+    with tempfile.TemporaryDirectory(prefix="support-coverage-") as root:
+
+        def run(question: object) -> tuple[Outcome, ...]:
+            nonlocal finished
+            outcomes = _question_outcomes(
+                question,
+                root=Path(root),
+                arms=arms,
+                settings=settings,
+                client=client,
+                capture_context=not args.no_capture_context,
+            )
+            with done:
+                finished += 1
+                shown = " ".join(
+                    f"{o.arm}={o.support[:8]}/{'y' if o.correct > 0.5 else 'n'}" for o in outcomes
+                )
+                print(
+                    f"[{finished}/{len(questions)}] {outcomes[0].question_id} {shown}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return outcomes
+
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            collected = list(pool.map(run, questions))
+
+    by_arm = {
+        arm.name: [row for rows in collected for row in rows if row.arm == arm.name] for arm in arms
+    }
+    control = by_arm[arms[0].name]
     report = {
         "dataset": str(args.dataset),
         "questions": len(questions),
@@ -321,15 +493,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "recall_limit": RECALL_LIMIT,
         "evidence_budget_chars": args.evidence_budget_chars,
         "capture_context": not args.no_capture_context,
+        "answer_model": settings["MINDBRIDGE_GENERATION_MODEL"],
+        "judge": {
+            "model": settings["MINDBRIDGE_GENERATION_MODEL"],
+            "protocol": "longmemeval_official_answer_check",
+            "note": (
+                "proxy judge: upstream's is gpt-4o-2024-08-06 and this is the model that also "
+                "answered, so no number here is comparable to a published row"
+            ),
+        },
         "elapsed_seconds": round(time.perf_counter() - started, 1),
-        "arms": {"baseline": _summarize(base), "expansion": _summarize(expanded)},
-        "paired_complete_support": _paired(base, expanded),
+        "arms": {name: _summarize(rows) for name, rows in by_arm.items()},
+        "accuracy_by_support": _accuracy_by_support(
+            [row for rows in collected for row in rows],
+        ),
+        "paired_against_window": {arm.name: _paired(control, by_arm[arm.name]) for arm in arms[1:]},
         "samples": [
-            {
-                "baseline": {k: v for k, v in asdict(before).items() if k != "window_ids"},
-                "expansion": {k: v for k, v in asdict(after).items() if k != "window_ids"},
-            }
-            for before, after in zip(base, expanded, strict=True)
+            {row.arm: {k: v for k, v in asdict(row).items() if k != "window_ids"} for row in rows}
+            for rows in collected
         ],
     }
     payload = json.dumps(report, indent=2, sort_keys=True)
