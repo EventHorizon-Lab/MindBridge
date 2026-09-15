@@ -39,3 +39,6 @@ celerybeat-schedule
 
 # Agent-created linked worktrees are local-only.
 /.claude/worktrees/
+
+# Codex CLI reads its MCP server list from here; the entries are per-contributor tooling.
+/.codex/
