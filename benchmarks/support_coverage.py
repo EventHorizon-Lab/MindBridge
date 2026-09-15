@@ -36,10 +36,11 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import cast
 
 from openai import APIError, OpenAI
 
@@ -58,7 +59,15 @@ from mindbridge.benchmarks._official.longmemeval_prompts import (
     build_answer_check_prompt,
     parse_answer_check,
 )
+from mindbridge.benchmarks.atm_bench import (
+    atm_capture_time,
+    atm_email_block,
+    load_atm_bench,
+    load_atm_emails,
+)
 from mindbridge.benchmarks.longmemeval import load_longmemeval
+from mindbridge.benchmarks.official_scorers import judge_plan, local_scores, parse_judge_response
+from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT, atm_format_constraint
 from mindbridge.exceptions import ModelError
 from mindbridge.models.openai_sdk import OpenAIModels
 
@@ -71,6 +80,17 @@ INGEST_BATCH = 64
 # window *smaller*. That proxy is what made a confounded first run look like a clean loss.
 _EXPANSION_NOTE = re.compile(r"(\d+) further records linked to the evidence above")
 _ENV_PATH = Path(os.environ.get("MINDBRIDGE_EVAL_ENV", "~/.config/mindbridge-eval.env"))
+# Which corpus this commit measures. The run command is fixed across the tree, so the corpus is a
+# committed property of the branch rather than a flag: `--dataset` is read only by the
+# `longmemeval` corpus and is stated as unused by the other.
+CORPUS: str = "atm"
+# ATM-Bench is one store every question reads, so its questions are answered concurrently inside
+# one open rather than each getting a store of their own.
+ATM_QUESTIONS = 120
+# `evidence_cost` charges an image 2,000 characters, so the text run'"'"'s 24,000 buys a ranked tail of
+# twelve images -- which is the `window` arm over again. The budget arm is scaled to the media the
+# linked arm reaches, so the contest stays composition at one media budget rather than volume.
+ATM_BUDGET_FACTOR = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +115,10 @@ class Outcome:
     window_chars: int
     expansion_rows: int
     prompt_chars: int
+    # Media rows are counted separately because `prompt_chars` cannot see them: an image reaches
+    # the reader as image tokens, not as characters, and on a photo corpus that is most of what a
+    # window costs. A comparison stated in characters alone would hide the whole media bill.
+    media_rows: int
     correct: float
     abstained: bool
     # The window's own IDs, so a run can prove two arms saw one index rather than assume it.
@@ -113,9 +137,22 @@ class _Recorder:
         self._backend = backend
         self.generation_capabilities = backend.generation_capabilities
         self.generation_model = backend.generation_model
-        self.grounded: tuple[SearchHit, ...] = ()
-        self.prompt_chars = 0
-        self.expansion_rows = 0
+        # One `Memory` holds one answerer, and the ATM corpus is one store every question reads,
+        # so several threads pass through this object at once. The capture is per ask, so it
+        # belongs to the asking thread and not to the recorder.
+        self._local = threading.local()
+
+    @property
+    def grounded(self) -> tuple[SearchHit, ...]:
+        return cast(tuple[SearchHit, ...], getattr(self._local, "grounded", ()))
+
+    @property
+    def prompt_chars(self) -> int:
+        return cast(int, getattr(self._local, "prompt_chars", 0))
+
+    @property
+    def expansion_rows(self) -> int:
+        return cast(int, getattr(self._local, "expansion_rows", 0))
 
     def answer(
         self,
@@ -125,11 +162,12 @@ class _Recorder:
         answer_policy: AnswerPolicy = "strict",
         exhaustive: bool = False,
     ) -> AnswerResult:
-        self.grounded = tuple(hits)
+        grounded = tuple(hits)
         text = question.text or ""
-        self.prompt_chars = len(text) + sum(len(hit.content) for hit in self.grounded)
         note = _EXPANSION_NOTE.search(text)
-        self.expansion_rows = 0 if note is None else int(note.group(1))
+        self._local.grounded = grounded
+        self._local.prompt_chars = len(text) + sum(len(hit.content) for hit in grounded)
+        self._local.expansion_rows = 0 if note is None else int(note.group(1))
         return self._backend.answer(
             question,
             hits,
@@ -166,6 +204,14 @@ def _support_class(gold: frozenset[str], window: frozenset[str], pool: frozenset
 
 
 def _embedder(settings: Mapping[str, str]) -> OpenAIModels:
+    """The local embedder, declared for the modalities this corpus actually holds.
+
+    A media corpus needs the `messages` request format, because that is the only shape this
+    endpoint accepts an image or a clip in. It also forces one record per request: the endpoint
+    returns a single vector for a list of messages, and the adapter refuses the mismatch rather
+    than mis-aligning a batch, which is the safe half of a slower ingest.
+    """
+    media = CORPUS == "atm"
     return OpenAIModels(
         embedding_client=OpenAI(
             base_url=settings["MINDBRIDGE_EMBEDDING_BASE_URL"],
@@ -175,7 +221,12 @@ def _embedder(settings: Mapping[str, str]) -> OpenAIModels:
         ),
         embedding_model=settings["MINDBRIDGE_EMBEDDING_MODEL"],
         embedding_dimension=EMBEDDING_DIMENSION,
-        embedding_capabilities=frozenset({Modality.TEXT}),
+        embedding_request_format="messages" if media else "input",
+        embedding_capabilities=(
+            frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO})
+            if media
+            else frozenset({Modality.TEXT})
+        ),
     )
 
 
@@ -192,7 +243,11 @@ def _reader(settings: Mapping[str, str], client: OpenAI) -> OpenAIModels:
     return OpenAIModels(
         generation_client=client,
         generation_model=settings["MINDBRIDGE_GENERATION_MODEL"],
-        generation_capabilities=frozenset({Modality.TEXT}),
+        generation_capabilities=(
+            frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO})
+            if CORPUS == "atm"
+            else frozenset({Modality.TEXT})
+        ),
         generation_temperature=0.0,
         generation_seed=42,
     )
@@ -330,6 +385,7 @@ def _question_outcomes(
                     window_chars=sum(len(hit.content) for hit in recorder.grounded),
                     expansion_rows=recorder.expansion_rows,
                     prompt_chars=recorder.prompt_chars,
+                    media_rows=sum(1 for hit in recorder.grounded if hit.assets),
                     correct=_judge(
                         client,
                         settings["MINDBRIDGE_GENERATION_MODEL"],
@@ -343,6 +399,183 @@ def _question_outcomes(
     finally:
         embedder.close()
     return tuple(outcomes)
+
+
+def _atm_score(question: object, prediction: str, client: OpenAI, model: str) -> float:
+    """Score one ATM answer the way ATM scores it.
+
+    Two protocols, not one: `number` and `list_recall` are deterministic upstream and a judge
+    never sees them, while `open_end` goes through the pinned judge prompt. Sending the countable
+    types to a judge would be a different benchmark that happens to share a name.
+    """
+    metadata = {"qtype": question.qtype, "evidence_ids": question.evidence_ids}  # type: ignore[attr-defined]
+    deterministic = local_scores(
+        "atm-bench-main",
+        score_kind="accuracy",
+        prediction=prediction,
+        parsed_choice=None,
+        expected_choice=None,
+        references=(question.reference_answer,),  # type: ignore[attr-defined]
+        question=question.question,  # type: ignore[attr-defined]
+        metadata=metadata,
+        evidence_source_ids=(),
+    )
+    if "accuracy" in deterministic:
+        return float(deterministic["accuracy"])
+    plan = judge_plan(
+        "atm-bench-main",
+        question=question.question,  # type: ignore[attr-defined]
+        references=(question.reference_answer,),  # type: ignore[attr-defined]
+        prediction=prediction,
+        metadata=metadata,
+    )
+    if plan is None:
+        return 0.0
+    messages = [{"role": message.role, "content": message.content} for message in plan.calls[0]]
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,  # type: ignore[arg-type]
+        temperature=0.0,
+        max_tokens=plan.max_tokens or 600,
+    )
+    return float(
+        parse_judge_response(plan, response.choices[0].message.content or "").get("accuracy", 0.0)
+    )
+
+
+# The provider adapter refuses an inline media item over 20 MiB base64-encoded, which is about
+# 15 MiB of bytes, and it refuses it before the request rather than after -- so the video-sampling
+# retry that rescues an over-long clip never runs for an over-large one. Twenty-one of ATM's 533
+# clips are over it. They are skipped and counted: three of the benchmark's 1,013 questions cite
+# one, none of them in the slice this node measures, and a silently missing record would make the
+# support decomposition a lie about what the store holds.
+_INLINE_MEDIA_BYTES = 20 * 1024 * 1024 * 3 // 4
+
+
+def _atm_ingest(memory: Memory, data: Path) -> tuple[int, tuple[str, ...]]:
+    """Write the whole ATM corpus: emails as text, photographs and clips as their own bytes.
+
+    The capture is the day, which is what a photo corpus actually has: the other pictures from one
+    afternoon are evidence a query has no way to name, and they are the edge this node is about.
+    Batching is one record per call because the endpoint'"'"'s `messages` embedding format collapses a
+    batch into a single vector, and a silently mis-aligned batch is worse than a slower ingest.
+    """
+    added = 0
+    for email in load_atm_emails(data / "raw_memory" / "email" / "emails.json"):
+        added += 1
+        memory.add(
+            atm_email_block(email),
+            occurred_at=email.occurred_at,
+            metadata={"source_id": email.email_id},
+            memory_type=MemoryType.EPISODIC,
+            context=ObservationContext(source_id=email.occurred_at.date().isoformat()),
+        )
+    skipped: list[str] = []
+    for folder, pattern in (("image", "*.jpg"), ("video", "*.mp4")):
+        for path in sorted((data / "raw_memory" / folder).glob(pattern)):
+            if path.stat().st_size > _INLINE_MEDIA_BYTES:
+                skipped.append(path.stem)
+                continue
+            added += 1
+            memory.add(
+                path,
+                occurred_at=atm_capture_time(path.stem),
+                metadata={"source_id": path.stem},
+                memory_type=MemoryType.EPISODIC,
+                context=ObservationContext(source_id=path.stem[:8]),
+            )
+    return added, tuple(skipped)
+
+
+def _atm_outcomes(
+    *,
+    root: Path,
+    arms: Sequence[Arm],
+    settings: Mapping[str, str],
+    client: OpenAI,
+    limit: int,
+    offset: int,
+    workers: int,
+    report: Callable[[str], None],
+) -> tuple[tuple[Outcome, ...], ...]:
+    """Ingest the ATM corpus once, then read it once per arm with its questions concurrent."""
+    data = Path(settings["MINDBRIDGE_BENCH_ROOT"]) / "atm-bench" / "data"
+    questions = load_atm_bench(data / "atm-bench" / "atm-bench.json")[offset : offset + limit]
+    embedder = _embedder(settings)
+    store = root / "atm"
+    model = settings["MINDBRIDGE_GENERATION_MODEL"]
+    by_question: dict[str, list[Outcome]] = {}
+    try:
+        started = time.perf_counter()
+        with _open(store, embedder, None, arms[0]) as memory:
+            records, skipped = _atm_ingest(memory, data)
+        report(
+            f"ingested {records} records in {(time.perf_counter() - started) / 60:.1f} min; "
+            f"skipped {len(skipped)} media over the inline limit"
+        )
+        for arm in arms:
+            recorder = _Recorder(_reader(settings, client))
+            with _open(store, embedder, recorder, arm) as memory:
+
+                def one(
+                    question: object,
+                    arm: Arm = arm,
+                    memory: Memory = memory,
+                    recorder: _Recorder = recorder,
+                ) -> Outcome:
+                    gold = frozenset(question.evidence_ids)  # type: ignore[attr-defined]
+                    prompt = ATM_BENCH_QUERY_PROMPT.text.format(
+                        question=question.question,  # type: ignore[attr-defined]
+                        format_constraint=atm_format_constraint(question.qtype),  # type: ignore[attr-defined]
+                    )
+                    result = memory.ask(prompt, limit=RECALL_LIMIT)
+                    window = _turn_ids(recorder.grounded)
+                    pool = _turn_ids(memory.search(question.question, limit=100))  # type: ignore[attr-defined]
+                    outcome = Outcome(
+                        question_id=str(question.question_id),  # type: ignore[attr-defined]
+                        arm=arm.name,
+                        support=_support_class(gold, window, pool | window),
+                        gold=len(gold),
+                        found=len(gold & window),
+                        window_rows=len(recorder.grounded),
+                        window_chars=sum(len(hit.content) for hit in recorder.grounded),
+                        expansion_rows=recorder.expansion_rows,
+                        prompt_chars=recorder.prompt_chars,
+                        media_rows=sum(1 for hit in recorder.grounded if hit.assets),
+                        correct=_atm_score(question, result.answer, client, model),
+                        abstained=result.abstained,
+                        window_ids=tuple(hit.id for hit in recorder.grounded),
+                    )
+                    report(
+                        f"{arm.name} {outcome.question_id} {outcome.support} "
+                        f"{'y' if outcome.correct > 0.5 else 'n'}"
+                    )
+                    return outcome
+
+                with ThreadPoolExecutor(max_workers=max(1, workers)) as pool_executor:
+                    for outcome in pool_executor.map(_retrying(one), questions):
+                        if outcome is not None:
+                            by_question.setdefault(outcome.question_id, []).append(outcome)
+    finally:
+        embedder.close()
+    # Only questions every arm answered, so the arms share one denominator.
+    return tuple(tuple(rows) for rows in by_question.values() if len(rows) == len(arms))
+
+
+def _retrying(work: Callable[[object], Outcome]) -> Callable[[object], Outcome | None]:
+    """Retry one unit of work over a flaky gateway, and give up on it rather than on the run."""
+
+    def attempt(item: object) -> Outcome | None:
+        for index in range(_RETRY_ATTEMPTS):
+            try:
+                return work(item)
+            except (APIError, ModelError):
+                if index + 1 == _RETRY_ATTEMPTS:
+                    return None
+                time.sleep(_RETRY_BACKOFF_SECONDS * (index + 1))
+        return None
+
+    return attempt
 
 
 def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
@@ -369,6 +602,7 @@ def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
         "mean_expansion_rows": round(
             statistics.fmean(outcome.expansion_rows for outcome in outcomes), 2
         ),
+        "mean_media_rows": round(statistics.fmean(outcome.media_rows for outcome in outcomes), 2),
     }
 
 
@@ -453,18 +687,62 @@ def main(argv: Sequence[str] | None = None) -> int:
     if missing:
         parser.error(f"{_ENV_PATH} is missing {', '.join(missing)}")
 
+    if CORPUS == "atm" and not settings.get("MINDBRIDGE_BENCH_ROOT"):
+        parser.error(f"{_ENV_PATH} is missing MINDBRIDGE_BENCH_ROOT")
+    budget = args.evidence_budget_chars * (ATM_BUDGET_FACTOR if CORPUS == "atm" else 1)
     arms = (
         Arm("window", budget=None, expansion=False),
         Arm("window+linked", budget=None, expansion=True),
-        Arm("budget", budget=args.evidence_budget_chars, expansion=False),
+        Arm("budget", budget=budget, expansion=False),
     )
-    questions = load_longmemeval(args.dataset)[args.offset : args.offset + args.limit]
     client = _generation_client(settings)
     done = threading.Lock()
     finished = 0
     abandoned: list[tuple[str, str]] = []
     started = time.perf_counter()
     collected: list[tuple[Outcome, ...]] = []
+
+    if CORPUS == "atm":
+        print(
+            f"corpus=atm; --dataset {args.dataset} is not read by this commit",
+            file=sys.stderr,
+            flush=True,
+        )
+        with tempfile.TemporaryDirectory(prefix="support-coverage-") as root:
+
+            def note(line: str) -> None:
+                nonlocal finished
+                with done:
+                    finished += 1
+                    print(f"[{finished}] {line}", file=sys.stderr, flush=True)
+
+            collected = list(
+                _atm_outcomes(
+                    root=Path(root),
+                    arms=arms,
+                    settings=settings,
+                    client=client,
+                    limit=ATM_QUESTIONS,
+                    offset=args.offset,
+                    workers=args.workers,
+                    report=note,
+                )
+            )
+        question_count = ATM_QUESTIONS
+        judged = "atm_bench_official_deterministic_and_judge"
+        return _emit(
+            args,
+            settings,
+            arms,
+            collected,
+            abandoned=abandoned,
+            question_count=question_count,
+            judge_protocol=judged,
+            budget=budget,
+            started=started,
+        )
+
+    questions = load_longmemeval(args.dataset)[args.offset : args.offset + args.limit]
     with tempfile.TemporaryDirectory(prefix="support-coverage-") as root:
 
         def run(question: object) -> tuple[Outcome, ...]:
@@ -508,27 +786,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
             collected = [rows for rows in pool.map(run, questions) if rows]
 
+    return _emit(
+        args,
+        settings,
+        arms,
+        collected,
+        abandoned=abandoned,
+        question_count=len(questions),
+        judge_protocol="longmemeval_official_answer_check",
+        budget=budget,
+        started=started,
+    )
+
+
+def _emit(
+    args: argparse.Namespace,
+    settings: Mapping[str, str],
+    arms: Sequence[Arm],
+    collected: Sequence[tuple[Outcome, ...]],
+    *,
+    abandoned: Sequence[tuple[str, str]],
+    question_count: int,
+    judge_protocol: str,
+    budget: int,
+    started: float,
+) -> int:
+    """Write one report, whichever corpus produced it."""
     by_arm = {
         arm.name: [row for rows in collected for row in rows if row.arm == arm.name] for arm in arms
     }
     control = by_arm[arms[0].name]
     report = {
-        "dataset": str(args.dataset),
-        "questions": len(questions),
+        "corpus": CORPUS,
+        "dataset": str(args.dataset) if CORPUS == "longmemeval" else None,
+        "questions": question_count,
         "scored_questions": len(collected),
         # Named, not silently dropped: a report whose denominator moved has to say so.
         "abandoned": [{"question_id": qid, "reason": why} for qid, why in abandoned],
         "offset": args.offset,
         "recall_limit": RECALL_LIMIT,
-        "evidence_budget_chars": args.evidence_budget_chars,
+        "evidence_budget_chars": budget,
         "capture_context": not args.no_capture_context,
         "answer_model": settings["MINDBRIDGE_GENERATION_MODEL"],
         "judge": {
             "model": settings["MINDBRIDGE_GENERATION_MODEL"],
-            "protocol": "longmemeval_official_answer_check",
+            "protocol": judge_protocol,
             "note": (
-                "proxy judge: upstream's is gpt-4o-2024-08-06 and this is the model that also "
-                "answered, so no number here is comparable to a published row"
+                "proxy judge where a judge is used at all: upstream's is a frontier model and "
+                "this is the model that also answered, so no number here is comparable to a "
+                "published row"
             ),
         },
         "elapsed_seconds": round(time.perf_counter() - started, 1),
