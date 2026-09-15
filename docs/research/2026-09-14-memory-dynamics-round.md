@@ -685,21 +685,34 @@ Open design directions the data actually supports.
   people the way users do, by role, kinship or pronoun, which needs an alias-to-identity step no
   benchmark exercises; and a measurement on scores rather than ranks, since a bounded multiplicative
   prior cannot be simulated on rank-only dumps. H-C is closed on evidence, not on principle.
-- **Enrichment as a separate key, with the aggregate untouched — an open candidate, not a result.**
-  This is the one positive measurement the round produced, and it is the reviewer's Phase-1
-  recommendation rather than anything this round registered or validated. At 99.4 % caption coverage
-  on day, adding the caption as its own retrieval key and leaving the record's aggregate alone is
-  **+3.00 pp `hit@12` [+1.0, +5.5] p = 0.031, +3.50 pp `hit@36` [+0.5, +6.5] p = 0.039, +1.07 pp
-  `cov@12` [+0.17, +2.15]**, confound-free by construction — the control's own record, one extra
-  key, the same speaker ids — on the split whose replay proxy is faithful. It has the properties the
-  rest of the round lacks: a pre-specified contrast, no selection over a grid, and intervals
-  excluding zero on three metrics. It is also not free: +52.5 % embed keys per captioned clip and
-  +133 min of ingest, so the frozen cost rule would demand ≥ +5 pp and this is +3. **It is a
-  write-path key-composition hypothesis, not a vision-budget one**, and it was discovered rather
-  than registered. Amendment 8 records it as a Phase-1 candidate, H-G, with registration pending its
-  feasibility numbers and an acceptance rule that requires a product-level paired A/B through the
-  real ranking rather than the replay proxy, plus a second captioned corpus as holdout. Until that
-  runs, nothing here licenses shipping it.
+- **Enrichment as a separate key, with the aggregate untouched — registered as H-G, tested, closed.**
+  The round's one positive measurement was the day graft: at 99.4 % caption coverage, adding the
+  caption as its own retrieval key and leaving the record's aggregate alone is **+3.00 pp `hit@12`
+  [+1.0, +5.5] p = 0.031, W/L 6/0**, confound-free by construction (the control's own record, one
+  extra key, the same speaker ids). Amendment 9 registered it as H-G with a pooled-holdout rule and a
+  product-level transfer check; Amendments 10–12 record the outcome.
+  *Holdouts* (offline graft, zero model calls): memlens-32k 0.00 pp and memlens-256k +0.58 pp are
+  inert — captions sit on 11 % of records and the dataset's own caption is already in every such
+  record's text. **mm-lifelong week, the only holdout that exercises the mechanism at day's coverage
+  (99.87 % of 6,266 clips captioned), is −0.50 pp `hit@12` [−2.5, +1.0], W/L/T 1/2/197.** Pooled
+  over the three holdouts, clustered by question (n = 546): **0.00 pp [−0.74, +0.73]** — the rule's
+  first clause (positive with a CI excluding zero) fails and its second (no split below −1.0 pp)
+  holds. On week the caption key re-orders 75 of 200 top-12 sets and moves gold on three questions,
+  one in and two out; the product's own recorded rankings put the captioned week store at 0.00 pp
+  `hit@12` against the no-caption store (W/L 33/33), so the day observation that a caption inside
+  the aggregate hurts does not recur either.
+  *Transfer*: a product re-ingest of the day unit under the patched kernel is **+1.50 pp `hit@12`
+  against the captioned store [−3.5, +6.5], p = 0.68** — the registered bar met on the point estimate
+  and on nothing stronger, and only on a reindexed copy: the check found that a store ingested from
+  scratch on this branch lineage gets a Zvec index whose vectors are bound to the wrong records (0.15
+  overlap with its own exhaustive ranking, 0.994 after a plain reindex), a blocking defect
+  independent of H-G that is registered for its own root cause and fix.
+  **H-G is closed for this round.** The merge condition — holdout and transfer both passing — is not
+  met, and `r0914/aggregate-key-composition` stays unmerged. What survives: the day number as a
+  single-split, single-video result; the finding on all three corpora that the caption key is the
+  argmax part for only 0.3–0.5 % of (query, clip) pairs; and the cost fact that the graft is free
+  where it is inert (−6.6 % embed keys on day, from the silent-clip dedup). Every week number here
+  is a replay-proxy number (see the proxy caveat below) except the product-level C − A.
 - **Exposure on video, if the floor is to be bounded.** The reader's window is fixed at 12 clips by
   a 12,000-char-per-asset charge, and the guaranteed `hits[:limit]` prefix is 6.2× the evidence
   budget while `_budgeted_hits` adds zero. That is the documented contract, so the open work is
@@ -711,8 +724,9 @@ Open design directions the data actually supports.
 conversations), longmemeval (60 questions, one per unit, baseline `complete@12` 0.90, so one
 question is 1.67 pp), and mm-lifelong day and week (200 questions each). The locomo and longmemeval
 replays are dense-only proxies of a hybrid ranking (mean top-12 overlap 81.7 % / 85.8 % with the
-product's stored order). No arm was promoted to a harness run, no answer was scored by a judge in
-this round, and no product code was changed.
+product's stored order). No answer was scored by a judge in this round. The only product-code
+change, H-G's key-composition patch, lives on an unmerged branch, and its one harness run was the
+transfer check.
 
 **The mm-lifelong week proxy is not the product, and it is stronger than the product.** Week replay
 overlap@12 is **0.630** and replay `hit@12` is **0.605** against the product's recorded **0.415** —
@@ -756,10 +770,12 @@ missing.
 Round directory layout, all under `autoresearch/orchestrator-260914/`:
 
 ```text
-PROTOCOL.md         pre-registration plus Amendments 1-8, appended in order, never rewritten
+PROTOCOL.md         pre-registration plus Amendments 1-12, appended in order, never rewritten
 PROTOCOL.sha256     the digest chain, one line appended per state of PROTOCOL.md
 reports/            kernel_map.md, p0-ha.md … p0-hf.md, autopsy.md,
-                    autopsy-budget-verify.md, queryform.md, review-round.md
+                    autopsy-budget-verify.md, queryform.md, review-round.md,
+                    hg-feasibility.md, hg-holdout.md, hg-review.md, hg-transfer.md,
+                    hg-holdout-week.md
 tools/              the analysis scripts, each with a --selfcheck mode
 p0/                 the numeric outputs and cached query vectors the reports cite
 receipts/           tool receipts for the round
@@ -769,6 +785,8 @@ review-receipts/    tool receipts for the adversarial reviews
 Scripts, by hypothesis: `ha_common.py` / `ha_run.py` / `ha_explore.py` (H-A), `p0_hb.py` (H-B),
 `p0_hc.py` (H-C), `p0_hd.py` (H-D), `he_extract.py` / `he_common.py` / `he_endpoints.py` /
 `he_run.py` / `he_diag.py` / `he_mech.py` (H-E), `hf_common.py` / `hf_run.py` (H-F),
+`hg_common.py` / `hg_run.py` / `hg_pool.py` / `hg_week.py` / `hg_transfer_search.py` /
+`hg_transfer_score.py` (H-G),
 `autopsy_common.py` / `autopsy_day.py` / `autopsy_locomo.py` / `autopsy_routes.py` /
 `autopsy_examples.py` (the autopsy), `qf_run.py` / `qf_day.py` (query form). Each runs under
 `/home/yons/thomas/MindBridge/.venv/bin/python` with `PYTHONPATH` pointing at this worktree's `src`
@@ -776,12 +794,14 @@ where product code is imported, and each carries a `--selfcheck` that must pass 
 numbers are read. Bootstraps are seeded (seed 42, 10,000 resamples); everything else is
 deterministic.
 
-`PROTOCOL.sha256` holds ten appended lines with nine distinct digests — the pre-registration plus
-Amendments 1–8 — and the last line, `318953e4…`, is the digest of the file as it stands. Reports
-name the digest they were registered against: `69086e1f…` for H-A's start, `c4b8299c…` for Amendment
+`PROTOCOL.sha256` holds fourteen appended lines with thirteen distinct digests — the
+pre-registration plus Amendments 1–12 — and the last line, `26d45f1d…`, is the digest of the file as
+it stands. Reports name the digest they were registered against: `69086e1f…` for H-A's start, `c4b8299c…` for Amendment
 1 as H-A finished, `c3240ee7…` for H-D and the query-form ablation, `3f715e72…` for H-F, and
-`dbac7b7e…` for H-E. That ordering is internally consistent with each hypothesis being registered
-before its numbers were read, and no amendment edits a prior hypothesis's kill-rule text — but read
+`dbac7b7e…` for H-E, `fe193294…` for the H-G memlens holdout, `7500bbe0…` for the H-G week holdout
+and transfer check, and `7f52ed10…` / `26d45f1d…` for Amendments 11 and 12 as written. That
+ordering is internally consistent with each hypothesis being registered before its numbers were
+read, and no amendment edits a prior hypothesis's kill-rule text — but read
 the integrity paragraph in section 7 before treating the chain as an audit trail, because it is
 hand-appended inside a directory the repository does not track. The protocol itself is reproduced
 byte for byte, inside a fenced block so that nothing is reformatted, at [the r0914 pre-registered

@@ -1,8 +1,8 @@
 # Round r0914 pre-registered protocol (verbatim copy)
 
-This is `autoresearch/orchestrator-260914/PROTOCOL.md`, the pre-registration and Amendments 1-8
+This is `autoresearch/orchestrator-260914/PROTOCOL.md`, the pre-registration and Amendments 1-12
 of the 2026-09-14 memory-dynamics round, copied here byte for byte at sha256
-`318953e439b767839d8284f7f8e08a17759a3655c214ce4787dffcb3753a348e`.
+`26d45f1d9723aacea3ff87c9ae0fae2b6c1d99bc3c56d1f5b3e5898a0d55cf78`.
 
 It is published in the documentation set because the round directory is excluded from the
 repository by `.gitignore`, so without this copy no record of the protocol exists inside the
@@ -200,4 +200,67 @@ in the lexical document. Zero additional model calls. Pre-registered acceptance 
 product-level paired A/B on mm-lifelong day via `search_with_trace` through the real ranking (not the proxy): hit@12 ≥ +2.0 pp
 with CI excluding 0 or McNemar p < 0.05; holdout = a second captioned corpus (offline graft and/or product re-ingest); cost rule
 unchanged. Kill if day product delta < +2.0 pp or holdout negative.
+
+## Amendment 9 (2026-09-15, H-G registration; before any holdout number is read)
+Feasibility (reports/hg-feasibility.md): both benchmark runs use the same embedder `tencent/WeMM-Embedding-2B:2048:messages-v1:l2-v1`
+and index recipe, so cross-run grafts are valid; matched caption/no-caption store pairs exist for m3-bench-robot (100 stores) and
+memlens 32k/64k/128k/256k (195 stores each); mm-lifelong week caption store lands ≈06:10 from the user's live eval. DescriptionCache
+covers 2 813/2 831 day clips. Change = aggregate key (object_part 0) embeds only the caller-provided observation; `[visual description:`
+/ `[facts:` sections keep their own keys and stay in the lexical document; transcripts untouched; recipe v12→v13; key count unchanged.
+**H-G acceptance, pre-registered:**
+- Dev (already read): day graft +3.00 pp hit@12 [+1.0,+5.5] p=0.031.
+- Holdouts (offline graft, zero model calls, same tooling he_extract/he_mech): memlens-32k, memlens-256k, m3-bench-robot, and
+  mm-lifelong week when available. Metric = the corpus's retrieval hit@12 / cov@12 against its gold evidence ids (if a corpus has no
+  gold ids it is NOT a holdout — say so). Rule: pooled holdout hit@12 delta > 0 with paired bootstrap CI excluding 0, AND no single
+  holdout < −1.0 pp with CI excluding 0. Report every split regardless.
+- Transfer check: product re-ingest of the day unit with the patched kernel (cached captions, ~18 vision calls), then the 200
+  questions through the REAL ranking (`search_with_trace`, limit 100) vs the existing captioned day store: hit@12 ≥ +1.0 pp with the
+  same sign as the proxy; if the product delta is ≤ 0 the proxy result does not transfer and H-G is not adopted.
+- Cost rule: embedding calls and rows per observation unchanged (verified by key count); ingest wall-clock within +5 %.
+- Adversarial review of the patch and of the holdout numbers by a separate agent before the verdict is written.
+
+## Amendment 10 (2026-09-15, H-G holdout + patch review read; transfer check pending)
+- Holdout (reports/hg-holdout.md): m3-bench-robot has no gold ids → not a holdout; week caption store not yet written. memlens-32k /
+  256k (n=173 each, nested): G−A hit@12 0.00 / +0.58 pp; pooled +0.29 pp CI95 [0.00, +0.87], W/L/T 1/0/345 → clause 1 (CI excludes 0)
+  FAILS by the letter. Reading recorded, not re-read: the population is inert (A already 0.9884 / 0.9480; captions 11 % of records;
+  dataset caption text already inside every captioned record; caption key argmax 0.52 %). Caption-in-aggregate is not harmful there
+  (C−A +1.16 / +0.58 ns). The only holdout that exercises the mechanism (video aggregate = vector + ~7-char ASR) is week — deferred
+  until the user's eval finishes writing it; H-G cannot be adopted as a default in this round regardless of the day transfer check.
+- Patch review (reports/hg-review.md): fix-first. F1 caption with interior blank line leaks into the aggregate (0/34 564 real captions
+  affected → read numbers uncontaminated); F2 caption-only record loses its redundant aggregate row (key count claim false);
+  F3 opening any v12 store with the patched kernel re-embeds it in place → controls must be measured on copies with the original
+  kernel (transfer agent warned); F7–F9 docstring/docs/migration-cost prose. Path parity add()==capture()+settle()==migration verified.
+
+## Amendment 11 (2026-09-15, transfer check read)
+- H-G transfer (reports/hg-transfer.md): product ranking on a reindexed copy of the fresh day store: NEW 0.415 / C 0.400 / A 0.405
+  hit@12; NEW−C +1.50 pp [−3.50,+6.50] 13W/10L p=0.68 (hit@36 +2.00, cov@12 +0.14, all@12 −0.50); NEW−A +1.00 [−4.0,+6.0]. Same sign as
+  the proxy on every hit@k; magnitude 2–4× smaller. Registered transfer rule met on the point estimate only; every CI crosses 0 →
+  **H-G not adopted as default**; branch kept (tip 5f4e576c) pending the week holdout. Cost: ingest 41 min with cached captions
+  (47 vision requests), vectors 10 014 vs 10 725 (−6.6 %, review F2: caption-only clips drop the redundant aggregate row).
+- **Defect found, not H-G's**: a store ingested from scratch by either kernel of this branch lineage (631704fa and its parent 8b3483e1,
+  i.e. the session branch with r0913b compaction/ef merges) has a Zvec index whose vectors are bound to wrong records: index vs
+  exhaustive-cosine overlap 0.15@100, hit@12 0.255, score error 0.091 mean; delete `zvec/` + reopen → 0.994 / 0.415. Stores written
+  by pre-branch kernels (26/40 unmerged segments) are 0.990/0.994. Suspect: incremental index write path + close-time segment merge
+  (r0913b 53e18e05/7c1d0c50). Registered as a blocking defect: root-cause, regression test, fix on `r0914/index-binding-fix`.
+
+## Amendment 12 (2026-09-15, H-G week holdout read — H-G closed)
+- Week holdout (reports/hg-holdout-week.md, registered against Amendment 9, read at 7500bbe0…; Amendment 11 landed while it ran):
+  the captioned week store finished 06:29 (6 266 clips, 6 258 captions = 99.87 % coverage; matched no-caption store
+  `baseline-…-20260911`; both read from VACUUM INTO snapshots, never opened through `Memory`). Graft G−A hit@12 **−0.50 pp
+  [−2.5, +1.0], W/L/T 1/2/197, McNemar 1.0**; hit@36 0.00; cov@12 +0.22 ns. Pooled over the three registered holdouts
+  (memlens-32k, memlens-256k, week; clustered by question, n=546): **0.00 pp [−0.74, +0.73], W/L/T 2/2/542** → clause 1 fails
+  (delta not > 0, CI includes 0); clause 2 holds (worst split −0.50, CI includes 0). **H-G fails its pre-registered holdout.**
+  With the transfer clause met on its point estimate only (Amendment 11), the merge condition (holdout AND transfer) is not met:
+  H-G is closed for this round, `r0914/aggregate-key-composition` stays unmerged (tip 5f4e576c).
+- Mechanism on week: the caption key is argmax for 0.30 % of (query, captioned clip) pairs and 6.8 % of captioned top-12 clips
+  (day 0.28 % / 2.1 %, memlens 0.52 % / 1.3 %); 75/200 top-12 sets change, gold moves on 3 questions (1 W / 2 L). C−A
+  (confounded, as on day) −2.00 pp ns; product-level C−A from both runs' recorded rankings 0.00 pp hit@12 (W/L 33/33), cov@12
+  −3.26 ns → caption-in-aggregate is not measurably harmful on week. Day's +3.00 pp stands as a single-split, single-video result
+  that did not generalise. Week proxy caveat unchanged (replay 0.605 vs product 0.415; overlap@12 0.63 for A, 0.43 for C).
+- Tooling: `hg_common.predict_roles` replays `stored_canonical_parts`, which does not cut `[speech identities:]` sections, so it
+  under-counts keys by one on every speech-bearing record (5 473/6 266 on week; a first pass with it was discarded unread). Week
+  roles are positional (`tools/hg_week.py`), asserted against the stored part count on every record and validated by cosine
+  (video key A↔C min 0.991). memlens records carry no speech section; Amendment 10's numbers are unaffected (0 mismatches there).
+- Chain note: this worker briefly appended a duplicate `7f52ed10… PROTOCOL.md` line to PROTOCOL.sha256 (a guard that stopped the
+  amendment did not stop the hash line) and removed it two minutes later; the chain below line 13 is otherwise untouched.
 ````
