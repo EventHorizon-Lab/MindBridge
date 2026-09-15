@@ -492,7 +492,7 @@ class ControlPlane(Traced):
     def rollback(self, operation_id: int) -> bool:
         with (
             self._trace("mindbridge.rollback", kind="operation"),
-            self._lifecycle.operation(),
+            self._lifecycle.operation() as assets,
             self._write_lock,
         ):
             if (
@@ -558,10 +558,11 @@ class ControlPlane(Traced):
                     # and must still un-forget rather than silently do nothing.
                     clear_forgotten=row.forgotten_ids
                     or (row.changed_ids if operation.intent is MemoryIntent.FORGET else ()),
+                    naming_projection_factory=self._formation.naming_projection_factory(assets),
                 )
             self._lifecycle.queue_asset_cleanup(orphaned)
             self._projection.drain()
-            if reverted and naming:
+            if reverted and naming and not self._settings.independent_evidence:
                 assert operation.claim is not None
                 self._reproject_identity(operation.claim.identity_id)
             return reverted
@@ -802,6 +803,7 @@ class ControlPlane(Traced):
                     targets=targets,
                     shown=shown,
                     window=window,
+                    assets=assets,
                 )
             )
         except StaleOperationError:
@@ -818,6 +820,7 @@ class ControlPlane(Traced):
         targets: Mapping[str, StoredMemory],
         shown: Mapping[str, MemoryRecord] | None,
         window: frozenset[str] | None,
+        assets: OperationAssets,
     ) -> StoredOperation:
         """Validate a REINFORCE, CORRECT, or FORGET proposal and commit its effect.
 
@@ -862,6 +865,7 @@ class ControlPlane(Traced):
                     require_unretired=(
                         operation.target_ids if operation.intent is MemoryIntent.REINFORCE else ()
                     ),
+                    naming_projection_factory=self._formation.naming_projection_factory(assets),
                 )
             if logged is None:
                 raise RejectedOperation("duplicate")
@@ -966,6 +970,7 @@ class ControlPlane(Traced):
         logged = self._formation.commit(
             tuple((prepared, source.id, proposal.confidence) for source in sources),
             (),
+            assets=assets,
             completed_at=now,
             recipe=self._backends.consolidation_recipe,
             operation=pending,
@@ -1086,6 +1091,7 @@ class ControlPlane(Traced):
             logged = self._formation.commit(
                 tuple((prepared, source.id, proposal.confidence) for source in sources),
                 (),
+                assets=assets,
                 completed_at=now,
                 recipe=self._backends.consolidation_recipe,
                 operation=pending,

@@ -300,6 +300,7 @@ class Identities(Traced):
         logged = self._formation.commit(
             ((prepared, None, proposal.confidence),),
             (),
+            assets=operation,
             completed_at=now,
             recipe=CONSENT_RECIPE,
             operation=StoredOperation(
@@ -405,6 +406,22 @@ class Identities(Traced):
         """
         with translate_storage_errors("read identity naming assertion"):
             removed, projection = self._store.identities.naming_projection_after_delete(memory_id)
+        factory = self._formation.naming_projection_factory(operation)
+        if factory is not None:
+            with translate_storage_errors("read affected speech memories"):
+                memory_ids = sorted(
+                    {
+                        memory_id
+                        for identity_id, _projected in projection
+                        for memory_id in self._store.identities.speaker_memory_ids(identity_id)
+                        or ()
+                    }
+                    - set(removed)
+                )
+                affected = self._store.records.read_memories(memory_ids)
+            # All previewed names travel together: two people may share one
+            # document, which must be embedded once with both resulting names.
+            return factory(dict(projection), affected)
         memories: tuple[StoredMemory, ...] = ()
         embeddings: tuple[StoredEmbedding, ...] = ()
         for identity_id, projected in projection:
@@ -587,6 +604,7 @@ class Identities(Traced):
         self._formation.commit(
             ((prepared, None, proposal.confidence),),
             (),
+            assets=operation,
             completed_at=now,
             recipe=NAMING_RECIPE,
             # Re-asserting a standing name changes nothing, so it logs nothing: the operation

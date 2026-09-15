@@ -145,6 +145,7 @@ class Memory:
         face_analyzer: FaceBackend | None = None,
         former: FormationBackend | None = None,
         consolidator: ConsolidationBackend | None = None,
+        independent_evidence: bool = _DEFAULT_CONFIG.independent_evidence,
         index_speech: bool = _DEFAULT_CONFIG.index_speech,
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         retrieval_mode: RetrievalMode = _DEFAULT_CONFIG.retrieval_mode,
@@ -172,6 +173,7 @@ class Memory:
         tracer = trace.get_tracer(TRACER_NAME) if tracer is None else tracer
         self._settings = resolve_settings(
             index_speech=index_speech,
+            independent_evidence=independent_evidence,
             index_quantization=index_quantization,
             retrieval_mode=retrieval_mode,
             minimum_relevance=minimum_relevance,
@@ -340,6 +342,7 @@ class Memory:
             tracer=tracer,
             storage=self._storage,
             backends=self._backends,
+            settings=self._settings,
             materializer=materializer,
             embedding=embedding,
             projection=self._projection,

@@ -20,8 +20,8 @@ from mindbridge.infrastructure.local.store._codec import (
 )
 from mindbridge.infrastructure.local.store._connections import Connections
 from mindbridge.infrastructure.local.store._identity import (
+    dependent_naming_identities,
     displaced_naming_versions,
-    naming_assertion_identities,
     reproject_identities,
     reproject_named_identities,
 )
@@ -402,7 +402,7 @@ def delete_memory(  # noqa: C901 - one atomic dependency and lineage teardown
             reconciled.add((row_text(semantic, "lineage_id"), row_text(semantic, "kind")))
     # Read before deletion: a derived naming assertion may be several dependency hops from
     # the requested source. Every unsupported node must stop feeding the identity projection.
-    named_identities = naming_assertion_identities(
+    named_identities = dependent_naming_identities(
         connection,
         (*removed_ids, *surviving_dependents),
     )

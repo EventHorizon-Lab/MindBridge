@@ -1273,6 +1273,237 @@ def test_an_agent_names_a_person_only_from_evidence_that_contains_them(tmp_path:
         assert _asserted_name(memory, identity_id) is None
 
 
+def test_independent_naming_preview_does_not_index_an_uncorroborated_name(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        transcriber=OnePersonSpeech(),
+        face_analyzer=OnePersonFace(),
+        identity_link_min_assets=1,
+        independent_evidence=True,
+    ) as memory:
+        first = memory.add(Blob(b"first arrival", "video/mp4", "first.mp4"))
+        second = memory.add(Blob(b"second arrival", "video/mp4", "second.mp4"))
+        identity_id = memory.speech(first.id)[0].speaker_id
+        assert identity_id is not None
+        summary = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(first.id, second.id),
+                proposal=_relation_summary(),
+            )
+        ).created_ids[0]
+        memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.IDENTIFY,
+                evidence_ids=(first.id, summary),
+                claim=IdentityClaim(identity_id=identity_id, name="Zora"),
+            )
+        )
+        identity = memory.identity(identity_id)
+        assert identity is not None and identity.name is None
+        assert "Zora" not in memory.get(first.id).content
+        assert "Zora" not in memory.get(second.id).content
+
+
+@pytest.mark.parametrize("limited", [False, True])
+def test_zero_confidence_or_limited_capture_cannot_put_an_inferred_name_in_speech(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limited: bool
+) -> None:
+    if limited:
+        from mindbridge.infrastructure.local.store import _corroboration
+
+        monkeypatch.setattr(_corroboration, "_MAX_MEMBER_ROWS", 1)
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        transcriber=OnePersonSpeech(),
+        face_analyzer=OnePersonFace(),
+        identity_link_min_assets=1,
+        independent_evidence=True,
+    ) as memory:
+        first = memory.add(Blob(b"normal capture", "video/mp4", "normal.mp4"))
+        second = memory.add(
+            Blob(b"unreliable capture", "video/mp4", "unreliable.mp4"),
+            context=ObservationContext(confidence=1 if limited else 0),
+        )
+        identity_id = memory.speech(first.id)[0].speaker_id
+        assert identity_id is not None
+        for source in (first, second):
+            memory.apply(
+                MemoryOperation(
+                    intent=MemoryIntent.IDENTIFY,
+                    evidence_ids=(source.id,),
+                    claim=IdentityClaim(identity_id=identity_id, name="ZorgUnexpected"),
+                )
+            )
+        identity = memory.identity(identity_id)
+        assert identity is not None and identity.name is None
+        assert "ZorgUnexpected" not in memory.get(first.id).content
+        assert "ZorgUnexpected" not in memory.get(second.id).content
+
+
+def test_nested_naming_projection_follows_support_rollback_and_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    embedder = TinyEmbedder()
+    with Memory(
+        tmp_path,
+        embedder=embedder,
+        transcriber=OnePersonSpeech(),
+        face_analyzer=OnePersonFace(),
+        identity_link_min_assets=1,
+        independent_evidence=True,
+    ) as memory:
+        first = memory.add(Blob(b"normal capture", "video/mp4", "normal.mp4"))
+        second, third = _observations(memory, "other situation", "independent situation")
+        identity_id = memory.speech(first.id)[0].speaker_id
+        assert identity_id is not None
+
+        def support(*sources: str) -> MemoryOperationRecord:
+            return memory.apply(
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=sources,
+                    proposal=_relation_summary(),
+                )
+            )
+
+        summary = support(first.id, second.id).created_ids[0]
+        naming = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.IDENTIFY,
+                evidence_ids=(first.id, summary),
+                claim=IdentityClaim(identity_id=identity_id, name="ZorgUnexpected"),
+            )
+        ).created_ids[0]
+
+        def projected(wanted: bool) -> None:
+            context = memory.get(naming).context
+            identity = memory.identity(identity_id)
+            assert context is not None and context.visible is wanted
+            assert identity is not None
+            assert identity.name == ("ZorgUnexpected" if wanted else None)
+            assert ("ZorgUnexpected" in memory.get(first.id).content) is wanted
+
+        projected(False)
+        alternative = support(third.id)
+        projected(True)
+        with monkeypatch.context() as fault:
+
+            def fail_embedding(
+                inputs: Sequence[ModelInput], **kwargs: object
+            ) -> tuple[tuple[float, ...], ...]:
+                raise RuntimeError("projection embedding failed")
+
+            fault.setattr(embedder, "embed", fail_embedding)
+            with pytest.raises(ModelError):
+                memory.rollback(alternative.operation_id)
+        projected(True)
+        assert (
+            next(
+                operation
+                for operation in memory.operations()
+                if operation.operation_id == alternative.operation_id
+            ).rolled_back_at
+            is None
+        )
+        assert memory.rollback(alternative.operation_id)
+        projected(False)
+        support(third.id)
+        projected(True)
+        assert memory.delete(third.id)
+        projected(False)
+
+
+def test_nested_naming_updates_two_speakers_in_one_indexed_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TwoPersonSpeech(OnePersonSpeech):
+        def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+            return tuple(
+                SpeechAnalysis(
+                    turns=(
+                        SpeechTurn(0, 900, "first speaker", "0"),
+                        SpeechTurn(1000, 1900, "second speaker", "1"),
+                    ),
+                    speakers=(
+                        SpeakerEmbedding("0", (1.0, 0.0)),
+                        SpeakerEmbedding("1", (0.0, 1.0)),
+                    ),
+                )
+                for _asset in assets
+            )
+
+    embedder = TinyEmbedder()
+    with Memory(
+        tmp_path,
+        embedder=embedder,
+        transcriber=TwoPersonSpeech(),
+        independent_evidence=True,
+    ) as memory:
+        first = memory.add(Blob(b"two speakers", "audio/wav", "two.wav"))
+        second, third = _observations(memory, "other situation", "independent situation")
+        identities = tuple(segment.speaker_id for segment in memory.speech(first.id))
+        assert len(set(identities)) == 2
+        summary = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(first.id, second.id),
+                proposal=_relation_summary(),
+            )
+        ).created_ids[0]
+        names = ("ZoraFirst", "ZoraSecond")
+        for identity_id, name in zip(identities, names, strict=True):
+            assert identity_id is not None
+            memory.apply(
+                MemoryOperation(
+                    intent=MemoryIntent.IDENTIFY,
+                    evidence_ids=(first.id, summary),
+                    claim=IdentityClaim(identity_id=identity_id, name=name),
+                )
+            )
+        alternative = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(third.id,),
+                proposal=_relation_summary(),
+            )
+        )
+        content = memory.get(first.id).content
+        assert all(name in content for name in names)
+        assert memory.rollback(alternative.operation_id)
+        content = memory.get(first.id).content
+        assert all(name not in content for name in names)
+        memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(third.id,),
+                proposal=_relation_summary(),
+            )
+        )
+        with monkeypatch.context() as fault:
+
+            def fail_embedding(
+                inputs: Sequence[ModelInput], **kwargs: object
+            ) -> tuple[tuple[float, ...], ...]:
+                raise RuntimeError("deletion projection embedding failed")
+
+            fault.setattr(embedder, "embed", fail_embedding)
+            with pytest.raises(ModelError):
+                memory.delete(third.id)
+        assert memory.get(third.id).id == third.id
+        content = memory.get(first.id).content
+        assert all(name in content for name in names)
+        assert memory.delete(third.id)
+        content = memory.get(first.id).content
+        assert all(name not in content for name in names)
+        for identity_id in identities:
+            assert identity_id is not None
+            profile = memory.identity(identity_id)
+            assert profile is not None and profile.name is None
+
+
 def test_identify_creation_cannot_be_rolled_back_before_its_later_reinforcement(
     tmp_path: Path,
 ) -> None:
