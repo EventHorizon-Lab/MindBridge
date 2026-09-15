@@ -14,6 +14,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
+from functools import partial
 from typing import cast
 
 from opentelemetry.trace import Tracer
@@ -22,6 +23,7 @@ from mindbridge._telemetry import mark_model_requests, record_formation_refusals
 from mindbridge.exceptions import MindBridgeError, ModelError
 from mindbridge.infrastructure.local.store import (
     CONSENT_PREDICATE,
+    NamingProjectionFactory,
     StoredEmbedding,
     StoredMemory,
     StoredOperation,
@@ -41,6 +43,7 @@ from mindbridge.kernel.lifecycle import OperationAssets
 from mindbridge.kernel.materialization import Materializer
 from mindbridge.kernel.projection import Projection
 from mindbridge.kernel.runtime import Storage, translate_storage_errors
+from mindbridge.kernel.settings import Settings
 from mindbridge.kernel.tracing import Traced
 from mindbridge.models.base import EmbedTask, FormationInput, ModelInput
 from mindbridge.types import (
@@ -504,6 +507,7 @@ class Formation(Traced):
         *,
         tracer: Tracer,
         storage: Storage,
+        settings: Settings,
         backends: Backends,
         materializer: Materializer,
         embedding: Embedding,
@@ -512,6 +516,7 @@ class Formation(Traced):
         super().__init__(tracer)
         self._formation_lock = storage.formation_lock
         self._store = storage.store
+        self._settings = settings
         self._write_lock = storage.write_lock
         self._backends = backends
         self._materializer = materializer
@@ -678,6 +683,7 @@ class Formation(Traced):
         self.commit(
             grounded,
             formed_sources,
+            assets=operation,
             completed_at=now,
             joint_evidence_clauses=True,
         )
@@ -687,6 +693,7 @@ class Formation(Traced):
         pairs: Sequence[tuple[PreparedMemory, str | None, float]],
         sources: Sequence[MemoryRecord],
         *,
+        assets: OperationAssets,
         completed_at: datetime,
         recipe: str | None = None,
         operation: StoredOperation | None = None,
@@ -788,7 +795,7 @@ class Formation(Traced):
             )
         projection_memories: tuple[StoredMemory, ...] = ()
         projection_embeddings: tuple[StoredEmbedding, ...] = ()
-        if projection_factory is not None:
+        if projection_factory is not None and not self._settings.independent_evidence:
             # Derived assertion vectors are prepared first, then every speech document the new
             # projection affects. Neither reaches SQLite until both model calls have succeeded.
             projection_memories, projection_embeddings = projection_factory()
@@ -835,6 +842,7 @@ class Formation(Traced):
                     projection_identity_id=projection_identity_id,
                     projection_memories=projection_memories,
                     projection_embeddings=projection_embeddings,
+                    naming_projection_factory=self.naming_projection_factory(assets),
                 )
             self._projection.drain()
         if operation is None:
@@ -846,6 +854,12 @@ class Formation(Traced):
         with translate_storage_errors("read a memory operation"):
             logged = self._store.control.read_operations(operation_key=operation.operation_key)
         return logged[0] if logged else None
+
+    def naming_projection_factory(self, assets: OperationAssets) -> NamingProjectionFactory | None:
+        """Prepare exact candidate speech projections before their transaction commits."""
+        if not self._settings.independent_evidence:
+            return None
+        return partial(self._embedding.refresh_naming_memories, operation=assets)
 
     def bound_identity(self, proposal: FormationProposal) -> str | None:
         """Resolve which recognized person a proposed claim is about, or None.

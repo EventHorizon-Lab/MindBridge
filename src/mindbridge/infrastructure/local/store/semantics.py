@@ -32,6 +32,11 @@ from mindbridge.infrastructure.local.store._lineage import (
     validate_formation_links,
     version_retired,
 )
+from mindbridge.infrastructure.local.store._naming_projection import (
+    NamingProjectionFactory,
+    naming_snapshot,
+    refresh_naming_documents,
+)
 from mindbridge.infrastructure.local.store._operations import active_operation_id, insert_operation
 from mindbridge.infrastructure.local.store.errors import StaleOperationError
 from mindbridge.infrastructure.local.store.records import (
@@ -82,6 +87,7 @@ class Semantics:
         projection_identity_id: str | None = None,
         projection_memories: Iterable[StoredMemory] = (),
         projection_embeddings: Iterable[StoredEmbedding] = (),
+        naming_projection_factory: NamingProjectionFactory | None = None,
     ) -> bool:
         """Commit derived records, evidence, and source completion in one transaction.
 
@@ -138,6 +144,27 @@ class Semantics:
                 return False
             require_active_memories(connection, require_active)
             require_unretired_memories(connection, require_unretired)
+            naming_before = naming_snapshot(
+                connection,
+                (
+                    *(memory.memory_id for memory in supplied_memories),
+                    *(memory_id for memory_id, _source, _confidence in evidence),
+                    *forget_ids,
+                ),
+                identity_ids=tuple(
+                    dict.fromkeys(
+                        (
+                            *(
+                                memory.context.identity_id
+                                for memory in supplied_memories
+                                if memory.context is not None
+                                and memory.context.identity_id is not None
+                            ),
+                            *(() if projection_identity_id is None else (projection_identity_id,)),
+                        )
+                    )
+                ),
+            )
             if any(
                 connection.execute(
                     """
@@ -272,6 +299,7 @@ class Semantics:
                         superseded=tuple(dict.fromkeys(superseded)),
                     ),
                 )
+            refresh_naming_documents(connection, naming_before, naming_projection_factory)
         return True
 
     def formation_completed(self, source_memory_id: str, recipe: str) -> bool:

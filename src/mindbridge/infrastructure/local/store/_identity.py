@@ -21,7 +21,11 @@ from mindbridge.infrastructure.local.store._codec import (
     row_text,
     unpack_vector,
 )
-from mindbridge.infrastructure.local.store._lineage import current_evidence_ids
+from mindbridge.infrastructure.local.store._corroboration import independent_evidence_enabled
+from mindbridge.infrastructure.local.store._lineage import (
+    active_evidence_dependent_closure,
+    current_evidence_ids,
+)
 from mindbridge.infrastructure.local.store.rows import validated_identity_modality
 from mindbridge.types import ConsentState, EvidenceBasis, MemoryKind
 
@@ -421,10 +425,20 @@ def reproject_named_identities(
     memory_ids: Sequence[str],
 ) -> tuple[str, ...]:
     """Reproject every identity named by one of these records. The projection hook."""
-    identity_ids = naming_assertion_identities(connection, memory_ids)
+    identity_ids = dependent_naming_identities(connection, memory_ids)
     if not identity_ids:
         return ()
     return reproject_identities(connection, identity_ids)
+
+
+def dependent_naming_identities(
+    connection: sqlite3.Connection, memory_ids: Sequence[str]
+) -> tuple[str, ...]:
+    affected = dict.fromkeys(memory_ids)
+    if independent_evidence_enabled(connection):
+        for memory_id in memory_ids:
+            affected.update(dict.fromkeys(active_evidence_dependent_closure(connection, memory_id)))
+    return naming_assertion_identities(connection, tuple(affected))
 
 
 def rebind_unlinked_claims(

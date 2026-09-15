@@ -23,6 +23,10 @@ from mindbridge.infrastructure.local.store._codec import (
     parse_datetime,
     row_text,
 )
+from mindbridge.infrastructure.local.store._corroboration import (
+    evidence_support,
+    independent_evidence_enabled,
+)
 from mindbridge.infrastructure.local.store._outbox import queue_memory_embeddings
 from mindbridge.infrastructure.local.store.errors import StaleOperationError
 from mindbridge.infrastructure.local.store.rows import (
@@ -759,6 +763,16 @@ def grounded_affected_memory_ids(  # noqa: C901 - bounded support fixed point
 
 def _is_evidence_root(connection: sqlite3.Connection, memory_id: str) -> bool:
     """Return whether a record stands without another memory's support."""
+    if (
+        independent_evidence_enabled(connection)
+        and connection.execute(
+            "SELECT 1 FROM memory_evidence_clauses WHERE memory_id = ? LIMIT 1", (memory_id,)
+        ).fetchone()
+        is not None
+    ):
+        # A formation can label derived content as a host statement or response feedback.
+        # Its basis cannot turn the old ancestry into a new root after withdrawal retires it.
+        return False
     row = connection.execute(
         """
         SELECT s.kind, s.basis
@@ -869,6 +883,25 @@ def restamp_dependent_evidence(
                 (source_memory_id,),
             ).fetchall()
         )
+    if independent_evidence_enabled(connection):
+        # Candidate projections read authoritative clauses directly, so no iterative group
+        # restamping is needed. Every dependent must refresh even if the legacy scalar stayed
+        # unchanged: a multi-root summary can gain or lose an independent alternative.
+        for dependent_id in closure:
+            refresh_evidence_projection(
+                connection,
+                dependent_id,
+                _next_semantic_transaction_time(connection, changed_at, (dependent_id,)),
+            )
+        return
+    _restamp_legacy_groups(connection, tuple(closure), changed_at)
+
+
+def _restamp_legacy_groups(
+    connection: sqlite3.Connection,
+    closure: Sequence[str],
+    changed_at: datetime,
+) -> None:
     # A sweep in arbitrary order can restamp a record before one of its own sources settles, so
     # sweep until nothing moves. The citation graph is acyclic, so each sweep settles at least
     # one more record and the bound is only there to stop a corrupted cycle from spinning.
@@ -1411,6 +1444,9 @@ def _evidence_summary(
     connection: sqlite3.Connection,
     memory_id: str,
 ) -> tuple[int, float]:
+    if independent_evidence_enabled(connection):
+        support = evidence_support(connection, memory_id)
+        return support.count, support.confidence
     # Historic singleton clauses retain the capture-group noisy-OR projection. A multi-member
     # clause is one model assessment, however many sources it names: treat all such assessments
     # as one conservative alternative rather than inventing independent votes from its members.

@@ -266,6 +266,58 @@ rather than a label on a registry row.
 new evidence or remove the incorrect derived record; do not present a derived rewrite as the
 original observation.
 
+## Experimental independent evidence
+
+`MemoryConfig.independent_evidence=True` selects a different consolidation support algorithm.
+It is off by default and does not change an answer prompt, retrieval budget, model, or source
+observation. Configure it through `Memory(..., independent_evidence=True)`, the corresponding
+`AsyncMemory` constructor, or `settings.independent_evidence` in a configuration file.
+
+The default projection above combines singleton capture groups and takes the maximum joint
+assessment. The experimental projection preserves each clause's AND witnesses and each memory's
+OR alternatives. It traces complete proofs to original capture groups, including intermediate
+derived records in each proof. Two assessments can corroborate only when their proofs share
+neither a capture nor an intermediate summary. Two alternative proofs of the same assessment
+still count once. An explicit `ObservationContext.source_id` names a capture group; omitting it
+uses that observation's record ID. Assigning different IDs to duplicate real events can still
+mislead the policy: capture-disjoint does not establish statistical independence.
+
+Support count saturates at two, the existing inferred-trait and inferred-name visibility
+threshold. A proof's confidence is the minimum along its assessment and observation path. The
+reported confidence is the maximum over one proof or the noisy-OR combination of an eligible
+pair. Count and confidence are separate maxima and may have different witnesses; this is a
+policy score, not a calibrated posterior. Additional independent assessments beyond two do not
+automatically raise the score. A derived record carrying a user-statement basis still retains
+its actual evidence ancestry for this computation and for withdrawal.
+
+Each projection loads at most 256 records including the target and 4,096 accepted clause-member rows
+(a query may read one extra sentinel row to detect truncation). Proof calculation retains up to
+64 proofs per node and spends at most 4,096 clause, join, and pair steps. Partial AND clauses
+and missing/cyclic-only proof paths cannot contribute. Reaching a bound logs a warning and uses
+only complete retained proofs, a conservative lower bound that can miss corroboration. Adding
+evidence can change the retained subset at these bounds; monotonicity is not promised there.
+These are bounds per projected memory, not a constant-time bound on a whole dependent closure.
+
+Changes to evidence reproject the dependent closure in the same SQLite transaction, including
+cases where the older scalar capture-group label did not change. Source deletion and operation
+rollback continue to withdraw whole conjunctions and preserve independent alternatives. The
+compiled context consumes the resulting visibility and confidence through its existing evidence
+and budget checks. Proof evaluation makes no model request. Formation, apply, and rollback
+re-embed speech for changed identity names inside their SQLite transaction; embedding failure
+rolls back the change. This holds that transaction open during embedding. Deletion prepares one
+batch from its exact rollback-only preview before committing the deletion and text replacement.
+No new storage service is introduced.
+
+The `evidence.projection_recipe` store metadata pins `legacy-v1` or `independent-v1`. Changing the
+setting when reopening raises `StorageError`. Existing unmarked nonempty stores are legacy;
+enabling the experiment requires a fresh directory and replaying the original observations and
+operations. There is no automatic migration or rewrite of historical versions. Open experimental
+stores only with a version that understands this policy marker; older binaries do not enforce it.
+The SQLite schema version and public operation schemas are unchanged.
+
+See the [experiment protocol](research/2026-09-12-corroboration-protocol.md). Structural SDK tests
+with fixed proposals do not establish real multimodal perception or natural-interaction quality.
+
 ## Valid time and transaction time
 
 Raw occurrence and typed assertion time answer different questions:

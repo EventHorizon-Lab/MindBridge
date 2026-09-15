@@ -81,6 +81,8 @@ class MemoryConfig:
     # no-op unless `plugins.transcriber` is a `SpeechBackend`; a plain `TranscriptionBackend`
     # reaches the index through the separate transcript-derivation path either way.
     index_speech: _StrictBool = True
+    # Experimental support projection, pinned for the lifetime of the physical store.
+    independent_evidence: _StrictBool = False
     index_quantization: IndexQuantization = IndexQuantization.NONE
     # A stable instance policy for diagnostics and lexical fallback. It selects candidate routes;
     # it does not introduce a request-local visibility scope.

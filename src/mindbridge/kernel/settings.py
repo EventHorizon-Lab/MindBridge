@@ -31,6 +31,7 @@ class Settings:
     face_margin: float
     identity_link_min_assets: int
     index_speech: bool
+    independent_evidence: bool
     minimum_relevance: float
     ambiguity_margin: float
     evidence_budget: int | None
@@ -49,6 +50,7 @@ class Settings:
 def resolve_settings(
     *,
     index_speech: bool,
+    independent_evidence: bool,
     index_quantization: IndexQuantization,
     retrieval_mode: RetrievalMode,
     minimum_relevance: float,
@@ -82,6 +84,7 @@ def resolve_settings(
         face_margin=unit_interval(face_margin, "face_margin"),
         identity_link_min_assets=positive_int(identity_link_min_assets, "identity_link_min_assets"),
         index_speech=strict_bool(index_speech, "index_speech"),
+        independent_evidence=strict_bool(independent_evidence, "independent_evidence"),
         minimum_relevance=unit_interval(minimum_relevance, "minimum_relevance"),
         ambiguity_margin=unit_interval(ambiguity_margin, "ambiguity_margin"),
         evidence_budget=None
