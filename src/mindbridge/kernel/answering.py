@@ -322,7 +322,7 @@ def _packed_grounding(
     expansion: Sequence[SearchHit],
     ranked: Sequence[SearchHit],
     budget_chars: int | None,
-) -> tuple[SearchHit, ...]:
+) -> tuple[tuple[SearchHit, ...], int]:
     """Fill one budget with the window, then the rest of the ranking, then its linked rows.
 
     Admission order is the whole claim expansion makes, and this order is the one the measurement
@@ -341,7 +341,13 @@ def _packed_grounding(
     # Without a budget the window is `limit` hits and there is no tail: walking the ranking here
     # would hand the reader the whole rerank pool, which is not what either path ever grounded.
     tail = ranked if budget_chars is not None else ()
-    for source in (tail, expansion):
+    # Counted here rather than intersected afterwards, because a linked row is usually also a
+    # ranked row: `window and expansion` credited expansion for every row the tail admitted that
+    # happened to share a capture, which on a saturated budget was 4.79 rows per question and
+    # none of them added. The note is a statement to the reader about where its evidence came
+    # from, so it has to be the number this loop actually admitted.
+    added = 0
+    for source, from_expansion in ((tail, False), (expansion, True)):
         for hit in source:
             if hit.id in taken:
                 continue
@@ -353,7 +359,8 @@ def _packed_grounding(
             selected.append(hit)
             taken.add(hit.id)
             spent += cost
-    return tuple(selected)
+            added += 1 if from_expansion else 0
+    return tuple(selected), added
 
 
 def expansion_note(added: int, expansion: _Expansion) -> str:
@@ -1067,8 +1074,12 @@ class Answering(Traced):
                 return grounding_hits(context.ranked, context.limit, budget_chars=budget), None
             required = grounding_hits(context.ranked, context.limit)
             expansion = self._expand_evidence(required, context)
-            hits = _packed_grounding(required, expansion.hits, context.ranked, budget)
-            added = sum(1 for hit in hits if hit.id in {row.id for row in expansion.hits})
+            hits, added = _packed_grounding(
+                required,
+                expansion.hits,
+                context.ranked,
+                budget,
+            )
             return hits, (expansion_note(added, expansion) if added else None)
         # `evidence_budget_chars` is what a caller who cares about prompt size sets, and a set
         # plan used to walk straight past it. The set budget may narrow that ceiling and never
@@ -1094,8 +1105,7 @@ class Answering(Traced):
             # budget has left. Planning and expansion are separate mechanisms and this is the
             # only place they meet.
             expansion = self._expand_evidence(hits, context)
-            packed = _packed_grounding(hits, expansion.hits, (), budget)
-            added = len(packed) - len(hits)
+            packed, added = _packed_grounding(hits, expansion.hits, (), budget)
             if added:
                 return packed, f"{note} {expansion_note(added, expansion)}"
         return hits, note

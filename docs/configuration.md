@@ -371,6 +371,8 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may add to the ranked window, never more than `evidence_budget_chars` when that is set (so `24000` under the defaults); a point plan keeps `limit`. Read only when `recall_planning` is on |
 | `recall_set_max_rows` | `60` | Matched rows a set, sequence or entity plan may add at all, whatever the character budget leaves room for; the rows past it are reported as not shown, so the set is declared incomplete. Bounds the matched set only. Read only when `recall_planning` is on |
 | `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; the second runs only when the first answer was a low-confidence guess under `answer_policy="best_effort"`. `1` disables it. Read only when `recall_planning` is on |
+| `evidence_expansion` | `False` | Widen `ask` grounding with the records the grounded evidence is structurally linked to -- same capture, recognized person, symbolic place, claim lineage, or evidence edge. Costs no model call: the edges are columns the kernel already wrote. The linked rows go last and spend only budget the ranking left unspent |
+| `evidence_expansion_max_rows` | `24` | Linked records one expansion may add, whatever `evidence_budget_chars` leaves room for. Read only when `evidence_expansion` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
 | `independent_evidence` | `False` | Experimental capture-grounded AND/OR corroboration for formation and consolidation; fixed when a store is created. See [independent evidence](memory-types-time-and-decay.md#experimental-independent-evidence) |
@@ -443,6 +445,34 @@ bound dropped are reported to the reader as matched records not shown. `recall_s
 is the same bound on the other axis: a corpus of short records fits hundreds of matched rows
 inside 30 000 characters, and the rows past the cap are dropped in favour of the earliest ones --
 the read's own chronological order, not a second ranking -- and counted as not shown.
+
+`evidence_expansion` widens the window along a different axis from either bound above, and it is
+the only widening that costs no model call. After the window is grounded, the kernel reads the
+records that window is *structurally* linked to -- committed under the same capture, about the
+same recognized person, labelled with the same symbolic place, in the same claim lineage, or
+joined to it by an evidence edge -- and admits them into whatever budget the ranking left unspent.
+Each edge is bounded on its own by the selectivity rule below, and an edge that links to more than
+a fifth of the corpus contributes nothing rather than thinning the window: on a two-speaker
+transcript every record is about both speakers, so the identity edge selects the corpus and says
+nothing about the question, while the capture edge beside it stays selective. Gating the edges
+together would let the first discard the second.
+
+The ordering is a measured decision, and the measurement went against the interesting version.
+Admitting linked rows *ahead* of the budget's ranked tail asks whether a structurally linked
+record is worth more than the next-best record by cosine; on 120 LongMemEval-S questions at a
+24 000-character budget it is not -- complete gold support in the window fell from 0.8917 to
+0.8583, three questions gained it and seven lost it, and 11.13 linked rows per question displaced
+the tail that had been finding the rest of the support. Linked rows therefore go last, and
+the same 120 questions then tie exactly -- 120 of 120, with the grounded rows and characters
+identical to baseline -- because a rerank pool a hundred candidates deep fills any budget before
+expansion is reached. On a text corpus whose captures the ranking already covers, the capture edge
+has nothing left to add; the setting is off by default for that reason, and the edges that a
+ranking cannot cover -- a person, a room, a claim's lineage -- are the ones a measurement on an
+embodied corpus still has to decide.
+
+What expansion adds is reported to the reader as records linked to the evidence rather than records
+a predicate matched, so nothing it adds licenses a count, and the count is the number of rows
+expansion actually admitted rather than the number of window rows that happen to be linked.
 
 A read is only allowed to be complete while its predicate is selective. A step whose predicate
 selected more than a fifth of the active corpus, or more than four times `limit` rows on a corpus

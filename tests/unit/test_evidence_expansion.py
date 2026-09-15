@@ -215,3 +215,37 @@ def test_evidence_expansion_max_rows_must_be_positive(tmp_path: Path) -> None:
             evidence_expansion=True,
             evidence_expansion_max_rows=0,
         )
+
+
+def test_a_saturated_budget_adds_nothing_and_says_nothing(tmp_path: Path) -> None:
+    """The note counts what expansion admitted, not what it happened to be linked to.
+
+    A linked record is usually also a ranked record, so intersecting the window with the
+    expansion read credited expansion for every row the ranked tail had already admitted. On a
+    budget the ranking fills, that was a prompt telling the reader linked records followed its
+    evidence when none had been added.
+    """
+    answerer = _RecordingAnswerer()
+    with _memory(tmp_path, answerer, evidence_expansion=True, evidence_budget_chars=40) as memory:
+        _capture(memory, "S1", "a red wrench", "a red hammer", "a red clamp")
+
+        memory.ask("red?", limit=1)
+
+    # The budget fits the window and nothing more, so the ranked tail spends it and expansion
+    # admits no row -- and the prompt must not claim otherwise.
+    assert "linked to the evidence above" not in (answerer.questions[-1].text or "")
+
+
+def test_linked_rows_fill_only_what_the_ranking_left(tmp_path: Path) -> None:
+    """Expansion goes last, so it spends leftover budget and never the ranking's own rows."""
+    answerer = _RecordingAnswerer()
+    with _memory(tmp_path, answerer, evidence_expansion=True, evidence_budget_chars=None) as memory:
+        _capture(memory, "S1", "a red wrench", "a red hammer")
+        window = tuple(hit.id for hit in memory.search("red wrench?", limit=1))
+
+        memory.ask("red wrench?", limit=1)
+
+    grounded = _grounded_ids(answerer)
+    assert grounded[0] == window[0]
+    assert len(grounded) == 2, "the capture partner fills the budget-free tail"
+    assert "linked to the evidence above (capture)" in (answerer.questions[-1].text or "")

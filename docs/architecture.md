@@ -301,6 +301,19 @@ information about the question; and the rows a selective read did return stop at
 capability, planner failure, or plan the kernel will not run falls back to the single ranked
 search, which is the default.
 
+With `evidence_expansion` enabled, the grounded window gains a third source beside the ranking
+and the recall program, and it is the one that costs no model call. After the window is grounded,
+`Answering` reads the records it is structurally linked to -- the capture an observation was
+committed under (`memory_semantics.source_id`), a recognized person (the same membership rule the
+identity scope uses), a symbolic `place_id`, a claim's `lineage_id`, or a `memory_evidence` edge in
+either direction -- each edge an indexed read over a column the kernel already wrote. Every edge is
+bounded on its own by the recall programs' selectivity rule, per edge rather than per read, so an
+edge that links to a fifth of the corpus is dropped whole and a selective edge beside it survives.
+The rows are admitted after the budget's ranked tail, so expansion can only spend what the ranking
+left unspent, and the read reports which edge produced each row so a run can say why the store
+could answer. `RelatedRead` carries that attribution; the trace carries it as
+`mindbridge.expansion.edges`.
+
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without
 copying memory content or metadata into the trace. `ask()` uses the same retrieval path, applies
 the evidence budget, routes the question and hits through the generation backend's declared
