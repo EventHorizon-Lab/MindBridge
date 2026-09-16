@@ -40,6 +40,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -110,6 +111,9 @@ GALLERY_SAMPLE_SEED = 20260916
 # so a twelve-row window costs far less than ATM's. The budget arm is sized to reach about the same
 # row count the linked arm does, which is what keeps the contest composition rather than volume.
 GALLERY_BUDGET_CHARS = 45_000
+# Set by the run once it knows whether this environment could load the OpenCV face recipe, so the
+# report can say whether the identity edge was measured or merely absent.
+_FACES_RAN = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -741,6 +745,79 @@ def _gallery_sample(
     return tuple(chosen)
 
 
+def _face_analyzer(settings: Mapping[str, str]) -> object | None:
+    """The OpenCV face recipe, or None when this environment cannot run it.
+
+    A run executes the tree's fixed command, which installs the `openai` extra and not `face`, so
+    OpenCV is absent from a run's snapshot however present it is in a worktree. Degrading is the
+    right answer rather than failing: on Mem-Gallery the capture edge supplies 125 of the 132
+    questions any edge could complete and identity supplies 29, so a run without faces measures
+    almost all of the headroom and loses only the identity attribution. What it must not do is
+    stay quiet about it, so the report says which of the two it was.
+    """
+    try:
+        from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
+    except Exception:
+        return None
+    try:
+        return OpenCVFaceAnalyzer(
+            detector_model=settings["MINDBRIDGE_FACE_DETECTOR"],
+            recognizer_model=settings["MINDBRIDGE_FACE_RECOGNIZER"],
+            score_threshold=0.9,
+        )
+    except (KeyError, ModelError):
+        return None
+
+
+def _note_faces(ran: bool) -> None:
+    """Record once whether any persona's store had a working face recipe behind it."""
+    global _FACES_RAN
+    _FACES_RAN = _FACES_RAN or ran
+
+
+def _gallery_outcome(
+    item: object,
+    *,
+    unit: Unit,
+    arm: Arm,
+    memory: Memory,
+    recorder: _Recorder,
+    client: OpenAI,
+    model: str,
+    report: Callable[[str], None],
+) -> Outcome:
+    """Answer one sampled question under one arm and score it Mem-Gallery's own two ways."""
+    index, incomplete = cast(tuple[int, bool], item)
+    question, gold, reference = unit.questions[index]
+    _reset_billing()
+    result = memory.ask(question, limit=RECALL_LIMIT)
+    billed = _billed_tokens()
+    window = _turn_ids(recorder.grounded)
+    pool = _turn_ids(memory.search(question, limit=100))
+    f1, judged = _gallery_score(question, reference, result.answer, client, model)
+    outcome = Outcome(
+        question_id=f"{unit.unit_id}:{index}",
+        arm=arm.name,
+        support=_support_class(gold, window, pool | window),
+        gold=len(gold),
+        found=len(gold & window),
+        window_rows=len(recorder.grounded),
+        window_chars=sum(len(hit.content) for hit in recorder.grounded),
+        expansion_rows=recorder.expansion_rows,
+        prompt_chars=recorder.prompt_chars,
+        evidence_cost=sum(evidence_cost(hit) for hit in recorder.grounded),
+        prompt_tokens=billed,
+        media_rows=sum(1 for hit in recorder.grounded if hit.assets),
+        correct=f1,
+        judged=judged,
+        incomplete_stratum=incomplete,
+        abstained=result.abstained,
+        window_ids=tuple(hit.id for hit in recorder.grounded),
+    )
+    report(f"{unit.unit_id} {arm.name} q{index} {outcome.support} f1={f1:.2f} judge={judged:.1f}")
+    return outcome
+
+
 def _gallery_outcomes(
     *,
     root: Path,
@@ -752,8 +829,6 @@ def _gallery_outcomes(
     abandoned: list[tuple[str, str]],
 ) -> tuple[tuple[Outcome, ...], ...]:
     """One store per persona: ingest, classify, then read the sampled questions once per arm."""
-    from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
-
     data = Path(settings["MINDBRIDGE_BENCH_ROOT"]) / "mem-gallery" / "data"
     model = settings["MINDBRIDGE_GENERATION_MODEL"]
     by_question: dict[str, list[Outcome]] = {}
@@ -761,11 +836,8 @@ def _gallery_outcomes(
     for unit in units:
         store = root / unit.unit_id
         embedder = _embedder(settings)
-        face = OpenCVFaceAnalyzer(
-            detector_model=settings["MINDBRIDGE_FACE_DETECTOR"],
-            recognizer_model=settings["MINDBRIDGE_FACE_RECOGNIZER"],
-            score_threshold=0.9,
-        )
+        face = _face_analyzer(settings)
+        _note_faces(face is not None)
         try:
             # Ingest and classification close before any arm reads, for the reason every run in
             # this line of work now closes first: a session that wrote merges its Zvec segments at
@@ -773,69 +845,37 @@ def _gallery_outcomes(
             with Memory(
                 store,
                 embedder=embedder,
-                face_analyzer=face,
+                face_analyzer=face,  # type: ignore[arg-type]
                 minimum_relevance=0.0,
                 ambiguity_margin=0.0,
                 reinforce_on_answer=False,
             ) as memory:
-                for memory_id in write_unit(memory, unit):
-                    memory.faces(memory_id)
+                media = write_unit(memory, unit)
+                if face is not None:
+                    for memory_id in media:
+                        memory.faces(memory_id)
                 sample = _gallery_sample(memory, unit)
             for arm in arms:
                 recorder = _Recorder(_reader(settings, client))
                 with _open(store, _embedder(settings), recorder, arm) as memory:
-
-                    def one(
-                        item: tuple[int, bool],
-                        arm: Arm = arm,
-                        memory: Memory = memory,
-                        recorder: _Recorder = recorder,
-                        unit: Unit = unit,
-                    ) -> Outcome:
-                        index, incomplete = item
-                        question, gold, reference = unit.questions[index]
-                        _reset_billing()
-                        result = memory.ask(question, limit=RECALL_LIMIT)
-                        billed = _billed_tokens()
-                        window = _turn_ids(recorder.grounded)
-                        pool = _turn_ids(memory.search(question, limit=100))
-                        f1, judged = _gallery_score(
-                            question, reference, result.answer, client, model
-                        )
-                        outcome = Outcome(
-                            question_id=f"{unit.unit_id}:{index}",
-                            arm=arm.name,
-                            support=_support_class(
-                                gold, frozenset(window), frozenset(pool | window)
-                            ),
-                            gold=len(gold),
-                            found=len(gold & window),
-                            window_rows=len(recorder.grounded),
-                            window_chars=sum(len(hit.content) for hit in recorder.grounded),
-                            expansion_rows=recorder.expansion_rows,
-                            prompt_chars=recorder.prompt_chars,
-                            evidence_cost=sum(evidence_cost(hit) for hit in recorder.grounded),
-                            prompt_tokens=billed,
-                            media_rows=sum(1 for hit in recorder.grounded if hit.assets),
-                            correct=f1,
-                            judged=judged,
-                            incomplete_stratum=incomplete,
-                            abstained=result.abstained,
-                            window_ids=tuple(hit.id for hit in recorder.grounded),
-                        )
-                        report(
-                            f"{unit.unit_id} {arm.name} q{index} {outcome.support} "
-                            f"f1={f1:.2f} judge={judged:.1f}"
-                        )
-                        return outcome
-
+                    answer = partial(
+                        _gallery_outcome,
+                        unit=unit,
+                        arm=arm,
+                        memory=memory,
+                        recorder=recorder,
+                        client=client,
+                        model=model,
+                        report=report,
+                    )
                     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool_executor:
-                        for outcome in pool_executor.map(_retrying(one), sample):
+                        for outcome in pool_executor.map(_retrying(answer), sample):
                             if outcome is not None:
                                 by_question.setdefault(outcome.question_id, []).append(outcome)
         finally:
             embedder.close()
-            face.close()
+            if face is not None:
+                face.close()  # type: ignore[attr-defined]
     for question_id, rows in by_question.items():
         if len(rows) != len(arms):
             abandoned.append((question_id, f"answered by {len(rows)} of {len(arms)} arms"))
@@ -1125,6 +1165,7 @@ def _emit(
         "recall_limit": RECALL_LIMIT,
         "evidence_budget_chars": budget,
         "capture_context": not args.no_capture_context,
+        "face_recognition_ran": _FACES_RAN,
         "answer_model": settings["MINDBRIDGE_GENERATION_MODEL"],
         "judge": {
             "model": settings["MINDBRIDGE_GENERATION_MODEL"],
