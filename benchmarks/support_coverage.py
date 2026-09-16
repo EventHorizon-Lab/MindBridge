@@ -96,7 +96,7 @@ _ENV_PATH = Path(os.environ.get("MINDBRIDGE_EVAL_ENV", "~/.config/mindbridge-eva
 # that `--dataset` is unused. Changing this constant is how a branch measures a different corpus --
 # and the other two need extras (`face` for identity, `benchmarks` for Mem-Gallery's own `f1`) that
 # a tree's command has to install, which is a property of the tree rather than of this file.
-CORPUS: str = "longmemeval"
+CORPUS: str = "mem-gallery"
 # ATM-Bench is one store every question reads, so its questions are answered concurrently inside
 # one open rather than each getting a store of their own.
 ATM_QUESTIONS = 120
