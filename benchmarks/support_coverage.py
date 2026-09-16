@@ -115,6 +115,8 @@ GALLERY_BUDGET_CHARS = 45_000
 # Set by the run once it knows whether this environment could load the OpenCV face recipe, so the
 # report can say whether the identity edge was measured or merely absent.
 _FACES_RAN = False
+# Whether Mem-Gallery's deterministic primary could be computed at all in this environment.
+_F1_AVAILABLE = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -684,17 +686,26 @@ def _gallery_score(
     the more sensitive paired signal.
     """
     metadata = {"point": "AR"}
-    deterministic = local_scores(
-        "mem-gallery",
-        score_kind="accuracy",
-        prediction=prediction,
-        parsed_choice=None,
-        expected_choice=None,
-        references=(reference,),
-        question=question,
-        metadata=metadata,
-        evidence_source_ids=(),
-    )
+    # `f1` is upstream's primary but its scorer needs the `benchmarks` extra, which the tree's
+    # fixed run command does not install. `llm_judge` is the other official metric for this family
+    # and needs only the pinned prompt, so it carries the comparison when f1 is unavailable -- and
+    # it is the more sensitive paired signal anyway, being three-valued rather than a token overlap.
+    global _F1_AVAILABLE
+    try:
+        deterministic = local_scores(
+            "mem-gallery",
+            score_kind="accuracy",
+            prediction=prediction,
+            parsed_choice=None,
+            expected_choice=None,
+            references=(reference,),
+            question=question,
+            metadata=metadata,
+            evidence_source_ids=(),
+        )
+    except (RuntimeError, ImportError):
+        _F1_AVAILABLE = False
+        deterministic = {}
     plan = judge_plan(
         "mem-gallery",
         question=question,
@@ -1170,6 +1181,7 @@ def _emit(
         "evidence_budget_chars": budget,
         "capture_context": not args.no_capture_context,
         "face_recognition_ran": _FACES_RAN,
+        "f1_available": _F1_AVAILABLE,
         "answer_model": settings["MINDBRIDGE_GENERATION_MODEL"],
         "judge": {
             "model": settings["MINDBRIDGE_GENERATION_MODEL"],
