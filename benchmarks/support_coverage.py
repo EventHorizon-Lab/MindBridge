@@ -90,10 +90,13 @@ INGEST_BATCH = 64
 # window *smaller*. That proxy is what made a confounded first run look like a clean loss.
 _EXPANSION_NOTE = re.compile(r"(\d+) further records linked to the evidence above")
 _ENV_PATH = Path(os.environ.get("MINDBRIDGE_EVAL_ENV", "~/.config/mindbridge-eval.env"))
-# Which corpus this commit measures. The run command is fixed across the tree, so the corpus is a
-# committed property of the branch rather than a flag: `--dataset` is read only by the
-# `longmemeval` corpus and is stated as unused by the other.
-CORPUS: str = "mem-gallery"
+# Which corpus this commit measures. A run command is fixed for the whole experiment tree it
+# belongs to, so the corpus is a committed property of a branch rather than a flag. The default is
+# the one `--dataset` names; the other two read their corpus from `MINDBRIDGE_BENCH_ROOT` and print
+# that `--dataset` is unused. Changing this constant is how a branch measures a different corpus --
+# and the other two need extras (`face` for identity, `benchmarks` for Mem-Gallery's own `f1`) that
+# a tree's command has to install, which is a property of the tree rather than of this file.
+CORPUS: str = "longmemeval"
 # ATM-Bench is one store every question reads, so its questions are answered concurrently inside
 # one open rather than each getting a store of their own.
 ATM_QUESTIONS = 120
