@@ -27,6 +27,7 @@ live in the tree that snapshot is taken from.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import random
@@ -756,16 +757,19 @@ def _face_analyzer(settings: Mapping[str, str]) -> object | None:
     stay quiet about it, so the report says which of the two it was.
     """
     try:
+        # The adapter loads OpenCV lazily at first `analyze`, not at construction, so importing
+        # it and building it both succeed in an environment that cannot run it -- which is how a
+        # run reached its first photograph before failing. The import that decides this is the
+        # one the adapter itself will eventually make.
+        importlib.import_module("cv2")
         from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
-    except Exception:
-        return None
-    try:
+
         return OpenCVFaceAnalyzer(
             detector_model=settings["MINDBRIDGE_FACE_DETECTOR"],
             recognizer_model=settings["MINDBRIDGE_FACE_RECOGNIZER"],
             score_threshold=0.9,
         )
-    except (KeyError, ModelError):
+    except (ImportError, KeyError, ModelError, OSError):
         return None
 
 
