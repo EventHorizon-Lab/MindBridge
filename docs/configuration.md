@@ -468,19 +468,20 @@ identical to baseline -- because a rerank pool a hundred candidates deep fills a
 expansion is reached. So the setting changes a window only where `evidence_budget_chars` is `None`
 and the window is `limit` rows that linked rows can follow; with a budget set it does nothing.
 
-Whether it is worth enabling there depends on the corpus, and the two measured corpora disagree.
-On LongMemEval-S a capture is a dialogue session whose turns the ranked tail already reaches, so
-linked rows duplicated it: 12 rows plus linked rows scored 0.7373 against 0.7203 for a comparable
-budget of ranked tail, at 62 % more prompt -- 0.301 accuracy points per 1,000 characters against
-the tail's 0.585. On ATM-Bench raw media, where a capture is a day of photographs and no query can
-name it, the order reverses: 0.5517 against 0.5259, at under half the characters and the same media
-rows, which is 0.796 points per 1,000 characters against 0.188. Both widenings rescue about the
-same few questions from incomplete support on either corpus; what differs is that a window padded
-with the rest of one afternoon reads better than one padded with twenty-two further ranked rows,
-while a window padded with more of a conversation the ranking already covered reads worse. Where a
-capture groups evidence a query cannot name, enable it; where the ranking already spans the
-capture, leave it off. It is off by default because a caller who has not measured their corpus
-should not pay for it.
+What it is worth enabling for is prompt size, not answer quality. Measured against a comparable
+budget of ranked tail on two corpora, a paired sign test cannot distinguish the answers: 6 won and
+4 lost on LongMemEval-S, 10 and 7 on ATM-Bench raw media. What differs is the price of reaching
+them. On LongMemEval-S a capture is a dialogue session whose turns the tail already reaches, so
+linked rows duplicate it and cost 39,800 prompt characters where the tail costs 24,600. On
+ATM-Bench, where a capture is a day of photographs no query can name, the same window is assembled
+for 12,900 characters against the tail's 27,200, with the same number of media rows. Both widenings
+raise complete gold support by about the same few questions on either corpus, so neither edge
+reaches evidence the other cannot.
+
+Enable it where captures group evidence a query has no way to name -- a day of photographs, a room,
+one recorded session of a robot's work -- and the window costs less than half as much to fill.
+Leave it off where the ranking already spans the capture. It is off by default because a caller who
+has not measured their own corpus should not pay for it.
 
 What expansion adds is reported to the reader as records linked to the evidence rather than records
 a predicate matched, so nothing it adds licenses a count, and the count is the number of rows
