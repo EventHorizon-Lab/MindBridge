@@ -494,7 +494,10 @@ fill. Leave it off where the ranking already spans the capture.
 How much any of this can matter is bounded by how often a window is missing evidence at all. On the
 120 ATM-Bench questions measured here, 98 windows already held every gold record, 22 were missing
 one, and some edge could supply it on 3 -- all three through the capture edge. The identity edge
-contributed one row across the whole set, because that corpus holds few recognisable faces.
+contributed one row across the whole set, because that corpus holds few recognisable faces. On
+Mem-Gallery, whose questions are about recurring personas, the same measurement reads very
+differently: of 1,527 questions, 493 windows were missing gold and 132 were completable, 125
+through the capture edge and 29 through identity.
 A store whose ranking already completes its windows has nothing for an edge to add, whichever edge
 it is, and `benchmarks/edge_power.py` reports that ceiling for a corpus without running a reader
 over it. It is off by default because a caller who
