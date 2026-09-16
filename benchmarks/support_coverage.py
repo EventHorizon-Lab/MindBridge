@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import statistics
 import sys
@@ -42,6 +43,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import cast
 
+from corpora import Unit, gallery_units, write_unit
 from openai import APIError, OpenAI
 
 # The installed OpenAI SDK is built on `httpx2`, not `httpx`, and only the former is in the
@@ -89,7 +91,7 @@ _ENV_PATH = Path(os.environ.get("MINDBRIDGE_EVAL_ENV", "~/.config/mindbridge-eva
 # Which corpus this commit measures. The run command is fixed across the tree, so the corpus is a
 # committed property of the branch rather than a flag: `--dataset` is read only by the
 # `longmemeval` corpus and is stated as unused by the other.
-CORPUS: str = "atm"
+CORPUS: str = "mem-gallery"
 # ATM-Bench is one store every question reads, so its questions are answered concurrently inside
 # one open rather than each getting a store of their own.
 ATM_QUESTIONS = 120
@@ -97,6 +99,17 @@ ATM_QUESTIONS = 120
 # twelve images -- which is the `window` arm over again. The budget arm is scaled to the media the
 # linked arm reaches, so the contest stays composition at one media budget rather than volume.
 ATM_BUDGET_FACTOR = 3
+# Questions per persona, and how many of them are drawn from the only population an edge can move.
+# All 1,527 questions across three arms is thirteen hours for a set that is two thirds unaffected
+# by construction; 15 per topic with 8 reserved for incomplete windows keeps the edge population
+# large and the control population honest. Seeded, so the subset survives a re-run.
+GALLERY_QUESTIONS_PER_TOPIC = 15
+GALLERY_INCOMPLETE_PER_TOPIC = 8
+GALLERY_SAMPLE_SEED = 20260916
+# A Mem-Gallery round is a few hundred characters of dialogue and a quarter of them carry an image,
+# so a twelve-row window costs far less than ATM's. The budget arm is sized to reach about the same
+# row count the linked arm does, which is what keeps the contest composition rather than volume.
+GALLERY_BUDGET_CHARS = 45_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +142,15 @@ class Outcome:
     prompt_tokens: int
     media_rows: int
     correct: float
-    abstained: bool
+    # Mem-Gallery's judged metric beside its deterministic primary; zero on the corpora that have
+    # only one official score.
+    judged: float = 0.0
+    # Whether the ranking left this question's window incomplete, decided before any arm ran. The
+    # edge population and the control population have to be separable in the analysis, because a
+    # question with sixteen clue rounds cannot fit a twelve-row window and widening to any depth
+    # helps it -- which is the release's shape, not the edge's effect.
+    incomplete_stratum: bool = False
+    abstained: bool = False
     # The window's own IDs, so a run can prove two arms saw one index rather than assume it.
     window_ids: tuple[str, ...] = field(default=(), repr=False)
 
@@ -249,7 +270,7 @@ def _embedder(settings: Mapping[str, str]) -> OpenAIModels:
     returns a single vector for a list of messages, and the adapter refuses the mismatch rather
     than mis-aligning a batch, which is the safe half of a slower ingest.
     """
-    media = CORPUS == "atm"
+    media = CORPUS != "longmemeval"
     return OpenAIModels(
         embedding_client=OpenAI(
             base_url=settings["MINDBRIDGE_EMBEDDING_BASE_URL"],
@@ -295,9 +316,9 @@ def _reader(settings: Mapping[str, str], client: OpenAI) -> OpenAIModels:
         generation_client=client,
         generation_model=settings["MINDBRIDGE_GENERATION_MODEL"],
         generation_capabilities=(
-            frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO})
-            if CORPUS == "atm"
-            else frozenset({Modality.TEXT})
+            frozenset({Modality.TEXT})
+            if CORPUS == "longmemeval"
+            else frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO})
         ),
         generation_temperature=0.0,
         generation_seed=42,
@@ -648,6 +669,179 @@ def _retrying(work: Callable[[object], Outcome]) -> Callable[[object], Outcome |
     return attempt
 
 
+def _gallery_score(
+    question: str, reference: str, prediction: str, client: OpenAI, model: str
+) -> tuple[float, float]:
+    """Score one Mem-Gallery answer with the release's own two official metrics.
+
+    `f1` is upstream's primary and is deterministic; `llm_judge` is its judged metric, scored
+    0, 0.5 or 1. Both are returned because the primary is the one to report and the judged one is
+    the more sensitive paired signal.
+    """
+    metadata = {"point": "AR"}
+    deterministic = local_scores(
+        "mem-gallery",
+        score_kind="accuracy",
+        prediction=prediction,
+        parsed_choice=None,
+        expected_choice=None,
+        references=(reference,),
+        question=question,
+        metadata=metadata,
+        evidence_source_ids=(),
+    )
+    plan = judge_plan(
+        "mem-gallery",
+        question=question,
+        references=(reference,),
+        prediction=prediction,
+        metadata=metadata,
+    )
+    judged = 0.0
+    if plan is not None:
+        messages = [{"role": m.role, "content": m.content} for m in plan.calls[0]]
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,  # type: ignore[arg-type]
+            temperature=0.0,
+            max_tokens=plan.max_tokens or 600,
+        )
+        judged = float(
+            parse_judge_response(plan, response.choices[0].message.content or "").get(
+                "llm_judge", 0.0
+            )
+        )
+    return float(deterministic.get("f1", 0.0)), judged
+
+
+def _gallery_sample(
+    memory: Memory,
+    unit: Unit,
+) -> tuple[tuple[int, bool], ...]:
+    """Choose which of a persona's questions to answer, and say which had incomplete windows.
+
+    The window is read once here, before any arm runs, so the stratum a question belongs to is a
+    property of the ranking rather than of whichever arm happened to see it first.
+    """
+    incomplete: list[int] = []
+    complete: list[int] = []
+    for index, (question, gold, _reference) in enumerate(unit.questions):
+        window = {
+            str(hit.metadata.get("source_id"))
+            for hit in memory.search(question, limit=RECALL_LIMIT)
+        }
+        (incomplete if gold - window else complete).append(index)
+    rng = random.Random(f"{GALLERY_SAMPLE_SEED}:{unit.unit_id}")
+    rng.shuffle(incomplete)
+    rng.shuffle(complete)
+    picked = incomplete[:GALLERY_INCOMPLETE_PER_TOPIC]
+    picked_complete = complete[: GALLERY_QUESTIONS_PER_TOPIC - len(picked)]
+    chosen = [(index, True) for index in picked] + [(index, False) for index in picked_complete]
+    chosen.sort()
+    return tuple(chosen)
+
+
+def _gallery_outcomes(
+    *,
+    root: Path,
+    arms: Sequence[Arm],
+    settings: Mapping[str, str],
+    client: OpenAI,
+    workers: int,
+    report: Callable[[str], None],
+    abandoned: list[tuple[str, str]],
+) -> tuple[tuple[Outcome, ...], ...]:
+    """One store per persona: ingest, classify, then read the sampled questions once per arm."""
+    from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
+
+    data = Path(settings["MINDBRIDGE_BENCH_ROOT"]) / "mem-gallery" / "data"
+    model = settings["MINDBRIDGE_GENERATION_MODEL"]
+    by_question: dict[str, list[Outcome]] = {}
+    units = gallery_units(data, 10_000)
+    for unit in units:
+        store = root / unit.unit_id
+        embedder = _embedder(settings)
+        face = OpenCVFaceAnalyzer(
+            detector_model=settings["MINDBRIDGE_FACE_DETECTOR"],
+            recognizer_model=settings["MINDBRIDGE_FACE_RECOGNIZER"],
+            score_threshold=0.9,
+        )
+        try:
+            # Ingest and classification close before any arm reads, for the reason every run in
+            # this line of work now closes first: a session that wrote merges its Zvec segments at
+            # close, and segment layout moves what an approximate search returns.
+            with Memory(
+                store,
+                embedder=embedder,
+                face_analyzer=face,
+                minimum_relevance=0.0,
+                ambiguity_margin=0.0,
+                reinforce_on_answer=False,
+            ) as memory:
+                for memory_id in write_unit(memory, unit):
+                    memory.faces(memory_id)
+                sample = _gallery_sample(memory, unit)
+            for arm in arms:
+                recorder = _Recorder(_reader(settings, client))
+                with _open(store, _embedder(settings), recorder, arm) as memory:
+
+                    def one(
+                        item: tuple[int, bool],
+                        arm: Arm = arm,
+                        memory: Memory = memory,
+                        recorder: _Recorder = recorder,
+                        unit: Unit = unit,
+                    ) -> Outcome:
+                        index, incomplete = item
+                        question, gold, reference = unit.questions[index]
+                        _reset_billing()
+                        result = memory.ask(question, limit=RECALL_LIMIT)
+                        billed = _billed_tokens()
+                        window = _turn_ids(recorder.grounded)
+                        pool = _turn_ids(memory.search(question, limit=100))
+                        f1, judged = _gallery_score(
+                            question, reference, result.answer, client, model
+                        )
+                        outcome = Outcome(
+                            question_id=f"{unit.unit_id}:{index}",
+                            arm=arm.name,
+                            support=_support_class(
+                                gold, frozenset(window), frozenset(pool | window)
+                            ),
+                            gold=len(gold),
+                            found=len(gold & window),
+                            window_rows=len(recorder.grounded),
+                            window_chars=sum(len(hit.content) for hit in recorder.grounded),
+                            expansion_rows=recorder.expansion_rows,
+                            prompt_chars=recorder.prompt_chars,
+                            evidence_cost=sum(evidence_cost(hit) for hit in recorder.grounded),
+                            prompt_tokens=billed,
+                            media_rows=sum(1 for hit in recorder.grounded if hit.assets),
+                            correct=f1,
+                            judged=judged,
+                            incomplete_stratum=incomplete,
+                            abstained=result.abstained,
+                            window_ids=tuple(hit.id for hit in recorder.grounded),
+                        )
+                        report(
+                            f"{unit.unit_id} {arm.name} q{index} {outcome.support} "
+                            f"f1={f1:.2f} judge={judged:.1f}"
+                        )
+                        return outcome
+
+                    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool_executor:
+                        for outcome in pool_executor.map(_retrying(one), sample):
+                            if outcome is not None:
+                                by_question.setdefault(outcome.question_id, []).append(outcome)
+        finally:
+            embedder.close()
+            face.close()
+    for question_id, rows in by_question.items():
+        if len(rows) != len(arms):
+            abandoned.append((question_id, f"answered by {len(rows)} of {len(arms)} arms"))
+    return tuple(tuple(rows) for rows in by_question.values() if len(rows) == len(arms))
+
+
 def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
     counts = Counter(outcome.support for outcome in outcomes)
     total = len(outcomes) or 1
@@ -673,6 +867,7 @@ def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
             statistics.fmean(outcome.expansion_rows for outcome in outcomes), 2
         ),
         "mean_media_rows": round(statistics.fmean(outcome.media_rows for outcome in outcomes), 2),
+        "judged": round(statistics.fmean(outcome.judged for outcome in outcomes), 4),
         "mean_evidence_cost": round(
             statistics.fmean(outcome.evidence_cost for outcome in outcomes), 1
         ),
@@ -733,6 +928,56 @@ def _paired(
     }
 
 
+def _longmemeval_outcomes(
+    args: argparse.Namespace,
+    *,
+    arms: Sequence[Arm],
+    settings: Mapping[str, str],
+    client: OpenAI,
+    report: Callable[[str], None],
+    abandoned: list[tuple[str, str]],
+    lock: threading.Lock,
+) -> tuple[list[tuple[Outcome, ...]], int]:
+    """One store per question, because each LongMemEval unit is its own haystack."""
+    questions = load_longmemeval(args.dataset)[args.offset : args.offset + args.limit]
+    with tempfile.TemporaryDirectory(prefix="support-coverage-") as root:
+
+        def run(question: object) -> tuple[Outcome, ...]:
+            question_id = str(question.question_id)  # type: ignore[attr-defined]
+            outcomes: tuple[Outcome, ...] = ()
+            reason = ""
+            for attempt in range(_RETRY_ATTEMPTS):
+                try:
+                    outcomes = _question_outcomes(
+                        question,
+                        root=Path(root),
+                        arms=arms,
+                        settings=settings,
+                        client=client,
+                        capture_context=not args.no_capture_context,
+                    )
+                    break
+                except (APIError, ModelError) as error:
+                    reason = f"{type(error).__name__}: {error}"
+                    if attempt + 1 == _RETRY_ATTEMPTS:
+                        break
+                    time.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
+            if outcomes:
+                shown = " ".join(
+                    f"{o.arm}={o.support[:8]}/{'y' if o.correct > 0.5 else 'n'}" for o in outcomes
+                )
+            else:
+                with lock:
+                    abandoned.append((question_id, reason))
+                shown = f"ABANDONED {reason[:120]}"
+            report(f"{question_id} {shown}")
+            return outcomes
+
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            collected = [rows for rows in pool.map(run, questions) if rows]
+    return collected, len(questions)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -763,9 +1008,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if missing:
         parser.error(f"{_ENV_PATH} is missing {', '.join(missing)}")
 
-    if CORPUS == "atm" and not settings.get("MINDBRIDGE_BENCH_ROOT"):
+    if CORPUS != "longmemeval" and not settings.get("MINDBRIDGE_BENCH_ROOT"):
         parser.error(f"{_ENV_PATH} is missing MINDBRIDGE_BENCH_ROOT")
-    budget = args.evidence_budget_chars * (ATM_BUDGET_FACTOR if CORPUS == "atm" else 1)
+    if CORPUS == "mem-gallery":
+        budget = GALLERY_BUDGET_CHARS
+    else:
+        budget = args.evidence_budget_chars * (ATM_BUDGET_FACTOR if CORPUS == "atm" else 1)
     arms = (
         Arm("window", budget=None, expansion=False),
         Arm("window+linked", budget=None, expansion=True),
@@ -778,98 +1026,71 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.perf_counter()
     collected: list[tuple[Outcome, ...]] = []
 
-    if CORPUS == "atm":
+    def progress() -> Callable[[str], None]:
+        """One numbered line per completed unit of work, whichever corpus produced it."""
+
+        def note(line: str) -> None:
+            nonlocal finished
+            with done:
+                finished += 1
+                print(f"[{finished}] {line}", file=sys.stderr, flush=True)
+
+        return note
+
+    if CORPUS in {"atm", "mem-gallery"}:
         print(
-            f"corpus=atm; --dataset {args.dataset} is not read by this commit",
+            f"corpus={CORPUS}; --dataset {args.dataset} is not read by this commit",
             file=sys.stderr,
             flush=True,
         )
         with tempfile.TemporaryDirectory(prefix="support-coverage-") as root:
-
-            def note(line: str) -> None:
-                nonlocal finished
-                with done:
-                    finished += 1
-                    print(f"[{finished}] {line}", file=sys.stderr, flush=True)
-
-            collected = list(
-                _atm_outcomes(
-                    root=Path(root),
-                    arms=arms,
-                    settings=settings,
-                    client=client,
-                    limit=ATM_QUESTIONS,
-                    offset=args.offset,
-                    workers=args.workers,
-                    report=note,
-                    abandoned=abandoned,
+            shared = {
+                "root": Path(root),
+                "arms": arms,
+                "settings": settings,
+                "client": client,
+                "workers": args.workers,
+                "report": progress(),
+                "abandoned": abandoned,
+            }
+            if CORPUS == "atm":
+                collected = list(
+                    _atm_outcomes(limit=ATM_QUESTIONS, offset=args.offset, **shared)  # type: ignore[arg-type]
                 )
-            )
-        question_count = ATM_QUESTIONS
-        judged = "atm_bench_official_deterministic_and_judge"
+                counted = ATM_QUESTIONS
+                protocol = "atm_bench_official_deterministic_and_judge"
+            else:
+                collected = list(_gallery_outcomes(**shared))  # type: ignore[arg-type]
+                counted = len(collected) + len(abandoned)
+                protocol = "mem_gallery_official_f1_and_judge"
         return _emit(
             args,
             settings,
             arms,
             collected,
             abandoned=abandoned,
-            question_count=question_count,
-            judge_protocol=judged,
+            question_count=counted,
+            judge_protocol=protocol,
             budget=budget,
             started=started,
         )
 
-    questions = load_longmemeval(args.dataset)[args.offset : args.offset + args.limit]
-    with tempfile.TemporaryDirectory(prefix="support-coverage-") as root:
-
-        def run(question: object) -> tuple[Outcome, ...]:
-            nonlocal finished, abandoned
-            question_id = str(question.question_id)  # type: ignore[attr-defined]
-            outcomes: tuple[Outcome, ...] = ()
-            reason = ""
-            for attempt in range(_RETRY_ATTEMPTS):
-                try:
-                    outcomes = _question_outcomes(
-                        question,
-                        root=Path(root),
-                        arms=arms,
-                        settings=settings,
-                        client=client,
-                        capture_context=not args.no_capture_context,
-                    )
-                    break
-                except (APIError, ModelError) as error:
-                    reason = f"{type(error).__name__}: {error}"
-                    if attempt + 1 == _RETRY_ATTEMPTS:
-                        break
-                    time.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
-            with done:
-                finished += 1
-                if outcomes:
-                    shown = " ".join(
-                        f"{o.arm}={o.support[:8]}/{'y' if o.correct > 0.5 else 'n'}"
-                        for o in outcomes
-                    )
-                else:
-                    abandoned.append((question_id, reason))
-                    shown = f"ABANDONED {reason[:120]}"
-                print(
-                    f"[{finished}/{len(questions)}] {question_id} {shown}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            return outcomes
-
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            collected = [rows for rows in pool.map(run, questions) if rows]
-
+    collected, counted = _longmemeval_outcomes(
+        args,
+        arms=arms,
+        settings=settings,
+        client=client,
+        report=progress(),
+        abandoned=abandoned,
+        lock=done,
+    )
     return _emit(
         args,
         settings,
         arms,
         collected,
         abandoned=abandoned,
-        question_count=len(questions),
+        question_count=counted,
         judge_protocol="longmemeval_official_answer_check",
         budget=budget,
         started=started,
@@ -919,6 +1140,23 @@ def _emit(
         "accuracy_by_support": _accuracy_by_support(
             [row for rows in collected for row in rows],
         ),
+        # The edge population and the control population, separated. An arm that helps only where
+        # the window was already complete is not doing what this mechanism claims to do.
+        "by_stratum": {
+            name: {
+                arm.name: _summarize(
+                    [
+                        row
+                        for rows in collected
+                        for row in rows
+                        if row.arm == arm.name and row.incomplete_stratum is incomplete
+                    ]
+                )
+                for arm in arms
+            }
+            for name, incomplete in (("incomplete_window", True), ("complete_window", False))
+            if any(row.incomplete_stratum is incomplete for rows in collected for row in rows)
+        },
         "paired_against_window": {
             arm.name: _paired(
                 control,

@@ -22,25 +22,16 @@ import json
 import tempfile
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
+from corpora import atm_units, gallery_units, source_id, write_unit
 from support_coverage import _embedder, _env
 
-from mindbridge import Memory, MemoryType, ObservationContext
-from mindbridge.benchmarks.atm_bench import (
-    atm_capture_time,
-    atm_email_block,
-    load_atm_bench,
-    load_atm_emails,
-)
-from mindbridge.benchmarks.mem_gallery import load_mem_gallery
+from mindbridge import Memory
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 
 LIMIT = 12
-INLINE = 20 * 1024 * 1024 * 3 // 4
 EDGES = ("capture", "identity", "place", "lineage", "evidence")
 # The shipped default, and measurement says it is right. Lowering it to 0.5 looked like more
 # signal -- 384 detections from 400 photographs instead of 19 -- and was the opposite: scored
@@ -51,108 +42,6 @@ EDGES = ("capture", "identity", "place", "lineage", "evidence")
 # it correctly declines to merge strangers; at 0.5 the median rises from 0.116 to 0.226 and 15.9 %
 # of pairs cross it, which is non-face crops embedding near each other and merging spuriously.
 FACE_SCORE_THRESHOLD = 0.9
-
-
-def _source_id(record: object) -> str:
-    """The benchmark's own id for a record, read out of canonical metadata JSON.
-
-    Parsed rather than pattern-matched: canonical JSON is compact, so a split on `"source_id": "`
-    matches nothing and silently reports that no edge ever supplies gold. That is exactly what the
-    first version of this check claimed.
-    """
-    return str(json.loads(record.metadata_json).get("source_id", ""))  # type: ignore[attr-defined]
-
-
-@dataclass(frozen=True, slots=True)
-class Unit:
-    """One physically isolated store's worth of a corpus, and the questions asked of it."""
-
-    unit_id: str
-    # `(content, occurred_at, source_id, capture_id, is_media)` per record.
-    records: tuple[tuple[object, datetime, str, str, bool], ...]
-    # `(question text, gold source ids)` per question.
-    questions: tuple[tuple[str, frozenset[str]], ...]
-
-
-def _atm_units(data: Path, limit: int) -> tuple[Unit, ...]:
-    """ATM-Bench is one store: every question reads the same photographs, clips and emails."""
-    records: list[tuple[object, datetime, str, str, bool]] = []
-    for email in load_atm_emails(data / "raw_memory" / "email" / "emails.json"):
-        records.append(
-            (
-                atm_email_block(email),
-                email.occurred_at,
-                email.email_id,
-                email.occurred_at.date().isoformat(),
-                False,
-            )
-        )
-    for folder, pattern in (("image", "*.jpg"), ("video", "*.mp4")):
-        for path in sorted((data / "raw_memory" / folder).glob(pattern)):
-            if path.stat().st_size > INLINE:
-                continue
-            records.append((path, atm_capture_time(path.stem), path.stem, path.stem[:8], True))
-    questions = tuple(
-        (question.question, frozenset(question.evidence_ids))
-        for question in load_atm_bench(data / "atm-bench" / "atm-bench.json")[:limit]
-    )
-    return (Unit("atm", tuple(records), questions),)
-
-
-def _gallery_units(data: Path, limit: int) -> tuple[Unit, ...]:
-    """Mem-Gallery is one store per topic: a persona, its dated sessions, and its questions.
-
-    The capture is the session, which is what the release actually groups by, and a round's image
-    rides on the same record as its text so a photograph of the persona is reachable both ways.
-    """
-    units = []
-    for topic in load_mem_gallery(data / "dialog"):
-        records: list[tuple[object, datetime, str, str, bool]] = []
-        for session in topic.sessions:
-            for round_ in session.rounds:
-                text = (
-                    f"[{session.occurred_at.date().isoformat()}] "
-                    f"{topic.profile.name}: {round_.user}\nAssistant: {round_.assistant}"
-                )
-                image = (
-                    None
-                    if round_.image_path is None
-                    else (data / "dialog" / round_.image_path).resolve()
-                )
-                content: object = text if image is None else (text, image)
-                records.append(
-                    (
-                        content,
-                        session.occurred_at,
-                        round_.round_id,
-                        session.session_id,
-                        image is not None,
-                    )
-                )
-        questions = tuple(
-            (question.question, frozenset(question.clue_round_ids))
-            for question in topic.questions
-            if question.clue_round_ids
-        )
-        if questions:
-            units.append(Unit(topic.topic, tuple(records), questions[:limit]))
-    return tuple(units)
-
-
-def _write(memory: Memory, unit: Unit) -> tuple[str, ...]:
-    """Write one unit's records and return the ids of those carrying media."""
-    media: list[str] = []
-    for content, occurred_at, source, capture, is_media in unit.records:
-        record = memory.add(
-            content,  # type: ignore[arg-type]
-            occurred_at=occurred_at,
-            metadata={"source_id": source},
-            memory_type=MemoryType.EPISODIC,
-            context=ObservationContext(source_id=capture),
-        )
-        if is_media:
-            media.append(record.id)
-    return tuple(media)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -166,10 +55,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = Path(settings["MINDBRIDGE_BENCH_ROOT"])
     if args.corpus == "atm":
         data = root / "atm-bench" / "data"
-        units = _atm_units(data, args.limit)
+        units = atm_units(data, args.limit)
     else:
         data = root / "mem-gallery" / "data"
-        units = _gallery_units(data, args.limit)
+        units = gallery_units(data, args.limit)
 
     def backends() -> tuple[OpenAIModels, OpenCVFaceAnalyzer]:
         """One pair per unit, because `Memory.close()` closes the backends it was handed.
@@ -211,7 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     minimum_relevance=0.0,
                     ambiguity_margin=0.0,
                 ) as memory:
-                    media = _write(memory, unit)
+                    media = write_unit(memory, unit)
                     for memory_id in media:
                         memory.faces(memory_id)
                     with memory._store.recall._connections.connection() as connection:
@@ -231,7 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     totals["units"] += 1
                     totals["records"] += records
                     totals["media_records"] += len(media)
-                    for question, gold in unit.questions:
+                    for question, gold, _reference in unit.questions:
                         totals["questions"] += 1
                         hits = memory.search(question, limit=LIMIT)
                         window_ids = tuple(hit.id for hit in hits)
@@ -245,7 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             read = memory._store.recall.related_memories(
                                 window_ids, edges=(edge,), ceiling=ceiling, max_rows=24
                             )
-                            found = missing & {_source_id(row) for row in read}
+                            found = missing & {source_id(row) for row in read}
                             edges[edge]["fired"] += 1 if len(read) else 0
                             edges[edge]["rows"] += len(read)
                             edges[edge]["supplied_gold"] += 1 if found else 0
