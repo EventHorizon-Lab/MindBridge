@@ -479,6 +479,14 @@ the tail's 63,800, 0.76x, carrying almost the same media rows in 36 rows rather 
 widenings raise complete gold support by about the same few questions on either corpus, so neither
 edge reaches evidence the other cannot.
 
+What it is *not* is a route to evidence the ranking cannot reach. Everything it recovered on
+ATM-Bench sat between ranks 13 and 36 -- inside the candidate pool, outside the window -- which is
+why the ranked tail recovers the same questions by walking there on cosine instead. Discarding the
+linked rows the ranking had also proposed was measured and removed the whole benefit: complete gold
+support fell to the narrow window's own figure and 117 of 117 questions tied. So expansion reaches
+further down one ranking by a different selector, and the only question is which selector is
+cheaper.
+
 Enable it where captures group evidence a query has no way to name -- a day of photographs, a room,
 one recorded session of a robot's work -- and the window costs about three quarters as much to
 fill. Leave it off where the ranking already spans the capture. It is off by default because a caller who

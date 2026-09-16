@@ -322,27 +322,37 @@ def test_linked_rows_fill_only_what_the_ranking_left(tmp_path: Path) -> None:
     assert partner in grounded, "the capture partner fills the budget-free tail"
 
 
-def test_a_linked_row_the_ranking_already_found_is_not_paid_for_twice(tmp_path: Path) -> None:
-    """Expansion pays only for evidence the ranking has no route to.
+def test_a_linked_row_the_ranking_also_ranked_is_still_offered(tmp_path: Path) -> None:
+    """Pool membership is not window membership, so it cannot decide what expansion admits.
 
-    A linked row inside the candidate pool is a row a wider budget reaches, so admitting it here
-    buys nothing and costs a window slot. What the edges are for is the record the ranking never
-    proposed -- and on a corpus where the ranking already spans the capture, that is none of them.
+    Discarding a linked row that appears anywhere in the candidate pool was tried and measured
+    harmful: with no character budget the pool is `min(100, limit * 3)` and the window is `limit`,
+    so a gold row at rank 20 is in the pool and will never be in the window. What removes the rows
+    a wider window would have held anyway is `_packed_grounding`'s dedup, which is the only place
+    that knows what the window holds.
     """
     answerer = _RecordingAnswerer()
-    with _memory(tmp_path, answerer, evidence_expansion=True, evidence_budget_chars=None) as memory:
-        # Two records, one capture: with `limit=2` the ranking proposes both, so the partner is
-        # reachable and the gate discards it.
-        _capture(memory, "S1", "a red wrench", "a red hammer")
+    with _memory(
+        tmp_path,
+        answerer,
+        evidence_expansion=True,
+        evidence_budget_chars=None,
+        embedder=_ScriptedEmbedder(_FAR_PARTNER),
+    ) as memory:
+        anchor, partner = _far_partner_store(memory)
+        # The partner is inside the pool the ask ranks and outside the window it grounds.
+        pool = {hit.id for hit in memory.search("a red wrench on the bench", limit=5)}
 
-        memory.ask("red?", limit=2)
+        memory.ask("a red wrench on the bench", limit=1)
 
-    assert len(_grounded_ids(answerer)) == 2
-    assert "linked to the evidence above" not in (answerer.questions[-1].text or "")
+    grounded = _grounded_ids(answerer)
+    assert {anchor, partner} <= pool, "the fixture must rank both inside the pool"
+    assert grounded[0] == anchor
+    assert partner in grounded, "a ranked-but-unwindowed row is still worth admitting"
 
 
 def test_a_linked_row_the_ranking_never_proposed_is_admitted(tmp_path: Path) -> None:
-    """The same capture, a window too narrow to contain it, and the partner survives the gate."""
+    """A capture partner outside the ranked pool entirely still reaches the window."""
     answerer = _RecordingAnswerer()
     with _memory(
         tmp_path,
@@ -352,11 +362,10 @@ def test_a_linked_row_the_ranking_never_proposed_is_admitted(tmp_path: Path) -> 
         embedder=_ScriptedEmbedder(_FAR_PARTNER),
     ) as memory:
         _anchor, partner = _far_partner_store(memory)
-        # The pool the ask ranks is `min(100, limit * 3)` deep; the partner is placed outside it.
         pool = {hit.id for hit in memory.search("a red wrench on the bench", limit=3)}
 
         memory.ask("a red wrench on the bench", limit=1)
 
     grounded = _grounded_ids(answerer)
-    assert partner not in pool, "the fixture must place the partner beyond the ranked pool"
-    assert partner in grounded, "a record the ranking did not propose reached the window"
+    assert partner not in pool, "the fixture must place the partner beyond the ask's own window"
+    assert partner in grounded, "a record the window would not have held reached it"

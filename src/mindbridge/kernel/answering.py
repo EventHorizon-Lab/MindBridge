@@ -1114,13 +1114,19 @@ class Answering(Traced):
     def _expand_evidence(self, hits: Sequence[SearchHit], context: _RecallContext) -> _Expansion:
         """Read the records this evidence is structurally linked to, at no model cost.
 
-        A linked row the ranking already found is discarded here, because widening the budget
-        reaches it and paying for it twice is the whole cost of this feature. What survives is
-        evidence the ranking has no route to, which is the only kind an edge can contribute that a
-        deeper window cannot. Measured over two corpora, the setting bought the same answers for
-        0.76x the evidence budget where captures group what a query cannot name and 1.62x where the
-        ranking already spanned the capture; the sign of that ratio is a property of the corpus, and
-        this is what lets the kernel decide it per question instead of asking the caller to know it.
+        Every linked row is offered, including one the ranking also found. Discarding those was
+        tried, on the theory that a wider budget reaches them anyway, and it removed the whole
+        benefit: with no character budget the candidate pool is `min(100, limit * 3)` while the
+        window it grounds is `limit`, so a gold row at rank 20 is in the pool and will never be in
+        the window. Gating on pool membership dropped exactly those rows -- complete support fell
+        to the narrow window's own 0.7949 on ATM-Bench and the paired comparison went to 117 ties
+        -- and kept the rows past rank 36, which are the ones that do not matter.
+
+        What the measurement left is a simpler reading of this feature. Expansion does not reach
+        evidence the ranking cannot; it reaches further down the same ranking by a different
+        selector, and it is worth enabling where that selector is cheaper than cosine depth. The
+        rows a wider window would have contained anyway are removed by `_packed_grounding`'s own
+        dedup, which is the only place that can know what the window will hold.
         """
         if not hits:
             return _Expansion(hits=(), edges={}, dropped=())
@@ -1134,15 +1140,15 @@ class Answering(Traced):
                 max_rows=self._settings.evidence_expansion_max_rows,
             )
             reachable = {hit.id for hit in context.ranked}
-            linked = len(expansion.hits)
-            expansion = replace(
-                expansion,
-                hits=tuple(hit for hit in expansion.hits if hit.id not in reachable),
-            )
             span.set_attributes(
                 {
                     EXPANSION_ROWS: len(expansion.hits),
-                    EXPANSION_LINKED_ROWS: linked,
+                    # How many of the linked rows the ranking also proposed. Kept as a signal
+                    # rather than a filter: gating on it was measured harmful, and the number is
+                    # still what says whether a corpus's captures track its ranking.
+                    EXPANSION_LINKED_ROWS: sum(
+                        1 for hit in expansion.hits if hit.id in reachable
+                    ),
                     EXPANSION_EDGES: tuple(
                         f"{edge}:{count}" for edge, count in expansion.edges.items() if count
                     ),
