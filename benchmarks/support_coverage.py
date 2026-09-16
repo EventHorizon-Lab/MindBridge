@@ -42,6 +42,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import cast
 
+import httpx
 from openai import APIError, OpenAI
 
 from mindbridge import (
@@ -68,6 +69,7 @@ from mindbridge.benchmarks.atm_bench import (
 from mindbridge.benchmarks.longmemeval import load_longmemeval
 from mindbridge.benchmarks.official_scorers import judge_plan, local_scores, parse_judge_response
 from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT, atm_format_constraint
+from mindbridge.context import evidence_cost
 from mindbridge.exceptions import ModelError
 from mindbridge.models.openai_sdk import OpenAIModels
 
@@ -87,7 +89,7 @@ CORPUS: str = "atm"
 # ATM-Bench is one store every question reads, so its questions are answered concurrently inside
 # one open rather than each getting a store of their own.
 ATM_QUESTIONS = 120
-# `evidence_cost` charges an image 2,000 characters, so the text run'"'"'s 24,000 buys a ranked tail of
+# `evidence_cost` charges an image 2,000 characters, so the text run's 24,000 buys a ranked tail of
 # twelve images -- which is the `window` arm over again. The budget arm is scaled to the media the
 # linked arm reaches, so the contest stays composition at one media budget rather than volume.
 ATM_BUDGET_FACTOR = 3
@@ -115,9 +117,12 @@ class Outcome:
     window_chars: int
     expansion_rows: int
     prompt_chars: int
-    # Media rows are counted separately because `prompt_chars` cannot see them: an image reaches
-    # the reader as image tokens, not as characters, and on a photo corpus that is most of what a
-    # window costs. A comparison stated in characters alone would hide the whole media bill.
+    # What the product itself charges this window: characters plus a flat price per media part.
+    # `prompt_chars` is text only, and on a photo corpus the media is most of the window, so a
+    # comparison stated in characters alone overstated one arm's saving by 1.6x.
+    evidence_cost: int
+    # What the provider said it was billed for the answer call. The only unmodelled cost here.
+    prompt_tokens: int
     media_rows: int
     correct: float
     abstained: bool
@@ -177,6 +182,35 @@ class _Recorder:
 
     def close(self) -> None:
         self._backend.close()
+
+
+_BILLED = threading.local()
+
+
+def _billing_hook(response: httpx.Response) -> None:
+    """Accumulate the prompt tokens the provider reports, for the asking thread.
+
+    Cost is the whole claim this measurement makes, and it has been got wrong twice by modelling
+    it -- once by counting characters and ignoring media entirely, once by pricing a media part at
+    the flat charge `evidence_cost` uses rather than what a model is billed for. The provider says
+    what it charged; read that instead. Best effort by construction: a body this cannot parse
+    leaves the modelled figure standing rather than failing an answer.
+    """
+    try:
+        response.read()
+        usage = response.json().get("usage") or {}
+        tokens = int(usage.get("prompt_tokens", 0))
+    except Exception:
+        return
+    _BILLED.tokens = getattr(_BILLED, "tokens", 0) + tokens
+
+
+def _billed_tokens() -> int:
+    return cast(int, getattr(_BILLED, "tokens", 0))
+
+
+def _reset_billing() -> None:
+    _BILLED.tokens = 0
 
 
 def _env() -> Mapping[str, str]:
@@ -245,6 +279,10 @@ def _generation_client(settings: Mapping[str, str]) -> OpenAI:
         api_key=settings["MINDBRIDGE_GENERATION_API_KEY"],
         max_retries=2,
         timeout=180.0,
+        http_client=httpx.Client(
+            timeout=180.0,
+            event_hooks={"response": [_billing_hook]},
+        ),
     )
 
 
@@ -376,11 +414,13 @@ def _question_outcomes(
         for arm in arms:
             recorder = _Recorder(_reader(settings, client))
             with _open(data_dir, embedder, recorder, arm) as memory:
+                _reset_billing()
                 result = memory.ask(
                     "Answer concisely using only the memories.\n"
                     f"Question: {question.question}\nAnswer:",  # type: ignore[attr-defined]
                     limit=RECALL_LIMIT,
                 )
+                billed = _billed_tokens()
                 pool = _turn_ids(memory.search(question.question, limit=100))  # type: ignore[attr-defined]
             window = _turn_ids(recorder.grounded)
             outcomes.append(
@@ -394,6 +434,8 @@ def _question_outcomes(
                     window_chars=sum(len(hit.content) for hit in recorder.grounded),
                     expansion_rows=recorder.expansion_rows,
                     prompt_chars=recorder.prompt_chars,
+                    evidence_cost=sum(evidence_cost(hit) for hit in recorder.grounded),
+                    prompt_tokens=billed,
                     media_rows=sum(1 for hit in recorder.grounded if hit.assets),
                     correct=_judge(
                         client,
@@ -506,6 +548,7 @@ def _atm_outcomes(
     offset: int,
     workers: int,
     report: Callable[[str], None],
+    abandoned: list[tuple[str, str]],
 ) -> tuple[tuple[Outcome, ...], ...]:
     """Ingest the ATM corpus once, then read it once per arm with its questions concurrent."""
     data = Path(settings["MINDBRIDGE_BENCH_ROOT"]) / "atm-bench" / "data"
@@ -537,7 +580,9 @@ def _atm_outcomes(
                         question=question.question,  # type: ignore[attr-defined]
                         format_constraint=atm_format_constraint(question.qtype),  # type: ignore[attr-defined]
                     )
+                    _reset_billing()
                     result = memory.ask(prompt, limit=RECALL_LIMIT)
+                    billed = _billed_tokens()
                     window = _turn_ids(recorder.grounded)
                     pool = _turn_ids(memory.search(question.question, limit=100))  # type: ignore[attr-defined]
                     outcome = Outcome(
@@ -550,6 +595,8 @@ def _atm_outcomes(
                         window_chars=sum(len(hit.content) for hit in recorder.grounded),
                         expansion_rows=recorder.expansion_rows,
                         prompt_chars=recorder.prompt_chars,
+                        evidence_cost=sum(evidence_cost(hit) for hit in recorder.grounded),
+                        prompt_tokens=billed,
                         media_rows=sum(1 for hit in recorder.grounded if hit.assets),
                         correct=_atm_score(question, result.answer, client, model),
                         abstained=result.abstained,
@@ -567,7 +614,17 @@ def _atm_outcomes(
                             by_question.setdefault(outcome.question_id, []).append(outcome)
     finally:
         embedder.close()
-    # Only questions every arm answered, so the arms share one denominator.
+    # Only questions every arm answered, so the arms share one denominator -- and whatever fell
+    # short is named rather than quietly dropped, because a report whose denominator moved has to
+    # say which questions moved it. An earlier run reported `abandoned: []` beside 116 of 120.
+    for question in questions:
+        rows = by_question.get(str(question.question_id))  # type: ignore[attr-defined]
+        if rows is None:
+            abandoned.append((str(question.question_id), "no arm answered it"))  # type: ignore[attr-defined]
+        elif len(rows) != len(arms):
+            abandoned.append(
+                (str(question.question_id), f"answered by {len(rows)} of {len(arms)} arms")  # type: ignore[attr-defined]
+            )
     return tuple(tuple(rows) for rows in by_question.values() if len(rows) == len(arms))
 
 
@@ -612,6 +669,12 @@ def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
             statistics.fmean(outcome.expansion_rows for outcome in outcomes), 2
         ),
         "mean_media_rows": round(statistics.fmean(outcome.media_rows for outcome in outcomes), 2),
+        "mean_evidence_cost": round(
+            statistics.fmean(outcome.evidence_cost for outcome in outcomes), 1
+        ),
+        "mean_prompt_tokens": round(
+            statistics.fmean(outcome.prompt_tokens for outcome in outcomes), 1
+        ),
     }
 
 
@@ -735,6 +798,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     offset=args.offset,
                     workers=args.workers,
                     report=note,
+                    abandoned=abandoned,
                 )
             )
         question_count = ATM_QUESTIONS

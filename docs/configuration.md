@@ -471,16 +471,17 @@ and the window is `limit` rows that linked rows can follow; with a budget set it
 What it is worth enabling for is prompt size, not answer quality. Measured against a comparable
 budget of ranked tail on two corpora, a paired sign test cannot distinguish the answers: 6 won and
 4 lost on LongMemEval-S, 10 and 7 on ATM-Bench raw media. What differs is the price of reaching
-them. On LongMemEval-S a capture is a dialogue session whose turns the tail already reaches, so
-linked rows duplicate it and cost 39,800 prompt characters where the tail costs 24,600. On
-ATM-Bench, where a capture is a day of photographs no query can name, the same window is assembled
-for 12,900 characters against the tail's 27,200, with the same number of media rows. Both widenings
-raise complete gold support by about the same few questions on either corpus, so neither edge
-reaches evidence the other cannot.
+them. Priced the way `evidence_cost` prices a window -- characters plus a flat charge per media
+part -- LongMemEval-S is a corpus where a capture is a dialogue session the tail already reaches,
+so linked rows duplicate it and cost 39,500 against the tail's 24,400, 1.62x. On ATM-Bench, where a
+capture is a day of photographs no query can name, the same window is assembled for 48,200 against
+the tail's 63,800, 0.76x, carrying almost the same media rows in 36 rows rather than 58. Both
+widenings raise complete gold support by about the same few questions on either corpus, so neither
+edge reaches evidence the other cannot.
 
 Enable it where captures group evidence a query has no way to name -- a day of photographs, a room,
-one recorded session of a robot's work -- and the window costs less than half as much to fill.
-Leave it off where the ranking already spans the capture. It is off by default because a caller who
+one recorded session of a robot's work -- and the window costs about three quarters as much to
+fill. Leave it off where the ranking already spans the capture. It is off by default because a caller who
 has not measured their own corpus should not pay for it.
 
 What expansion adds is reported to the reader as records linked to the evidence rather than records

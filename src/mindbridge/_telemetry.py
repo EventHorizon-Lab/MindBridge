@@ -56,7 +56,11 @@ RECALL_NON_SELECTIVE_STEPS = "mindbridge.recall.non_selective_steps"
 # Evidence expansion reports which structural edge linked the rows it added and which edge was
 # dropped for selecting too much of the corpus. Two expansions of the same size are different
 # claims about the store when one came from a capture and the other from a place.
+# `rows` is what expansion admitted; `linked_rows` is what the edges found before the gate
+# discarded whatever the ranking had already reached. The difference is the cost the gate saved,
+# and it is the number that says whether a corpus needs this feature at all.
 EXPANSION_ROWS = "mindbridge.expansion.rows"
+EXPANSION_LINKED_ROWS = "mindbridge.expansion.linked_rows"
 EXPANSION_EDGES = "mindbridge.expansion.edges"
 EXPANSION_DROPPED_EDGES = "mindbridge.expansion.dropped_edges"
 EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"

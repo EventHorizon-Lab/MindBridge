@@ -8,7 +8,8 @@ an authoritative column instead of a cosine, so it costs one indexed read and no
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from _feature_support import TinyEmbedder
 from mindbridge import (
     AnswerPolicy,
     AnswerResult,
+    EmbedTask,
     Memory,
     Modality,
     ModelInput,
@@ -27,6 +29,42 @@ from mindbridge import (
 from mindbridge.exceptions import ValidationError
 
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+
+
+class _ScriptedEmbedder:
+    """Places records at chosen angles from the query, so a test can dictate the ranking.
+
+    The gate compares linked rows against the candidates the ask ranked, and that pool is
+    `min(100, limit * 3)` deep. A hash embedder cannot say which record lands inside it, so a test
+    about the gate has to choose: text mapped to an angle, the query at zero, and cosine order is
+    the order the angles were written.
+    """
+
+    embedding_capabilities = frozenset({Modality.TEXT})
+    embedding_model = "scripted-test"
+    embedding_space = "scripted-test:2:l2-v1"
+    embedding_dimension = 2
+
+    def __init__(self, angles: Mapping[str, float]) -> None:
+        self._angles = dict(angles)
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        del task
+        vectors = []
+        for value in inputs:
+            angle = next(
+                (turn for text, turn in self._angles.items() if text in value.text),
+                math.pi / 2,
+            )
+            vectors.append((math.cos(angle), math.sin(angle)))
+        return tuple(vectors)
+
+    def close(self) -> None:
+        return None
 
 
 class _RecordingAnswerer:
@@ -63,10 +101,11 @@ def _memory(
     *,
     evidence_expansion: bool = False,
     evidence_budget_chars: int | None = 24_000,
+    embedder: object | None = None,
 ) -> Memory:
     return Memory(
         tmp_path / "store",
-        embedder=TinyEmbedder(),
+        embedder=embedder or TinyEmbedder(),  # type: ignore[arg-type]
         answerer=answerer,
         minimum_relevance=0.0,
         ambiguity_margin=0.0,
@@ -136,12 +175,40 @@ def test_expansion_is_off_by_default_and_changes_nothing(tmp_path: Path) -> None
     assert "linked to the evidence above" not in (answerer.questions[-1].text or "")
 
 
+# One capture whose partner the ranking never proposes: `limit=1` ranks three candidates, and the
+# partner is placed fifth. Distractors fill the pool so the gate has something to discard.
+_FAR_PARTNER = {
+    "a red wrench on the bench": 0.0,
+    "distractor one": 0.2,
+    "distractor two": 0.3,
+    "distractor three": 0.4,
+    "and a red hammer beside it": 1.2,
+}
+
+
+def _far_partner_store(memory: Memory) -> tuple[str, str]:
+    anchor, partner = _capture(
+        memory,
+        "S1",
+        "a red wrench on the bench",
+        "and a red hammer beside it",
+    )
+    _capture(memory, "S2", "distractor one", "distractor two", "distractor three", minute=30)
+    return anchor, partner
+
+
 def test_the_note_says_which_edge_linked_the_rows_and_refuses_a_total(tmp_path: Path) -> None:
     """A linked record is not a matched record, and a reader that cannot tell states wrong totals."""
     answerer = _RecordingAnswerer()
-    with _memory(tmp_path, answerer, evidence_expansion=True, evidence_budget_chars=None) as memory:
-        _capture(memory, "S1", "a red wrench on the bench", "and a red hammer beside it")
-        memory.ask("what is red?", limit=1)
+    with _memory(
+        tmp_path,
+        answerer,
+        evidence_expansion=True,
+        evidence_budget_chars=None,
+        embedder=_ScriptedEmbedder(_FAR_PARTNER),
+    ) as memory:
+        _far_partner_store(memory)
+        memory.ask("a red wrench on the bench", limit=1)
 
     note = answerer.questions[-1].text or ""
     assert "linked to the evidence above (capture)" in note
@@ -239,13 +306,57 @@ def test_a_saturated_budget_adds_nothing_and_says_nothing(tmp_path: Path) -> Non
 def test_linked_rows_fill_only_what_the_ranking_left(tmp_path: Path) -> None:
     """Expansion goes last, so it spends leftover budget and never the ranking's own rows."""
     answerer = _RecordingAnswerer()
-    with _memory(tmp_path, answerer, evidence_expansion=True, evidence_budget_chars=None) as memory:
-        _capture(memory, "S1", "a red wrench", "a red hammer")
-        window = tuple(hit.id for hit in memory.search("red wrench?", limit=1))
+    with _memory(
+        tmp_path,
+        answerer,
+        evidence_expansion=True,
+        evidence_budget_chars=None,
+        embedder=_ScriptedEmbedder(_FAR_PARTNER),
+    ) as memory:
+        anchor, partner = _far_partner_store(memory)
 
-        memory.ask("red wrench?", limit=1)
+        memory.ask("a red wrench on the bench", limit=1)
 
     grounded = _grounded_ids(answerer)
-    assert grounded[0] == window[0]
-    assert len(grounded) == 2, "the capture partner fills the budget-free tail"
-    assert "linked to the evidence above (capture)" in (answerer.questions[-1].text or "")
+    assert grounded[0] == anchor, "the window the ranking earned stays first"
+    assert partner in grounded, "the capture partner fills the budget-free tail"
+
+
+def test_a_linked_row_the_ranking_already_found_is_not_paid_for_twice(tmp_path: Path) -> None:
+    """Expansion pays only for evidence the ranking has no route to.
+
+    A linked row inside the candidate pool is a row a wider budget reaches, so admitting it here
+    buys nothing and costs a window slot. What the edges are for is the record the ranking never
+    proposed -- and on a corpus where the ranking already spans the capture, that is none of them.
+    """
+    answerer = _RecordingAnswerer()
+    with _memory(tmp_path, answerer, evidence_expansion=True, evidence_budget_chars=None) as memory:
+        # Two records, one capture: with `limit=2` the ranking proposes both, so the partner is
+        # reachable and the gate discards it.
+        _capture(memory, "S1", "a red wrench", "a red hammer")
+
+        memory.ask("red?", limit=2)
+
+    assert len(_grounded_ids(answerer)) == 2
+    assert "linked to the evidence above" not in (answerer.questions[-1].text or "")
+
+
+def test_a_linked_row_the_ranking_never_proposed_is_admitted(tmp_path: Path) -> None:
+    """The same capture, a window too narrow to contain it, and the partner survives the gate."""
+    answerer = _RecordingAnswerer()
+    with _memory(
+        tmp_path,
+        answerer,
+        evidence_expansion=True,
+        evidence_budget_chars=None,
+        embedder=_ScriptedEmbedder(_FAR_PARTNER),
+    ) as memory:
+        _anchor, partner = _far_partner_store(memory)
+        # The pool the ask ranks is `min(100, limit * 3)` deep; the partner is placed outside it.
+        pool = {hit.id for hit in memory.search("a red wrench on the bench", limit=3)}
+
+        memory.ask("a red wrench on the bench", limit=1)
+
+    grounded = _grounded_ids(answerer)
+    assert partner not in pool, "the fixture must place the partner beyond the ranked pool"
+    assert partner in grounded, "a record the ranking did not propose reached the window"
