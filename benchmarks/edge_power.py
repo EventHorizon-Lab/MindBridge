@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from support_coverage import _embedder, _env
@@ -32,6 +35,8 @@ from mindbridge.benchmarks.atm_bench import (
     load_atm_bench,
     load_atm_emails,
 )
+from mindbridge.benchmarks.mem_gallery import load_mem_gallery
+from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 
 LIMIT = 12
@@ -58,130 +63,216 @@ def _source_id(record: object) -> str:
     return str(json.loads(record.metadata_json).get("source_id", ""))  # type: ignore[attr-defined]
 
 
-def _ingest(memory: Memory, data: Path) -> tuple[str, ...]:
-    """Write the ATM corpus with day captures and return its media record ids."""
-    media: list[str] = []
+@dataclass(frozen=True, slots=True)
+class Unit:
+    """One physically isolated store's worth of a corpus, and the questions asked of it."""
+
+    unit_id: str
+    # `(content, occurred_at, source_id, capture_id, is_media)` per record.
+    records: tuple[tuple[object, datetime, str, str, bool], ...]
+    # `(question text, gold source ids)` per question.
+    questions: tuple[tuple[str, frozenset[str]], ...]
+
+
+def _atm_units(data: Path, limit: int) -> tuple[Unit, ...]:
+    """ATM-Bench is one store: every question reads the same photographs, clips and emails."""
+    records: list[tuple[object, datetime, str, str, bool]] = []
     for email in load_atm_emails(data / "raw_memory" / "email" / "emails.json"):
-        memory.add(
-            atm_email_block(email),
-            occurred_at=email.occurred_at,
-            metadata={"source_id": email.email_id},
-            memory_type=MemoryType.EPISODIC,
-            context=ObservationContext(source_id=email.occurred_at.date().isoformat()),
+        records.append(
+            (
+                atm_email_block(email),
+                email.occurred_at,
+                email.email_id,
+                email.occurred_at.date().isoformat(),
+                False,
+            )
         )
     for folder, pattern in (("image", "*.jpg"), ("video", "*.mp4")):
         for path in sorted((data / "raw_memory" / folder).glob(pattern)):
             if path.stat().st_size > INLINE:
                 continue
-            media.append(
-                memory.add(
-                    path,
-                    occurred_at=atm_capture_time(path.stem),
-                    metadata={"source_id": path.stem},
-                    memory_type=MemoryType.EPISODIC,
-                    context=ObservationContext(source_id=path.stem[:8]),
-                ).id
-            )
+            records.append((path, atm_capture_time(path.stem), path.stem, path.stem[:8], True))
+    questions = tuple(
+        (question.question, frozenset(question.evidence_ids))
+        for question in load_atm_bench(data / "atm-bench" / "atm-bench.json")[:limit]
+    )
+    return (Unit("atm", tuple(records), questions),)
+
+
+def _gallery_units(data: Path, limit: int) -> tuple[Unit, ...]:
+    """Mem-Gallery is one store per topic: a persona, its dated sessions, and its questions.
+
+    The capture is the session, which is what the release actually groups by, and a round's image
+    rides on the same record as its text so a photograph of the persona is reachable both ways.
+    """
+    units = []
+    for topic in load_mem_gallery(data / "dialog"):
+        records: list[tuple[object, datetime, str, str, bool]] = []
+        for session in topic.sessions:
+            for round_ in session.rounds:
+                text = (
+                    f"[{session.occurred_at.date().isoformat()}] "
+                    f"{topic.profile.name}: {round_.user}\nAssistant: {round_.assistant}"
+                )
+                image = (
+                    None
+                    if round_.image_path is None
+                    else (data / "dialog" / round_.image_path).resolve()
+                )
+                content: object = text if image is None else (text, image)
+                records.append(
+                    (
+                        content,
+                        session.occurred_at,
+                        round_.round_id,
+                        session.session_id,
+                        image is not None,
+                    )
+                )
+        questions = tuple(
+            (question.question, frozenset(question.clue_round_ids))
+            for question in topic.questions
+            if question.clue_round_ids
+        )
+        if questions:
+            units.append(Unit(topic.topic, tuple(records), questions[:limit]))
+    return tuple(units)
+
+
+def _write(memory: Memory, unit: Unit) -> tuple[str, ...]:
+    """Write one unit's records and return the ids of those carrying media."""
+    media: list[str] = []
+    for content, occurred_at, source, capture, is_media in unit.records:
+        record = memory.add(
+            content,  # type: ignore[arg-type]
+            occurred_at=occurred_at,
+            metadata={"source_id": source},
+            memory_type=MemoryType.EPISODIC,
+            context=ObservationContext(source_id=capture),
+        )
+        if is_media:
+            media.append(record.id)
     return tuple(media)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--limit", type=int, default=120)
-    parser.add_argument(
-        "--store",
-        type=Path,
-        default=Path.home() / ".cache/mindbridge-edge-power/atm",
-        help="kept between runs so the query pass can be repeated without re-ingesting",
-    )
+    parser.add_argument("--corpus", choices=("atm", "mem-gallery"), default="atm")
+    parser.add_argument("--limit", type=int, default=120, help="questions per unit")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args(argv)
 
     settings = _env()
-    data = Path(settings["MINDBRIDGE_BENCH_ROOT"]) / "atm-bench" / "data"
-    embedder = _embedder(settings)
-    face = OpenCVFaceAnalyzer(
-        detector_model=settings["MINDBRIDGE_FACE_DETECTOR"],
-        recognizer_model=settings["MINDBRIDGE_FACE_RECOGNIZER"],
-        score_threshold=FACE_SCORE_THRESHOLD,
-    )
-    questions = load_atm_bench(data / "atm-bench" / "atm-bench.json")[: args.limit]
-    fresh = not args.store.exists()
-    timings: dict[str, float] = {}
-    try:
-        with Memory(
-            args.store,
-            embedder=embedder,
-            face_analyzer=face,
-            minimum_relevance=0.0,
-            ambiguity_margin=0.0,
-        ) as memory:
-            if fresh:
-                started = time.perf_counter()
-                media = _ingest(memory, data)
-                timings["ingest_minutes"] = round((time.perf_counter() - started) / 60, 1)
-                started = time.perf_counter()
-                for memory_id in media:
-                    memory.faces(memory_id)
-                timings["face_pass_minutes"] = round((time.perf_counter() - started) / 60, 1)
-            with memory._store.recall._connections.connection() as connection:
-                identities = connection.execute("SELECT COUNT(*) FROM identities").fetchone()[0]
-                spanning = connection.execute(
-                    """
-                    SELECT COUNT(*) FROM (
-                      SELECT fo.identity_id FROM face_observations fo
-                      JOIN memory_assets ma ON ma.asset_id = fo.asset_id
-                      GROUP BY fo.identity_id HAVING COUNT(DISTINCT ma.memory_id) > 1)
-                    """
-                ).fetchone()[0]
-            records = memory._store.recall.recall_digest().records
-            # The bound recall programs apply to a predicate, restated here so a probe and the
-            # kernel refuse the same non-selective edge.
-            ceiling = max(4 * LIMIT, -(-records // 5))
-            edges = {edge: {"fired": 0, "rows": 0, "supplied_gold": 0} for edge in EDGES}
-            incomplete = 0
-            recoverable = 0
-            for question in questions:
-                hits = memory.search(question.question, limit=LIMIT)
-                window_ids = tuple(hit.id for hit in hits)
-                window = {str(hit.metadata.get("source_id")) for hit in hits}
-                missing = set(question.evidence_ids) - window
-                if not missing:
-                    continue
-                incomplete += 1
-                recovered: set[str] = set()
-                for edge in EDGES:
-                    read = memory._store.recall.related_memories(
-                        window_ids, edges=(edge,), ceiling=ceiling, max_rows=24
-                    )
-                    found = missing & {_source_id(row) for row in read}
-                    edges[edge]["fired"] += 1 if len(read) else 0
-                    edges[edge]["rows"] += len(read)
-                    edges[edge]["supplied_gold"] += 1 if found else 0
-                    recovered |= found
-                recoverable += 1 if recovered else 0
-    finally:
-        embedder.close()
-        face.close()
+    root = Path(settings["MINDBRIDGE_BENCH_ROOT"])
+    if args.corpus == "atm":
+        data = root / "atm-bench" / "data"
+        units = _atm_units(data, args.limit)
+    else:
+        data = root / "mem-gallery" / "data"
+        units = _gallery_units(data, args.limit)
+
+    def backends() -> tuple[OpenAIModels, OpenCVFaceAnalyzer]:
+        """One pair per unit, because `Memory.close()` closes the backends it was handed.
+
+        Mem-Gallery is twenty physically isolated stores, so a shared analyzer is closed by the
+        first one and refuses the second -- which is the correct behaviour of a resource a memory
+        owns, and the reason this is a function rather than two values.
+        """
+        return (
+            _embedder(settings),
+            OpenCVFaceAnalyzer(
+                detector_model=settings["MINDBRIDGE_FACE_DETECTOR"],
+                recognizer_model=settings["MINDBRIDGE_FACE_RECOGNIZER"],
+                score_threshold=FACE_SCORE_THRESHOLD,
+            ),
+        )
+
+    edges = {edge: {"fired": 0, "rows": 0, "supplied_gold": 0} for edge in EDGES}
+    totals = {
+        "units": 0,
+        "records": 0,
+        "media_records": 0,
+        "questions": 0,
+        "identities": 0,
+        "identities_spanning_several_memories": 0,
+        "windows_missing_gold": 0,
+        "windows_an_edge_could_complete": 0,
+    }
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="edge-power-") as workspace:
+        for unit in units:
+            store = Path(workspace) / unit.unit_id
+            embedder, face = backends()
+            try:
+                with Memory(
+                    store,
+                    embedder=embedder,
+                    face_analyzer=face,
+                    minimum_relevance=0.0,
+                    ambiguity_margin=0.0,
+                ) as memory:
+                    media = _write(memory, unit)
+                    for memory_id in media:
+                        memory.faces(memory_id)
+                    with memory._store.recall._connections.connection() as connection:
+                        totals["identities"] += connection.execute(
+                            "SELECT COUNT(*) FROM identities"
+                        ).fetchone()[0]
+                        totals["identities_spanning_several_memories"] += connection.execute(
+                            """
+                            SELECT COUNT(*) FROM (
+                              SELECT fo.identity_id FROM face_observations fo
+                              JOIN memory_assets ma ON ma.asset_id = fo.asset_id
+                              GROUP BY fo.identity_id HAVING COUNT(DISTINCT ma.memory_id) > 1)
+                            """
+                        ).fetchone()[0]
+                    records = memory._store.recall.recall_digest().records
+                    ceiling = max(4 * LIMIT, -(-records // 5))
+                    totals["units"] += 1
+                    totals["records"] += records
+                    totals["media_records"] += len(media)
+                    for question, gold in unit.questions:
+                        totals["questions"] += 1
+                        hits = memory.search(question, limit=LIMIT)
+                        window_ids = tuple(hit.id for hit in hits)
+                        window = {str(hit.metadata.get("source_id")) for hit in hits}
+                        missing = gold - window
+                        if not missing:
+                            continue
+                        totals["windows_missing_gold"] += 1
+                        recovered: set[str] = set()
+                        for edge in EDGES:
+                            read = memory._store.recall.related_memories(
+                                window_ids, edges=(edge,), ceiling=ceiling, max_rows=24
+                            )
+                            found = missing & {_source_id(row) for row in read}
+                            edges[edge]["fired"] += 1 if len(read) else 0
+                            edges[edge]["rows"] += len(read)
+                            edges[edge]["supplied_gold"] += 1 if found else 0
+                            recovered |= found
+                        totals["windows_an_edge_could_complete"] += 1 if recovered else 0
+            finally:
+                embedder.close()
+                face.close()
+            print(
+                f"[{totals['units']}/{len(units)}] {unit.unit_id}: "
+                f"{totals['windows_missing_gold']} missing so far, "
+                f"{totals['windows_an_edge_could_complete']} completable",
+                flush=True,
+            )
 
     report = {
-        "corpus": "atm",
-        "questions": len(questions),
+        "corpus": args.corpus,
         "recall_limit": LIMIT,
         "face_score_threshold": FACE_SCORE_THRESHOLD,
-        "identities": identities,
-        "identities_spanning_several_memories": spanning,
-        "records": records,
-        "edge_ceiling": ceiling,
-        "windows_missing_gold": incomplete,
-        "windows_an_edge_could_complete": recoverable,
+        "elapsed_minutes": round((time.perf_counter() - started) / 60, 1),
         "edges": edges,
-        "timings": timings,
         "note": (
             "headroom, not effect: `windows_an_edge_could_complete` is the most questions any "
             "reader arm built on these edges could move, so it bounds what a reader run could "
             "ever show"
         ),
+        **totals,
     }
     payload = json.dumps(report, indent=2, sort_keys=True)
     if args.output is not None:
