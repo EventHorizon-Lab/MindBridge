@@ -42,8 +42,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import cast
 
-import httpx
 from openai import APIError, OpenAI
+
+# The installed OpenAI SDK is built on `httpx2`, not `httpx`, and only the former is in the
+# dependency closure. Taking the module the client itself uses keeps the hook attachable whichever
+# one a future pin brings, instead of importing a name that is not installed.
+from openai._base_client import httpx2 as httpx
 
 from mindbridge import (
     AnswerPolicy,
