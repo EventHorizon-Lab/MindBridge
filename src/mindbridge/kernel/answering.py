@@ -1146,9 +1146,7 @@ class Answering(Traced):
                     # How many of the linked rows the ranking also proposed. Kept as a signal
                     # rather than a filter: gating on it was measured harmful, and the number is
                     # still what says whether a corpus's captures track its ranking.
-                    EXPANSION_LINKED_ROWS: sum(
-                        1 for hit in expansion.hits if hit.id in reachable
-                    ),
+                    EXPANSION_LINKED_ROWS: sum(1 for hit in expansion.hits if hit.id in reachable),
                     EXPANSION_EDGES: tuple(
                         f"{edge}:{count}" for edge, count in expansion.edges.items() if count
                     ),
