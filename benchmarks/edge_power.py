@@ -37,10 +37,15 @@ from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 LIMIT = 12
 INLINE = 20 * 1024 * 1024 * 3 // 4
 EDGES = ("capture", "identity", "place", "lineage", "evidence")
-# YuNet's own default of 0.9 finds a face in 4.5 % of these photographs; 0.5 finds one in 28 %.
-# The corpus is personal photography where faces are small and turned away, so the default is the
-# wrong end of its range here. Stated because it is a choice and it decides how live the edge is.
-FACE_SCORE_THRESHOLD = 0.5
+# The shipped default, and measurement says it is right. Lowering it to 0.5 looked like more
+# signal -- 384 detections from 400 photographs instead of 19 -- and was the opposite: scored
+# against a vision model asked whether a photo shows a face clearly enough to recognise the
+# person, YuNet at 0.5 has recall 1.00 and precision 0.21, because only 3 of 60 photographs here
+# contain a recognisable face at all. The recognizer then shows what those extra detections are:
+# at 0.9 the pairwise cosines top out at 0.384 and one pair of 171 crosses SFace's own 0.363, so
+# it correctly declines to merge strangers; at 0.5 the median rises from 0.116 to 0.226 and 15.9 %
+# of pairs cross it, which is non-face crops embedding near each other and merging spuriously.
+FACE_SCORE_THRESHOLD = 0.9
 
 
 def _source_id(record: object) -> str:
