@@ -489,7 +489,14 @@ cheaper.
 
 Enable it where captures group evidence a query has no way to name -- a day of photographs, a room,
 one recorded session of a robot's work -- and the window costs about three quarters as much to
-fill. Leave it off where the ranking already spans the capture. It is off by default because a caller who
+fill. Leave it off where the ranking already spans the capture.
+
+How much any of this can matter is bounded by how often a window is missing evidence at all. On the
+120 ATM-Bench questions measured here, 98 windows already held every gold record, 22 were missing
+one, and some edge could supply it on 4 -- three through the capture edge and one through identity.
+A store whose ranking already completes its windows has nothing for an edge to add, whichever edge
+it is, and `benchmarks/edge_power.py` reports that ceiling for a corpus without running a reader
+over it. It is off by default because a caller who
 has not measured their own corpus should not pay for it.
 
 What expansion adds is reported to the reader as records linked to the evidence rather than records
