@@ -1,0 +1,10 @@
+{
+  "suite_id": "icm-four-baseline-20260917",
+  "phase": "prepare",
+  "tasks": ["icm-bench", "longmemeval-s", "atm-bench-main", "mem-gallery"],
+  "limit": "all",
+  "evidence_budget_chars": 24000,
+  "recall_limit": 12,
+  "request_concurrency": 8,
+  "unit_concurrency": 2
+}

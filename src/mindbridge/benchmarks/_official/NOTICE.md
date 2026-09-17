@@ -3,6 +3,14 @@
 MindBridge's Apache-2.0 license does not replace the terms for the third-party benchmark material
 described below.
 
+## ICM-Bench evaluator
+
+The semantic-equivalence prompt in `icm_prompt.py` is copied from
+`Shidu-Ren/ICM-Bench@10f02babe3c79f45417b71207347d59dbbb06bf7`,
+`evaluation/judging/prompts.py`. That file retains the ByteDance Apache-2.0 notice and the
+ICM-Bench authors' modification notice. MindBridge adapts transport and result serialization.
+The repository is MIT; the separately downloaded dataset is CC BY-NC-SA 4.0.
+
 ## Upstream repository without a declared license
 
 The pinned `slptongji/ES-MemEval@692624208acc077b8867698c1d6fcd998dee641a` repository contains

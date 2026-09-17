@@ -33,7 +33,7 @@ mindbridge-bench eval --list-tasks
 
 The catalog currently covers LoCoMo-Refined, ES-MemEval, M3-Bench, Video-MME-v2, WorldMemArena,
 EgoTempo, MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench, Mem-Gallery, LongMemEval, CL-Bench,
-BEAM, PersonaMem-v3, and OpenEQA. Use the listing command
+BEAM, PersonaMem-v3, OpenEQA, and ICM-Bench. Use the listing command
 instead of copying task names from this page; it is generated from the catalog used by the
 runner.
 
@@ -56,6 +56,27 @@ uv run --frozen mindbridge-bench eval \
 
 The JSON response reports `unit_count`, `question_count`, `dataset_sha256`, and
 `evaluation_sha256` for each selected task.
+
+### ICM-Bench
+
+The `icm-bench` task pins the public `ryanren0330/ICM-Bench` release. Its input is raw video
+plus the release's speakerless ASR, including the initial calibration video. Recall and Retrieval
+questions see clips through `before_clip` inclusively; Profile questions see the full album.
+The runner incrementally ingests these prefixes in one physically isolated store. Clip positions
+are causal ordering coordinates, not video offsets or wall-clock dates.
+
+Reference answers, target character IDs, evidence annotations, `characters.json`, and
+speaker-labeled transcripts never enter the model input. Evidence annotations may be incomplete;
+retrieval recall against them is a diagnostic, not exhaustive proof coverage.
+
+The scorer uses the pinned upstream semantic-equivalence prompt and exact `Yes` verdict parser.
+Its released default judge is `gemini-3-flash-preview`; another judge is marked as a proxy.
+Generation backends that turn video into frames do not thereby receive native audio or implement
+face/voice identity binding. Report effective modalities and identity configuration with results.
+
+Use `--tasks icm-bench --download` with the normal evaluator. Downloads include a video tar archive
+and its extracted clips. Data is CC BY-NC-SA 4.0; the upstream code is MIT, and the copied judge
+prompt retains its Apache-2.0 notice. See the [official repository](https://github.com/Shidu-Ren/ICM-Bench).
 
 ## Run an evaluation
 

@@ -668,6 +668,73 @@ def _video_mme_v2(
     )
 
 
+def _icm_bench(
+    _spec: TaskSpec,
+    dataset: Path,
+    media: MediaResolver,
+    root: Path,
+    limit: Limit,
+    offset: int,
+) -> tuple[EvalUnit, ...]:
+    from mindbridge.benchmarks.icm_bench import clip_position, load_icm_bench
+
+    release = root / "icm-bench"
+    rows = [
+        json.loads(line)
+        for line in (release / "videos/metadata.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    clips = sorted((str(row["video_id"]) for row in rows), key=clip_position)
+    if not clips or clips[0] != "clip_000" or len(set(clips)) != len(clips):
+        raise ValueError("ICM timeline must have unique clips and a calibration clip")
+    questions = _selected(load_icm_bench(dataset), limit, offset)
+    memories = []
+    for clip in clips:
+        position = clip_position(clip)
+        transcript = release / "resources/asr_transcripts" / f"{clip}.srt"
+        # Speaker-labeled transcripts and characters.json are scorer-only resources.
+        text = f"Video {clip}"
+        if transcript.is_file():
+            text += "\nSpeakerless ASR:\n" + transcript.read_text(encoding="utf-8")
+        memories.append(
+            MemoryItem(
+                clip,
+                (text, media.path(f"{clip}.mp4")),
+                start_seconds=float(position),
+                end_seconds=float(position + 1),
+            )
+        )
+    for question in questions:
+        if not set(question.evidence_video_ids).issubset(clips):
+            raise ValueError("ICM question references absent evidence clips")
+        if question.before_clip is not None and question.before_clip not in clips:
+            raise ValueError("ICM question cutoff is absent from the timeline")
+    return (
+        EvalUnit(
+            "life-album",
+            tuple(memories),
+            tuple(
+                EvalQuestion(
+                    question.question_id,
+                    _free_text_parts(question.question),
+                    (question.reference_answer,),
+                    cutoff_seconds=None
+                    if question.before_clip is None
+                    else float(clip_position(question.before_clip) + 1),
+                    metadata={
+                        "category": question.category,
+                        "evidence_ids": question.evidence_video_ids,
+                        "target_character_ids": question.target_character_ids,
+                        "before_clip": question.before_clip,
+                    },
+                    source_question=question.question,
+                )
+                for question in questions
+            ),
+        ),
+    )
+
+
 def _worldmemarena(
     _spec: TaskSpec,
     dataset: Path,
@@ -1613,6 +1680,7 @@ def _split_parts(text: str) -> tuple[str, ...]:
 
 
 _LOADERS = {
+    "icm-bench": _icm_bench,
     "locomo-refined": _locomo,
     "m3-bench-robot": _m3,
     "m3-bench-web": _m3,
