@@ -311,8 +311,8 @@ edge but the capture, whose `memory_semantics.source_id` carries no index yet. E
 bounded on its own by the recall programs' selectivity rule, per edge rather than per read, so an
 edge that links to a fifth of the corpus is dropped whole and a selective edge beside it survives.
 The rows are admitted after the budget's ranked tail, so expansion can only spend what the ranking
-left unspent, and the read reports which edge produced each row so a run can say why the store
-could answer. `RelatedRead` carries that attribution; the trace carries it as
+left unspent, their media rows stop at the same `2 * limit` cap `_budgeted_recall` puts on a plan's,
+and the read reports which edge produced each row so a run can say why the store could answer. `RelatedRead` carries that attribution; the trace carries it as
 `mindbridge.expansion.edges`.
 
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without

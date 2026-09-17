@@ -19,6 +19,7 @@ from _feature_support import TinyEmbedder
 from mindbridge import (
     AnswerPolicy,
     AnswerResult,
+    AssetRef,
     EmbedTask,
     Memory,
     Modality,
@@ -28,6 +29,7 @@ from mindbridge import (
 )
 from mindbridge.exceptions import ValidationError
 from mindbridge.infrastructure.local.store import RECALL_MAX_ROWS
+from mindbridge.kernel.answering import _packed_grounding
 
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -434,3 +436,51 @@ def test_a_linked_row_the_ranking_never_proposed_is_admitted(tmp_path: Path) -> 
     grounded = _grounded_ids(answerer)
     assert partner not in pool, "the fixture must place the partner beyond the ask's own window"
     assert partner in grounded, "a record the window would not have held reached it"
+
+
+def _hit(identifier: str, *, media: bool = False) -> SearchHit:
+    asset = AssetRef(
+        id=f"asset-{identifier}",
+        modality=Modality.IMAGE,
+        media_type="image/png",
+        size_bytes=1,
+        sha256="0" * 64,
+        path=Path(f"/nonexistent/{identifier}.png"),
+    )
+    return SearchHit(
+        id=identifier,
+        content=identifier,
+        score=0.5,
+        created_at=NOW,
+        modality=Modality.IMAGE if media else Modality.TEXT,
+        assets=(asset,) if media else (),
+    )
+
+
+def test_expansion_media_rows_stop_at_the_cap_a_plan_s_media_rows_stop_at() -> None:
+    """Linked clips cost recognition writes exactly as a plan's matched clips do.
+
+    A capture on a photo corpus is a day of photographs, so an unbounded expansion could follow a
+    `limit`-row window with `evidence_expansion_max_rows` clips -- each one paying face and speech
+    recognition before the answer call and again on every replan round, which is the cost
+    `_budgeted_recall` already refuses to let a set read run up. The cap is a packing pass like
+    every other bound here, so a text row behind a refused clip still gets in.
+    """
+    window = (_hit("w1"),)
+    expansion = (_hit("m1", media=True), _hit("m2", media=True), _hit("t1"))
+
+    packed, added = _packed_grounding(window, expansion, (), None, media_limit=1)
+
+    assert [hit.id for hit in packed] == ["w1", "m1", "t1"]
+    assert added == 2, "the clip over the cap is refused; the text row behind it is not"
+
+
+def test_the_media_cap_never_trims_the_window_or_the_budget_s_own_tail() -> None:
+    """The cap bounds what expansion added. The ranking is never trimmed for carrying media."""
+    window = (_hit("w1", media=True),)
+    tail = (_hit("r1", media=True), _hit("r2", media=True))
+
+    packed, added = _packed_grounding(window, (), tail, 100_000, media_limit=0)
+
+    assert [hit.id for hit in packed] == ["w1", "r1", "r2"]
+    assert added == 0
