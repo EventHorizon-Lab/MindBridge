@@ -306,7 +306,8 @@ and the recall program, and it is the one that costs no model call. After the wi
 `Answering` reads the records it is structurally linked to -- the capture an observation was
 committed under (`memory_semantics.source_id`), a recognized person (the same membership rule the
 identity scope uses), a symbolic `place_id`, a claim's `lineage_id`, or a `memory_evidence` edge in
-either direction -- each edge an indexed read over a column the kernel already wrote. Every edge is
+either direction -- each edge one read over a column the kernel already wrote, indexed for every
+edge but the capture, whose `memory_semantics.source_id` carries no index yet. Every edge is
 bounded on its own by the recall programs' selectivity rule, per edge rather than per read, so an
 edge that links to a fifth of the corpus is dropped whole and a selective edge beside it survives.
 The rows are admitted after the budget's ranked tail, so expansion can only spend what the ranking

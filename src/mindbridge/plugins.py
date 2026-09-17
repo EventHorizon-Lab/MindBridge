@@ -160,9 +160,10 @@ class MemoryConfig:
     recall_rounds: _PositiveInt = 2
     # Whether the grounding window is widened with the records it is structurally linked to: the
     # capture an observation was committed under, a recognized person, a symbolic place, a claim's
-    # lineage, an evidence edge. Off by default and free when on -- the edges are columns the
-    # kernel already wrote, so expansion is one indexed read per edge and no model call, which is
-    # what separates it from `recall_planning`. It answers the measured failure where a question
+    # lineage, an evidence edge. Off by default and cheap when on -- the edges are columns the
+    # kernel already wrote, so expansion is one read per edge and no model call, which is what
+    # separates it from `recall_planning`. Every edge but the capture is indexed; that one scans
+    # `memory_semantics`, which is fine at companion-store sizes and not at a million records. It answers the measured failure where a question
     # needs several records and the ranking finds the one that shares words with it: the reply to
     # a retrieved question, the other observation from the same capture. An edge that links to
     # more than a fifth of the corpus is dropped whole, per edge, because an edge that selects the

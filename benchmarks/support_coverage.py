@@ -885,7 +885,7 @@ def _gallery_outcomes(
                 sample = _gallery_sample(memory, unit)
             for arm in arms:
                 recorder = _Recorder(_reader(settings, client))
-                with _open(store, _embedder(settings), recorder, arm) as memory:
+                with _open(store, embedder, recorder, arm) as memory:
                     answer = partial(
                         _gallery_outcome,
                         unit=unit,

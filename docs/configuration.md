@@ -451,6 +451,8 @@ the only widening that costs no model call. After the window is grounded, the ke
 records that window is *structurally* linked to -- committed under the same capture, about the
 same recognized person, labelled with the same symbolic place, in the same claim lineage, or
 joined to it by an evidence edge -- and admits them into whatever budget the ranking left unspent.
+Each edge is one read over a column the kernel already wrote, indexed for every edge but the
+capture, whose `memory_semantics.source_id` carries no index yet and is scanned instead.
 Each edge is bounded on its own by the selectivity rule below, and an edge that links to more than
 a fifth of the corpus contributes nothing rather than thinning the window: on a two-speaker
 transcript every record is about both speakers, so the identity edge selects the corpus and says

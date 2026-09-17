@@ -27,6 +27,7 @@ from mindbridge import (
     SearchHit,
 )
 from mindbridge.exceptions import ValidationError
+from mindbridge.infrastructure.local.store import RECALL_MAX_ROWS
 
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -101,6 +102,7 @@ def _memory(
     *,
     evidence_expansion: bool = False,
     evidence_budget_chars: int | None = 24_000,
+    evidence_expansion_max_rows: int = 24,
     embedder: object | None = None,
 ) -> Memory:
     return Memory(
@@ -111,6 +113,7 @@ def _memory(
         ambiguity_margin=0.0,
         reinforce_on_answer=False,
         evidence_expansion=evidence_expansion,
+        evidence_expansion_max_rows=evidence_expansion_max_rows,
         evidence_budget_chars=evidence_budget_chars,
     )
 
@@ -282,6 +285,68 @@ def test_evidence_expansion_max_rows_must_be_positive(tmp_path: Path) -> None:
             evidence_expansion=True,
             evidence_expansion_max_rows=0,
         )
+
+
+def test_evidence_expansion_max_rows_is_bounded_by_the_store_read_it_becomes(
+    tmp_path: Path,
+) -> None:
+    """The value goes straight to a recall read's own `max_rows`, which refuses 501.
+
+    Unbounded at wiring, a caller who set it high opened a memory that worked and then raised a
+    bare store `ValueError` out of every `ask` -- policy failing at query time instead of once.
+    """
+    with pytest.raises(ValidationError):
+        Memory(
+            tmp_path / "store",
+            embedder=TinyEmbedder(),
+            evidence_expansion=True,
+            evidence_expansion_max_rows=RECALL_MAX_ROWS + 1,
+        )
+
+
+# One anchor whose capture partner and whose place-mate are both linked, and only one slot for
+# them: the place-mate is older, so corpus order gives it the slot and the capture supplies
+# nothing the reader ends up holding.
+_ONE_SLOT = {
+    "an older note from the kitchen": 0.8,
+    "a red wrench on the bench": 0.0,
+    "and a red hammer beside it": 1.2,
+}
+
+
+def test_the_note_names_only_the_edges_that_supplied_a_row(tmp_path: Path) -> None:
+    """Attribution is a claim to the reader, so it is counted over the rows it actually got.
+
+    Counted over what the edges linked to instead, scope and `max_rows` drop rows between the two
+    and the prompt tells a reader a record is there because it shares a capture when the capture
+    edge supplied nothing at all.
+    """
+    answerer = _RecordingAnswerer()
+    with _memory(
+        tmp_path,
+        answerer,
+        evidence_expansion=True,
+        evidence_budget_chars=None,
+        evidence_expansion_max_rows=1,
+        embedder=_ScriptedEmbedder(_ONE_SLOT),
+    ) as memory:
+        older = memory.add(
+            "an older note from the kitchen",
+            occurred_at=NOW,
+            context=ObservationContext(source_id="S2", place_id="kitchen"),
+        ).id
+        for offset, text in enumerate(("a red wrench on the bench", "and a red hammer beside it")):
+            memory.add(
+                text,
+                occurred_at=NOW + timedelta(minutes=10 + offset),
+                context=ObservationContext(source_id="S1", place_id="kitchen"),
+            )
+
+        memory.ask("a red wrench on the bench", limit=1)
+
+    assert _grounded_ids(answerer)[-1] == older, "the one slot went to the older place-mate"
+    note = answerer.questions[-1].text or ""
+    assert "linked to the evidence above (place)" in note
 
 
 def test_a_saturated_budget_adds_nothing_and_says_nothing(tmp_path: Path) -> None:

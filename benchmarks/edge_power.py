@@ -28,6 +28,7 @@ from corpora import atm_units, gallery_units, source_id, write_unit
 from support_coverage import _embedder, _env
 
 from mindbridge import Memory
+from mindbridge.kernel.answering import expansion_ceiling
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 
@@ -116,7 +117,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                             """
                         ).fetchone()[0]
                     records = memory._store.recall.recall_digest().records
-                    ceiling = max(4 * LIMIT, -(-records // 5))
+                    # The product's own bound, not a restatement of it: a headroom number
+                    # measured against a different ceiling is not the bound expansion applies.
+                    ceiling = expansion_ceiling(LIMIT, records)
                     totals["units"] += 1
                     totals["records"] += records
                     totals["media_records"] += len(media)
