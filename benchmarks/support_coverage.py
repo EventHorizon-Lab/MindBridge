@@ -27,6 +27,7 @@ live in the tree that snapshot is taken from.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import importlib
 import json
 import os
@@ -90,6 +91,15 @@ INGEST_BATCH = 64
 # window *smaller*. That proxy is what made a confounded first run look like a clean loss.
 _EXPANSION_NOTE = re.compile(r"(\d+) further records linked to the evidence above")
 _ENV_PATH = Path(os.environ.get("MINDBRIDGE_EVAL_ENV", "~/.config/mindbridge-eval.env"))
+# How long the run may go without completing a single unit of work before it prints every Python
+# thread's stack. A Mem-Gallery run stopped making progress at its 675th answer and left nothing to
+# read: the process was idle, and the 224 native threads it carries -- OpenCV's per-core pool,
+# RocksDB's background threads, and the OpenMP teams under them -- are its steady state rather than
+# a leak, so a thread count says nothing about where it stopped. `faulthandler` names the line
+# instead, re-armed by every completed unit and repeating so a reader can see whether the stacks
+# move. An answer over a media window returns in tens of seconds against a 180-second client
+# deadline, so fifteen minutes of total silence is a stall and not a slow question.
+_STALL_SECONDS = 900.0
 # Which corpus this commit measures. A run command is fixed for the whole experiment tree it
 # belongs to, so the corpus is a committed property of a branch rather than a flag. The default is
 # the one `--dataset` names; the other two read their corpus from `MINDBRIDGE_BENCH_ROOT` and print
@@ -1082,6 +1092,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     finished = 0
     abandoned: list[tuple[str, str]] = []
     started = time.perf_counter()
+    faulthandler.dump_traceback_later(_STALL_SECONDS, repeat=True, exit=False)
     collected: list[tuple[Outcome, ...]] = []
 
     def progress() -> Callable[[str], None]:
@@ -1092,6 +1103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             with done:
                 finished += 1
                 print(f"[{finished}] {line}", file=sys.stderr, flush=True)
+                faulthandler.dump_traceback_later(_STALL_SECONDS, repeat=True, exit=False)
 
         return note
 
@@ -1168,6 +1180,7 @@ def _emit(
     started: float,
 ) -> int:
     """Write one report, whichever corpus produced it."""
+    faulthandler.cancel_dump_traceback_later()
     by_arm = {
         arm.name: [row for rows in collected for row in rows if row.arm == arm.name] for arm in arms
     }
