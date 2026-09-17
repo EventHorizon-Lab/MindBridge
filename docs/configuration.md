@@ -503,6 +503,22 @@ it is, and `benchmarks/edge_power.py` reports that ceiling for a corpus without 
 over it. It is off by default because a caller who
 has not measured their own corpus should not pay for it.
 
+Mem-Gallery is also the only corpus measured here whose windows had that headroom, and running the
+three arms over 224 of its questions shows what the headroom buys. Both widenings recover complete
+gold support with no question losing it -- 0.4777 on the window alone, 0.6741 with linked rows
+(44 won, 0 lost), 0.8080 with the ranked tail (74 won, 0 lost) -- so even where an edge has room,
+the tail reaches more. The two official metrics then disagree about that tail: judged correctness
+rises from 0.6004 to 0.6674 (37 won, 16 lost) while token overlap with the short gold string falls
+from 0.1708 to 0.1395 (55 won, 100 lost), which is what a longer, better-grounded answer does to an
+F1 scored against a phrase. Linked rows hold that overlap where the tail does not, 0.224 against
+0.161 on the questions whose window was already complete.
+
+Splitting those questions by where their gold sat is what decides the setting. Where the window
+held part of the support, linked rows help: judged 0.549 to 0.659 on 82 questions. Where the gold
+was ranked but below the window they *hurt* -- 0.191 to 0.088, against the tail's 0.338, on 34
+questions -- because that is evidence cosine can reach on its own, and the linked rows crowd it out
+of the prompt. The edge is worth its window only for evidence the ranking has no way to name.
+
 What expansion adds is reported to the reader as records linked to the evidence rather than records
 a predicate matched, so nothing it adds licenses a count, and the count is the number of rows
 expansion actually admitted rather than the number of window rows that happen to be linked.
