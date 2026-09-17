@@ -4,25 +4,34 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
+from sqlite3 import Connection
 
-from mindbridge.infrastructure.local.store._codec import optional_datetime_from_row, row_text
+from mindbridge.infrastructure.local.store._codec import (
+    SQLITE_PARAMETER_BATCH,
+    optional_datetime_from_row,
+    row_text,
+)
 from mindbridge.infrastructure.local.store._connections import Connections
 from mindbridge.infrastructure.local.store._identity import canonical_subject, resolve_identity_id
 from mindbridge.infrastructure.local.store._recall import (
     RECALL_EVENT_TIME,
+    RELATED_EDGES,
     neighbor_ids,
     recall_term_clause,
     recall_terms,
     recall_time_clause,
+    related_memory_ids,
     require_recall_filters,
     require_recall_neighbors,
     require_recall_window,
+    require_related_edges,
 )
 from mindbridge.infrastructure.local.store._selection import identity_scope
 from mindbridge.infrastructure.local.store.records import MemoryRecords
 from mindbridge.infrastructure.local.store.rows import (
     RecallDigest,
     RecallRead,
+    RelatedRead,
     StoredMemory,
     require_identifier,
 )
@@ -216,6 +225,132 @@ class RecallReads:
             ),
             selected=len(selected),
         )
+
+    def related_memories(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        edges: Sequence[str] = RELATED_EDGES,
+        ceiling: int | None = None,
+        max_rows: int = 200,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
+    ) -> RelatedRead:
+        """Return the active memories the anchors are structurally linked to, oldest first.
+
+        The link is a column the kernel wrote -- the capture an observation was committed under,
+        a recognized person, a symbolic place, a claim's lineage, an evidence edge -- so this
+        read costs one query per edge and no model call. It is the counterpart to `neighbor_
+        memories`: that one follows corpus order, which every corpus has and which therefore says
+        nothing about a record beyond when it arrived; this one follows the structure the store
+        actually knows about the records.
+
+        The anchors are excluded, because the step that found them already holds them. `ceiling`
+        drops an edge that links to more records than it allows, per edge and not per read, and
+        names it in `dropped`: an edge that selects the corpus carries no information about the
+        question, and gating the edges together would let one such edge discard a selective one
+        beside it. Scope and hydration are `read_memories`', exactly as every other recall read.
+        """
+        anchors = tuple(dict.fromkeys(memory_ids))
+        for memory_id in anchors:
+            require_identifier(memory_id, "memory_id")
+        chosen = require_related_edges(edges)
+        require_recall_filters(None, None, max_rows)
+        if ceiling is not None and (isinstance(ceiling, bool) or not isinstance(ceiling, int)):
+            raise ValueError("ceiling must be an integer or None")
+        if not anchors:
+            return RelatedRead()
+        anchor_ids = set(anchors)
+        with self._connections.read_transaction() as connection:
+            identity_clause, identity_parameters = identity_scope(connection, identity_id)
+            if identity_clause is None:
+                return RelatedRead()
+            linked, dropped = related_memory_ids(
+                connection,
+                anchors,
+                edges=chosen,
+                ceiling=ceiling,
+            )
+            members = {
+                edge: {found for found in ids if found not in anchor_ids}
+                for edge, ids in linked.items()
+            }
+            candidates = tuple(
+                dict.fromkeys(
+                    found for ids in linked.values() for found in ids if found not in anchor_ids
+                )
+            )
+            ordered = self._ordered_candidates(
+                connection,
+                candidates,
+                place_id=place_id,
+                identity_clause=identity_clause,
+                identity_parameters=identity_parameters,
+            )
+        selected = ordered[:max_rows]
+        # Counted over the rows this read returns, not over what the edges linked to. Scope,
+        # corpus order and `max_rows` all drop rows between the two, and the caller states the
+        # attribution to a reader: an edge whose rows all fell out must not be named as the
+        # reason a row is there.
+        counts = {
+            edge: sum(1 for found in selected if found in ids) for edge, ids in members.items()
+        }
+        return RelatedRead(
+            self._hydrate_recall(
+                selected,
+                valid_at=valid_at,
+                known_at=known_at,
+                near=near,
+                radius_m=radius_m,
+                place_id=place_id,
+                identity_id=identity_id,
+            ),
+            selected=len(selected),
+            edges=counts,
+            dropped=dropped,
+        )
+
+    def _ordered_candidates(
+        self,
+        connection: Connection,
+        candidates: Sequence[str],
+        *,
+        place_id: str | None,
+        identity_clause: str,
+        identity_parameters: tuple[object, ...],
+    ) -> tuple[str, ...]:
+        """Put an unordered candidate set into corpus order, applying the pushed-down filters."""
+        if not candidates:
+            return ()
+        place_clause = "" if place_id is None else "AND place_id = ?"
+        place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
+        found: list[tuple[str, int, str]] = []
+        for offset in range(0, len(candidates), SQLITE_PARAMETER_BATCH):
+            batch = candidates[offset : offset + SQLITE_PARAMETER_BATCH]
+            placeholders = ", ".join("?" for _memory_id in batch)
+            found.extend(
+                (
+                    row_text(row, "event_time"),
+                    int(row["row_position"]),
+                    row_text(row, "memory_id"),
+                )
+                for row in connection.execute(
+                    f"""
+                    SELECT memory_id, {RECALL_EVENT_TIME} AS event_time, rowid AS row_position
+                    FROM memory_records
+                    WHERE memory_id IN ({placeholders})
+                      AND forgotten_at IS NULL
+                      {place_clause}
+                      {identity_clause}
+                    """,
+                    (*batch, *place_parameters, *identity_parameters),
+                )
+            )
+        return tuple(memory_id for _event_time, _row_position, memory_id in sorted(found))
 
     def identity_id_for_name(self, name: str) -> str | None:
         """Resolve a display name to the canonical identity ID that carries it.

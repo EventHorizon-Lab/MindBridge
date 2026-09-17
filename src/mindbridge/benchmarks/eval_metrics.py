@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import statistics
+from collections import Counter
 from collections.abc import (
     Mapping,
     Sequence,
@@ -396,6 +397,33 @@ def _retrieved_sources(sample: SampleResult) -> tuple[str, ...]:
     return tuple(dict.fromkeys(source for source in sample.ranked_source_ids if source))
 
 
+def _support_class(
+    gold: Sequence[Sequence[str]],
+    retrieved: Sequence[str],
+    *,
+    window_size: int,
+) -> str:
+    """Say where one question's support sits relative to the window the reader is grounded on.
+
+    Four populations, because they fail differently and are fixed differently. Complete support
+    inside the window is a reader problem. Partial support is the failure a ranking cannot see:
+    the turn that shares words with the question is found and its partner is not, so the answer
+    is missing evidence the store holds and ranked. Support beyond the window is a budget or
+    depth problem, and support outside the candidate list entirely is a retrieval problem.
+    """
+    window = set(retrieved[:window_size])
+    pool = set(retrieved)
+    inside = sum(1 for group in gold if window.intersection(group))
+    reachable = sum(1 for group in gold if pool.intersection(group))
+    if inside == len(gold):
+        return "complete_in_window"
+    if inside:
+        return "partial_in_window"
+    if reachable:
+        return "beyond_window"
+    return "outside_candidates"
+
+
 def _retrieval_quality(
     samples: Sequence[SampleResult],
     *,
@@ -439,6 +467,8 @@ def _retrieval_quality(
             "labelled_question_count": 0,
             "unranked_labelled_question_count": 0,
             "recall_at_k": {},
+            "complete_support_at_k": {},
+            "support_decomposition": {},
             "random_ranker_recall_at_k": {},
             "unresolved_gold_evidence_ids": unresolved,
             "unavailable_reason": (
@@ -459,6 +489,8 @@ def _retrieval_quality(
             "labelled_question_count": 0,
             "unranked_labelled_question_count": unranked,
             "recall_at_k": {},
+            "complete_support_at_k": {},
+            "support_decomposition": {},
             "random_ranker_recall_at_k": {},
             "unresolved_gold_evidence_ids": unresolved,
             "unavailable_reason": (
@@ -467,20 +499,31 @@ def _retrieval_quality(
             ),
         }
     measured: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
+    complete: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
     random_ranker: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
+    decomposition = Counter[str]()
     pool_sizes = []
     for sample in labelled:
         gold = gold_source_groups(sample.metadata, key)
         retrieved = _retrieved_sources(sample)
         pool = sample.candidate_count
         pool_sizes.append(pool)
+        decomposition[_support_class(gold, retrieved, window_size=recall_limit)] += 1
         for cutoff in _RECALL_CUTOFFS:
             window = set(retrieved[:cutoff])
+            hit_groups = sum(1 for group in gold if window.intersection(group))
             measured[cutoff].append(
+                ScoredValue(sample.sample_id, sample.unit_id, hit_groups / len(gold))
+            )
+            # Mean group recall and complete support are different questions, and the second is
+            # the one that predicts whether an answer is possible: a question whose support is
+            # half present scored 0.40 on the run this metric was added for, against 0.83 with
+            # all of it present. A mean cannot separate those two populations.
+            complete[cutoff].append(
                 ScoredValue(
                     sample.sample_id,
                     sample.unit_id,
-                    sum(1 for group in gold if window.intersection(group)) / len(gold),
+                    1.0 if hit_groups == len(gold) else 0.0,
                 )
             )
             if pool > 0:
@@ -514,6 +557,20 @@ def _retrieval_quality(
         "unranked_labelled_question_count": unranked,
         "unresolved_gold_evidence_ids": unresolved,
         "recall_at_k": rows(measured),
+        "complete_support_at_k": rows(complete),
+        "support_decomposition": {
+            "window_size": recall_limit,
+            "pool_size": ranked_limit,
+            "counts": dict(decomposition),
+            "shares": {
+                name: count / len(labelled) for name, count in sorted(decomposition.items())
+            },
+            "method": (
+                "where each labelled question's gold support sits relative to the ranked window "
+                "the reader is grounded on: complete inside it, partly inside it, wholly beyond "
+                "it but inside the ranked candidate list, or absent from that list entirely"
+            ),
+        },
         "random_ranker_recall_at_k": rows(random_ranker),
         "random_ranker_method": (
             "exact expectation for a uniformly random ranker: min(1, k / candidate_pool_size) "

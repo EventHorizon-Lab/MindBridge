@@ -1333,3 +1333,97 @@ def test_a_search_only_run_reports_nothing_under_search() -> None:
     assert search["count"] == 0
     assert search["latency_ms"] is None
     assert search["throughput_per_second"] is None
+
+
+def _retrieval_sample(
+    question_id: str,
+    *,
+    gold: Sequence[str],
+    ranked: Sequence[str],
+) -> eval_results_module.SampleResult:
+    """One labelled question with a hand-written gold label and ranked list."""
+    return eval_results_module.SampleResult(
+        task="longmemeval-s",
+        benchmark="LongMemEval",
+        dataset_sha256="3" * 64,
+        evaluation_sha256="4" * 64,
+        unit_id=question_id,
+        question_id=question_id,
+        prediction="answered",
+        parsed_choice=None,
+        score=1.0,
+        exact_match=None,
+        latency_ms=1.0,
+        confidence=0.0,
+        memory_ids=(),
+        ingest_failure_count=0,
+        error_code=None,
+        metadata={"evidence_ids": tuple(gold)},
+        candidate_count=len(ranked),
+        retrieval_candidates=len(ranked),
+        ranked_source_ids=tuple(ranked),
+        ranked_source_ids_complete=True,
+    )
+
+
+def test_support_decomposition_separates_the_four_ways_a_window_can_fail() -> None:
+    """Mean group recall hides the split the loss decomposition is stated in.
+
+    Two questions can share a group recall of 0.5 while one is answerable and the other is not,
+    so the reported block names the four populations: support complete inside the window, partly
+    inside it, wholly beyond it but ranked, and never ranked at all.
+    """
+    samples = (
+        # All of its support inside the window.
+        _retrieval_sample("complete", gold=("a", "b"), ranked=("a", "b", "x")),
+        # The turn that shares words with the question is found; its partner is not. This is the
+        # population expansion exists for, and the one a mean cannot distinguish.
+        _retrieval_sample("partial", gold=("a", "b"), ranked=("a", "x", "y", "b")),
+        # Ranked, but past the window the reader is grounded on.
+        _retrieval_sample("beyond", gold=("z",), ranked=("x", "y", "w", "z")),
+        # Never ranked, so no budget recovers it.
+        _retrieval_sample("absent", gold=("q",), ranked=("x", "y", "w")),
+    )
+
+    retrieval = eval_metrics_module._retrieval_quality(
+        samples,
+        seed=7,
+        bootstrap_samples=8,
+        recall_limit=3,
+    )
+
+    decomposition = cast(Mapping[str, Any], retrieval["support_decomposition"])
+    assert decomposition["window_size"] == 3
+    assert decomposition["counts"] == {
+        "complete_in_window": 1,
+        "partial_in_window": 1,
+        "beyond_window": 1,
+        "outside_candidates": 1,
+    }
+    complete = cast(Mapping[str, Mapping[str, float]], retrieval["complete_support_at_k"])
+    recall = cast(Mapping[str, Mapping[str, float]], retrieval["recall_at_k"])
+    # At depth five every group is reachable for three of the four questions.
+    assert complete["5"]["mean"] == pytest.approx(0.75)
+    # At depth one the two measures separate: two questions hold one of their two groups, which
+    # is a quarter of the groups and none of the answers. That gap is why both are reported.
+    assert recall["1"]["mean"] == pytest.approx(0.25)
+    assert complete["1"]["mean"] == pytest.approx(0.0)
+
+
+def test_complete_support_is_all_or_nothing_per_question() -> None:
+    """A question whose support is one group short scores zero, not a fraction."""
+    samples = (_retrieval_sample("one-short", gold=("a", "b", "c"), ranked=("a", "b", "z")),)
+
+    retrieval = eval_metrics_module._retrieval_quality(
+        samples,
+        seed=7,
+        bootstrap_samples=8,
+        recall_limit=3,
+    )
+
+    recall = cast(Mapping[str, Mapping[str, float]], retrieval["recall_at_k"])
+    complete = cast(Mapping[str, Mapping[str, float]], retrieval["complete_support_at_k"])
+    assert recall["5"]["mean"] == pytest.approx(2 / 3)
+    assert complete["5"]["mean"] == pytest.approx(0.0)
+    decomposition = cast(Mapping[str, Any], retrieval["support_decomposition"])
+    assert decomposition["counts"] == {"partial_in_window": 1}

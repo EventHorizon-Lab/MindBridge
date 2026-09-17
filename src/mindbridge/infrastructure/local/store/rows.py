@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
-from typing import Literal, NoReturn
+from typing import Literal, NoReturn, cast
 
 from mindbridge.types import MemoryContext
 
@@ -67,6 +67,34 @@ class RecallRead(tuple["StoredMemory", ...]):
     ) -> RecallRead:
         read = super().__new__(cls, memories)
         read.selected = len(read) if selected is None else selected
+        return read
+
+
+class RelatedRead(RecallRead):
+    """A related read's rows, plus which structural edge produced them and which was dropped.
+
+    Attribution is not diagnostics here: an expansion that recovered evidence through the capture
+    edge and one that recovered it through the identity edge are different claims about why the
+    store could answer, and a run that cannot tell them apart cannot say which edge a corpus
+    needs. `dropped` names the edges that linked to more of the corpus than the caller's ceiling
+    allows, which is the difference between an edge that found nothing and an edge that found
+    everything.
+    """
+
+    edges: Mapping[str, int]
+    dropped: tuple[str, ...]
+
+    def __new__(
+        cls,
+        memories: Sequence[StoredMemory] = (),
+        *,
+        selected: int | None = None,
+        edges: Mapping[str, int] | None = None,
+        dropped: Sequence[str] = (),
+    ) -> RelatedRead:
+        read = cast("RelatedRead", super().__new__(cls, memories, selected=selected))
+        read.edges = dict(edges or {})
+        read.dropped = tuple(dropped)
         return read
 
 

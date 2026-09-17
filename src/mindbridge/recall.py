@@ -81,10 +81,10 @@ DEFAULT_MAX_ROWS = 200
 # records. Those rows flooded the reader: accuracy 0.721 -> 0.528 on exactly those questions and
 # abstention 18 -> 57. Completeness over a predicate that matches most of the corpus carries no
 # information about the question and only dilutes the window.
-_RECALL_NON_SELECTIVE_SHARE = 0.2
+RECALL_NON_SELECTIVE_SHARE = 0.2
 # The floor under that share, in multiples of the ask's own grounding limit: on a small corpus
 # one fifth of it is a handful of rows, and a read of that size is not what flooded anything.
-_RECALL_NON_SELECTIVE_MIN_ROWS = 4
+RECALL_NON_SELECTIVE_MIN_ROWS = 4
 
 _EnumT = TypeVar("_EnumT", Modality, MemoryType)
 
@@ -307,8 +307,8 @@ def execute(
     fix the point past which a read is not a question's answer but the corpus itself.
     """
     ceiling = max(
-        _RECALL_NON_SELECTIVE_MIN_ROWS * limit,
-        ceil(_RECALL_NON_SELECTIVE_SHARE * active_records),
+        RECALL_NON_SELECTIVE_MIN_ROWS * limit,
+        ceil(RECALL_NON_SELECTIVE_SHARE * active_records),
     )
     executed: list[RecallStepResult] = []
     exhaustive: dict[str, SearchHit] = {}

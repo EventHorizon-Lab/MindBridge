@@ -371,6 +371,8 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may add to the ranked window, never more than `evidence_budget_chars` when that is set (so `24000` under the defaults); a point plan keeps `limit`. Read only when `recall_planning` is on |
 | `recall_set_max_rows` | `60` | Matched rows a set, sequence or entity plan may add at all, whatever the character budget leaves room for; the rows past it are reported as not shown, so the set is declared incomplete. Bounds the matched set only. Read only when `recall_planning` is on |
 | `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; the second runs only when the first answer was a low-confidence guess under `answer_policy="best_effort"`. `1` disables it. Read only when `recall_planning` is on |
+| `evidence_expansion` | `False` | Widen `ask` grounding with the records the grounded evidence is structurally linked to -- same capture, recognized person, symbolic place, claim lineage, or evidence edge. Costs no model call: the edges are columns the kernel already wrote. The linked rows go last and spend only budget the ranking left unspent |
+| `evidence_expansion_max_rows` | `24` | Linked records one expansion may add, whatever `evidence_budget_chars` leaves room for; the media rows among them stop earlier still, at twice the ask's own `limit`. Read only when `evidence_expansion` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
 | `independent_evidence` | `False` | Experimental capture-grounded AND/OR corroboration for formation and consolidation; fixed when a store is created. See [independent evidence](memory-types-time-and-decay.md#experimental-independent-evidence) |
@@ -443,6 +445,91 @@ bound dropped are reported to the reader as matched records not shown. `recall_s
 is the same bound on the other axis: a corpus of short records fits hundreds of matched rows
 inside 30 000 characters, and the rows past the cap are dropped in favour of the earliest ones --
 the read's own chronological order, not a second ranking -- and counted as not shown.
+
+`evidence_expansion` widens the window along a different axis from either bound above, and it is
+the only widening that costs no model call. After the window is grounded, the kernel reads the
+records that window is *structurally* linked to -- committed under the same capture, about the
+same recognized person, labelled with the same symbolic place, in the same claim lineage, or
+joined to it by an evidence edge -- and admits them into whatever budget the ranking left unspent.
+Each edge is one read over a column the kernel already wrote, indexed for every edge but the
+capture, whose `memory_semantics.source_id` carries no index yet and is scanned instead.
+The linked media rows are capped at twice `limit` on top of `evidence_expansion_max_rows`, the
+same bound a recall program's matched media rows hit and for the same reason: a media row reaching
+the answer call pays face and speech recognition, again on every replan round, and a capture on
+the photo corpora this is recommended for is a whole day of clips. The cap bounds only what
+expansion added -- the ranked window and the budget's own tail are the ranking, and the ranking is
+never trimmed for carrying media.
+Each edge is bounded on its own by the selectivity rule below, and an edge that links to more than
+a fifth of the corpus contributes nothing rather than thinning the window: on a two-speaker
+transcript every record is about both speakers, so the identity edge selects the corpus and says
+nothing about the question, while the capture edge beside it stays selective. Gating the edges
+together would let the first discard the second.
+
+The ordering is a measured decision, and the measurement went against the interesting version.
+Admitting linked rows *ahead* of the budget's ranked tail asks whether a structurally linked
+record is worth more than the next-best record by cosine; on 120 LongMemEval-S questions at a
+24 000-character budget it is not -- complete gold support in the window fell from 0.8917 to
+0.8583, three questions gained it and seven lost it, and 11.13 linked rows per question displaced
+the tail that had been finding the rest of the support. Linked rows therefore go last, and
+the same 120 questions then tie exactly -- 120 of 120, with the grounded rows and characters
+identical to baseline -- because a rerank pool a hundred candidates deep fills any budget before
+expansion is reached. So the setting changes a window only where `evidence_budget_chars` is `None`
+and the window is `limit` rows that linked rows can follow; with a budget set it does nothing.
+
+What it is worth enabling for is prompt size, not answer quality. Measured against a comparable
+budget of ranked tail on two corpora, a paired sign test cannot distinguish the answers: 6 won and
+4 lost on LongMemEval-S, 10 and 7 on ATM-Bench raw media. What differs is the price of reaching
+them. Priced the way `evidence_cost` prices a window -- characters plus a flat charge per media
+part -- LongMemEval-S is a corpus where a capture is a dialogue session the tail already reaches,
+so linked rows duplicate it and cost 39,500 against the tail's 24,400, 1.62x. On ATM-Bench, where a
+capture is a day of photographs no query can name, the same window is assembled for 48,200 against
+the tail's 63,800, 0.76x, carrying almost the same media rows in 36 rows rather than 58. Both
+widenings raise complete gold support by about the same few questions on either corpus, so neither
+edge reaches evidence the other cannot.
+
+What it is *not* is a route to evidence the ranking cannot reach. Everything it recovered on
+ATM-Bench sat between ranks 13 and 36 -- inside the candidate pool, outside the window -- which is
+why the ranked tail recovers the same questions by walking there on cosine instead. Discarding the
+linked rows the ranking had also proposed was measured and removed the whole benefit: complete gold
+support fell to the narrow window's own figure and 117 of 117 questions tied. So expansion reaches
+further down one ranking by a different selector, and the only question is which selector is
+cheaper.
+
+Enable it where captures group evidence a query has no way to name -- a day of photographs, a room,
+one recorded session of a robot's work -- and the window costs about three quarters as much to
+fill. Leave it off where the ranking already spans the capture.
+
+How much any of this can matter is bounded by how often a window is missing evidence at all. On the
+120 ATM-Bench questions measured here, 98 windows already held every gold record, 22 were missing
+one, and some edge could supply it on 3 -- all three through the capture edge. The identity edge
+contributed one row across the whole set, because that corpus holds few recognisable faces. On
+Mem-Gallery, whose questions are about recurring personas, the same measurement reads very
+differently: of 1,527 questions, 493 windows were missing gold and 132 were completable, 125
+through the capture edge and 29 through identity.
+A store whose ranking already completes its windows has nothing for an edge to add, whichever edge
+it is, and `benchmarks/edge_power.py` reports that ceiling for a corpus without running a reader
+over it. It is off by default because a caller who
+has not measured their own corpus should not pay for it.
+
+Mem-Gallery is also the only corpus measured here whose windows had that headroom, and running the
+three arms over 224 of its questions shows what the headroom buys. Both widenings recover complete
+gold support with no question losing it -- 0.4777 on the window alone, 0.6741 with linked rows
+(44 won, 0 lost), 0.8080 with the ranked tail (74 won, 0 lost) -- so even where an edge has room,
+the tail reaches more. The two official metrics then disagree about that tail: judged correctness
+rises from 0.6004 to 0.6674 (37 won, 16 lost) while token overlap with the short gold string falls
+from 0.1708 to 0.1395 (55 won, 100 lost), which is what a longer, better-grounded answer does to an
+F1 scored against a phrase. Linked rows hold that overlap where the tail does not, 0.224 against
+0.161 on the questions whose window was already complete.
+
+Splitting those questions by where their gold sat is what decides the setting. Where the window
+held part of the support, linked rows help: judged 0.549 to 0.659 on 82 questions. Where the gold
+was ranked but below the window they *hurt* -- 0.191 to 0.088, against the tail's 0.338, on 34
+questions -- because that is evidence cosine can reach on its own, and the linked rows crowd it out
+of the prompt. The edge is worth its window only for evidence the ranking has no way to name.
+
+What expansion adds is reported to the reader as records linked to the evidence rather than records
+a predicate matched, so nothing it adds licenses a count, and the count is the number of rows
+expansion actually admitted rather than the number of window rows that happen to be linked.
 
 A read is only allowed to be complete while its predicate is selective. A step whose predicate
 selected more than a fifth of the active corpus, or more than four times `limit` rows on a corpus

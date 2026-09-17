@@ -7,7 +7,15 @@ import unicodedata
 from collections.abc import Sequence
 from datetime import datetime
 
-from mindbridge.infrastructure.local.store._codec import datetime_text, row_text
+from mindbridge.infrastructure.local.store._codec import (
+    SQLITE_PARAMETER_BATCH,
+    datetime_text,
+    row_text,
+)
+from mindbridge.infrastructure.local.store._membership import (
+    IDENTITY_MEMORIES_SQL,
+    identity_projections,
+)
 from mindbridge.infrastructure.local.store.rows import (
     MEMORY_MODALITIES,
     MEMORY_TYPES,
@@ -168,3 +176,127 @@ def neighbor_ids(
             for row in rows
         )
     return tuple(found)
+
+
+# The structural edges a related read may follow. Every one is an authoritative column the kernel
+# wrote, never a similarity: two records share a capture, a person, a room, a lineage, or an
+# evidence link, or they do not. That is what makes expansion free -- the edges are already in
+# SQLite, so recovering the rest of a question's support costs one indexed read and no model call.
+RELATED_EDGES: tuple[str, ...] = ("capture", "identity", "place", "lineage", "evidence")
+
+
+# Anchor rows to the keys one edge groups by, and those keys back to the memories that carry
+# them. `identity` and `evidence` are not key lookups and are handled in `related_memory_ids`.
+_EDGE_KEYS: dict[str, str] = {
+    "capture": (
+        "SELECT DISTINCT source_id AS edge_key FROM memory_semantics "
+        "WHERE memory_id IN ({ids}) AND source_id IS NOT NULL"
+    ),
+    "lineage": (
+        "SELECT DISTINCT lineage_id AS edge_key FROM memory_semantics WHERE memory_id IN ({ids})"
+    ),
+    "place": (
+        "SELECT DISTINCT place_id AS edge_key FROM memory_records "
+        "WHERE memory_id IN ({ids}) AND place_id IS NOT NULL"
+    ),
+}
+
+
+# ponytail: `memory_semantics.source_id` carries no index, so the capture edge is a scan of the
+# semantic table -- fine at the sizes a companion store reaches, wrong for a million-record one.
+# `CREATE INDEX memory_semantics_source_idx ON memory_semantics (source_id, memory_id) WHERE
+# source_id IS NOT NULL` is the upgrade, and it needs a schema version.
+_EDGE_MEMBERS: dict[str, str] = {
+    "capture": "SELECT memory_id FROM memory_semantics WHERE source_id IN ({keys})",
+    "lineage": "SELECT memory_id FROM memory_semantics WHERE lineage_id IN ({keys})",
+    "place": "SELECT memory_id FROM memory_records WHERE place_id IN ({keys})",
+}
+
+
+def require_related_edges(edges: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(edges, (str, bytes)):
+        raise ValueError("edges must be a sequence of edge names")
+    chosen = tuple(dict.fromkeys(edges))
+    unknown = tuple(edge for edge in chosen if edge not in RELATED_EDGES)
+    if not chosen or unknown:
+        raise ValueError(f"edges must be chosen from {', '.join(RELATED_EDGES)}")
+    return chosen
+
+
+def related_memory_ids(
+    connection: sqlite3.Connection,
+    anchors: Sequence[str],
+    *,
+    edges: Sequence[str],
+    ceiling: int | None,
+) -> tuple[dict[str, tuple[str, ...]], tuple[str, ...]]:
+    """Return the memories each edge links the anchors to, and the edges that matched too much.
+
+    An edge is dropped whole when it links to more than `ceiling` records, and it is reported
+    rather than trimmed. This is the per-edge form of the bound recall programs already apply to
+    a predicate: on a two-speaker transcript every record is about both speakers, so the identity
+    edge selects the corpus and says nothing about the question -- while the capture edge beside
+    it stays selective. Gating the reads together would let the first discard the second.
+    """
+    found: dict[str, tuple[str, ...]] = {}
+    dropped: list[str] = []
+    for edge in edges:
+        if edge == "identity":
+            keys = tuple(
+                dict.fromkeys(
+                    identity_id
+                    for identities in identity_projections(connection, anchors).values()
+                    for identity_id in identities
+                )
+            )
+            members = tuple(
+                row_text(row, "memory_id")
+                for key in keys
+                for row in connection.execute(IDENTITY_MEMORIES_SQL, (key, key, key))
+            )
+        elif edge == "evidence":
+            members = tuple(
+                row_text(row, "memory_id")
+                for statement in (
+                    "SELECT memory_id FROM memory_evidence "
+                    "WHERE source_memory_id IN ({ids}) AND retired_at IS NULL",
+                    "SELECT source_memory_id AS memory_id FROM memory_evidence "
+                    "WHERE memory_id IN ({ids}) AND retired_at IS NULL",
+                )
+                for row in _rows_for_ids(connection, statement, anchors)
+            )
+        else:
+            keys = tuple(
+                dict.fromkeys(
+                    row_text(row, "edge_key")
+                    for row in _rows_for_ids(connection, _EDGE_KEYS[edge], anchors)
+                )
+            )
+            members = tuple(
+                row_text(row, "memory_id")
+                for row in _rows_for_ids(connection, _EDGE_MEMBERS[edge], keys, key="keys")
+            )
+        linked = tuple(dict.fromkeys(members))
+        if ceiling is not None and len(linked) > ceiling:
+            dropped.append(edge)
+            continue
+        found[edge] = linked
+    return found, tuple(dropped)
+
+
+def _rows_for_ids(
+    connection: sqlite3.Connection,
+    statement: str,
+    identifiers: Sequence[str],
+    *,
+    key: str = "ids",
+) -> tuple[sqlite3.Row, ...]:
+    """Run one `IN (...)` statement over an identifier set too large for a single bind."""
+    rows: list[sqlite3.Row] = []
+    for offset in range(0, len(identifiers), SQLITE_PARAMETER_BATCH):
+        batch = identifiers[offset : offset + SQLITE_PARAMETER_BATCH]
+        if not batch:
+            continue
+        placeholders = ", ".join("?" for _identifier in batch)
+        rows.extend(connection.execute(statement.format(**{key: placeholders}), tuple(batch)))
+    return tuple(rows)

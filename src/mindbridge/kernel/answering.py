@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import builtins
 from collections import Counter
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, suppress
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
+from math import ceil
 from time import perf_counter
 from typing import Any, cast
 
@@ -24,6 +25,10 @@ from opentelemetry.trace import Tracer
 
 from mindbridge._telemetry import (
     ASYNC_QUEUE_TIME,
+    EXPANSION_DROPPED_EDGES,
+    EXPANSION_EDGES,
+    EXPANSION_LINKED_ROWS,
+    EXPANSION_ROWS,
     MODEL_TTFT,
     OPERATION_TTFT,
     RECALL_COMPLETE,
@@ -67,6 +72,8 @@ from mindbridge.kernel.validation import (
 from mindbridge.kernel.vision import Vision
 from mindbridge.models.base import ModelInput, RecallPlanningBackend, StreamingGenerationBackend
 from mindbridge.recall import (
+    RECALL_NON_SELECTIVE_MIN_ROWS,
+    RECALL_NON_SELECTIVE_SHARE,
     RecallPlan,
     RecallResult,
     RecallRows,
@@ -242,6 +249,32 @@ class _RecallReads:
             identity_id=identity_id,
         )
 
+    def related(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        ceiling: int,
+        max_rows: int,
+    ) -> _Expansion:
+        """Read what the grounded evidence is structurally linked to, under the caller's scope."""
+        scope = self._context.scope or RetrievalScope()
+        read = self._store.recall.related_memories(
+            tuple(memory_ids),
+            ceiling=ceiling,
+            max_rows=max_rows,
+            valid_at=scope.valid_at,
+            known_at=scope.known_at,
+            near=scope.near,
+            radius_m=scope.radius_m,
+            place_id=scope.place_id,
+            identity_id=scope.identity_id,
+        )
+        return _Expansion(
+            hits=self._hits(read).rows,
+            edges=read.edges,
+            dropped=read.dropped,
+        )
+
     def time_span(self, rows: Sequence[SearchHit]) -> tuple[datetime, datetime] | None:
         """Bound a later recall read by these rows' event times and stated dates."""
         return rows_time_span(rows, self._context.reference)
@@ -262,6 +295,103 @@ class _RecallReads:
             tuple(self._hydrator.search_hit(memory, 0.0) for memory in read),
             read.selected,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _Expansion:
+    """The linked rows one expansion read, and which edge each of them came through."""
+
+    hits: tuple[SearchHit, ...]
+    edges: Mapping[str, int]
+    dropped: tuple[str, ...]
+
+
+def expansion_ceiling(limit: int, active_records: int) -> int:
+    """The per-edge bound, which is the bound recall programs already apply to a predicate.
+
+    Reused rather than restated: an edge that links to a fifth of the corpus and a `match` that
+    selects a fifth of it fail the same way, by describing the store instead of the question.
+    """
+    return max(
+        RECALL_NON_SELECTIVE_MIN_ROWS * limit,
+        ceil(RECALL_NON_SELECTIVE_SHARE * active_records),
+    )
+
+
+def _packed_grounding(
+    required: Sequence[SearchHit],
+    expansion: Sequence[SearchHit],
+    ranked: Sequence[SearchHit],
+    budget_chars: int | None,
+    *,
+    media_limit: int,
+) -> tuple[tuple[SearchHit, ...], int]:
+    """Fill one budget with the window, then the rest of the ranking, then its linked rows.
+
+    Admission order is the whole claim expansion makes, and this order is the one the measurement
+    chose. Putting linked rows *ahead* of the budget's ranked tail asked the sharp question -- at
+    one prompt size, is a structurally linked record worth more than the next-best record by
+    cosine -- and on LongMemEval-S at 24 000 characters the answer was no: complete support fell
+    from 0.8917 to 0.8583, three questions won and seven lost, with 11.13 linked rows per question
+    displacing the tail that had been finding the rest of the support. So expansion goes last and
+    spends only what the ranking left unspent, which restores the invariant the recall-program
+    path already keeps: nothing MindBridge adds to a window may cost that window evidence it
+    already had. With no budget there is no tail, and the linked rows are simply appended.
+
+    `media_limit` is the same bound `_budgeted_recall` puts on a plan's media rows, for the same
+    reason and counted the same way: each media row reaching the answer call carries face and
+    speech recognition -- writes, paid again on every replan round -- and the configuration
+    expansion actually fires in is the one with no character budget, where nothing else bounds
+    them. A capture edge is "a day of photographs" on the corpus this is recommended for, so
+    without it a window of `limit` rows could be followed by `evidence_expansion_max_rows` clips.
+    Like the plan's, the cap bounds only what expansion added: the ranked window and the budget's
+    own tail are the ranking, and the ranking is never trimmed for carrying media.
+    """
+    selected = list(required)
+    taken = {hit.id for hit in selected}
+    spent = sum(evidence_cost(hit) for hit in selected)
+    # Without a budget the window is `limit` hits and there is no tail: walking the ranking here
+    # would hand the reader the whole rerank pool, which is not what either path ever grounded.
+    tail = ranked if budget_chars is not None else ()
+    # Counted here rather than intersected afterwards, because a linked row is usually also a
+    # ranked row: `window and expansion` credited expansion for every row the tail admitted that
+    # happened to share a capture, which on a saturated budget was 4.79 rows per question and
+    # none of them added. The note is a statement to the reader about where its evidence came
+    # from, so it has to be the number this loop actually admitted.
+    added = 0
+    media = 0
+    for source, from_expansion in ((tail, False), (expansion, True)):
+        for hit in source:
+            if hit.id in taken:
+                continue
+            cost = evidence_cost(hit)
+            if (budget_chars is not None and spent + cost > budget_chars) or (
+                from_expansion and hit.assets and media >= media_limit
+            ):
+                # A packing pass, not a prefix: an oversized row, or one over the media cap, must
+                # not block a smaller or text-only row behind it from using what is left.
+                continue
+            selected.append(hit)
+            taken.add(hit.id)
+            spent += cost
+            added += 1 if from_expansion else 0
+            media += 1 if from_expansion and hit.assets else 0
+    return tuple(selected), added
+
+
+def expansion_note(added: int, expansion: _Expansion) -> str:
+    """Say what the linked rows are, and refuse to let them be read as a set.
+
+    They are records the evidence above is linked to, not records a predicate matched, so nothing
+    here licenses a count -- and the note says which link, because "same conversation" and "same
+    person" are different reasons for a reader to trust a row.
+    """
+    edges = ", ".join(edge for edge, count in expansion.edges.items() if count)
+    return (
+        f"{added} further records linked to the evidence above ({edges}) follow it. "
+        "They were not matched by a predicate and are not a complete set: do not state a total "
+        "over them."
+    )
 
 
 def _budgeted_recall(
@@ -956,22 +1086,96 @@ class Answering(Traced):
         """
         if program is None or not program.plan.exhaustive:
             budget = self._settings.evidence_budget
-            return grounding_hits(context.ranked, context.limit, budget_chars=budget), None
-        hits, omitted = _budgeted_recall(
-            program,
-            # `evidence_budget_chars` is what a caller who cares about prompt size sets, and a
-            # set plan used to walk straight past it. The set budget may narrow that ceiling and
-            # never widen it; with no ceiling set, the set budget is the only bound.
+            if not self._settings.evidence_expansion:
+                return grounding_hits(context.ranked, context.limit, budget_chars=budget), None
+            required = grounding_hits(context.ranked, context.limit)
+            expansion = self._expand_evidence(required, context)
+            hits, added = _packed_grounding(
+                required,
+                expansion.hits,
+                context.ranked,
+                budget,
+                media_limit=_RECALL_MEDIA_FACTOR * context.limit,
+            )
+            return hits, (expansion_note(added, expansion) if added else None)
+        # `evidence_budget_chars` is what a caller who cares about prompt size sets, and a set
+        # plan used to walk straight past it. The set budget may narrow that ceiling and never
+        # widen it; with no ceiling set, the set budget is the only bound.
+        budget = (
             self._settings.recall_set_budget
             if self._settings.evidence_budget is None
-            else min(self._settings.recall_set_budget, self._settings.evidence_budget),
+            else min(self._settings.recall_set_budget, self._settings.evidence_budget)
+        )
+        hits, omitted = _budgeted_recall(
+            program,
+            budget,
             media_limit=_RECALL_MEDIA_FACTOR * context.limit,
             max_rows=self._settings.recall_set_max_rows,
             # Exactly what the unplanned path grounds, this question's modality floor included,
             # so no plan can cost a question the evidence it already had.
             required=grounding_hits(context.ranked, context.limit),
         )
-        return hits, recall_note(program, omitted=omitted)
+        note = recall_note(program, omitted=omitted)
+        if self._settings.evidence_expansion:
+            # A plan already decided what else to read, so expansion follows its set rather than
+            # competing with it: the rows go after everything the plan grounded, on whatever the
+            # budget has left. Planning and expansion are separate mechanisms and this is the
+            # only place they meet.
+            expansion = self._expand_evidence(hits, context)
+            packed, added = _packed_grounding(
+                hits,
+                expansion.hits,
+                (),
+                budget,
+                media_limit=_RECALL_MEDIA_FACTOR * context.limit,
+            )
+            if added:
+                return packed, f"{note} {expansion_note(added, expansion)}"
+        return hits, note
+
+    def _expand_evidence(self, hits: Sequence[SearchHit], context: _RecallContext) -> _Expansion:
+        """Read the records this evidence is structurally linked to, at no model cost.
+
+        Every linked row is offered, including one the ranking also found. Discarding those was
+        tried, on the theory that a wider budget reaches them anyway, and it removed the whole
+        benefit: with no character budget the candidate pool is `min(100, limit * 3)` while the
+        window it grounds is `limit`, so a gold row at rank 20 is in the pool and will never be in
+        the window. Gating on pool membership dropped exactly those rows -- complete support fell
+        to the narrow window's own 0.7949 on ATM-Bench and the paired comparison went to 117 ties
+        -- and kept the rows past rank 36, which are the ones that do not matter.
+
+        What the measurement left is a simpler reading of this feature. Expansion does not reach
+        evidence the ranking cannot; it reaches further down the same ranking by a different
+        selector, and it is worth enabling where that selector is cheaper than cosine depth. The
+        rows a wider window would have contained anyway are removed by `_packed_grounding`'s own
+        dedup, which is the only place that can know what the window will hold.
+        """
+        if not hits:
+            return _Expansion(hits=(), edges={}, dropped=())
+        with self._trace("mindbridge.expand", kind="stage") as span:
+            expansion = _RecallReads(self._store, self._hydrator, context).related(
+                tuple(hit.id for hit in hits),
+                ceiling=expansion_ceiling(
+                    context.limit,
+                    self._store.recall.recall_digest().records,
+                ),
+                max_rows=self._settings.evidence_expansion_max_rows,
+            )
+            reachable = {hit.id for hit in context.ranked}
+            span.set_attributes(
+                {
+                    EXPANSION_ROWS: len(expansion.hits),
+                    # How many of the linked rows the ranking also proposed. Kept as a signal
+                    # rather than a filter: gating on it was measured harmful, and the number is
+                    # still what says whether a corpus's captures track its ranking.
+                    EXPANSION_LINKED_ROWS: sum(1 for hit in expansion.hits if hit.id in reachable),
+                    EXPANSION_EDGES: tuple(
+                        f"{edge}:{count}" for edge, count in expansion.edges.items() if count
+                    ),
+                    EXPANSION_DROPPED_EDGES: expansion.dropped,
+                }
+            )
+            return expansion
 
     def _replan_possible(self, context: _RecallContext, *, attempt: int) -> bool:
         """Whether a later round could replace this one, which is what makes it unstreamable.
