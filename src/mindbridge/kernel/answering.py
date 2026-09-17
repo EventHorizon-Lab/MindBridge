@@ -323,6 +323,8 @@ def _packed_grounding(
     expansion: Sequence[SearchHit],
     ranked: Sequence[SearchHit],
     budget_chars: int | None,
+    *,
+    media_limit: int,
 ) -> tuple[tuple[SearchHit, ...], int]:
     """Fill one budget with the window, then the rest of the ranking, then its linked rows.
 
@@ -335,6 +337,15 @@ def _packed_grounding(
     spends only what the ranking left unspent, which restores the invariant the recall-program
     path already keeps: nothing MindBridge adds to a window may cost that window evidence it
     already had. With no budget there is no tail, and the linked rows are simply appended.
+
+    `media_limit` is the same bound `_budgeted_recall` puts on a plan's media rows, for the same
+    reason and counted the same way: each media row reaching the answer call carries face and
+    speech recognition -- writes, paid again on every replan round -- and the configuration
+    expansion actually fires in is the one with no character budget, where nothing else bounds
+    them. A capture edge is "a day of photographs" on the corpus this is recommended for, so
+    without it a window of `limit` rows could be followed by `evidence_expansion_max_rows` clips.
+    Like the plan's, the cap bounds only what expansion added: the ranked window and the budget's
+    own tail are the ranking, and the ranking is never trimmed for carrying media.
     """
     selected = list(required)
     taken = {hit.id for hit in selected}
@@ -348,19 +359,23 @@ def _packed_grounding(
     # none of them added. The note is a statement to the reader about where its evidence came
     # from, so it has to be the number this loop actually admitted.
     added = 0
+    media = 0
     for source, from_expansion in ((tail, False), (expansion, True)):
         for hit in source:
             if hit.id in taken:
                 continue
             cost = evidence_cost(hit)
-            if budget_chars is not None and spent + cost > budget_chars:
-                # A packing pass, not a prefix: an oversized row must not block a smaller one
-                # behind it from using what the budget has left.
+            if (budget_chars is not None and spent + cost > budget_chars) or (
+                from_expansion and hit.assets and media >= media_limit
+            ):
+                # A packing pass, not a prefix: an oversized row, or one over the media cap, must
+                # not block a smaller or text-only row behind it from using what is left.
                 continue
             selected.append(hit)
             taken.add(hit.id)
             spent += cost
             added += 1 if from_expansion else 0
+            media += 1 if from_expansion and hit.assets else 0
     return tuple(selected), added
 
 
@@ -1080,6 +1095,7 @@ class Answering(Traced):
                 expansion.hits,
                 context.ranked,
                 budget,
+                media_limit=_RECALL_MEDIA_FACTOR * context.limit,
             )
             return hits, (expansion_note(added, expansion) if added else None)
         # `evidence_budget_chars` is what a caller who cares about prompt size sets, and a set
@@ -1106,7 +1122,13 @@ class Answering(Traced):
             # budget has left. Planning and expansion are separate mechanisms and this is the
             # only place they meet.
             expansion = self._expand_evidence(hits, context)
-            packed, added = _packed_grounding(hits, expansion.hits, (), budget)
+            packed, added = _packed_grounding(
+                hits,
+                expansion.hits,
+                (),
+                budget,
+                media_limit=_RECALL_MEDIA_FACTOR * context.limit,
+            )
             if added:
                 return packed, f"{note} {expansion_note(added, expansion)}"
         return hits, note

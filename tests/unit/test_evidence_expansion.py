@@ -19,6 +19,7 @@ from _feature_support import TinyEmbedder
 from mindbridge import (
     AnswerPolicy,
     AnswerResult,
+    AssetRef,
     EmbedTask,
     Memory,
     Modality,
@@ -27,6 +28,8 @@ from mindbridge import (
     SearchHit,
 )
 from mindbridge.exceptions import ValidationError
+from mindbridge.infrastructure.local.store import RECALL_MAX_ROWS
+from mindbridge.kernel.answering import _packed_grounding
 
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -101,6 +104,7 @@ def _memory(
     *,
     evidence_expansion: bool = False,
     evidence_budget_chars: int | None = 24_000,
+    evidence_expansion_max_rows: int = 24,
     embedder: object | None = None,
 ) -> Memory:
     return Memory(
@@ -111,6 +115,7 @@ def _memory(
         ambiguity_margin=0.0,
         reinforce_on_answer=False,
         evidence_expansion=evidence_expansion,
+        evidence_expansion_max_rows=evidence_expansion_max_rows,
         evidence_budget_chars=evidence_budget_chars,
     )
 
@@ -284,6 +289,68 @@ def test_evidence_expansion_max_rows_must_be_positive(tmp_path: Path) -> None:
         )
 
 
+def test_evidence_expansion_max_rows_is_bounded_by_the_store_read_it_becomes(
+    tmp_path: Path,
+) -> None:
+    """The value goes straight to a recall read's own `max_rows`, which refuses 501.
+
+    Unbounded at wiring, a caller who set it high opened a memory that worked and then raised a
+    bare store `ValueError` out of every `ask` -- policy failing at query time instead of once.
+    """
+    with pytest.raises(ValidationError):
+        Memory(
+            tmp_path / "store",
+            embedder=TinyEmbedder(),
+            evidence_expansion=True,
+            evidence_expansion_max_rows=RECALL_MAX_ROWS + 1,
+        )
+
+
+# One anchor whose capture partner and whose place-mate are both linked, and only one slot for
+# them: the place-mate is older, so corpus order gives it the slot and the capture supplies
+# nothing the reader ends up holding.
+_ONE_SLOT = {
+    "an older note from the kitchen": 0.8,
+    "a red wrench on the bench": 0.0,
+    "and a red hammer beside it": 1.2,
+}
+
+
+def test_the_note_names_only_the_edges_that_supplied_a_row(tmp_path: Path) -> None:
+    """Attribution is a claim to the reader, so it is counted over the rows it actually got.
+
+    Counted over what the edges linked to instead, scope and `max_rows` drop rows between the two
+    and the prompt tells a reader a record is there because it shares a capture when the capture
+    edge supplied nothing at all.
+    """
+    answerer = _RecordingAnswerer()
+    with _memory(
+        tmp_path,
+        answerer,
+        evidence_expansion=True,
+        evidence_budget_chars=None,
+        evidence_expansion_max_rows=1,
+        embedder=_ScriptedEmbedder(_ONE_SLOT),
+    ) as memory:
+        older = memory.add(
+            "an older note from the kitchen",
+            occurred_at=NOW,
+            context=ObservationContext(source_id="S2", place_id="kitchen"),
+        ).id
+        for offset, text in enumerate(("a red wrench on the bench", "and a red hammer beside it")):
+            memory.add(
+                text,
+                occurred_at=NOW + timedelta(minutes=10 + offset),
+                context=ObservationContext(source_id="S1", place_id="kitchen"),
+            )
+
+        memory.ask("a red wrench on the bench", limit=1)
+
+    assert _grounded_ids(answerer)[-1] == older, "the one slot went to the older place-mate"
+    note = answerer.questions[-1].text or ""
+    assert "linked to the evidence above (place)" in note
+
+
 def test_a_saturated_budget_adds_nothing_and_says_nothing(tmp_path: Path) -> None:
     """The note counts what expansion admitted, not what it happened to be linked to.
 
@@ -369,3 +436,51 @@ def test_a_linked_row_the_ranking_never_proposed_is_admitted(tmp_path: Path) -> 
     grounded = _grounded_ids(answerer)
     assert partner not in pool, "the fixture must place the partner beyond the ask's own window"
     assert partner in grounded, "a record the window would not have held reached it"
+
+
+def _hit(identifier: str, *, media: bool = False) -> SearchHit:
+    asset = AssetRef(
+        id=f"asset-{identifier}",
+        modality=Modality.IMAGE,
+        media_type="image/png",
+        size_bytes=1,
+        sha256="0" * 64,
+        path=Path(f"/nonexistent/{identifier}.png"),
+    )
+    return SearchHit(
+        id=identifier,
+        content=identifier,
+        score=0.5,
+        created_at=NOW,
+        modality=Modality.IMAGE if media else Modality.TEXT,
+        assets=(asset,) if media else (),
+    )
+
+
+def test_expansion_media_rows_stop_at_the_cap_a_plan_s_media_rows_stop_at() -> None:
+    """Linked clips cost recognition writes exactly as a plan's matched clips do.
+
+    A capture on a photo corpus is a day of photographs, so an unbounded expansion could follow a
+    `limit`-row window with `evidence_expansion_max_rows` clips -- each one paying face and speech
+    recognition before the answer call and again on every replan round, which is the cost
+    `_budgeted_recall` already refuses to let a set read run up. The cap is a packing pass like
+    every other bound here, so a text row behind a refused clip still gets in.
+    """
+    window = (_hit("w1"),)
+    expansion = (_hit("m1", media=True), _hit("m2", media=True), _hit("t1"))
+
+    packed, added = _packed_grounding(window, expansion, (), None, media_limit=1)
+
+    assert [hit.id for hit in packed] == ["w1", "m1", "t1"]
+    assert added == 2, "the clip over the cap is refused; the text row behind it is not"
+
+
+def test_the_media_cap_never_trims_the_window_or_the_budget_s_own_tail() -> None:
+    """The cap bounds what expansion added. The ranking is never trimmed for carrying media."""
+    window = (_hit("w1", media=True),)
+    tail = (_hit("r1", media=True), _hit("r2", media=True))
+
+    packed, added = _packed_grounding(window, (), tail, 100_000, media_limit=0)
+
+    assert [hit.id for hit in packed] == ["w1", "r1", "r2"]
+    assert added == 0

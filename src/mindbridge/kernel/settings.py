@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from mindbridge.exceptions import ValidationError
+from mindbridge.infrastructure.local.store import RECALL_MAX_ROWS
 from mindbridge.kernel.contracts import index_recipe_for, validated_index_quantization
 from mindbridge.kernel.validation import (
     positive_int,
@@ -47,6 +48,19 @@ class Settings:
     query_failure_window: timedelta
     query_failure_history: int
     retention: RetentionPolicy
+
+
+def _expansion_max_rows(value: object) -> int:
+    """Bound the expansion read the way the store bounds every other recall read.
+
+    The value goes straight to `related_memories(max_rows=...)`, which refuses anything above
+    `RECALL_MAX_ROWS`. Unbounded here, a caller who set it high built a memory that opened fine
+    and then raised out of the store on every `ask`; policy is validated once, at wiring.
+    """
+    rows = positive_int(value, "evidence_expansion_max_rows")
+    if rows > RECALL_MAX_ROWS:
+        raise ValidationError(f"evidence_expansion_max_rows must be at most {RECALL_MAX_ROWS}")
+    return rows
 
 
 def resolve_settings(
@@ -99,9 +113,7 @@ def resolve_settings(
         recall_set_max_rows=positive_int(recall_set_max_rows, "recall_set_max_rows"),
         recall_rounds=positive_int(recall_rounds, "recall_rounds"),
         evidence_expansion=strict_bool(evidence_expansion, "evidence_expansion"),
-        evidence_expansion_max_rows=positive_int(
-            evidence_expansion_max_rows, "evidence_expansion_max_rows"
-        ),
+        evidence_expansion_max_rows=_expansion_max_rows(evidence_expansion_max_rows),
         decay_half_life=validated_decay_half_life(decay_half_life_days),
         reinforce_on_answer=strict_bool(reinforce_on_answer, "reinforce_on_answer"),
         memory_budget_records=(

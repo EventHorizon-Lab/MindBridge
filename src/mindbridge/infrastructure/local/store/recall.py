@@ -275,8 +275,8 @@ class RecallReads:
                 edges=chosen,
                 ceiling=ceiling,
             )
-            counts = {
-                edge: len([found for found in ids if found not in anchor_ids])
+            members = {
+                edge: {found for found in ids if found not in anchor_ids}
                 for edge, ids in linked.items()
             }
             candidates = tuple(
@@ -292,6 +292,13 @@ class RecallReads:
                 identity_parameters=identity_parameters,
             )
         selected = ordered[:max_rows]
+        # Counted over the rows this read returns, not over what the edges linked to. Scope,
+        # corpus order and `max_rows` all drop rows between the two, and the caller states the
+        # attribution to a reader: an edge whose rows all fell out must not be named as the
+        # reason a row is there.
+        counts = {
+            edge: sum(1 for found in selected if found in ids) for edge, ids in members.items()
+        }
         return RelatedRead(
             self._hydrate_recall(
                 selected,

@@ -467,6 +467,8 @@ def _retrieval_quality(
             "labelled_question_count": 0,
             "unranked_labelled_question_count": 0,
             "recall_at_k": {},
+            "complete_support_at_k": {},
+            "support_decomposition": {},
             "random_ranker_recall_at_k": {},
             "unresolved_gold_evidence_ids": unresolved,
             "unavailable_reason": (
@@ -487,6 +489,8 @@ def _retrieval_quality(
             "labelled_question_count": 0,
             "unranked_labelled_question_count": unranked,
             "recall_at_k": {},
+            "complete_support_at_k": {},
+            "support_decomposition": {},
             "random_ranker_recall_at_k": {},
             "unresolved_gold_evidence_ids": unresolved,
             "unavailable_reason": (

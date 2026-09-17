@@ -160,18 +160,24 @@ class MemoryConfig:
     recall_rounds: _PositiveInt = 2
     # Whether the grounding window is widened with the records it is structurally linked to: the
     # capture an observation was committed under, a recognized person, a symbolic place, a claim's
-    # lineage, an evidence edge. Off by default and free when on -- the edges are columns the
-    # kernel already wrote, so expansion is one indexed read per edge and no model call, which is
-    # what separates it from `recall_planning`. It answers the measured failure where a question
-    # needs several records and the ranking finds the one that shares words with it: the reply to
-    # a retrieved question, the other observation from the same capture. An edge that links to
-    # more than a fifth of the corpus is dropped whole, per edge, because an edge that selects the
-    # corpus says nothing about the question. It only ever adds: the ranked window is kept intact
-    # and the added rows follow it, so no question grounds less evidence with this on.
+    # lineage, an evidence edge. Off by default and cheap when on -- the edges are columns the
+    # kernel already wrote, so expansion is one read per edge and no model call, which is what
+    # separates it from `recall_planning`. Every edge but the capture is indexed; that one scans
+    # `memory_semantics`, which is fine at companion-store sizes and not at a million records. It
+    # answers the measured failure where a question needs several records and the ranking finds
+    # the one that shares words with it: the reply to a retrieved question, the other observation
+    # from the same capture. An edge that links to more than a fifth of the corpus is dropped
+    # whole, per edge, because an edge that selects the corpus says nothing about the question. It
+    # only ever adds: the ranked window is kept intact and the added rows follow it, so no
+    # question grounds less evidence with this on.
     evidence_expansion: _StrictBool = False
     # How many linked records one expansion may add, whatever `evidence_budget_chars` leaves room
     # for. The same reasoning as `recall_set_max_rows`, at the smaller size a window extension
-    # wants rather than a set read: this is the tail of a window, not the answer's shape.
+    # wants rather than a set read: this is the tail of a window, not the answer's shape. Media
+    # rows among them stop earlier still, at twice the ask's own `limit` -- the same cap a recall
+    # program's matched media rows hit, because a linked clip costs face and speech recognition
+    # before the answer call and again on every replan, and a capture on a photo corpus is a whole
+    # day of them.
     evidence_expansion_max_rows: _PositiveInt = 24
     decay_half_life_days: _PositiveFloat | None = None
     # `ask` counts the evidence it cited, which is what keeps the reinforcement factor in
