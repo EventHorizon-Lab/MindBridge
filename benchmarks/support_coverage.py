@@ -1253,6 +1253,10 @@ def _emit(
 
 if __name__ == "__main__":
     # A committed suite recipe preserves this experiment tree's fixed launch command.
+    if Path(__file__).with_name("complementary_trial.json").is_file():
+        from complementary_trial import main as complementary_main
+
+        raise SystemExit(complementary_main())
     if Path(__file__).with_name("four_benchmark_suite.json").is_file():
         from four_benchmark_suite import main as suite_main
 

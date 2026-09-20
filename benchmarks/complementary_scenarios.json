@@ -1,0 +1,1484 @@
+[
+  {
+    "id": "identity-0-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "identity",
+    "pair": "identity-0",
+    "variant": 0,
+    "question": "What measuring tool did Mara borrow, and from whom?",
+    "reference": "Mara borrowed the brass caliper from Niko.",
+    "observations": [
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Niko catalogued workshop shelf 6; no action by Mara was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Niko catalogued workshop shelf 7; no action by Mara was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Niko borrowed a red screwdriver from Uma on Monday."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Niko catalogued workshop shelf 4; no action by Mara was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Niko catalogued workshop shelf 2; no action by Mara was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Niko catalogued workshop shelf 3; no action by Mara was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Niko catalogued workshop shelf 1; no action by Mara was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "On Tuesday, Mara borrowed a brass caliper from Niko for measuring a model."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Niko catalogued workshop shelf 8; no action by Mara was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Niko catalogued workshop shelf 5; no action by Mara was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00"
+    ]
+  },
+  {
+    "id": "identity-0-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "identity",
+    "pair": "identity-0",
+    "variant": 1,
+    "question": "What measuring tool did Mara borrow, and from whom?",
+    "reference": "Mara borrowed the brass caliper from Niko.",
+    "observations": [
+      {
+        "id": "e02",
+        "text": "Workshop message 0: Niko, not Mara, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e10",
+        "text": "Inventory note 2: Niko catalogued workshop shelf 3; no action by Mara was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "On Tuesday, Mara borrowed a brass caliper from Niko for measuring a model."
+      },
+      {
+        "id": "e14",
+        "text": "Inventory note 6: Niko catalogued workshop shelf 7; no action by Mara was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Workshop message 4: Niko, not Mara, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e05",
+        "text": "Workshop message 3: Niko, not Mara, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e03",
+        "text": "Workshop message 1: Niko, not Mara, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 0: Niko catalogued workshop shelf 1; no action by Mara was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Workshop message 5: Niko, not Mara, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e11",
+        "text": "Inventory note 3: Niko catalogued workshop shelf 4; no action by Mara was recorded."
+      },
+      {
+        "id": "e15",
+        "text": "Inventory note 7: Niko catalogued workshop shelf 8; no action by Mara was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Niko borrowed a red screwdriver from Uma on Monday."
+      },
+      {
+        "id": "e12",
+        "text": "Inventory note 4: Niko catalogued workshop shelf 5; no action by Mara was recorded."
+      },
+      {
+        "id": "e13",
+        "text": "Inventory note 5: Niko catalogued workshop shelf 6; no action by Mara was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 1: Niko catalogued workshop shelf 2; no action by Mara was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Workshop message 2: Niko, not Mara, borrowed a red screwdriver from Uma."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00"
+    ]
+  },
+  {
+    "id": "duplicates-0-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "duplicates",
+    "pair": "duplicates-0",
+    "variant": 0,
+    "question": "Which two aids does Mara use in the workshop, and under which circumstances?",
+    "reference": "A magnifying lamp for tiny gear repairs and padded gloves for carrying heavy housings.",
+    "observations": [
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Niko catalogued workshop shelf 6; no action by Mara was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Niko catalogued workshop shelf 7; no action by Mara was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Mara puts on padded gloves when carrying heavy housings."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Niko catalogued workshop shelf 4; no action by Mara was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Niko catalogued workshop shelf 2; no action by Mara was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Niko catalogued workshop shelf 3; no action by Mara was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Niko catalogued workshop shelf 1; no action by Mara was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "Mara uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Niko catalogued workshop shelf 8; no action by Mara was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Niko catalogued workshop shelf 5; no action by Mara was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00",
+      "e01"
+    ]
+  },
+  {
+    "id": "duplicates-0-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "duplicates",
+    "pair": "duplicates-0",
+    "variant": 1,
+    "question": "Which two aids does Mara use in the workshop, and under which circumstances?",
+    "reference": "A magnifying lamp for tiny gear repairs and padded gloves for carrying heavy housings.",
+    "observations": [
+      {
+        "id": "e02",
+        "text": "Copy 0 of the SAME Tuesday observation, not another event: Mara uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e10",
+        "text": "Inventory note 2: Niko catalogued workshop shelf 3; no action by Mara was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "Mara uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e14",
+        "text": "Inventory note 6: Niko catalogued workshop shelf 7; no action by Mara was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Copy 4 of the SAME Tuesday observation, not another event: Mara uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e05",
+        "text": "Copy 3 of the SAME Tuesday observation, not another event: Mara uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e03",
+        "text": "Copy 1 of the SAME Tuesday observation, not another event: Mara uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 0: Niko catalogued workshop shelf 1; no action by Mara was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Copy 5 of the SAME Tuesday observation, not another event: Mara uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e11",
+        "text": "Inventory note 3: Niko catalogued workshop shelf 4; no action by Mara was recorded."
+      },
+      {
+        "id": "e15",
+        "text": "Inventory note 7: Niko catalogued workshop shelf 8; no action by Mara was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Mara puts on padded gloves when carrying heavy housings."
+      },
+      {
+        "id": "e12",
+        "text": "Inventory note 4: Niko catalogued workshop shelf 5; no action by Mara was recorded."
+      },
+      {
+        "id": "e13",
+        "text": "Inventory note 5: Niko catalogued workshop shelf 6; no action by Mara was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 1: Niko catalogued workshop shelf 2; no action by Mara was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Copy 2 of the SAME Tuesday observation, not another event: Mara uses a magnifying lamp when repairing tiny gears."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00",
+      "e01"
+    ]
+  },
+  {
+    "id": "correction-0-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "correction",
+    "pair": "correction-0",
+    "variant": 0,
+    "question": "According to the retained observations, where were Mara's samples most recently stored?",
+    "reference": "The blue vault.",
+    "observations": [
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Niko catalogued workshop shelf 6; no action by Mara was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Niko catalogued workshop shelf 7; no action by Mara was recorded."
+      },
+      {
+        "id": "update",
+        "text": "On Friday, Mara moved all the samples from the cedar room into the blue vault. The previous location is now empty."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Niko catalogued workshop shelf 4; no action by Mara was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Niko catalogued workshop shelf 2; no action by Mara was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Niko catalogued workshop shelf 3; no action by Mara was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Niko catalogued workshop shelf 1; no action by Mara was recorded."
+      },
+      {
+        "id": "old",
+        "text": "On Monday, Mara stored samples in the cedar room."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Niko catalogued workshop shelf 8; no action by Mara was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Niko catalogued workshop shelf 5; no action by Mara was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "update"
+    ]
+  },
+  {
+    "id": "correction-0-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "correction",
+    "pair": "correction-0",
+    "variant": 1,
+    "question": "According to the retained observations, where were Mara's samples most recently stored?",
+    "reference": "cedar room",
+    "observations": [
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Niko catalogued workshop shelf 5; no action by Mara was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Niko catalogued workshop shelf 7; no action by Mara was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Niko catalogued workshop shelf 8; no action by Mara was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Niko catalogued workshop shelf 6; no action by Mara was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Niko catalogued workshop shelf 4; no action by Mara was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Niko catalogued workshop shelf 2; no action by Mara was recorded."
+      },
+      {
+        "id": "old",
+        "text": "On Monday, Mara stored samples in the cedar room."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Niko catalogued workshop shelf 3; no action by Mara was recorded."
+      },
+      {
+        "id": "update",
+        "text": "On Friday, Mara moved all the samples from the cedar room into the blue vault. The previous location is now empty."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Niko catalogued workshop shelf 1; no action by Mara was recorded."
+      }
+    ],
+    "delete": [
+      "update"
+    ],
+    "gold": [
+      "old"
+    ]
+  },
+  {
+    "id": "counterevidence-0-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "counterevidence",
+    "pair": "counterevidence-0",
+    "variant": 0,
+    "question": "Which route does Mara use on dry days and rainy days?",
+    "reference": "Hill route in both dry and rainy weather; waterproof boots when it rains.",
+    "observations": [
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Niko catalogued workshop shelf 6; no action by Mara was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Niko catalogued workshop shelf 7; no action by Mara was recorded."
+      },
+      {
+        "id": "rain",
+        "text": "Mara explicitly says: On rainy days I still use the hill route with waterproof boots."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Niko catalogued workshop shelf 4; no action by Mara was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Niko catalogued workshop shelf 2; no action by Mara was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Niko catalogued workshop shelf 3; no action by Mara was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Niko catalogued workshop shelf 1; no action by Mara was recorded."
+      },
+      {
+        "id": "dry",
+        "text": "Mara explicitly says: I use the hill route on dry days."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Niko catalogued workshop shelf 8; no action by Mara was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Niko catalogued workshop shelf 5; no action by Mara was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "dry",
+      "rain"
+    ]
+  },
+  {
+    "id": "counterevidence-0-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "counterevidence",
+    "pair": "counterevidence-0",
+    "variant": 1,
+    "question": "Which route does Mara use on dry days and rainy days?",
+    "reference": "Hill route on dry days and sheltered canal route on rainy days.",
+    "observations": [
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Niko catalogued workshop shelf 5; no action by Mara was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Niko catalogued workshop shelf 7; no action by Mara was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Niko catalogued workshop shelf 8; no action by Mara was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Niko catalogued workshop shelf 6; no action by Mara was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Niko catalogued workshop shelf 4; no action by Mara was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Niko catalogued workshop shelf 2; no action by Mara was recorded."
+      },
+      {
+        "id": "dry",
+        "text": "Mara explicitly says: I use the hill route on dry days."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Niko catalogued workshop shelf 3; no action by Mara was recorded."
+      },
+      {
+        "id": "rain",
+        "text": "Mara explicitly says: On rainy days I instead use the sheltered canal route."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Niko catalogued workshop shelf 1; no action by Mara was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "dry",
+      "rain"
+    ]
+  },
+  {
+    "id": "identity-1-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "identity",
+    "pair": "identity-1",
+    "variant": 0,
+    "question": "What measuring tool did Elian borrow, and from whom?",
+    "reference": "Elian borrowed the ceramic gauge from Sora.",
+    "observations": [
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Sora catalogued workshop shelf 3; no action by Elian was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "On Tuesday, Elian borrowed a ceramic gauge from Sora for measuring a model."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Sora catalogued workshop shelf 4; no action by Elian was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Sora catalogued workshop shelf 8; no action by Elian was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Sora catalogued workshop shelf 2; no action by Elian was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Sora borrowed a red screwdriver from Uma on Monday."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Sora catalogued workshop shelf 5; no action by Elian was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Sora catalogued workshop shelf 7; no action by Elian was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Sora catalogued workshop shelf 6; no action by Elian was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Sora catalogued workshop shelf 1; no action by Elian was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00"
+    ]
+  },
+  {
+    "id": "identity-1-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "identity",
+    "pair": "identity-1",
+    "variant": 1,
+    "question": "What measuring tool did Elian borrow, and from whom?",
+    "reference": "Elian borrowed the ceramic gauge from Sora.",
+    "observations": [
+      {
+        "id": "e12",
+        "text": "Inventory note 4: Sora catalogued workshop shelf 5; no action by Elian was recorded."
+      },
+      {
+        "id": "e10",
+        "text": "Inventory note 2: Sora catalogued workshop shelf 3; no action by Elian was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Workshop message 2: Sora, not Elian, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e15",
+        "text": "Inventory note 7: Sora catalogued workshop shelf 8; no action by Elian was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Sora borrowed a red screwdriver from Uma on Monday."
+      },
+      {
+        "id": "e11",
+        "text": "Inventory note 3: Sora catalogued workshop shelf 4; no action by Elian was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Workshop message 0: Sora, not Elian, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 1: Sora catalogued workshop shelf 2; no action by Elian was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Workshop message 1: Sora, not Elian, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e13",
+        "text": "Inventory note 5: Sora catalogued workshop shelf 6; no action by Elian was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "On Tuesday, Elian borrowed a ceramic gauge from Sora for measuring a model."
+      },
+      {
+        "id": "e07",
+        "text": "Workshop message 5: Sora, not Elian, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e05",
+        "text": "Workshop message 3: Sora, not Elian, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 0: Sora catalogued workshop shelf 1; no action by Elian was recorded."
+      },
+      {
+        "id": "e14",
+        "text": "Inventory note 6: Sora catalogued workshop shelf 7; no action by Elian was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Workshop message 4: Sora, not Elian, borrowed a red screwdriver from Uma."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00"
+    ]
+  },
+  {
+    "id": "duplicates-1-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "duplicates",
+    "pair": "duplicates-1",
+    "variant": 0,
+    "question": "Which two aids does Elian use in the workshop, and under which circumstances?",
+    "reference": "A magnifying lamp for tiny gear repairs and padded gloves for carrying heavy housings.",
+    "observations": [
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Sora catalogued workshop shelf 3; no action by Elian was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "Elian uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Sora catalogued workshop shelf 4; no action by Elian was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Sora catalogued workshop shelf 8; no action by Elian was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Sora catalogued workshop shelf 2; no action by Elian was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Elian puts on padded gloves when carrying heavy housings."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Sora catalogued workshop shelf 5; no action by Elian was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Sora catalogued workshop shelf 7; no action by Elian was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Sora catalogued workshop shelf 6; no action by Elian was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Sora catalogued workshop shelf 1; no action by Elian was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00",
+      "e01"
+    ]
+  },
+  {
+    "id": "duplicates-1-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "duplicates",
+    "pair": "duplicates-1",
+    "variant": 1,
+    "question": "Which two aids does Elian use in the workshop, and under which circumstances?",
+    "reference": "A magnifying lamp for tiny gear repairs and padded gloves for carrying heavy housings.",
+    "observations": [
+      {
+        "id": "e12",
+        "text": "Inventory note 4: Sora catalogued workshop shelf 5; no action by Elian was recorded."
+      },
+      {
+        "id": "e10",
+        "text": "Inventory note 2: Sora catalogued workshop shelf 3; no action by Elian was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Copy 2 of the SAME Tuesday observation, not another event: Elian uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e15",
+        "text": "Inventory note 7: Sora catalogued workshop shelf 8; no action by Elian was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Elian puts on padded gloves when carrying heavy housings."
+      },
+      {
+        "id": "e11",
+        "text": "Inventory note 3: Sora catalogued workshop shelf 4; no action by Elian was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Copy 0 of the SAME Tuesday observation, not another event: Elian uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 1: Sora catalogued workshop shelf 2; no action by Elian was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Copy 1 of the SAME Tuesday observation, not another event: Elian uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e13",
+        "text": "Inventory note 5: Sora catalogued workshop shelf 6; no action by Elian was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "Elian uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e07",
+        "text": "Copy 5 of the SAME Tuesday observation, not another event: Elian uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e05",
+        "text": "Copy 3 of the SAME Tuesday observation, not another event: Elian uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 0: Sora catalogued workshop shelf 1; no action by Elian was recorded."
+      },
+      {
+        "id": "e14",
+        "text": "Inventory note 6: Sora catalogued workshop shelf 7; no action by Elian was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Copy 4 of the SAME Tuesday observation, not another event: Elian uses a magnifying lamp when repairing tiny gears."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00",
+      "e01"
+    ]
+  },
+  {
+    "id": "correction-1-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "correction",
+    "pair": "correction-1",
+    "variant": 0,
+    "question": "According to the retained observations, where were Elian's samples most recently stored?",
+    "reference": "The blue vault.",
+    "observations": [
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Sora catalogued workshop shelf 3; no action by Elian was recorded."
+      },
+      {
+        "id": "old",
+        "text": "On Monday, Elian stored samples in the west cabinet."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Sora catalogued workshop shelf 4; no action by Elian was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Sora catalogued workshop shelf 8; no action by Elian was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Sora catalogued workshop shelf 2; no action by Elian was recorded."
+      },
+      {
+        "id": "update",
+        "text": "On Friday, Elian moved all the samples from the west cabinet into the blue vault. The previous location is now empty."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Sora catalogued workshop shelf 5; no action by Elian was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Sora catalogued workshop shelf 7; no action by Elian was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Sora catalogued workshop shelf 6; no action by Elian was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Sora catalogued workshop shelf 1; no action by Elian was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "update"
+    ]
+  },
+  {
+    "id": "correction-1-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "correction",
+    "pair": "correction-1",
+    "variant": 1,
+    "question": "According to the retained observations, where were Elian's samples most recently stored?",
+    "reference": "west cabinet",
+    "observations": [
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Sora catalogued workshop shelf 5; no action by Elian was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Sora catalogued workshop shelf 6; no action by Elian was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Sora catalogued workshop shelf 1; no action by Elian was recorded."
+      },
+      {
+        "id": "update",
+        "text": "On Friday, Elian moved all the samples from the west cabinet into the blue vault. The previous location is now empty."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Sora catalogued workshop shelf 3; no action by Elian was recorded."
+      },
+      {
+        "id": "old",
+        "text": "On Monday, Elian stored samples in the west cabinet."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Sora catalogued workshop shelf 7; no action by Elian was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Sora catalogued workshop shelf 4; no action by Elian was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Sora catalogued workshop shelf 2; no action by Elian was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Sora catalogued workshop shelf 8; no action by Elian was recorded."
+      }
+    ],
+    "delete": [
+      "update"
+    ],
+    "gold": [
+      "old"
+    ]
+  },
+  {
+    "id": "counterevidence-1-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "counterevidence",
+    "pair": "counterevidence-1",
+    "variant": 0,
+    "question": "Which route does Elian use on dry days and rainy days?",
+    "reference": "Hill route in both dry and rainy weather; waterproof boots when it rains.",
+    "observations": [
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Sora catalogued workshop shelf 3; no action by Elian was recorded."
+      },
+      {
+        "id": "dry",
+        "text": "Elian explicitly says: I use the hill route on dry days."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Sora catalogued workshop shelf 4; no action by Elian was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Sora catalogued workshop shelf 8; no action by Elian was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Sora catalogued workshop shelf 2; no action by Elian was recorded."
+      },
+      {
+        "id": "rain",
+        "text": "Elian explicitly says: On rainy days I still use the hill route with waterproof boots."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Sora catalogued workshop shelf 5; no action by Elian was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Sora catalogued workshop shelf 7; no action by Elian was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Sora catalogued workshop shelf 6; no action by Elian was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Sora catalogued workshop shelf 1; no action by Elian was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "dry",
+      "rain"
+    ]
+  },
+  {
+    "id": "counterevidence-1-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "counterevidence",
+    "pair": "counterevidence-1",
+    "variant": 1,
+    "question": "Which route does Elian use on dry days and rainy days?",
+    "reference": "Hill route on dry days and sheltered canal route on rainy days.",
+    "observations": [
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Sora catalogued workshop shelf 5; no action by Elian was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Sora catalogued workshop shelf 6; no action by Elian was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Sora catalogued workshop shelf 1; no action by Elian was recorded."
+      },
+      {
+        "id": "rain",
+        "text": "Elian explicitly says: On rainy days I instead use the sheltered canal route."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Sora catalogued workshop shelf 3; no action by Elian was recorded."
+      },
+      {
+        "id": "dry",
+        "text": "Elian explicitly says: I use the hill route on dry days."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Sora catalogued workshop shelf 7; no action by Elian was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Sora catalogued workshop shelf 4; no action by Elian was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Sora catalogued workshop shelf 2; no action by Elian was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Sora catalogued workshop shelf 8; no action by Elian was recorded."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "dry",
+      "rain"
+    ]
+  },
+  {
+    "id": "identity-2-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "identity",
+    "pair": "identity-2",
+    "variant": 0,
+    "question": "What measuring tool did Tavi borrow, and from whom?",
+    "reference": "Tavi borrowed the steel compass from Rhea.",
+    "observations": [
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Rhea catalogued workshop shelf 7; no action by Tavi was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Rhea catalogued workshop shelf 5; no action by Tavi was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Rhea catalogued workshop shelf 4; no action by Tavi was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Rhea catalogued workshop shelf 6; no action by Tavi was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Rhea catalogued workshop shelf 1; no action by Tavi was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Rhea catalogued workshop shelf 3; no action by Tavi was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Rhea borrowed a red screwdriver from Uma on Monday."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Rhea catalogued workshop shelf 8; no action by Tavi was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Rhea catalogued workshop shelf 2; no action by Tavi was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "On Tuesday, Tavi borrowed a steel compass from Rhea for measuring a model."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00"
+    ]
+  },
+  {
+    "id": "identity-2-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "identity",
+    "pair": "identity-2",
+    "variant": 1,
+    "question": "What measuring tool did Tavi borrow, and from whom?",
+    "reference": "Tavi borrowed the steel compass from Rhea.",
+    "observations": [
+      {
+        "id": "e15",
+        "text": "Inventory note 7: Rhea catalogued workshop shelf 8; no action by Tavi was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Rhea borrowed a red screwdriver from Uma on Monday."
+      },
+      {
+        "id": "e14",
+        "text": "Inventory note 6: Rhea catalogued workshop shelf 7; no action by Tavi was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 1: Rhea catalogued workshop shelf 2; no action by Tavi was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 0: Rhea catalogued workshop shelf 1; no action by Tavi was recorded."
+      },
+      {
+        "id": "e12",
+        "text": "Inventory note 4: Rhea catalogued workshop shelf 5; no action by Tavi was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Workshop message 1: Rhea, not Tavi, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e10",
+        "text": "Inventory note 2: Rhea catalogued workshop shelf 3; no action by Tavi was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Workshop message 5: Rhea, not Tavi, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e13",
+        "text": "Inventory note 5: Rhea catalogued workshop shelf 6; no action by Tavi was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Workshop message 2: Rhea, not Tavi, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e00",
+        "text": "On Tuesday, Tavi borrowed a steel compass from Rhea for measuring a model."
+      },
+      {
+        "id": "e06",
+        "text": "Workshop message 4: Rhea, not Tavi, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e05",
+        "text": "Workshop message 3: Rhea, not Tavi, borrowed a red screwdriver from Uma."
+      },
+      {
+        "id": "e11",
+        "text": "Inventory note 3: Rhea catalogued workshop shelf 4; no action by Tavi was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Workshop message 0: Rhea, not Tavi, borrowed a red screwdriver from Uma."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00"
+    ]
+  },
+  {
+    "id": "duplicates-2-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "duplicates",
+    "pair": "duplicates-2",
+    "variant": 0,
+    "question": "Which two aids does Tavi use in the workshop, and under which circumstances?",
+    "reference": "A magnifying lamp for tiny gear repairs and padded gloves for carrying heavy housings.",
+    "observations": [
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Rhea catalogued workshop shelf 7; no action by Tavi was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Rhea catalogued workshop shelf 5; no action by Tavi was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Rhea catalogued workshop shelf 4; no action by Tavi was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Rhea catalogued workshop shelf 6; no action by Tavi was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Rhea catalogued workshop shelf 1; no action by Tavi was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Rhea catalogued workshop shelf 3; no action by Tavi was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Tavi puts on padded gloves when carrying heavy housings."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Rhea catalogued workshop shelf 8; no action by Tavi was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Rhea catalogued workshop shelf 2; no action by Tavi was recorded."
+      },
+      {
+        "id": "e00",
+        "text": "Tavi uses a magnifying lamp when repairing tiny gears."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00",
+      "e01"
+    ]
+  },
+  {
+    "id": "duplicates-2-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "duplicates",
+    "pair": "duplicates-2",
+    "variant": 1,
+    "question": "Which two aids does Tavi use in the workshop, and under which circumstances?",
+    "reference": "A magnifying lamp for tiny gear repairs and padded gloves for carrying heavy housings.",
+    "observations": [
+      {
+        "id": "e15",
+        "text": "Inventory note 7: Rhea catalogued workshop shelf 8; no action by Tavi was recorded."
+      },
+      {
+        "id": "e01",
+        "text": "Tavi puts on padded gloves when carrying heavy housings."
+      },
+      {
+        "id": "e14",
+        "text": "Inventory note 6: Rhea catalogued workshop shelf 7; no action by Tavi was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 1: Rhea catalogued workshop shelf 2; no action by Tavi was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 0: Rhea catalogued workshop shelf 1; no action by Tavi was recorded."
+      },
+      {
+        "id": "e12",
+        "text": "Inventory note 4: Rhea catalogued workshop shelf 5; no action by Tavi was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Copy 1 of the SAME Tuesday observation, not another event: Tavi uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e10",
+        "text": "Inventory note 2: Rhea catalogued workshop shelf 3; no action by Tavi was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Copy 5 of the SAME Tuesday observation, not another event: Tavi uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e13",
+        "text": "Inventory note 5: Rhea catalogued workshop shelf 6; no action by Tavi was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Copy 2 of the SAME Tuesday observation, not another event: Tavi uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e00",
+        "text": "Tavi uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e06",
+        "text": "Copy 4 of the SAME Tuesday observation, not another event: Tavi uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e05",
+        "text": "Copy 3 of the SAME Tuesday observation, not another event: Tavi uses a magnifying lamp when repairing tiny gears."
+      },
+      {
+        "id": "e11",
+        "text": "Inventory note 3: Rhea catalogued workshop shelf 4; no action by Tavi was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Copy 0 of the SAME Tuesday observation, not another event: Tavi uses a magnifying lamp when repairing tiny gears."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "e00",
+      "e01"
+    ]
+  },
+  {
+    "id": "correction-2-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "correction",
+    "pair": "correction-2",
+    "variant": 0,
+    "question": "According to the retained observations, where were Tavi's samples most recently stored?",
+    "reference": "The blue vault.",
+    "observations": [
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Rhea catalogued workshop shelf 7; no action by Tavi was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Rhea catalogued workshop shelf 5; no action by Tavi was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Rhea catalogued workshop shelf 4; no action by Tavi was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Rhea catalogued workshop shelf 6; no action by Tavi was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Rhea catalogued workshop shelf 1; no action by Tavi was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Rhea catalogued workshop shelf 3; no action by Tavi was recorded."
+      },
+      {
+        "id": "update",
+        "text": "On Friday, Tavi moved all the samples from the loft locker into the blue vault. The previous location is now empty."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Rhea catalogued workshop shelf 8; no action by Tavi was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Rhea catalogued workshop shelf 2; no action by Tavi was recorded."
+      },
+      {
+        "id": "old",
+        "text": "On Monday, Tavi stored samples in the loft locker."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "update"
+    ]
+  },
+  {
+    "id": "correction-2-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "correction",
+    "pair": "correction-2",
+    "variant": 1,
+    "question": "According to the retained observations, where were Tavi's samples most recently stored?",
+    "reference": "loft locker",
+    "observations": [
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Rhea catalogued workshop shelf 6; no action by Tavi was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Rhea catalogued workshop shelf 8; no action by Tavi was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Rhea catalogued workshop shelf 3; no action by Tavi was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Rhea catalogued workshop shelf 2; no action by Tavi was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Rhea catalogued workshop shelf 7; no action by Tavi was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Rhea catalogued workshop shelf 1; no action by Tavi was recorded."
+      },
+      {
+        "id": "old",
+        "text": "On Monday, Tavi stored samples in the loft locker."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Rhea catalogued workshop shelf 5; no action by Tavi was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Rhea catalogued workshop shelf 4; no action by Tavi was recorded."
+      },
+      {
+        "id": "update",
+        "text": "On Friday, Tavi moved all the samples from the loft locker into the blue vault. The previous location is now empty."
+      }
+    ],
+    "delete": [
+      "update"
+    ],
+    "gold": [
+      "old"
+    ]
+  },
+  {
+    "id": "counterevidence-2-0",
+    "dataset": "constructed-text-diagnostics",
+    "family": "counterevidence",
+    "pair": "counterevidence-2",
+    "variant": 0,
+    "question": "Which route does Tavi use on dry days and rainy days?",
+    "reference": "Hill route in both dry and rainy weather; waterproof boots when it rains.",
+    "observations": [
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Rhea catalogued workshop shelf 7; no action by Tavi was recorded."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Rhea catalogued workshop shelf 5; no action by Tavi was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Rhea catalogued workshop shelf 4; no action by Tavi was recorded."
+      },
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Rhea catalogued workshop shelf 6; no action by Tavi was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Rhea catalogued workshop shelf 1; no action by Tavi was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Rhea catalogued workshop shelf 3; no action by Tavi was recorded."
+      },
+      {
+        "id": "rain",
+        "text": "Tavi explicitly says: On rainy days I still use the hill route with waterproof boots."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Rhea catalogued workshop shelf 8; no action by Tavi was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Rhea catalogued workshop shelf 2; no action by Tavi was recorded."
+      },
+      {
+        "id": "dry",
+        "text": "Tavi explicitly says: I use the hill route on dry days."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "dry",
+      "rain"
+    ]
+  },
+  {
+    "id": "counterevidence-2-1",
+    "dataset": "constructed-text-diagnostics",
+    "family": "counterevidence",
+    "pair": "counterevidence-2",
+    "variant": 1,
+    "question": "Which route does Tavi use on dry days and rainy days?",
+    "reference": "Hill route on dry days and sheltered canal route on rainy days.",
+    "observations": [
+      {
+        "id": "e07",
+        "text": "Inventory note 5: Rhea catalogued workshop shelf 6; no action by Tavi was recorded."
+      },
+      {
+        "id": "e09",
+        "text": "Inventory note 7: Rhea catalogued workshop shelf 8; no action by Tavi was recorded."
+      },
+      {
+        "id": "e04",
+        "text": "Inventory note 2: Rhea catalogued workshop shelf 3; no action by Tavi was recorded."
+      },
+      {
+        "id": "e03",
+        "text": "Inventory note 1: Rhea catalogued workshop shelf 2; no action by Tavi was recorded."
+      },
+      {
+        "id": "e08",
+        "text": "Inventory note 6: Rhea catalogued workshop shelf 7; no action by Tavi was recorded."
+      },
+      {
+        "id": "e02",
+        "text": "Inventory note 0: Rhea catalogued workshop shelf 1; no action by Tavi was recorded."
+      },
+      {
+        "id": "dry",
+        "text": "Tavi explicitly says: I use the hill route on dry days."
+      },
+      {
+        "id": "e06",
+        "text": "Inventory note 4: Rhea catalogued workshop shelf 5; no action by Tavi was recorded."
+      },
+      {
+        "id": "e05",
+        "text": "Inventory note 3: Rhea catalogued workshop shelf 4; no action by Tavi was recorded."
+      },
+      {
+        "id": "rain",
+        "text": "Tavi explicitly says: On rainy days I instead use the sheltered canal route."
+      }
+    ],
+    "delete": [],
+    "gold": [
+      "dry",
+      "rain"
+    ]
+  }
+]
