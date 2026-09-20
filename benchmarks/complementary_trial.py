@@ -210,6 +210,19 @@ def open_memory(
     )
 
 
+def vision_backend(client: OpenAI, model: str) -> OpenAIModels:
+    # The describer contract accepts visual modalities only, unlike the answerer.
+    return OpenAIModels(
+        generation_client=client,
+        generation_model=model,
+        generation_capabilities=frozenset({Modality.IMAGE, Modality.VIDEO}),
+        generation_temperature=0,
+        generation_seed=0,
+        generation_video_limit=8,
+        generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+
+
 def score(client: OpenAI, model: str, question: str, reference: str, prediction: str) -> float:
     plan = judge_plan(
         "icm-bench", question=question, references=(reference,), prediction=prediction, metadata={}
@@ -302,7 +315,7 @@ def run_cases(
     embedder: OpenAIModels,
     reader: SelectorBackend,
     audit: Audit,
-    backend: OpenAIModels,
+    vision: OpenAIModels,
 ) -> list[dict[str, Any]]:
     from paired_replay import _closed_store_lock
 
@@ -346,7 +359,7 @@ def run_cases(
         flush=True,
     )
     reader.row_limit = recipe["reader_rows"]
-    with open_memory(copied, embedder, reader, vision=backend) as memory:
+    with open_memory(copied, embedder, reader, vision=vision) as memory:
         for identifier in recipe["question_ids"]:
             q = questions[identifier]
             if q.before_clip is not None:
@@ -439,8 +452,9 @@ def main() -> int:
     reader = SelectorBackend(
         backend, client, settings["MINDBRIDGE_GENERATION_MODEL"], audit, recipe, output
     )
+    vision = vision_backend(client, settings["MINDBRIDGE_GENERATION_MODEL"])
     try:
-        results = run_cases(recipe, output, embedder, reader, audit, backend)
+        results = run_cases(recipe, output, embedder, reader, audit, vision)
     finally:
         client.close()
         embedding_client.close()

@@ -136,3 +136,20 @@ def test_media_audit_hashes_payload_without_logging_media_bytes() -> None:
     result = driver.redact_media({"url": "data:image/jpeg;base64,SECRET_FRAME"})
     assert "SECRET_FRAME" not in json.dumps(result)
     assert result["url"]["encoded_chars"] > 0
+
+
+def test_trial_visual_backend_satisfies_memory_contract(tmp_path: Path) -> None:
+    driver = _driver()
+    with OpenAI(api_key="test", base_url="http://mock/v1") as client:
+        vision = driver.vision_backend(client, "mock")
+        models = _FakeModels()
+        reader = driver.SelectorBackend(
+            models,
+            client,
+            "mock",
+            driver.Audit(tmp_path / "http.jsonl"),
+            {"reader_rows": 12, "reader_chars": 24000, "candidate_rows": 60},
+            tmp_path,
+        )
+        with driver.open_memory(tmp_path / "store", models, reader, vision=vision):
+            assert vision.vision_capabilities == frozenset({Modality.IMAGE, Modality.VIDEO})
