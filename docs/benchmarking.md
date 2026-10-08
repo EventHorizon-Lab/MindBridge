@@ -13,6 +13,10 @@ quality claims; use the utilities only for their narrower artifact or storage pu
 Never point a benchmark at an application's live `data_dir`. One physical directory has one live
 MindBridge owner, and each independent benchmark unit needs its own new directory.
 
+For participant-hosted Add/Search evaluation, use `mindbridge-bench eval serve`. See the
+[Agent Memory Leaderboard adapter](agent-memory-leaderboard.md) for configuration, authentication,
+ordered image content, physical user isolation, and retry behavior.
+
 ## Install and inspect tasks
 
 From a repository checkout, install the model and dataset extras used by the evaluation harness:

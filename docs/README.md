@@ -55,6 +55,8 @@ have one place to stay current.
 - [Command line](api/cli.md) — commands, input forms, JSON output, and exit codes.
 - [Local WeMM deployment](use-local-wemm.md) — configure a local WeMM embedding service with the
   public SDK.
+- [Agent Memory Leaderboard](agent-memory-leaderboard.md) — host the benchmark Add/Search format
+  with physically isolated user stores.
 
 ## Deploy and operate
 
