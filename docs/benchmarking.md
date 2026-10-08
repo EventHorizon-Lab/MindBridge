@@ -1371,6 +1371,30 @@ synthetic-vector storage number and is not the product ingest figure: it never e
 modality, prepares media, grounds an answer, or touches `Memory`. The product ingest latency and
 throughput come from the `ingest` block of an `eval` run, which drives the public SDK.
 
+## Prompt selection diagnostic
+
+`benchmarks/prompt_ab.py` compares independent relevance with the additional information a
+candidate contributes beside a fixed anchor. Run it from the repository root:
+
+```bash
+uv run --frozen python benchmarks/prompt_ab.py
+```
+
+The runner uses the endpoint settings in `MINDBRIDGE_EVAL_ENV` (default
+`~/.config/mindbridge-eval.env`): `MINDBRIDGE_GENERATION_MODEL`,
+`MINDBRIDGE_GENERATION_BASE_URL`, `MINDBRIDGE_GENERATION_API_KEY`,
+`MINDBRIDGE_EMBEDDING_MODEL`, `MINDBRIDGE_EMBEDDING_BASE_URL`, and optionally
+`MINDBRIDGE_EMBEDDING_API_KEY`. Its embedding endpoint must serve 2048-dimensional vectors
+through the chat-style embedding request format used by the research runners.
+
+Each of 36 constructed scenarios has ten candidates and a four-record reader window. Both
+prompts run with two candidate orders through `Memory.ask`, using a separate temporary store
+for each scenario. Answers use normalized exact matching, with no model judge. Recipes,
+samples, request usage, and summaries are saved beneath
+`~/.local/share/openresearch/benchmark-cache/mindbridge/prompt-ab-20260920/`.
+These authored scenarios diagnose the selection mechanism; they do not establish performance
+on natural benchmark data. The ordinary benchmark launch commands retain their existing dispatch.
+
 ## Artifact safety
 
 Benchmark directories may contain licensed dataset content, embeddings, prompts, and responses.
