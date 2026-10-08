@@ -7,6 +7,10 @@ owns the typed-record contract, [context compilation](context-compilation.md) ow
 [plugin architecture](plugin-architecture.md) owns the admission rule, and the API references own
 current contracts.
 
+Scope: this is a direction document. The implemented status below refers to this checkout;
+research citations support the design discussion, not a benchmark claim for MindBridge. Frozen
+experiments and rejected integration paths are indexed in the [research archive](research/README.md).
+
 ## Positioning
 
 The product goal is not to recognize a person's true emotion. Emotion is not a measurable field

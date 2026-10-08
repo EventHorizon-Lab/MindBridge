@@ -1,5 +1,9 @@
 # Compact context presentation prototype
 
+Status: `ContextBundle.compact()` is implemented as an opt-in Python surface in this checkout.
+The prototype name and frozen measurement below describe its evaluation status. For current
+selection and budget semantics, see [context compilation](context-compilation.md).
+
 `ContextBundle.render()` already exists and remains unchanged. This prototype adds the optional
 Python-only `ContextBundle.compact()` method. It returns a frozen `ContextPresentation` containing
 the presentation text, its exact character count, and an ordered tuple of typed `ContextSymbol`

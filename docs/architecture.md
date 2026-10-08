@@ -236,6 +236,12 @@ must be distinguishable from one who is absent.
 
 ## Retrieval consistency
 
+`retrieval_mode` selects the instance's candidate routes. `hybrid` runs dense and lexical
+retrieval; `dense` runs vector candidates only; `lexical` skips query embedding and ranks native
+normalized full-text candidates. Every mode still hydrates SQLite records and applies the same
+visibility and scope checks. Ingestion stores embeddings in all modes, so changing the route
+after closing an owner does not require re-embedding.
+
 ```mermaid
 flowchart LR
     query["Validate and prepare query"] --> embed["Embed aggregate and focused keys"]

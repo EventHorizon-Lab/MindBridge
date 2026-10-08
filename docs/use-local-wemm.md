@@ -37,12 +37,23 @@ settings:
   index_speech: true
 ```
 
-Open the configuration with the public SDK:
+Save the YAML as `config.yaml`. Install the SDK surfaces and the host's YAML parser:
+
+```bash
+uv add "mindbridge[openai,local]" pyyaml
+```
+
+Decode the file before opening the configuration with the public SDK:
 
 ```python
+from pathlib import Path
+
+import yaml
+
 from mindbridge import Memory
 
-with Memory.from_config("/absolute/path/to/config.yaml") as memory:
+config = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+with Memory.from_config(config) as memory:
     # Add records and ask questions through this one physical memory directory.
     pass
 ```
@@ -54,8 +65,10 @@ The local WeMM service in this recipe has a 2048-vector `messages` contract. It 
 images, and videos; it does not accept audio embeddings. Configure FunASR to turn audio and video
 audio into searchable text, then keep `index_speech` enabled. This adds ASR work on ingestion.
 
-The local service limits one request to 128 samples and 64 MiB, each inline media object to 20 MiB,
-and native video input to at least two real frames. It internally microbatches eight samples. Use
+The research service used with this recipe limits one request to 128 samples and 64 MiB, each
+inline media object to 20 MiB, and native video input to at least two real frames. It internally
+microbatches eight samples. These are deployment-specific service limits, not guarantees of the
+WeMM model or MindBridge. Verify them against your server. Use
 the direct service URL above for normal deployments; an experiment cache proxy is not part of the
 public SDK configuration.
 
@@ -96,7 +109,8 @@ needs smaller requests, choose that application-level batch size before calling 
 ```python
 from mindbridge import Memory
 
-with Memory.from_config("/absolute/path/to/config.yaml") as memory:
+# Reuse the decoded config above after adding its optional formation section.
+with Memory.from_config(config) as memory:
     observations = (
         "Ada said she prefers tea.",
         "Ada brought a blue mug to the meeting.",

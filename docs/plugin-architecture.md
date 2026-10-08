@@ -112,14 +112,14 @@ end-to-end identity use case, and product-path tests. A capability that satisfie
 but nothing else is exported surface area with no user, and it costs the same to maintain as one
 that works.
 
-### Outstanding violation
+### Resolved admission gap
 
 `VisionDescriptionBackend` breached criterion 1 for as long as no implementation shipped in `src/`
 and its only implementor in this repository was a test fake. `OpenAIModels.describe` and the
 `vision` configuration key close it; the entry stays because the sequence is the point — a protocol
 admitted ahead of its implementation spent releases as exported surface with no user.
 
-Criterion 2 no longer applies to it either. The describer used to be reachable only from the
+The implementation also meets criterion 2. The describer used to be reachable only from the
 asynchronous vision capture stream; `add` and `add_many` now call a configured one for every
 embedder whenever a visual asset has no description yet, so the capability reaches the path a user
 actually invokes. Declarative configuration closed the remaining gap: the `vision` key builds the

@@ -11,7 +11,7 @@ none creates another store or isolation scope.
 | --- | --- |
 | `memory_type` | Hard exact-role filter when supplied |
 | `occurred_from` / `occurred_until` | Hard event-overlap filter |
-| `RetrievalScope` | Hard valid-time, known-time, symbolic-place, and same-frame metric filters |
+| `RetrievalScope` | Hard valid-time, known-time, identity, symbolic-place, and same-frame metric filters |
 | Temporal phrases in query text | Soft event-time ranking signal relative to `reference_at` |
 | Reinforcement and decay | Soft ranking signals; content is never rewritten or deleted |
 

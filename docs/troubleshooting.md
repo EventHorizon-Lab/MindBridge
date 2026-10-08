@@ -38,6 +38,13 @@ Retry only when `retryable` is true. The closed retryable reasons are `connectio
 
 ## Memory does not open
 
+### A configuration filename is rejected
+
+`Memory.from_config()` accepts a mapping or `MindBridgeConfig`, not a path. Decode JSON with
+`json.loads()` or YAML with the host's `yaml.safe_load()` before passing it. Unknown fields,
+providers, and invalid numeric or Boolean values are rejected at this boundary. See
+[file loading](configuration.md#loading-a-configuration-file).
+
 ### The directory is in use
 
 `reason="data_dir_in_use"` means a live `Memory` owns the physical directory. Close that owner,
@@ -102,8 +109,9 @@ the floor against observed scores gives the wrong value. `search_with_trace()` r
 candidate; use it rather than inferring the threshold from hits that were returned.
 
 Before changing thresholds, rule out a record that was captured but never settled:
-`pending_captures()` lists records that are durable and returned by `get()` and `list()` but hold
-no vectors, and nothing settles them on its own; pass `memory_ids=` to ask about one record, and
+`pending_captures()` lists durable records with deferred work. An `awaiting="enrichment"` row has
+no searchable vectors; an `awaiting="formation"` row is already searchable. Nothing settles them
+on its own; pass `memory_ids=` to ask about one record, and
 read its `awaiting`, `attempts`, and `last_error` if it keeps failing. Call `settle()` —
 `settle(memory_ids=...)` for that record alone, past its retry ceiling — or add the same content,
 which settles it, and search again. A record whose `forgotten_at` is set is excluded
@@ -122,6 +130,11 @@ Then:
 
 SQLite hydration deliberately drops stale Zvec IDs. The defaults and valid ranges are in
 [local memory settings](configuration.md#local-memory-settings).
+
+Check `retrieval_mode` before diagnosing an embedding outage. `lexical` skips query embedding
+and dense candidates, but writes still need embeddings. An image with no text or configured
+caption may have no lexical match; changing to lexical mode is not a substitute for visual
+descriptions. Mode changes do not require re-embedding, but close the owner before reopening.
 
 ## A stored media record fails to load
 

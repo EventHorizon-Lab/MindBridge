@@ -1,5 +1,8 @@
 # Baseline loss decomposition — 2026-09-12
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Source run: `.benchmarks/results/baseline-qwen38-27b-wemm9b-20260911` (`mindbridge-bench eval
 --config .benchmarks/baseline.yaml`, runner at `7d2dd30`, answerer and proxy judge `qwen3.8-27b`,
 embedder `tencent/WeMM-Embedding-2B`, `recall_limit 12`, `answer_policy strict`). Every number here

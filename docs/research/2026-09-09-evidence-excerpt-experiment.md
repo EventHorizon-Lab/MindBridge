@@ -1,5 +1,8 @@
 # Evidence excerpt experiment
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Date: 2026-09-09
 
 Status: isolated prototype. The accepted schema-17 product snapshot was not modified. No model,

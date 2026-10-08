@@ -10,7 +10,7 @@ implemented use-case map. [Architecture](architecture.md) owns implementation in
 
 ```text
 content -> model preparation -> SQLite commit -> Zvec projection
-query   -> Zvec candidates -> SQLite hydration -> ranked evidence
+query   -> selected dense/lexical routes -> SQLite hydration -> ranked evidence
 ```
 
 **Contract:** SQLite is authoritative for records, embeddings, metadata, and pending index work.
@@ -19,6 +19,11 @@ index can be rebuilt from stored embeddings without re-embedding content.
 
 **Guidance:** Treat `Memory` as one embedded runtime boundary. Do not build application state by
 reading SQLite, `assets/`, or Zvec directly.
+
+`capture()` commits the source before model work; `settle()` later enriches and indexes it.
+`get()` and `list()` can read an unsettled source, while retrieval waits for enrichment. A pending
+row may instead owe formation only and already be searchable: inspect its `awaiting` field.
+The host schedules settlement; opening, searching, and closing never do it automatically.
 
 ## Content becomes a record
 
@@ -91,6 +96,7 @@ Every memory requires an `EmbeddingBackend`. Other capabilities are optional:
 | `FaceBackend` | Local face observations and identity evidence |
 | `VisionDescriptionBackend` | Captions not-yet-described visual assets on every write (`add`/`add_many`/`settle`) |
 | `FormationBackend` | Typed records derived from committed observations |
+| `ConsolidationBackend` | Explicit, bounded memory-management proposals validated by the kernel |
 
 Routing follows each backend's declared atomic modalities. Unsupported media fails explicitly
 instead of being discarded.
@@ -114,6 +120,10 @@ probability.
 `ask()` uses the same retrieval path before calling a configured generation backend. Its
 `AnswerResult` reports the answer, the canonical hits used, and explicit abstention state. Calling
 `ask()` without an answerer is a configuration error.
+
+`compile()` instead returns a structured, evidence-closed context bundle without calling a
+generation model. Its character and item budgets differ from `ask()`'s grounding window. Use
+[context compilation](context-compilation.md) when the host constructs its own prompt.
 
 **Guidance:** Handle empty search results and answer abstention as ordinary outcomes. Use
 `search_with_trace()` for one local ranking investigation; normal telemetry intentionally omits
