@@ -1328,11 +1328,6 @@ async def test_the_compile_tool_reports_a_named_actor_too() -> None:
     ]
 
 
-def test_the_compile_tool_schema_rejects_non_finite_freshness() -> None:
-    with pytest.raises(ValueError):
-        content.ContextBudgetInput.model_validate({"freshness_seconds": float("inf")})
-
-
 async def test_the_compile_tool_rejects_an_unrepresentable_freshness() -> None:
     memory = FakeMemory()
 

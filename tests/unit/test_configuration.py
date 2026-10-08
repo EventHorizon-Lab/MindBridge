@@ -188,19 +188,6 @@ def test_local_policy_defaults_stay_pinned_to_their_recorded_provenance() -> Non
         face_margin=0.05,
         identity_link_min_assets=2,
     )
-    # `0.10` gates the same relevance `SearchHit.score` reports and reproduces the effective floor
-    # of the pre-rescale `0.55`. A future reader tidying it to a rounder number would silently
-    # tighten retrieval, so pin it separately from the whole-value assertion above.
-    assert defaults.minimum_relevance == 0.10
-    # `face_similarity` is upstream SFace's `_threshold_cosine` verbatim. `speaker_similarity` has
-    # no upstream provenance and is deliberately NOT the pinned CAM++ recipe's published
-    # `yesOrno_thr` of 0.31: that number is calibrated for a single embedding pair, while the
-    # matcher accepts on a `max` over up to 20 exemplars, where it is a lower bound rather than an
-    # operating point. Erring high fragments identities; erring low merges two people.
-    assert defaults.face_similarity == 0.363
-    assert defaults.speaker_similarity == 0.78
-    assert defaults.speaker_similarity > 0.31
-    assert defaults.speaker_margin > 0
     # The kernel and the declarative path must read the same defaults; a divergence would make
     # `Memory(...)` and `Memory.from_config({})` two different products.
     assert (

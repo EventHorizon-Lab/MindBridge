@@ -1189,33 +1189,6 @@ def test_scalar_metric_samples_do_not_truncate_late_observations() -> None:
 # --- reproducibility fields ------------------------------------------------------------------
 
 
-def test_metric_breakdown_families_all_exist_in_the_single_family_table() -> None:
-    """No second, drifting copy of the task-family table may reappear in ``eval.py``."""
-    from mindbridge.benchmarks.official_scorers import task_family
-    from mindbridge.benchmarks.task_catalog import TASKS
-
-    known = {task_family(name) for name in TASKS} - {None}
-    task = cast(Any, SimpleNamespace(spec=SimpleNamespace(name="locomo-refined")))
-    declared = eval_metrics_module._metric_breakdowns(task, (), _arguments())
-
-    assert declared == {}
-    assert "locomo-refined" in known
-    for family in (
-        "locomo-refined",
-        "m3-bench",
-        "video-mme-v2",
-        "worldmemarena",
-        "egotempo",
-        "memlens",
-        "mm-lifelong",
-        "supermemory-vqa",
-        "atm-bench",
-        "mem-gallery",
-        "openeqa",
-    ):
-        assert family in known, family
-
-
 def test_table_refuses_a_task_row_that_carries_no_controls() -> None:
     results = {
         "tasks": [

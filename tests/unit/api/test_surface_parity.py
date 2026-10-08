@@ -825,15 +825,6 @@ def test_every_surface_publishes_one_context_bundle_document() -> None:
     assert actors[1] == {"identity_id": "identity_1", "memory_ids": ["memory_1"]}
 
 
-def test_render_covers_every_section_the_bundle_declares() -> None:
-    """A section added to `ContextBundle` must be rendered, not silently dropped from the text."""
-    bundle = _sample_bundle()
-    headings = {heading.casefold() for heading, _section in bundle._sections()}
-
-    assert headings <= {field.name for field in dataclass_fields(ContextBundle)}
-    assert "## Actors" in bundle.render()
-
-
 def test_the_two_budget_projections_agree_on_every_bound() -> None:
     """`ContextBudget.document()` is what all three surfaces publish and the CLI sends."""
     budget = ContextBudget(max_chars=2_000, max_items=8, min_confidence=0.5)

@@ -960,7 +960,7 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
     assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
 
 
-def test_backend_pool_forwards_every_memory_setting(
+def test_backend_pool_forwards_every_memory_setting_and_plugin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A hand-written forwarding list drops new policy or a new plugin silently, which is worse
@@ -978,13 +978,9 @@ def test_backend_pool_forwards_every_memory_setting(
     settings = MemoryConfig(
         evidence_budget_chars=4_242, minimum_relevance=0.11, recall_set_max_rows=17
     )
-    pool._settings = settings
-    pool._tracer = trace.get_tracer(__name__)
-    for entry in fields(MemoryPlugins):
-        setattr(pool, f"_{entry.name}", None)
     # Every declared plugin slot gets its own distinguishable sentinel, so a dropped or
     # mis-mapped backend cannot pass by looking like its neighbour or like "not configured".
-    backends = {entry.name: f"backend:{entry.name}" for entry in fields(MemoryPlugins)}
+    backends = {entry.name: object() for entry in fields(MemoryPlugins)}
     pool._settings = settings
     pool._tracer = cast(Tracer, None)
     for name, value in backends.items():
@@ -995,39 +991,12 @@ def test_backend_pool_forwards_every_memory_setting(
     for entry in fields(MemoryConfig):
         assert captured[entry.name] == getattr(settings, entry.name), entry.name
     for name, value in backends.items():
-        assert captured[name] == value, name
+        assert captured[name] is value, name
     # Deriving the forwarding from the dataclasses is only safe while every declared field names
     # a real constructor keyword; a field added without one would raise at call time instead.
     declared = {entry.name for entry in (*fields(MemoryConfig), *fields(MemoryPlugins))}
     unaccepted = declared - set(signature(Memory.__init__).parameters)
     assert not unaccepted, f"Memory.__init__ has no keyword for {sorted(unaccepted)}"
-
-
-def test_backend_pool_forwards_every_capability_plugin(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """`former` was declared on `MemoryPlugins`, built by the SDK adapter, and used by `Memory`,
-    yet the harness never passed it, so no benchmark run has ever exercised derived-memory
-    formation. Deriving the expected keywords from the dataclass makes the next omission red."""
-    captured: dict[str, object] = {}
-
-    class Recorder:
-        def __init__(self, _data_dir: object, **values: object) -> None:
-            captured.update(values)
-
-    monkeypatch.setattr(eval_module, "Memory", Recorder)
-    monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
-    pool = object.__new__(eval_module._BackendPool)
-    pool._settings = MemoryConfig()
-    pool._tracer = trace.get_tracer(__name__)
-    markers = {entry.name: object() for entry in fields(MemoryPlugins)}
-    for name, marker in markers.items():
-        setattr(pool, f"_{name}", marker)
-
-    pool.memory(tmp_path / "unused")
-
-    for name, marker in markers.items():
-        assert captured[name] is marker, name
 
 
 def test_implementation_identity_tracks_editable_source_changes(
@@ -4094,6 +4063,7 @@ def test_every_family_breaks_its_scores_down_by_its_own_metadata(
     )
 
     assert set(breakdowns) == set(fields_expected), family
+    assert eval_metrics_module._metric_breakdowns(task, (), cast(Any, _breakdown_arguments())) == {}
     for name in fields_expected:
         cell = cast(dict[str, object], breakdowns[name])
         assert f"{name}-value" in cell, f"{family}.{name}"
