@@ -54,13 +54,16 @@ uv add "mindbridge[local,openai]"
 ```python
 from openai import OpenAI
 
-from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
+from mindbridge import SentenceTransformersEmbedder, Memory, OpenAIModels
 
 client = OpenAI(timeout=30.0, max_retries=3)
 try:
     with Memory(
         "/var/lib/mindbridge/assistant",
-        embedder=JinaOmniEmbedder(),
+        embedder=SentenceTransformersEmbedder(
+            model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+            revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        ),
         answerer=OpenAIModels(generation_client=client),
     ) as memory:
         memory.add("Process-owned memory")
@@ -88,13 +91,16 @@ Compose one caller-owned instance in `my_application.py`:
 ```python
 from openai import OpenAI
 
-from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
+from mindbridge import SentenceTransformersEmbedder, Memory, OpenAIModels
 from mindbridge.api import create_app
 
 client = OpenAI(timeout=30.0, max_retries=3)
 memory = Memory(
     "/var/lib/mindbridge/assistant",
-    embedder=JinaOmniEmbedder(),
+    embedder=SentenceTransformersEmbedder(
+        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+    ),
     answerer=OpenAIModels(generation_client=client),
 )
 app = create_app(memory=memory)
@@ -134,7 +140,11 @@ from mindbridge.api.mcp import build_mcp_server
 with Memory.from_config(
     {
         "data_dir": "/var/lib/mindbridge/assistant",
-        "embedding": {"provider": "jina-omni"},
+        "embedding": {
+            "provider": "sentence-transformers",
+            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        },
     }
 ) as memory:
     build_mcp_server(memory).run("stdio")

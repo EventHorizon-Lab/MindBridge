@@ -26,7 +26,7 @@ from mindbridge.benchmarks.locomo_refined_runner import (
     run_locomo_refined_conversation,
 )
 from mindbridge.benchmarks.model_config import ModelConfig
-from mindbridge.models.jina import DEFAULT_JINA_DIMENSION, DEFAULT_JINA_MODEL_ID
+from mindbridge.models._jina import DEFAULT_JINA_DIMENSION, DEFAULT_JINA_MODEL_ID
 
 LOCOMO_REFINED_RUNNER_VERSION = "locomo_refined_local_v2"
 

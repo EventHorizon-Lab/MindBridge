@@ -35,7 +35,6 @@ from mindbridge.models.base import (
     VisionDescriptionBackend,
 )
 from mindbridge.models.funasr import FunASRTranscriber
-from mindbridge.models.jina import DEFAULT_JINA_DIMENSION, JinaOmniEmbedder
 from mindbridge.models.openai_sdk import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_MODEL,
@@ -120,17 +119,10 @@ class OpenAIEmbeddingConfig(_OpenAIConfig):
     request_format: Literal["input", "messages"] = "input"
 
 
-class JinaEmbeddingConfig(_ConfigModel):
-    provider: Literal["jina-omni"]
-    dimension: _PositiveInt = DEFAULT_JINA_DIMENSION
-    device: _Text | None = None
-    batch_size: _PositiveInt = 32
-
-
 class SentenceTransformersEmbeddingConfig(_ConfigModel):
     provider: Literal["sentence-transformers"]
     model: _Text
-    revision: _Text
+    revision: _Text | None = None
     dimension: _PositiveInt | None = None
     device: _Text | None = None
     batch_size: _PositiveInt = 32
@@ -244,7 +236,7 @@ class OpenCVFaceConfig(_ConfigModel):
 
 
 EmbeddingProviderConfig = Annotated[
-    OpenAIEmbeddingConfig | JinaEmbeddingConfig | SentenceTransformersEmbeddingConfig,
+    OpenAIEmbeddingConfig | SentenceTransformersEmbeddingConfig,
     Field(discriminator="provider"),
 ]
 SpeechProviderConfig = Annotated[
@@ -404,14 +396,8 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
         if config.space is not None:
             values["embedding_space"] = config.space
         return _openai_factory(values)
-    if isinstance(config, JinaEmbeddingConfig):
-        return JinaOmniEmbedder(
-            dimension=config.dimension,
-            device=config.device,
-            batch_size=config.batch_size,
-        )
-    return SentenceTransformersEmbedder.load(
-        config.model,
+    return SentenceTransformersEmbedder(
+        model_id=config.model,
         revision=config.revision,
         dimension=config.dimension,
         device=config.device,
@@ -504,7 +490,6 @@ def _build_face(config: OpenCVFaceConfig) -> FaceBackend:
 __all__ = [
     "EmbeddingProviderConfig",
     "FunASRSpeechConfig",
-    "JinaEmbeddingConfig",
     "MemoryComposition",
     "MindBridgeConfig",
     "OpenAIConsolidationConfig",

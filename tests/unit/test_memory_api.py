@@ -2522,7 +2522,11 @@ def test_memory_from_config_uses_the_same_kernel_and_closes_resolved_backends(
 
     config = {
         "data_dir": tmp_path,
-        "embedding": {"provider": "jina-omni"},
+        "embedding": {
+            "provider": "sentence-transformers",
+            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        },
         "generation": {"provider": "openai", "model": "gpt-5-mini"},
         "speech": {"provider": "funasr"},
         "face": {
@@ -2580,7 +2584,11 @@ def test_memory_from_config_validates_settings_before_building_backends(
     with pytest.raises(ValidationError, match=r"config\.settings\.minimum_relevance"):
         Memory.from_config(
             {
-                "embedding": {"provider": "jina-omni"},
+                "embedding": {
+                    "provider": "sentence-transformers",
+                    "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+                    "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                },
                 "settings": {"minimum_relevance": 2},
             }
         )
@@ -2600,7 +2608,11 @@ def test_config_resolution_closes_an_earlier_backend_when_a_later_one_fails(
     with pytest.raises(ValidationError, match="generation config failed"):
         Memory.from_config(
             {
-                "embedding": {"provider": "jina-omni"},
+                "embedding": {
+                    "provider": "sentence-transformers",
+                    "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+                    "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                },
                 "generation": {"provider": "openai"},
             }
         )
@@ -6393,15 +6405,14 @@ async def test_omni_prefetch_coalesces_snapshots_and_confirms_the_final_query() 
     audio = Blob(b"audio", "audio/wav", "sound.wav")
     partial: list[str | Blob] = ["red partial", image, audio]
 
-    first_revision = prefetch.submit(partial)
+    prefetch.submit(partial)
     partial[0] = "mutated after submit"
     await search_memory.started.wait()
     prefetch.submit(("red newer", image, audio))
     search_memory.release.set()
     result = await prefetch.finalize(("red final", image, audio))
 
-    assert first_revision == 1
-    assert result.revision == 3
+    assert result.hits == ()
     assert search_memory.calls == [
         ("red partial", image, audio),
         ("red final", image, audio),
@@ -6431,8 +6442,51 @@ async def test_omni_prefetch_retries_a_failed_final_snapshot() -> None:
     await search_memory.failed.wait()
     result = await prefetch.finalize("red final")
 
-    assert result.revision == 2
+    assert result.hits == ()
     assert search_memory.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_omni_prefetch_reuses_a_completed_snapshot() -> None:
+    class SearchMemory:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.completed = asyncio.Event()
+
+        async def search(self, _query: object, **_options: object) -> tuple[SearchHit, ...]:
+            self.calls += 1
+            self.completed.set()
+            return ()
+
+    search_memory = SearchMemory()
+    prefetch = AsyncOmniPrefetch(cast(AsyncMemory, search_memory))
+    prefetch.submit("final")
+    await search_memory.completed.wait()
+    completed = prefetch.latest
+    assert completed is not None
+    assert await prefetch.finalize("final") is completed
+    assert search_memory.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_omni_prefetch_does_not_return_an_old_success_after_final_failure() -> None:
+    class SearchMemory:
+        def __init__(self) -> None:
+            self.completed = asyncio.Event()
+
+        async def search(self, query: object, **_options: object) -> tuple[SearchHit, ...]:
+            if query == "final":
+                raise ModelError("final search failed")
+            self.completed.set()
+            return ()
+
+    search_memory = SearchMemory()
+    prefetch = AsyncOmniPrefetch(cast(AsyncMemory, search_memory))
+    prefetch.submit("partial")
+    await search_memory.completed.wait()
+    assert prefetch.latest is not None
+    with pytest.raises(ModelError, match="final search failed"):
+        await prefetch.finalize("final")
 
 
 @pytest.mark.asyncio
@@ -6473,7 +6527,11 @@ async def test_async_memory_from_config_uses_the_same_composition(
     async with AsyncMemory.from_config(
         {
             "data_dir": tmp_path,
-            "embedding": {"provider": "jina-omni"},
+            "embedding": {
+                "provider": "sentence-transformers",
+                "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+                "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            },
             "settings": {"minimum_relevance": 0},
         }
     ) as memory:

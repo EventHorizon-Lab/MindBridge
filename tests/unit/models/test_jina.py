@@ -7,15 +7,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import mindbridge.models.jina as jina
+import mindbridge.models._jina as jina
+from mindbridge import Memory
 from mindbridge.exceptions import ModelError, ValidationError
-from mindbridge.models.base import EmbeddingBackend, EmbedTask, ModelInput
-from mindbridge.models.jina import (
+from mindbridge.infrastructure.local.store import LocalStore
+from mindbridge.models._jina import (
     DEFAULT_JINA_MODEL_ID,
     DEFAULT_JINA_REVISION,
-    JinaOmniEmbedder,
 )
-from mindbridge.models.sentence_transformers import _recipe_space
+from mindbridge.models.base import EmbeddingBackend, EmbedTask, ModelInput
+from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder, _recipe_space
 from mindbridge.types import AssetRef, Modality
 
 _DEFAULT_PROCESSOR = object()
@@ -93,7 +94,7 @@ class _Encoder:
     def __init__(
         self,
         *,
-        dimension: int = 2,
+        dimension: int = 32,
         processor: object | None = _DEFAULT_PROCESSOR,
     ) -> None:
         self.dimension = dimension
@@ -128,7 +129,7 @@ class _Encoder:
     ) -> _Matrix:
         del convert_to_numpy, normalize_embeddings
         self.calls.append(("encode", sentences, truncate_dim, batch_size))
-        return _Matrix([[3.0, 4.0] for _ in sentences])
+        return _Matrix([[3.0, 4.0, *([0.0] * (self.dimension - 2))] for _ in sentences])
 
     def encode_query(
         self,
@@ -141,7 +142,7 @@ class _Encoder:
     ) -> _Matrix:
         del convert_to_numpy, normalize_embeddings
         self.calls.append(("query", sentences, truncate_dim, batch_size))
-        return _Matrix([[3.0, 4.0] for _ in sentences])
+        return _Matrix([[3.0, 4.0, *([0.0] * (self.dimension - 2))] for _ in sentences])
 
     def encode_document(
         self,
@@ -154,14 +155,20 @@ class _Encoder:
     ) -> _Matrix:
         del convert_to_numpy, normalize_embeddings
         self.calls.append(("document", sentences, truncate_dim, batch_size))
-        return _Matrix([[3.0, 4.0] for _ in sentences])
+        return _Matrix([[3.0, 4.0, *([0.0] * (self.dimension - 2))] for _ in sentences])
 
 
 def test_loaded_jina_uses_official_query_document_methods_and_native_parts(
     tmp_path: Path,
 ) -> None:
     encoder = _Encoder()
-    embedder = jina._LoadedJinaOmniEmbedder(encoder, dimension=2, batch_size=6)
+    embedder = SentenceTransformersEmbedder(
+        model_id=DEFAULT_JINA_MODEL_ID,
+        revision=DEFAULT_JINA_REVISION,
+        encoder=encoder,
+        dimension=32,
+        batch_size=6,
+    )
     image = _asset(tmp_path, "image", Modality.IMAGE, "image/png")
 
     vectors = embedder.embed(
@@ -179,8 +186,8 @@ def test_loaded_jina_uses_official_query_document_methods_and_native_parts(
         Modality.VIDEO,
         Modality.AUDIO,
     }
-    assert vectors[0] == pytest.approx((0.6, 0.8))
-    assert vectors[1] == pytest.approx((0.6, 0.8))
+    assert vectors[0] == pytest.approx((0.6, 0.8, *([0.0] * 30)))
+    assert vectors[1] == pytest.approx((0.6, 0.8, *([0.0] * 30)))
     method, prepared, truncate_dim, batch_size = encoder.calls[0]
     assert (method, truncate_dim, batch_size) == ("query", None, 6)
     fused = prepared[0]
@@ -195,7 +202,12 @@ def test_application_text_cannot_trigger_jina_url_or_path_autodetection(tmp_path
     local.write_bytes(b"not an image")
     texts = ("https://127.0.0.1/private.png", str(local))
     encoder = _Encoder()
-    embedder = jina._LoadedJinaOmniEmbedder(encoder, dimension=2)
+    embedder = SentenceTransformersEmbedder(
+        model_id=DEFAULT_JINA_MODEL_ID,
+        revision=DEFAULT_JINA_REVISION,
+        encoder=encoder,
+        dimension=32,
+    )
 
     embedder.embed(tuple(ModelInput(text=text) for text in texts))
 
@@ -212,7 +224,12 @@ def test_loaded_jina_keeps_video_paths_and_configures_only_its_processor() -> No
     first = encoder[0]
     other = sibling[0]
 
-    jina._LoadedJinaOmniEmbedder(encoder, dimension=2)
+    SentenceTransformersEmbedder(
+        model_id=DEFAULT_JINA_MODEL_ID,
+        revision=DEFAULT_JINA_REVISION,
+        encoder=encoder,
+        dimension=32,
+    )
 
     assert first._encode_composite_parts([("video", "clip.mp4")], "cpu") == ("clip.mp4",)  # type: ignore[attr-defined]
     assert other._encode_composite_parts([("video", "clip.mp4")], "cpu") == (  # type: ignore[attr-defined]
@@ -249,7 +266,12 @@ def test_loaded_jina_uses_pyav_metadata_and_unique_bounded_frames(tmp_path: Path
 
     video_processor = qwen.Qwen3VLVideoProcessor()
     encoder = _Encoder(processor=SimpleNamespace(video_processor=video_processor))
-    jina._LoadedJinaOmniEmbedder(encoder, dimension=2)
+    SentenceTransformersEmbedder(
+        model_id=DEFAULT_JINA_MODEL_ID,
+        revision=DEFAULT_JINA_REVISION,
+        encoder=encoder,
+        dimension=32,
+    )
 
     batched_frames, batched_metadata = video_processor.fetch_videos(
         [str(path)], sample_indices_fn=video_processor.sample_frames
@@ -308,18 +330,26 @@ def test_loaded_jina_uses_pyav_metadata_and_unique_bounded_frames(tmp_path: Path
         video_processor.sample_frames(metadata_module.VideoMetadata(total_num_frames=0))
 
 
+@pytest.mark.parametrize("revision", (None, DEFAULT_JINA_REVISION))
 def test_public_adapter_has_fixed_identity_and_does_not_load_until_needed(
     monkeypatch: pytest.MonkeyPatch,
+    revision: str | None,
 ) -> None:
     loads: list[dict[str, object]] = []
     monkeypatch.setattr(jina, "find_spec", lambda _name: SimpleNamespace())
 
-    def unexpected_load(**kwargs: object) -> jina._LoadedJinaOmniEmbedder:
+    def unexpected_load(**kwargs: object) -> _Encoder:
         loads.append(kwargs)
         raise AssertionError("empty embed or close loaded weights")
 
     monkeypatch.setattr(jina, "_load_jina", unexpected_load)
-    backend = JinaOmniEmbedder(dimension=32, device="cpu", batch_size=7)
+    backend = SentenceTransformersEmbedder(
+        model_id=DEFAULT_JINA_MODEL_ID,
+        revision=revision,
+        dimension=32,
+        device="cpu",
+        batch_size=7,
+    )
 
     assert isinstance(backend, EmbeddingBackend)
     assert backend.embedding_model == DEFAULT_JINA_MODEL_ID
@@ -428,7 +458,13 @@ def test_loader_pins_revision_and_isolates_provider_class_patch(
     monkeypatch.setattr(jina, "find_spec", lambda _name: SimpleNamespace())
     monkeypatch.setattr(jina, "import_module", importer)
     monkeypatch.setattr(jina, "_jina_methods", None)
-    backend = JinaOmniEmbedder.load(dimension=32, device="cpu", batch_size=5)
+    backend = SentenceTransformersEmbedder.load(
+        model_id=DEFAULT_JINA_MODEL_ID,
+        revision=DEFAULT_JINA_REVISION,
+        dimension=32,
+        device="cpu",
+        batch_size=5,
+    )
 
     assert DEFAULT_JINA_REVISION == "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4"
     assert calls == [
@@ -453,13 +489,23 @@ def test_jina_readiness_validation_stays_at_the_adapter_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ModelError, match="media processor"):
-        jina._LoadedJinaOmniEmbedder(_Encoder(processor=None), dimension=2)
+        SentenceTransformersEmbedder(
+            model_id=DEFAULT_JINA_MODEL_ID,
+            revision=DEFAULT_JINA_REVISION,
+            encoder=_Encoder(processor=None),
+            dimension=32,
+        )
 
     monkeypatch.setattr(jina, "find_spec", lambda _name: None)
     with pytest.raises(ModelError, match="local extra"):
-        JinaOmniEmbedder()
+        SentenceTransformersEmbedder(
+            model_id=DEFAULT_JINA_MODEL_ID,
+            revision=DEFAULT_JINA_REVISION,
+        )
     with pytest.raises(ValidationError, match="one of"):
-        JinaOmniEmbedder(dimension=2)
+        SentenceTransformersEmbedder(
+            model_id=DEFAULT_JINA_MODEL_ID, revision=DEFAULT_JINA_REVISION, dimension=2
+        )
 
 
 def test_jina_video_provider_shape_mismatch_fails_closed() -> None:
@@ -469,6 +515,57 @@ def test_jina_video_provider_shape_mismatch_fails_closed() -> None:
 
     with pytest.raises(ModelError, match="video integration is incompatible"):
         jina._configure_jina_video(module)
+
+
+def test_jina_rejects_an_unsupported_revision_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jina, "find_spec", lambda _name: None)
+    with pytest.raises(ValidationError, match="supported pinned revision"):
+        SentenceTransformersEmbedder.load(DEFAULT_JINA_MODEL_ID, revision="a" * 40)
+
+
+def test_lazy_jina_can_retry_after_encoder_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jina, "find_spec", lambda _name: SimpleNamespace())
+    encoders = iter((_Encoder(dimension=2), _Encoder(dimension=32)))
+    monkeypatch.setattr(jina, "_load_jina", lambda **_kwargs: next(encoders))
+    backend = SentenceTransformersEmbedder(
+        model_id=DEFAULT_JINA_MODEL_ID, revision=DEFAULT_JINA_REVISION, dimension=32
+    )
+    try:
+        with pytest.raises(ModelError, match="native dimension"):
+            backend.embed((ModelInput(text="memory"),))
+        assert len(backend.embed((ModelInput(text="memory"),))[0]) == 32
+    finally:
+        backend.close()
+
+
+def test_unified_jina_reopens_the_existing_space_without_reembedding(tmp_path: Path) -> None:
+    encoder = _Encoder(dimension=32)
+    backend = SentenceTransformersEmbedder(
+        encoder, model_id=DEFAULT_JINA_MODEL_ID, revision=DEFAULT_JINA_REVISION, dimension=32
+    )
+    with Memory(tmp_path, embedder=backend) as memory:
+        record = memory.add("The spare key is in the blue toolbox.")
+    with LocalStore(tmp_path) as store:
+        assert store.get_metadata("embedding.space_id") == _recipe_space(
+            "jina-v5-omni-official-sentence-transformers-v6",
+            DEFAULT_JINA_MODEL_ID,
+            DEFAULT_JINA_REVISION,
+            32,
+        )
+    reopened_encoder = _Encoder(dimension=32)
+    reopened = SentenceTransformersEmbedder(
+        reopened_encoder,
+        model_id=DEFAULT_JINA_MODEL_ID,
+        revision=DEFAULT_JINA_REVISION,
+        dimension=32,
+    )
+    with Memory(tmp_path, embedder=reopened) as memory:
+        assert memory.get(record.id).content == record.content
+        assert reopened_encoder.calls == []
 
 
 def _asset(

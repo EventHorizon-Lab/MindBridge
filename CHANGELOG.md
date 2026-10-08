@@ -366,7 +366,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - An `AsyncMemory` facade with the same operations and return values.
 - `AsyncOmniPrefetch`, a per-turn speculative-recall helper that accepts complete text, image,
   video, audio, or combined snapshots, permits only one real search at a time, coalesces queued
-  revisions, and confirms the exact final snapshot without persisting partial input.
+  snapshots, and confirms the exact final snapshot without persisting partial input.
 - An OpenEQA (EM-EQA) benchmark task pair, `openeqa-hm3d` and `openeqa-scannet`, scored with
   the official LLM-Match protocol. Episode histories are operator-supplied and are prepared by
   encoding each episode's official frame order at one frame per second.
@@ -568,6 +568,19 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- **Breaking:** `PrefetchResult` contains only `hits`, and `AsyncOmniPrefetch.submit()` returns
+  `None`. Submission revisions remain internal; use `finalize()` for the exact final query.
+- Sentence Transformers model `revision` is optional in Python and configuration. Omitted
+  revisions resolve to an immutable Hub commit before loading; Jina retains its bundled pin,
+  and injected encoders use their configuration's commit hash. Vector-space identity still
+  includes the resolved commit. Explicit pins remain available for reproducible offline use.
+- **Breaking:** Jina Omni now uses `SentenceTransformersEmbedder` and the
+  `sentence-transformers` configuration provider with an explicit model. The separate
+  `JinaOmniEmbedder` import and `jina-omni` configuration provider are removed. The pinned
+  checkpoint retains lazy construction, remote-code isolation, typed text input, bounded video
+  sampling, its current embedding space ID, and historical space upgrades.
+  `SentenceTransformersEmbedder.load` still loads eagerly, and the CLI `jina-omni` model recipe
+  remains available. See the [migration guide](docs/configuration.md#migrating-the-jina-provider).
 - Dense search asks the vector index for the largest candidate list Zvec accepts instead of 300.
   Once a collection holds enough vectors for Zvec to build a graph its search is approximate, and
   nothing in the index reports the neighbours it missed: `doc_count` and `index_completeness` both
