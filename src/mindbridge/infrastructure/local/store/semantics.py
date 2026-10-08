@@ -43,6 +43,7 @@ from mindbridge.infrastructure.local.store._operations import active_operation_i
 from mindbridge.infrastructure.local.store.errors import StaleOperationError
 from mindbridge.infrastructure.local.store.records import (
     MemoryRecords,
+    read_memories,
     replace_memory_embeddings,
     write_embedding,
     write_memory,
@@ -83,7 +84,8 @@ class Semantics:
         require_identifier(memory_id, "memory_id")
         with self._connections.read_transaction() as connection:
             nodes, truncated = _load_nodes(connection, memory_id)
-            records = self._records.read_memories(
+            records = read_memories(
+                connection,
                 tuple(nodes),
                 valid_at=None if scope is None else scope.valid_at,
                 known_at=None if scope is None else scope.known_at,

@@ -114,7 +114,8 @@ the historical ICM model scoring run has not been repeated by this patch.
 ## Selected proof and diagnostic media implementation
 
 `ContextBudget.selected_proofs` defaults off. When enabled, SQLite supplies bounded authoritative
-AND assessments and raw capture groups; complete acyclic certificates preserve the separately
+AND assessments and scoped records in one read snapshot, including during concurrent deletion.
+Complete acyclic certificates preserve the separately
 required support count and confidence. Selection buys their union, which may require different
 witnesses, and completes the confidence obligations of intermediate delivered assertions.
 Certificate text, full records and media all spend the ordinary budgets. Competing-value and
