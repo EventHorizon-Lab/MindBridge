@@ -18,6 +18,11 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from mindbridge.exceptions import ValidationError
+from mindbridge.models._jina import (
+    DEFAULT_JINA_DIMENSION,
+    DEFAULT_JINA_MODEL_ID,
+    DEFAULT_JINA_REVISION,
+)
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -32,12 +37,6 @@ from mindbridge.models.funasr import (
     DEFAULT_FUNASR_RECIPE,
     FunASRTranscriber,
 )
-from mindbridge.models.jina import (
-    DEFAULT_JINA_DIMENSION,
-    DEFAULT_JINA_MODEL_ID,
-    DEFAULT_JINA_REVISION,
-    JinaOmniEmbedder,
-)
 from mindbridge.models.openai_sdk import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_MODEL,
@@ -45,6 +44,7 @@ from mindbridge.models.openai_sdk import (
     DEFAULT_TRANSCRIPTION_MODEL,
     OpenAIModels,
 )
+from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 from mindbridge.types import Modality
 
 if TYPE_CHECKING:
@@ -112,7 +112,7 @@ def describe(name: str) -> dict[str, object]:
     if family == JINA_OMNI:
         return {
             "recipe": name,
-            "class": _qualified(JinaOmniEmbedder),
+            "class": _qualified(SentenceTransformersEmbedder),
             "slots": list(slots(name)),
             "models": {"embedder": DEFAULT_JINA_MODEL_ID},
             "revision": DEFAULT_JINA_REVISION,
@@ -231,7 +231,8 @@ def _build(name: str, *, slot: Slot, load: bool) -> object:
     family, model = _split(name)
     require_slot(name, slot)
     if family == JINA_OMNI:
-        return JinaOmniEmbedder.load() if load else JinaOmniEmbedder()
+        factory = SentenceTransformersEmbedder.load if load else SentenceTransformersEmbedder
+        return factory(model_id=DEFAULT_JINA_MODEL_ID, revision=DEFAULT_JINA_REVISION)
     if family == FUNASR:
         if load:
             # FunASR publishes no loader, so the deepest honest probe is the deferred import an

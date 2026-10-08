@@ -290,7 +290,8 @@ generation:
 That is exactly what `--gen-kwargs enable_thinking=false` writes, so a file that declares it does
 not need the flag.
 
-Omitted sections use the same defaults as a run without `--config`: a `jina-omni` embedder and an
+Omitted sections use the same defaults as a run without `--config`: the pinned Jina Omni model
+through the `sentence-transformers` provider and an
 `openai` generation endpoint. The runner always replaces `data_dir` with isolated per-unit
 directories.
 

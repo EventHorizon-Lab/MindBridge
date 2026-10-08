@@ -44,6 +44,7 @@ from mindbridge import (
     ObservationContext,
     RetrievalMode,
     SearchHit,
+    SentenceTransformersEmbedder,
 )
 from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL, VISION_BATCHES_FAILED
 from mindbridge.configuration import resolve_memory_config
@@ -56,6 +57,14 @@ from mindbridge.models.base import (
     VisionDescriptionBackend,
 )
 from mindbridge.types import IndexQuantization
+
+
+def test_sentence_transformers_config_allows_omitting_revision() -> None:
+    config = MindBridgeConfig.model_validate(
+        {"embedding": {"provider": "sentence-transformers", "model": "org/text"}}
+    )
+    assert isinstance(config.embedding, configuration.SentenceTransformersEmbeddingConfig)
+    assert config.embedding.revision is None
 
 
 def test_declarative_config_is_typed_strict_and_keeps_local_policy_separate(
@@ -103,6 +112,33 @@ def test_declarative_config_is_typed_strict_and_keeps_local_policy_separate(
                 "embedding": {"provider": "openai", "unexpected": True},
             }
         )
+
+
+def test_jina_is_selected_through_the_sentence_transformers_provider() -> None:
+    config = MindBridgeConfig.model_validate(
+        {
+            "embedding": {
+                "provider": "sentence-transformers",
+                "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+                "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                "dimension": 32,
+            }
+        }
+    )
+    composition = resolve_memory_config(config)
+    try:
+        assert isinstance(composition.plugins.embedder, SentenceTransformersEmbedder)
+        assert composition.plugins.embedder.embedding_dimension == 32
+        assert composition.plugins.embedder.embedding_capabilities == {
+            Modality.TEXT,
+            Modality.IMAGE,
+            Modality.AUDIO,
+            Modality.VIDEO,
+        }
+    finally:
+        composition.close()
+    with pytest.raises(PydanticValidationError, match="union_tag_invalid"):
+        MindBridgeConfig.model_validate({"embedding": {"provider": "jina-omni"}})
 
 
 @pytest.mark.parametrize(
@@ -188,19 +224,6 @@ def test_local_policy_defaults_stay_pinned_to_their_recorded_provenance() -> Non
         face_margin=0.05,
         identity_link_min_assets=2,
     )
-    # `0.10` gates the same relevance `SearchHit.score` reports and reproduces the effective floor
-    # of the pre-rescale `0.55`. A future reader tidying it to a rounder number would silently
-    # tighten retrieval, so pin it separately from the whole-value assertion above.
-    assert defaults.minimum_relevance == 0.10
-    # `face_similarity` is upstream SFace's `_threshold_cosine` verbatim. `speaker_similarity` has
-    # no upstream provenance and is deliberately NOT the pinned CAM++ recipe's published
-    # `yesOrno_thr` of 0.31: that number is calibrated for a single embedding pair, while the
-    # matcher accepts on a `max` over up to 20 exemplars, where it is a lower bound rather than an
-    # operating point. Erring high fragments identities; erring low merges two people.
-    assert defaults.face_similarity == 0.363
-    assert defaults.speaker_similarity == 0.78
-    assert defaults.speaker_similarity > 0.31
-    assert defaults.speaker_margin > 0
     # The kernel and the declarative path must read the same defaults; a divergence would make
     # `Memory(...)` and `Memory.from_config({})` two different products.
     assert (

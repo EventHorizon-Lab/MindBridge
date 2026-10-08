@@ -478,7 +478,11 @@ from mindbridge import ContextBudget, Memory, MemoryType
 
 config = {
     "data_dir": "./data/compile-example",
-    "embedding": {"provider": "jina-omni"},
+    "embedding": {
+        "provider": "sentence-transformers",
+        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+    },
     "settings": {"minimum_relevance": 0, "ambiguity_margin": 0},
 }
 

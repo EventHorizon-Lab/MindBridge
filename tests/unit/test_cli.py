@@ -37,9 +37,9 @@ from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, _parser, main
 from mindbridge.control import load_operation
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.kernel.contracts import declared_capabilities
+from mindbridge.models._jina import DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.models.funasr import DEFAULT_FUNASR_MODEL_ID
-from mindbridge.models.jina import DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION
 from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
@@ -713,69 +713,28 @@ def test_recipes_pin_identity_to_the_constants_in_the_source() -> None:
     assert "OPENAI_API_KEY" in cast(str, recipes.describe("openai")["credential"])
 
 
-def test_the_former_flag_reaches_the_memory_it_composes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("slot", "keyword"),
+    (("former", "former"), ("consolidator", "consolidator"), ("vision", "vision_describer")),
+)
+def test_backend_flags_reach_the_memory_they_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slot: str, keyword: str
 ) -> None:
-    """`--former` is only wired if the constructed backend arrives as `Memory(former=...)`.
-
-    Asserting the `--explain` document instead would stay green while `_open_memory` dropped the
-    slot on the floor, which is the failure this flag was added to prevent.
-    """
     from mindbridge import cli
 
     sentinel = object()
     captured: dict[str, object] = {}
     # Parse before patching: `_parser` derives its defaults from `Memory`'s own signature.
     arguments = cli._parser().parse_args(
-        ["--data-dir", str(tmp_path), "--embedder", "openai", "--former", "openai", "list"]
+        ["--data-dir", str(tmp_path), "--embedder", "openai", f"--{slot}", "openai", "list"]
     )
     monkeypatch.setattr(recipes, "embedder", lambda name, **kw: object())
-    monkeypatch.setattr(recipes, "former", lambda name, **kw: sentinel)
+    monkeypatch.setattr(recipes, slot, lambda name, **kw: sentinel)
     monkeypatch.setattr(cli, "Memory", lambda *args, **kwargs: captured.update(kwargs))
 
     cli._open_memory(arguments)
 
-    assert captured["former"] is sentinel
-
-
-def test_the_consolidator_flag_reaches_the_memory_it_composes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Without this the shipped `mindbridge consolidate` command needed `--app` to work at all."""
-    from mindbridge import cli
-
-    sentinel = object()
-    captured: dict[str, object] = {}
-    arguments = cli._parser().parse_args(
-        ["--data-dir", str(tmp_path), "--embedder", "openai", "--consolidator", "openai", "list"]
-    )
-    monkeypatch.setattr(recipes, "embedder", lambda name, **kw: object())
-    monkeypatch.setattr(recipes, "consolidator", lambda name, **kw: sentinel)
-    monkeypatch.setattr(cli, "Memory", lambda *args, **kwargs: captured.update(kwargs))
-
-    cli._open_memory(arguments)
-
-    assert captured["consolidator"] is sentinel
-
-
-def test_the_vision_flag_reaches_the_memory_it_composes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`--vision` is the only flag whose `Memory` keyword differs from the slot's own name."""
-    from mindbridge import cli
-
-    sentinel = object()
-    captured: dict[str, object] = {}
-    arguments = cli._parser().parse_args(
-        ["--data-dir", str(tmp_path), "--embedder", "openai", "--vision", "openai", "list"]
-    )
-    monkeypatch.setattr(recipes, "embedder", lambda name, **kw: object())
-    monkeypatch.setattr(recipes, "vision", lambda name, **kw: sentinel)
-    monkeypatch.setattr(cli, "Memory", lambda *args, **kwargs: captured.update(kwargs))
-
-    cli._open_memory(arguments)
-
-    assert captured["vision_describer"] is sentinel
+    assert captured[keyword] is sentinel
 
 
 def test_the_vision_recipe_declares_a_visual_capability_memory_accepts(

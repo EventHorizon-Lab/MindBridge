@@ -88,6 +88,7 @@ class AsyncOmniPrefetch:
         self._submitted: tuple[int, ContentInput] | None = None
         self._pending: tuple[int, ContentInput] | None = None
         self._latest: PrefetchResult | None = None
+        self._latest_revision = 0
         self._failure: tuple[int, Exception] | None = None
         self._worker: asyncio.Task[None] | None = None
         self._closed = False
@@ -97,7 +98,7 @@ class AsyncOmniPrefetch:
         """Return the newest completed result without waiting."""
         return self._latest
 
-    def submit(self, query: ContentInput) -> int:
+    def submit(self, query: ContentInput) -> None:
         """Queue a complete current snapshot, replacing any not-yet-started snapshot."""
         if self._closed:
             raise ValidationError("prefetch is closed")
@@ -106,7 +107,7 @@ class AsyncOmniPrefetch:
         if self._submitted is not None and self._submitted[1] == snapshot:
             failed = self._failure is not None and self._failure[0] == self._submitted[0]
             if not failed:
-                return self._submitted[0]
+                return
         self._revision += 1
         revision = self._revision
         self._submitted = (revision, snapshot)
@@ -114,7 +115,6 @@ class AsyncOmniPrefetch:
         self._failure = None
         if self._worker is None:
             self._worker = loop.create_task(self._run())
-        return revision
 
     async def finalize(self, query: ContentInput | None = None) -> PrefetchResult:
         """Finish the turn and return a result for the exact final snapshot."""
@@ -123,14 +123,15 @@ class AsyncOmniPrefetch:
         if query is None:
             if self._submitted is None:
                 raise ValidationError("prefetch has no submitted query")
-            target = self._submitted[0]
         else:
-            target = self.submit(query)
+            self.submit(query)
+        assert self._submitted is not None
+        target = self._submitted[0]
         self._closed = True
         worker = self._worker
         if worker is not None:
             await asyncio.shield(worker)
-        if self._latest is not None and self._latest.revision == target:
+        if self._latest is not None and self._latest_revision == target:
             return self._latest
         if self._failure is not None and self._failure[0] == target:
             raise self._failure[1]
@@ -161,7 +162,8 @@ class AsyncOmniPrefetch:
                 except Exception as error:
                     self._failure = (revision, error)
                     continue
-                self._latest = PrefetchResult(revision=revision, hits=hits)
+                self._latest = PrefetchResult(hits=hits)
+                self._latest_revision = revision
         finally:
             self._worker = None
 

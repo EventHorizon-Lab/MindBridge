@@ -45,6 +45,11 @@ class RecordingEncoder:
         self.calls: list[tuple[str, list[object], int | None]] = []
         self.batch_sizes: list[int] = []
         self.closed = 0
+        self.prompts = {
+            "query": "task: search result | query: ",
+            "document": "title: none | text: ",
+        }
+        self.passed_prompts: list[str | None] = []
 
     def supports(self, modality: str | tuple[str, ...]) -> bool:
         requested = (modality,) if isinstance(modality, str) else modality
@@ -61,11 +66,13 @@ class RecordingEncoder:
         convert_to_numpy: bool,
         normalize_embeddings: bool,
         truncate_dim: int | None,
+        prompt: str | None = None,
     ) -> Matrix:
         assert convert_to_numpy is True
         assert normalize_embeddings is True
         self.batch_sizes.append(batch_size)
         self.calls.append(("query", sentences, truncate_dim))
+        self.passed_prompts.append(prompt)
         return Matrix(self.values)
 
     def encode_document(
@@ -76,11 +83,13 @@ class RecordingEncoder:
         convert_to_numpy: bool,
         normalize_embeddings: bool,
         truncate_dim: int | None,
+        prompt: str | None = None,
     ) -> Matrix:
         assert convert_to_numpy is True
         assert normalize_embeddings is True
         self.batch_sizes.append(batch_size)
         self.calls.append(("document", sentences, truncate_dim))
+        self.passed_prompts.append(prompt)
         return Matrix(self.values)
 
     def close(self) -> None:
@@ -156,6 +165,43 @@ def test_query_and_document_methods_remain_distinct() -> None:
         embedder.embed(batch, "classification")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("task", (EmbedTask.QUERY, EmbedTask.DOCUMENT))
+def test_ordered_multimodal_inputs_keep_repeated_assets(tmp_path: Path, task: EmbedTask) -> None:
+    encoder = RecordingEncoder(
+        [[1.0, 0.0]], supported=("text", "image", "audio", "video", "message")
+    )
+    embedder = SentenceTransformersEmbedder(encoder, model_id="org/omni", revision=REVISION)
+    assets = (
+        _asset(tmp_path, "first", Modality.IMAGE, "image/png"),
+        _asset(tmp_path, "speech", Modality.AUDIO, "audio/wav"),
+        _asset(tmp_path, "second", Modality.IMAGE, "image/png"),
+        _asset(tmp_path, "clip", Modality.VIDEO, "video/mp4"),
+    )
+
+    embedder.embed((ModelInput(text="context", assets=assets),), task)
+
+    assert encoder.calls == [
+        (
+            "query" if task is EmbedTask.QUERY else "document",
+            [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "context"},
+                            {"type": "image", "image": str(assets[0].path)},
+                            {"type": "audio", "audio": str(assets[1].path)},
+                            {"type": "image", "image": str(assets[2].path)},
+                            {"type": "video", "video": str(assets[3].path)},
+                        ],
+                    }
+                ]
+            ],
+            None,
+        )
+    ]
+
+
 def test_instance_encode_isolated_from_class_level_remote_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -182,6 +228,7 @@ def test_instance_encode_isolated_from_class_level_remote_patch(
             convert_to_numpy: bool,
             normalize_embeddings: bool,
             truncate_dim: int | None,
+            prompt: str | None = None,
         ) -> Matrix:
             return self.encode(
                 sentences,
@@ -279,7 +326,20 @@ def test_native_or_advertised_matryoshka_dimensions_define_the_space() -> None:
         )
 
 
+def test_injected_encoder_infers_its_revision_without_changing_vector_identity() -> None:
+    encoder = RecordingEncoder([[1.0, 0.0]])
+    encoder.config._commit_hash = REVISION
+    inferred = SentenceTransformersEmbedder(encoder, model_id="org/text")
+    pinned = SentenceTransformersEmbedder(encoder, model_id="org/text", revision=REVISION)
+    assert inferred.embedding_space == pinned.embedding_space
+    encoder.config._commit_hash = "b" * 40
+    updated = SentenceTransformersEmbedder(encoder, model_id="org/text")
+    assert updated.embedding_space != inferred.embedding_space
+
+
 def test_injected_encoder_requires_an_immutable_revision_and_positive_batch() -> None:
+    with pytest.raises(ValidationError, match="revision"):
+        SentenceTransformersEmbedder(RecordingEncoder([[1.0, 0.0]]), model_id="org/text")
     with pytest.raises(ValidationError, match="immutable"):
         SentenceTransformersEmbedder(
             RecordingEncoder([[1.0, 0.0]]),
@@ -293,6 +353,182 @@ def test_injected_encoder_requires_an_immutable_revision_and_positive_batch() ->
             revision=REVISION,
             batch_size=0,
         )
+
+
+@pytest.mark.parametrize("dimension", (128, 256, 512, 768))
+def test_embeddinggemma2_dimensions_without_optional_mrl_metadata(dimension: int) -> None:
+    encoder = RecordingEncoder([[3.0, 4.0, *([0.0] * (dimension - 2))]], native_dimension=768)
+    encoder.config = SimpleNamespace(model_type="embedding_gemma2")
+    embedder = SentenceTransformersEmbedder(
+        encoder,
+        model_id="google/embeddinggemma-2",
+        revision=REVISION,
+        dimension=dimension,
+    )
+
+    vector = embedder.embed((ModelInput(text="document"),))[0]
+    assert embedder.embedding_space != sentence_transformers._recipe_space(
+        "sentence-transformers-standard-input-v1", "google/embeddinggemma-2", REVISION, dimension
+    )
+    assert len(vector) == dimension
+    assert vector[:2] == pytest.approx((0.6, 0.8))
+    assert encoder.calls[0][2] == (None if dimension == 768 else dimension)
+    with pytest.raises(ModelError, match="advertised Matryoshka"):
+        SentenceTransformersEmbedder(
+            encoder,
+            model_id="google/embeddinggemma-2",
+            revision=REVISION,
+            dimension=64,
+        )
+
+
+def test_embeddinggemma2_loader_uses_safe_precision(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+    encoder = RecordingEncoder([[1.0, 0.0]])
+
+    def factory(model_path: str, **kwargs: object) -> RecordingEncoder:
+        assert model_path == "google/embeddinggemma-2"
+        calls.append(kwargs)
+        return encoder
+
+    monkeypatch.setattr(
+        sentence_transformers,
+        "import_module",
+        lambda _name: SimpleNamespace(SentenceTransformer=factory),
+    )
+    SentenceTransformersEmbedder.load("google/embeddinggemma-2", revision=REVISION)
+
+    assert calls == [
+        {
+            "revision": REVISION,
+            "trust_remote_code": False,
+            "device": None,
+            "model_kwargs": {"dtype": "float32"},
+        }
+    ]
+
+
+@pytest.mark.parametrize("dimension", (128, 256, 512))
+def test_other_embeddinggemma2_checkpoints_require_mrl_metadata(dimension: int) -> None:
+    encoder = RecordingEncoder([[1.0] * dimension], native_dimension=768)
+    encoder.config = SimpleNamespace(model_type="embedding_gemma2")
+
+    with pytest.raises(ModelError, match="advertised Matryoshka"):
+        SentenceTransformersEmbedder(
+            encoder,
+            model_id="org/embeddinggemma-2-finetuned",
+            revision=REVISION,
+            dimension=dimension,
+        )
+
+
+def test_other_embeddinggemma2_checkpoint_keeps_advertised_mrl_dimensions() -> None:
+    encoder = RecordingEncoder(
+        [[1.0] * 128], native_dimension=768, matryoshka_dimensions=(128, 768)
+    )
+    encoder.config.model_type = "embedding_gemma2"
+    model_id = "org/embeddinggemma-2-finetuned"
+
+    embedder = SentenceTransformersEmbedder(
+        encoder, model_id=model_id, revision=REVISION, dimension=128
+    )
+    assert embedder.embedding_dimension == 128
+    with pytest.raises(ModelError, match="advertised Matryoshka"):
+        SentenceTransformersEmbedder(encoder, model_id=model_id, revision=REVISION, dimension=256)
+
+
+def test_injected_embeddinggemma2_keeps_its_video_decoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def decoder(path: object) -> object:
+        return path
+
+    video_processor = SimpleNamespace(fetch_videos=decoder)
+    module = SimpleNamespace(processor=SimpleNamespace(video_processor=video_processor))
+
+    class VideoEncoder(RecordingEncoder):
+        def __getitem__(self, _index: int) -> object:
+            return module
+
+    def unexpected_import(name: str) -> object:
+        raise AssertionError(f"injected encoder must not import {name}")
+
+    monkeypatch.setattr(sentence_transformers, "import_module", unexpected_import)
+    SentenceTransformersEmbedder(
+        VideoEncoder([[1.0, 0.0]]), model_id="google/embeddinggemma-2", revision=REVISION
+    )
+
+    assert video_processor.fetch_videos is decoder
+    assert video_processor.fetch_videos("clip.mp4") == "clip.mp4"
+
+
+def test_embeddinggemma2_video_decoder_uses_pyav_and_keeps_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, dict[str, object]]] = []
+    video_processor = SimpleNamespace()
+    module = SimpleNamespace(processor=SimpleNamespace(video_processor=video_processor))
+
+    class VideoEncoder(RecordingEncoder):
+        def __getitem__(self, _index: int) -> object:
+            return module
+
+    def load_video(path: object, **kwargs: object) -> tuple[object, object]:
+        calls.append((path, kwargs))
+        return path, {"fps": 2}
+
+    def importer(name: str) -> object:
+        if name == "sentence_transformers":
+            return SimpleNamespace(SentenceTransformer=lambda *_args, **_kwargs: encoder)
+        assert name == "transformers.video_utils"
+        return SimpleNamespace(load_video=load_video)
+
+    encoder = VideoEncoder([[1.0, 0.0]])
+    monkeypatch.setattr(sentence_transformers, "import_module", importer)
+    SentenceTransformersEmbedder.load("google/embeddinggemma-2", revision=REVISION)
+
+    def sample(_metadata: object) -> list[int]:
+        return [0]
+
+    assert video_processor.fetch_videos(["first.mp4", "second.mp4"], sample) == [
+        ("first.mp4", "second.mp4"),
+        ({"fps": 2}, {"fps": 2}),
+    ]
+    assert calls == [
+        (path, {"backend": "pyav", "sample_indices_fn": sample})
+        for path in ("first.mp4", "second.mp4")
+    ]
+
+
+@pytest.mark.parametrize("task", (EmbedTask.QUERY, EmbedTask.DOCUMENT))
+def test_embeddinggemma2_prefixes_only_text(tmp_path: Path, task: EmbedTask) -> None:
+    encoder = RecordingEncoder([[1.0, 0.0]] * 3)
+    embedder = SentenceTransformersEmbedder(
+        encoder, model_id="google/embeddinggemma-2", revision=REVISION
+    )
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png")
+    embedder.embed(
+        (
+            ModelInput(text="red"),
+            ModelInput(assets=(image,)),
+            ModelInput(text="red", assets=(image,)),
+        ),
+        task=task,
+    )
+
+    name = "query" if task is EmbedTask.QUERY else "document"
+    assert encoder.calls == [
+        (
+            name,
+            [
+                encoder.prompts[name] + "red",
+                {"image": str(image.path)},
+                {"text": encoder.prompts[name] + "red", "image": str(image.path)},
+            ],
+            None,
+        )
+    ]
+    assert encoder.passed_prompts == [""]
 
 
 def test_standard_loader_passes_the_immutable_revision_directly(
@@ -334,6 +570,58 @@ def test_standard_loader_passes_the_immutable_revision_directly(
     assert encoder.batch_sizes == [9]
 
 
+def test_loader_resolves_an_omitted_revision_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    encoder = RecordingEncoder([[1.0, 0.0]])
+
+    def model_info(model_id: str) -> SimpleNamespace:
+        calls.append(model_id)
+        return SimpleNamespace(sha=REVISION)
+
+    def factory(model_id: str, **kwargs: object) -> RecordingEncoder:
+        calls.append((model_id, kwargs["revision"]))
+        return encoder
+
+    modules = {
+        "huggingface_hub": SimpleNamespace(model_info=model_info),
+        "sentence_transformers": SimpleNamespace(SentenceTransformer=factory),
+    }
+    monkeypatch.setattr(sentence_transformers, "import_module", modules.__getitem__)
+    inferred = SentenceTransformersEmbedder.load("org/text")
+    pinned = SentenceTransformersEmbedder(encoder, model_id="org/text", revision=REVISION)
+
+    assert calls == ["org/text", ("org/text", REVISION)]
+    assert inferred.embedding_space == pinned.embedding_space
+
+
+@pytest.mark.parametrize("sha", (None, "main", ""))
+def test_loader_rejects_unresolved_revisions_before_loading(
+    monkeypatch: pytest.MonkeyPatch, sha: str | None
+) -> None:
+    def imported(name: str) -> SimpleNamespace:
+        assert name == "huggingface_hub"
+        return SimpleNamespace(model_info=lambda _model: SimpleNamespace(sha=sha))
+
+    monkeypatch.setattr(sentence_transformers, "import_module", imported)
+    with pytest.raises(ModelError, match=r"resolve.*revision"):
+        SentenceTransformersEmbedder.load("org/text")
+
+
+def test_revision_resolution_maps_hub_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    def model_info(_model: str) -> None:
+        raise OSError("Hub unavailable")
+
+    monkeypatch.setattr(
+        sentence_transformers,
+        "import_module",
+        lambda _name: SimpleNamespace(model_info=model_info),
+    )
+    with pytest.raises(ModelError, match=r"resolve.*revision"):
+        SentenceTransformersEmbedder.load("org/text")
+
+
 def test_optional_dependency_and_mutable_revision_fail_before_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -351,6 +639,10 @@ def test_optional_dependency_and_mutable_revision_fail_before_execution(
     with pytest.raises(ModelError, match="local extra"):
         SentenceTransformersEmbedder.load("org/text", revision=REVISION)
     assert imported == ["sentence_transformers"]
+
+    with pytest.raises(ModelError, match="local extra"):
+        SentenceTransformersEmbedder.load("org/text")
+    assert imported == ["sentence_transformers", "huggingface_hub"]
 
 
 class GatedEncoder(RecordingEncoder):
@@ -374,6 +666,7 @@ class GatedEncoder(RecordingEncoder):
         convert_to_numpy: bool,
         normalize_embeddings: bool,
         truncate_dim: int | None,
+        prompt: str | None = None,
     ) -> Matrix:
         return self._wait("query", sentences, truncate_dim)
 
@@ -385,6 +678,7 @@ class GatedEncoder(RecordingEncoder):
         convert_to_numpy: bool,
         normalize_embeddings: bool,
         truncate_dim: int | None,
+        prompt: str | None = None,
     ) -> Matrix:
         return self._wait("document", sentences, truncate_dim)
 

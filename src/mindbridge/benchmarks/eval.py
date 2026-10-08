@@ -51,7 +51,6 @@ from mindbridge import (
     FaceAnalysis,
     FunASRTranscriber,
     IndexUnavailableError,
-    JinaOmniEmbedder,
     Memory,
     MemoryConfig,
     MemoryType,
@@ -59,6 +58,7 @@ from mindbridge import (
     Modality,
     OpenAIModels,
     SearchHit,
+    SentenceTransformersEmbedder,
     resolve_memory_config,
 )
 from mindbridge._telemetry import (
@@ -218,6 +218,11 @@ from mindbridge.benchmarks.task_catalog import (
     listing,
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
+from mindbridge.models._jina import (
+    DEFAULT_JINA_DIMENSION,
+    DEFAULT_JINA_MODEL_ID,
+    DEFAULT_JINA_REVISION,
+)
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -230,11 +235,6 @@ from mindbridge.models.base import (
     SpeechBackend,
     TranscriptionBackend,
     VisionDescriptionBackend,
-)
-from mindbridge.models.jina import (
-    DEFAULT_JINA_DIMENSION,
-    DEFAULT_JINA_MODEL_ID,
-    DEFAULT_JINA_REVISION,
 )
 
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v18"
@@ -640,7 +640,12 @@ class _BackendPool:
                 }
             ),
         )
-        self.embedder = JinaOmniEmbedder(device=device, batch_size=batch_size)
+        self.embedder = SentenceTransformersEmbedder(
+            model_id=DEFAULT_JINA_MODEL_ID,
+            revision=DEFAULT_JINA_REVISION,
+            device=device,
+            batch_size=batch_size,
+        )
         self.embedder.embed((ModelInput(text="MindBridge benchmark warmup"),), task=EmbedTask.QUERY)
         self.embedding_warmup_count = 1
         self.transcriber = (
@@ -3691,12 +3696,9 @@ def _model_result(
         return result
     embedding = memory_config.embedding.model_dump(mode="json")
     speech = None if memory_config.speech is None else memory_config.speech.model_dump(mode="json")
-    provider = str(embedding["provider"])
     result.update(
-        embedding_model=(DEFAULT_JINA_MODEL_ID if provider == "jina-omni" else embedding["model"]),
-        embedding_revision=(
-            DEFAULT_JINA_REVISION if provider == "jina-omni" else embedding.get("revision")
-        ),
+        embedding_model=embedding["model"],
+        embedding_revision=embedding.get("revision"),
         embedding_dimension=embedding.get("dimension"),
         device=_configured_device_label(arguments.device, memory_config),
         transcription_model=(
@@ -3737,7 +3739,7 @@ def _configured_device_label(explicit: str | None, config: MindBridgeConfig) -> 
     if explicit is not None:
         return explicit
     devices = []
-    if config.embedding.provider in {"jina-omni", "sentence-transformers"}:
+    if config.embedding.provider == "sentence-transformers":
         devices.append(config.embedding.device or "auto")
     if config.speech is not None and config.speech.provider == "funasr":
         devices.append(config.speech.device)
@@ -3813,7 +3815,7 @@ def _evaluation_devices(
     if config is None:
         return (explicit,)
     configured = []
-    if config.embedding.provider in {"jina-omni", "sentence-transformers"}:
+    if config.embedding.provider == "sentence-transformers":
         configured.append(explicit or config.embedding.device or "auto")
     # The speech backend is only constructed when a unit carries audio or video, so a text-only
     # run must not hold the GPU lock for a model it never loads: that lock serialized every

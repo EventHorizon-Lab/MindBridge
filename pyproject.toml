@@ -42,13 +42,14 @@ all = [
     "pillow>=10,<13",
     "pyarrow>=18,<26",
     "pyyaml>=6,<7",
-    "sentence-transformers[image,video]>=5.7,<6",
+    "sentence-transformers[image,video]>=6.1,<7",
     "soundfile>=0.13,<1",
     "starlette>=0.46,<2",
     "torch>=2.6,<3",
     "torchaudio>=2.11,<3",
     "torchvision>=0.26,<0.27",
     "tqdm>=4.66,<5",
+    "transformers>=5.18,<6",
 ]
 benchmarks = [
     # download.py imports httpx at module scope; huggingface-hub happens to require it today.
@@ -83,7 +84,8 @@ local = [
     # wheels. Jina only needs librosa and soundfile for its native audio path.
     "librosa>=0.11,<2",
     "funasr>=1.4.6,<2",
-    "sentence-transformers[image,video]>=5.7,<6",
+    # EmbeddingGemma 2 requires ordered multimodal inputs introduced in ST 6.1.
+    "sentence-transformers[image,video]>=6.1,<7",
     "soundfile>=0.13,<1",
     # FunASR imports torch at module scope and declares neither torch nor torchaudio, so both
     # arrive only because sentence-transformers happens to pull torch in.
@@ -93,6 +95,7 @@ local = [
     # sentence-transformers[image] imports torchvision; declaring it directly lets uv select the
     # matching CUDA build instead of mixing PyPI's default build with the pinned torch build.
     "torchvision>=0.26,<0.27",
+    "transformers>=5.18,<6",
 ]
 server = [
     "fastapi>=0.116,<1",

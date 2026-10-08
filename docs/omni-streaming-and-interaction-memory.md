@@ -118,11 +118,11 @@ hits = result.hits
 ```
 
 Only one search runs at a time. While it runs, a newer submission replaces the snapshot that has
-not started yet. `latest` returns the newest completed `PrefetchResult` and its revision without
-waiting.
+not started yet. `latest` returns the newest completed `PrefetchResult` without waiting. Results
+contain only `hits`; `submit` returns `None`.
 
 `finalize` returns only a result for the exact final snapshot. It reuses an already completed
-revision when the values match and that revision succeeded; otherwise it waits for a search of the
+result when the values match and that search succeeded; otherwise it waits for a search of the
 final snapshot. It then closes that per-turn prefetcher.
 
 Snapshots accept immutable text, `Blob`, and `AssetRef` values. Raw `Path` values are rejected
@@ -399,7 +399,7 @@ would have to pass is in the [benchmark protocol](benchmarking.md#mandatory-cont
 ## Observability
 
 Every completed stream item emits an ordinary `mindbridge.add` operation span. Every speculative
-revision that starts emits an ordinary `mindbridge.search` span. This keeps model request, token,
+search that starts emits an ordinary `mindbridge.search` span. This keeps model request, token,
 latency, and failure accounting comparable with non-streaming calls. See
 [operations](operations.md#telemetry) for the attribute contract.
 

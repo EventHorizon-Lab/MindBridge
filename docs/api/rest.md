@@ -45,7 +45,11 @@ from mindbridge.api import create_app
 memory = Memory.from_config(
     {
         "data_dir": "./data/assistant",
-        "embedding": {"provider": "jina-omni"},
+        "embedding": {
+            "provider": "sentence-transformers",
+            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        },
     }
 )
 app = create_app(memory=memory)

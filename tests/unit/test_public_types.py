@@ -120,8 +120,11 @@ def test_search_hit_is_flat_and_rejects_invalid_scores() -> None:
             memory_type="episodic",  # type: ignore[arg-type]
         )
 
-    with pytest.raises(ValidationError, match="positive integer"):
-        PrefetchResult(revision=0, hits=(hit,))
+    result = PrefetchResult(hits=(hit,))
+    assert asdict(result) == {"hits": (asdict(hit),)}
+    assert pickle.loads(pickle.dumps(result)) == result
+    with pytest.raises(ValidationError, match="hits"):
+        PrefetchResult(hits=(object(),))  # type: ignore[arg-type]
 
 
 def test_retrieval_trace_values_are_immutable_and_bounded() -> None:

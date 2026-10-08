@@ -2193,26 +2193,12 @@ def test_refusals_are_reported_however_the_model_formats_them(answer: str) -> No
         "I don't know why the cat moved, but the memories place it on the sofa.",
         "The evidence is insufficient to say when the cat moved, but it is on the sofa.",
         "",
-    ],
-)
-def test_a_hedge_inside_a_real_answer_is_not_reported_as_a_refusal(answer: str) -> None:
-    assert openai_backend._abstention_reason(answer) is None
-
-
-@pytest.mark.parametrize(
-    "answer",
-    [
+        # A quoted marker word in evidence is ordinary text, not the machine refusal token.
         "The runbook says the API returns insufficient_evidence when no memory matches.",
         "Alice logged: status=insufficient_evidence at 09:12, then retried.",
     ],
 )
-def test_evidence_that_quotes_the_marker_word_is_not_a_refusal(answer: str) -> None:
-    """The brackets are what make the marker a machine token rather than an ordinary word.
-
-    Matching the bare word anywhere reported a correct answer as a refusal whenever the corpus
-    itself mentioned `insufficient_evidence` -- a runbook line, a logged status -- which corrupts
-    the refusal meter in the opposite direction from the exact-equality check it replaced.
-    """
+def test_non_refusal_answers_are_not_reported_as_refusals(answer: str) -> None:
     assert openai_backend._abstention_reason(answer) is None
 
 

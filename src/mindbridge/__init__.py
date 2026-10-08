@@ -38,7 +38,6 @@ from mindbridge.models.funasr import (
     FunASRRecipe,
     FunASRTranscriber,
 )
-from mindbridge.models.jina import JinaOmniEmbedder
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
@@ -197,7 +196,6 @@ __all__ = [
     "IdentityProfile",
     "IndexQuantization",
     "IndexUnavailableError",
-    "JinaOmniEmbedder",
     "Memory",
     "MemoryCapabilities",
     "MemoryComposition",

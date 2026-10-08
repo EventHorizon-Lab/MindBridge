@@ -46,7 +46,8 @@ from mindbridge import Memory
 config = {
     "data_dir": "./data/assistant",
     "embedding": {
-        "provider": "jina-omni",
+        "provider": "sentence-transformers",
+        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
         "device": "cuda",
         "batch_size": 16,
     },
@@ -79,8 +80,7 @@ In this table, connection fields are `base_url`, `api_key`, `timeout`, and `max_
 
 | Slot and provider | Required | Optional defaults |
 | --- | --- | --- |
-| `embedding: jina-omni` | — | `dimension=1024`, `device=None`, `batch_size=32` |
-| `embedding: sentence-transformers` | `model`, `revision` | `dimension=None`, `device=None`, `batch_size=32` |
+| `embedding: sentence-transformers` | `model` | `revision=None`, `dimension=None`, `device=None`, `batch_size=32` |
 | `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
 | `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
 | `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
@@ -133,11 +133,14 @@ the vision slot.
 
 The embedding model defines durable vector identity, so every memory requires one:
 
-- `jina-omni` is the pinned multimodal recipe used in project examples. Its weights are CC BY-NC
-  4.0. Loading executes pinned upstream code with `trust_remote_code=True`; review that code and
-  license as part of the application's trust boundary.
-- `sentence-transformers` loads an application-selected model at a required immutable 40-character
-  commit revision. The model declares its supported modalities.
+- `sentence-transformers` loads an application-selected model. An optional `revision` pins a
+  40-character immutable commit hash. When omitted, MindBridge resolves the current Hub revision
+  before loading and retains that commit in the vector-space identity; Jina uses its bundled pin.
+  Resolution requires Hub access. Specify a commit for reproducible or cached offline loading.
+  The model declares its supported modalities. The pinned Jina Omni checkpoint used in project
+  examples supports text, images, audio, and video, with 1024 dimensions by default. Its weights
+  are CC BY-NC 4.0 and loading executes pinned upstream code with `trust_remote_code=True`;
+  review that code and license as part of the application's trust boundary.
 - `openai` defaults to text embedding. For an OpenAI-compatible multimodal server, declare its
   `modalities` and use `request_format=input` for the embeddings array or
   `request_format=messages` for chat-style media parts. The request format is part of the embedding
@@ -153,6 +156,56 @@ MindBridge refuses unrecognized store metadata mismatches instead of mixing spac
 existing directory only for a supported bundled migration; see
 [store metadata mismatch](troubleshooting.md#store-metadata-mismatch).
 
+### Migrating the Jina provider
+
+`JinaOmniEmbedder` and the `jina-omni` configuration provider have been removed. Use
+`SentenceTransformersEmbedder` or `provider: sentence-transformers` with
+`model: jinaai/jina-embeddings-v5-omni-small-retrieval`, as in the example above. The bundled pin is
+`e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4`. Only this Jina revision is supported; another revision
+fails validation before loading remote code.
+
+Without a caller-supplied encoder, the constructor and declarative configuration keep this pinned
+Jina checkpoint lazy. `SentenceTransformersEmbedder.load(...)` loads it immediately. Other models
+load immediately and continue to use `trust_remote_code=False`. The Jina input recipe, embedding
+space ID, and historical space upgrades are preserved, so an existing current-recipe Jina directory
+can reopen without re-embedding. The CLI `--embedder jina-omni` remains a model recipe that constructs
+the same Sentence Transformers backend.
+
+### EmbeddingGemma 2
+
+Install `mindbridge[local]` and select
+[Google EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) through the existing
+Sentence Transformers provider:
+
+```json
+{
+  "data_dir": "./data/embeddinggemma2",
+  "embedding": {
+    "provider": "sentence-transformers",
+    "model": "google/embeddinggemma-2",
+    "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+    "dimension": 768,
+    "device": "cpu",
+    "batch_size": 8
+  }
+}
+```
+
+The local extra requires Sentence Transformers 6.1 or newer and Transformers 5.18 or newer.
+The adapter loads this model in FP32; `device` can also be `cuda`. Queries and documents use the
+checkpoint's separate retrieval prompts for text automatically; media alone receives no prefix.
+Video decoding uses the existing PyAV dependency and preserves the model's frame sampling.
+This text-only prompt recipe has a distinct space ID from generic ST batch prompting.
+Text, images, audio, video, and ordered
+combinations use the same embedding space. Supported dimensions are `128`, `256`, `512`, and
+`768`; shortened vectors are normalized again. The model has an 8,192-token shared context;
+split larger inputs before embedding them.
+
+Applications injecting their own Sentence Transformer encoder must use FP32 or BF16, never FP16.
+This checkpoint uses Apache 2.0 weights and loads with `trust_remote_code=False`. It supplies
+embeddings only; generation, transcription, speaker recognition, and face recognition remain
+separate backends. Use a new data directory when switching from another embedding model.
+
 ## Automatic memory formation
 
 The optional `formation` slot builds the bundled OpenAI-compatible `FormationBackend`. It proposes
@@ -166,7 +219,11 @@ from mindbridge import Memory
 with Memory.from_config(
     {
         "data_dir": "./data/assistant",
-        "embedding": {"provider": "jina-omni"},
+        "embedding": {
+            "provider": "sentence-transformers",
+            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        },
         "formation": {
             "provider": "openai",
             "model": "qwen3-8b",
@@ -247,7 +304,11 @@ retrieval reach a visual memory at all.
 
 ```python
 config = {
-    "embedding": {"provider": "jina-omni"},
+    "embedding": {
+        "provider": "sentence-transformers",
+        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+    },
     "vision": {
         "provider": "openai",
         "model": "gpt-5-mini",
@@ -343,7 +404,11 @@ which is what `consolidate()` needs. It reads the same completion knobs as `form
 with Memory.from_config(
     {
         "data_dir": "./data/assistant",
-        "embedding": {"provider": "jina-omni"},
+        "embedding": {
+            "provider": "sentence-transformers",
+            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        },
         "consolidation": {
             "provider": "openai",
             "model": "gpt-5-mini",
@@ -636,7 +701,11 @@ setting shapes what recall returns and can be changed back, and this one deletes
 
 ```python
 config = {
-    "embedding": {"provider": "jina-omni"},
+    "embedding": {
+        "provider": "sentence-transformers",
+        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+    },
     "retention": {
         "media_days": 30,
         "forgotten_days": 90,
@@ -674,7 +743,7 @@ connection pooling:
 ```python
 from openai import OpenAI
 
-from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
+from mindbridge import SentenceTransformersEmbedder, Memory, OpenAIModels
 
 with OpenAI(timeout=30.0, max_retries=3) as client:
     models = OpenAIModels(
@@ -683,7 +752,10 @@ with OpenAI(timeout=30.0, max_retries=3) as client:
     )
     with Memory(
         "./data/assistant",
-        embedder=JinaOmniEmbedder(),
+        embedder=SentenceTransformersEmbedder(
+            model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+            revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        ),
         answerer=models,
     ) as memory:
         memory.add("The spare key is in the blue toolbox.")
@@ -708,7 +780,10 @@ fill `answerer=`, `former=`, and `consolidator=`:
 models = OpenAIModels(generation_model="gpt-5-mini")
 memory = Memory(
     "./data/assistant",
-    embedder=JinaOmniEmbedder(),
+    embedder=SentenceTransformersEmbedder(
+        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+    ),
     answerer=models,
     former=models,
     consolidator=models,

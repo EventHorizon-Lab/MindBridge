@@ -1635,16 +1635,9 @@ class PendingCapture:
 class PrefetchResult:
     """The newest completed speculative search for one streaming turn."""
 
-    revision: int
     hits: tuple[SearchHit, ...]
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.revision, bool)
-            or not isinstance(self.revision, int)
-            or self.revision <= 0
-        ):
-            raise ValidationError("prefetch revision must be a positive integer")
         hits = tuple(self.hits)
         if any(not isinstance(hit, SearchHit) for hit in hits):
             raise ValidationError("prefetch hits are invalid")

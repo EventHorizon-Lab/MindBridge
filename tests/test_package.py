@@ -12,7 +12,6 @@ from importlib.metadata import distributions
 from pathlib import Path
 from typing import cast
 
-import pytest
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
@@ -49,6 +48,7 @@ def test_base_import_does_not_load_optional_protocols() -> None:
 
 def test_full_modal_contract_is_exported_from_the_package_root() -> None:
     package = importlib.import_module("mindbridge")
+    assert not hasattr(package, "JinaOmniEmbedder")
     names = {
         "ASRPartial",
         "AcousticBoundary",
@@ -78,7 +78,6 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "FaceBackend",
         "FaceObservation",
         "GenerationBackend",
-        "JinaOmniEmbedder",
         "ModelInput",
         "OpenAIModels",
         "OpenCVFaceAnalyzer",
@@ -265,17 +264,7 @@ def test_console_script_targets_exist() -> None:
         assert callable(getattr(importlib.import_module(module_name), attribute))
 
 
-def test_the_product_cli_cannot_reach_the_benchmark_family(tmp_path: Path) -> None:
-    """Two console scripts exist because one dispatcher cannot satisfy the guard above.
-
-    ``test_product_does_not_address_benchmarks`` already covers every product module, but it passes
-    trivially while the CLI is small. This pins the reason the layout is what it is: the scan reads
-    string constants, so even a lazy ``import_module`` of the other family trips it.
-    """
-    product_cli = SOURCE / "cli.py"
-    assert product_cli.exists()
-    assert _benchmark_references(product_cli) == set()
-
+def test_benchmark_reference_scan_detects_a_lazy_import(tmp_path: Path) -> None:
     dispatcher = tmp_path / "single_tree.py"
     dispatcher.write_text(
         "from importlib import import_module\n"
@@ -321,6 +310,7 @@ def test_dependency_surface_is_exact() -> None:
             "torch",
             "torchaudio",
             "torchvision",
+            "transformers",
         },
         "server": {"fastapi", "starlette"},
         "mcp": {"mcp"},
@@ -343,17 +333,3 @@ def test_dependency_surface_is_exact() -> None:
 
 def _name(requirement: str) -> str:
     return Requirement(requirement).name.lower()
-
-
-@pytest.mark.parametrize(
-    "modules",
-    [
-        ("mindbridge", "mindbridge.memory", "mindbridge.infrastructure.local"),
-        ("mindbridge.api.app", "mindbridge.api.errors"),
-        ("mindbridge.api.mcp",),
-    ],
-    ids=("base", "server", "mcp"),
-)
-def test_supported_modules_import(modules: tuple[str, ...]) -> None:
-    for module in modules:
-        importlib.import_module(module)

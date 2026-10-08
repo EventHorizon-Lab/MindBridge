@@ -15,9 +15,14 @@ is the isolation boundary. See [architecture](../architecture.md) for storage an
 Pass already-constructed backends directly:
 
 ```python
-from mindbridge import JinaOmniEmbedder, Memory
+from mindbridge import SentenceTransformersEmbedder, Memory
 
-with Memory("./data/assistant", embedder=JinaOmniEmbedder()) as memory:
+with Memory(
+    "./data/assistant",
+    embedder=SentenceTransformersEmbedder(
+        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+    ),
+) as memory:
     record = memory.add("The spare key is in the blue toolbox.")
     hits = memory.search("Where is the spare key?")
 ```
@@ -30,7 +35,10 @@ from mindbridge import Memory
 with Memory.from_config(
     {
         "data_dir": "./data/assistant",
-        "embedding": {"provider": "jina-omni"},
+        "embedding": {
+            "provider": "sentence-transformers",
+            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        },
     }
 ) as memory:
     memory.add("Remember this")
@@ -985,14 +993,18 @@ AsyncOmniPrefetch(
 ) -> None
 
 latest: PrefetchResult | None
-submit(query: ContentInput) -> int
+submit(query: ContentInput) -> None
 async finalize(query: ContentInput | None = None) -> PrefetchResult
 async close() -> None
 ```
 
 Only one search runs at once and only the newest queued snapshot survives. `finalize` returns the
-exact final revision and closes the helper. Snapshots reject mutable `Path` atoms; use `Blob` or
+result for the exact final snapshot and closes the helper. `PrefetchResult` contains only `hits`;
+submission numbers are internal. Snapshots reject mutable `Path` atoms; use `Blob` or
 `AssetRef`.
+
+Migration: remove reads of `PrefetchResult.revision` and uses of the `submit()` return value.
+Use `finalize()` when results must match the final query; `latest` remains speculative.
 
 ### Async capture streams
 
@@ -1053,7 +1065,7 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 126 supported names exported by `mindbridge`:
+These are the 125 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
@@ -1063,7 +1075,7 @@ These are the 126 supported names exported by `mindbridge`:
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums and literal aliases | `AnswerPolicy`, `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `ContextSymbolNamespace`, `ContextSymbolCoverage`, `ContextSymbolRole`, `AbstentionReason`, `IndexQuantization`, `RetrievalMode`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
-| Bundled adapters | `JinaOmniEmbedder`, `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
+| Bundled adapters | `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
 
 ### Public values
@@ -1135,7 +1147,7 @@ The principal immutable values are:
 | `VisionFrame` | `image`, `stream_id`, `occurred_at` |
 | `VisionPartial` | `text`, `stream_id`, `occurred_at` |
 | `SceneBoundary` | `boundary`, `stream_id`, `occurred_at` |
-| `PrefetchResult` | positive `revision`, `hits` |
+| `PrefetchResult` | `hits` |
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
 | `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
@@ -1307,29 +1319,23 @@ The public construction signatures are:
 
 ```text
 SentenceTransformersEmbedder(
-    encoder,
+    encoder=None,
     *,
     model_id: str,
-    revision: str,
+    revision: str | None = None,
     dimension: int | None = None,
+    device: str | None = None,
     batch_size: int = 32,
 )
 
 SentenceTransformersEmbedder.load(
     model_id: str,
     *,
-    revision: str,
+    revision: str | None = None,
     dimension: int | None = None,
     device: str | None = None,
     batch_size: int = 32,
 ) -> SentenceTransformersEmbedder
-
-JinaOmniEmbedder(
-    *,
-    dimension: int = 1024,
-    device: str | None = None,
-    batch_size: int = 32,
-)
 
 FunASRTranscriber(
     recipe: FunASRRecipe = DEFAULT_FUNASR_RECIPE,
@@ -1364,13 +1370,26 @@ OpenCVFaceAnalyzer(
 ```
 
 The direct `SentenceTransformersEmbedder` constructor accepts a caller-owned encoder implementing
-`supports`, `get_embedding_dimension`, `encode_query`, and `encode_document`; `load` constructs that
-encoder and requires a 40-character immutable commit revision. `JinaOmniEmbedder.load` has the same
-keyword parameters as its constructor and eagerly loads the pinned model. Jina loading sets
+`supports`, `get_embedding_dimension`, `encode_query`, and `encode_document`. With no encoder,
+the constructor loads the selected model, deferring the pinned Jina checkpoint until the first
+non-empty embedding call; `load` eagerly loads every model. An explicit
+`revision` must be a 40-character immutable commit hash. When omitted, a Hub model's current
+revision is resolved before loading and included in its vector-space identity. This resolution
+requires Hub access; specify a commit hash for reproducible or cached offline loading. An injected
+encoder must expose an immutable `_commit_hash` in its model configuration or receive an explicit
+`revision`. The bundled Jina model defaults to its supported pinned revision. Jina loading sets
 `trust_remote_code=True` while pinning both model and code revisions. Its weights are CC BY-NC 4.0;
 that license covers the weights, not MindBridge. `DEFAULT_FUNASR_MODEL_ID` and
 `DEFAULT_FUNASR_RECIPE` publish the default speech recipe.
 `FunASRRecipe.auto_model_arguments() -> dict[str, object]` returns its standard FunASR composition.
+
+The separate `JinaOmniEmbedder` import has been removed; see the
+[Jina migration](../configuration.md#migrating-the-jina-provider) for its replacement.
+
+For `google/embeddinggemma-2`, the generic loader uses FP32 and supports `128`, `256`, `512`, or
+`768` dimensions without requiring optional Matryoshka metadata. Query and document prompts come
+from the pinned checkpoint. See the [EmbeddingGemma 2 configuration](../configuration.md#embeddinggemma-2)
+for a complete example and input limits.
 
 `OpenAIModels` can fill embedding, generation, transcription, and formation capabilities. Pass the
 same object only to the slots it should serve:

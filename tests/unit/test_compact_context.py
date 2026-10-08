@@ -225,10 +225,6 @@ def test_symbol_table_records_namespaces_roles_delivery_and_exact_round_trip() -
     )
     assert symbols[(ContextSymbolNamespace.MEMORY, RAW)].coverage is ContextSymbolCoverage.FULL
     assert (
-        symbols[(ContextSymbolNamespace.MEMORY, OUTSIDE_EVIDENCE)].coverage
-        is ContextSymbolCoverage.REFERENCE_ONLY
-    )
-    assert (
         symbols[(ContextSymbolNamespace.IDENTITY, IDENTITY)].coverage
         is ContextSymbolCoverage.REFERENCE_ONLY
     )

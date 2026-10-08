@@ -609,7 +609,12 @@ def _arguments(
 # builds when `--config` is omitted entirely, so adding a file to set one unrelated knob does not
 # silently change which models run. Naming a section overrides the default for that section only.
 DEFAULT_CONFIG_SECTIONS: Mapping[str, Mapping[str, object]] = {
-    "embedding": {"provider": "jina-omni"},
+    "embedding": {
+        "provider": "sentence-transformers",
+        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        "dimension": 1024,
+    },
     "generation": {"provider": "openai"},
 }
 
@@ -935,7 +940,7 @@ def _evaluation_memory_config(
     embedding = config.embedding
     speech = config.speech
     if arguments.device is not None:
-        if embedding.provider in {"jina-omni", "sentence-transformers"}:
+        if embedding.provider == "sentence-transformers":
             embedding = embedding.model_copy(update={"device": arguments.device})
         if speech is not None and speech.provider == "funasr":
             speech = speech.model_copy(update={"device": arguments.device})

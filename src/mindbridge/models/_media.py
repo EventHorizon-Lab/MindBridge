@@ -1,11 +1,27 @@
-"""Small shared helpers for reading local media metadata."""
+"""Small shared helpers for reading local media and its metadata."""
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
+
+
+def fetch_videos(
+    load_video: Callable[..., object],
+    videos: object,
+    sample_indices_fn: Callable[..., object] | None = None,
+) -> object:
+    """Decode through PyAV while preserving the provider's sampling and metadata contract."""
+    if isinstance(videos, list):
+        decoded = (
+            cast(tuple[object, object], fetch_videos(load_video, video, sample_indices_fn))
+            for video in videos
+        )
+        return list(zip(*decoded, strict=False))
+    return load_video(videos, backend="pyav", sample_indices_fn=sample_indices_fn)
 
 
 class _Container(Protocol):

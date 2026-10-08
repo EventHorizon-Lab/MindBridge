@@ -152,7 +152,7 @@ providers, download benchmark datasets, or supply the YuNet and SFace model file
 Transport extras do not choose a model backend. The base package always requires an application
 supplied embedder.
 
-The first `jina-omni` embedding call downloads the pinned
+The first Jina embedding call through `SentenceTransformersEmbedder` downloads the pinned
 `jinaai/jina-embeddings-v5-omni-small-retrieval` model and executes its pinned remote code with
 `trust_remote_code=True`. Its weights are CC BY-NC 4.0. Review that code and license before
 sensitive or commercial use; choose another backend when those terms do not fit.
@@ -170,7 +170,11 @@ from mindbridge import Memory
 
 config = {
     "data_dir": "./data/mindbridge-demo",
-    "embedding": {"provider": "jina-omni"},
+    "embedding": {
+        "provider": "sentence-transformers",
+        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+    },
     "settings": {
         "minimum_relevance": 0.0,
         "ambiguity_margin": 0.0,
