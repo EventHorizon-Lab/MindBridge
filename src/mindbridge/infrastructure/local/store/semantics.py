@@ -17,6 +17,7 @@ from mindbridge.infrastructure.local.store._codec import (
     row_text,
 )
 from mindbridge.infrastructure.local.store._connections import Connections
+from mindbridge.infrastructure.local.store._corroboration import _load_nodes
 from mindbridge.infrastructure.local.store._identity import (
     reproject_named_identities,
     resolve_identity_id,
@@ -55,7 +56,8 @@ from mindbridge.infrastructure.local.store.rows import (
     require_aware,
     require_identifier,
 )
-from mindbridge.types import SpatialContext
+from mindbridge.kernel.corroboration import EvidenceNode
+from mindbridge.types import RetrievalScope, SpatialContext
 
 
 class Semantics:
@@ -69,6 +71,29 @@ class Semantics:
     ) -> None:
         self._connections = connections
         self._records = records
+
+    def delivery_evidence(
+        self, memory_id: str, *, scope: RetrievalScope | None = None
+    ) -> tuple[dict[str, EvidenceNode], tuple[StoredMemory, ...], bool]:
+        """Read bounded current assessments and scoped records in one SQLite snapshot.
+
+        Historical compilation uses the existing full closure path: current assessments cannot
+        attest a past certificate. Scope and visibility apply to every delivered record.
+        """
+        require_identifier(memory_id, "memory_id")
+        with self._connections.read_transaction() as connection:
+            nodes, truncated = _load_nodes(connection, memory_id)
+            records = self._records.read_memories(
+                tuple(nodes),
+                valid_at=None if scope is None else scope.valid_at,
+                known_at=None if scope is None else scope.known_at,
+                near=None if scope is None else scope.near,
+                radius_m=None if scope is None else scope.radius_m,
+                place_id=None if scope is None else scope.place_id,
+                identity_id=None if scope is None else scope.identity_id,
+                active_only=True,
+            )
+        return nodes, records, truncated
 
     def apply_formation(  # noqa: C901 - one atomic formation transaction
         self,

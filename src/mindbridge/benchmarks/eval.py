@@ -237,7 +237,7 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_REVISION,
 )
 
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v17"
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v18"
 _BENCHMARK_SEARCH_REPLAY_SETUP_SPAN = "mindbridge.benchmark.search_replay_setup"
 
 

@@ -112,6 +112,17 @@ media omitted and the omission declared in the prompt, because the memories' tex
 and the provider names the modality, never the clip. Formation and consolidation have neither
 field because they shape answer evidence, not proposals.
 
+`generation.media_policy="on_demand"` enables one text-only diagnostic call before each answer
+that has eligible memory media. It selects original attachments only for a missing detail or
+conflicting descriptions. `generation.media_max_items` defaults to `2` and accepts integers from
+`1` to `8`; the existing byte and video limits still apply. At most 64 candidate attachments are
+offered to diagnosis. Question attachments remain intact, and all retained memory text and
+provenance remain available. Invalid or failed diagnosis adds no media; omission metadata remains
+in the answer request. A provider media rejection does not trigger another diagnosis. The default
+`media_policy="all"` preserves existing generation. Diagnosis has its own model span and request
+and token costs. SDK construction uses `generation_media_policy` and `generation_media_max_items`
+on `OpenAIModels`. This mechanism has local tests, not benchmark evidence of accuracy or cost gains.
+
 `vision` takes the same completion fields as `formation`, but its `modalities` accepts only `image`
 and `video`, because it is the visual capability set rather than a generation one. `generation`,
 `formation`, `vision`, and `consolidation` are separate slots and separate clients: setting one
@@ -209,6 +220,14 @@ versions as background. Records and contexts share one database read snapshot wi
 media metadata. A typed record with no version known by that cutoff does not consume the row
 window. Each target owns its history aliases and grounding snapshot, even when another target
 reads a different version of the same record.
+
+With history enabled, a named event, state, relation, trait, or affect about an entity in that
+history must jointly cite a still-standing entity record naming the subject. Retired names cannot
+be reused by citing only the new observation. Missing or competing naming witnesses withhold that
+proposal; a supported anonymous event is still accepted. The check does not rewrite source text,
+interpret arbitrary withdrawal prose, or change host naming and consent authority. Forgotten
+records stay excluded from history. Current identity binding also refuses competing visible names
+for the same identity instead of selecting one by recording order.
 
 This is version selection, not complete historical replay: stored text, metadata and in-place
 confidence/visibility projections retain the store's existing semantics.

@@ -467,6 +467,14 @@ reports `elapsed_ms`, `deadline_exceeded`, and the `unknowns` the request implie
 does not carry. `ask` is unchanged. [Context compilation](../context-compilation.md) owns the
 contract.
 
+`ContextBudget(selected_proofs=True)` enables current-knowledge delivery certificates in
+`bundle.proofs`. Each `ContextProof(anchor_id, nodes)` is a complete acyclic witness;
+`ContextProofNode(memory_id, confidence, sources=(), capture_id=None)` identifies an AND assessment
+or a capture leaf. The compiler charges certificate text and the materialized record union,
+preserves each record's full `evidence_ids`, and includes separate count and confidence witnesses.
+Historical `scope.known_at` uses full provenance. See
+[selected certificates](../context-compilation.md#selected-delivery-certificates) for limits.
+
 When `allow_partial_sources=True`, `bundle.excerpts` contains separately typed `ContextExcerpt`
 values when a verified dense text part of a newly written raw observation fits but its complete
 parent does not. The default `False` preserves full-record-only compilation and skips selector
@@ -1096,7 +1104,9 @@ The principal immutable values are:
 | `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `identity_id`, `spatial`, `cue_modality`, `valence`, `arousal` |
 | `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id`, `identity_id` |
 | `RetrievalMode` | `hybrid`, `dense`, `lexical` instance candidate policy |
-| `ContextBudget` | `max_chars`, `max_items`, `max_media_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
+| `ContextBudget` | `max_chars`, `max_items`, `max_media_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms`, `selected_proofs` |
+| `ContextProof` | `anchor_id`, complete `nodes`; derived `confidence`, `footprint`, `independent_of()`, and `render()` |
+| `ContextProofNode` | `memory_id`, `confidence`, `sources`, `capture_id` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
 | `NamedActor` | `identity_id`, `name`, `memory_ids`, `naming_assertion_id`: an identity a currently visible naming assertion names, reached through a compiled bundle's `actors` evidence rather than the assertion itself |
@@ -1108,7 +1118,7 @@ The principal immutable values are:
 | `ContextSymbol` | request-local `symbol`, `namespace`, stable ID, `coverage`, structural `roles`, and a selector only for partial memory coverage |
 | `ContextCitation` | decoded `memory_id`, full or partial `coverage`, and a selector exactly when partial; reference-only construction is rejected |
 | `ContextPresentation` | compact `text`, typed `symbols`, exact `chars`; pure `resolve()` identity decoding and eligibility-checking `resolve_citation()` |
-| `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `excerpts`; `hits` property, stable-ID `render()`, and opt-in `compact()` |
+| `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `excerpts`, `proofs`; `hits` property, stable-ID `render()`, and opt-in `compact()` |
 | `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `identity`, `rationale` |
 | `IdentityClaim` | `identity_id`, `name`, `relationship` |
 | `IdentityChange` | `identity_id`, `moved_ids` |
@@ -1391,6 +1401,9 @@ OpenAIModels(
     generation_min_video_seconds: float | None = None,
     generation_video_limit: int | None = 8,
     generation_extra_body: Mapping[str, object] | None = None,
+    generation_stream: bool = False,
+    generation_media_policy: Literal["all", "on_demand"] = "all",
+    generation_media_max_items: int = 2,
 )
 ```
 

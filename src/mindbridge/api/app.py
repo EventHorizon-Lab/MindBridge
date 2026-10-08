@@ -54,6 +54,7 @@ from mindbridge.types import (
     ContentInput,
     ContextBudget,
     ContextBundle,
+    ContextProof,
     ContextUnknownKind,
     ExportBundle,
     FaceObservation,
@@ -430,6 +431,7 @@ class ContextBudgetResponse(_ResponseModel):
     min_confidence: float
     freshness_seconds: float | None
     max_latency_ms: int | None
+    selected_proofs: bool
 
 
 class ContextConflictResponse(_ResponseModel):
@@ -512,6 +514,7 @@ class ContextBundleResponse(_ResponseModel):
     elapsed_ms: int
     deadline_exceeded: bool
     excerpts: tuple[ContextExcerptResponse, ...] = ()
+    proofs: tuple[ContextProof, ...] = ()
     # The deterministic text of `ContextBundle.render()`, so a caller need not re-derive it.
     rendered: str
 

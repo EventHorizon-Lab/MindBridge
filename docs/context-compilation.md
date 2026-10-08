@@ -45,13 +45,13 @@ window came back full and the bundle still lost evidence, `unknowns` carries a
 
 ## Evidence-closed selection
 
-For a derived hit, `compile()` follows its actual `context.evidence_ids` recursively and admits
+By default, for a derived hit, `compile()` follows its actual `context.evidence_ids` recursively and admits
 the assertion only with the complete finite dependency closure. Every member is hydrated under the
 same scope, type, confidence, freshness, active, and knowledge-time bounds. A missing, filtered,
 cyclic, or bounded dependency refuses the anchor and emits `evidence_unavailable`; this strict
 first version can therefore omit a claim whose historical or differently typed source a request
-excluded. All evidence IDs are conjunctive in this version: the schema has no minimal sufficient
-OR-of-AND support groups. Dependencies receive score `0.0`, which means supporting evidence rather
+excluded. The default delivery closes the full flattened audit union rather than selecting from
+SQLite's OR-of-AND assessments. Dependencies receive score `0.0`, which means supporting evidence rather
 than an independently query-ranked result. Their rendered lines retain basis and bounded evidence
 IDs; an evidence pointer is provenance, not semantic entailment.
 
@@ -70,6 +70,30 @@ distinct included memories can still be charged more than once. Candidate-window
 representatives are co-required with their own closures; that is bounded counterevidence coverage,
 not a global completeness guarantee. Co-derived events remain co-occurrence metadata and never
 become support or cause.
+
+### Selected delivery certificates
+
+`ContextBudget(selected_proofs=True)` opts into bounded certificate selection for current
+knowledge. Each delivered derived assertion carries `ContextProof` witnesses in `bundle.proofs`.
+Their `ContextProofNode` values identify one complete AND assessment or a raw capture, including
+its assessment confidence and capture group. A witness is acyclic and contains every required
+member. Count and confidence are separate obligations: selection buys their combined witnesses,
+which can require three or four proofs. Intermediate derived records must also justify their own
+delivered confidence. Shared captures and shared intermediate assertions cannot corroborate each
+other, and alternatives of one top-level clause cannot establish independence.
+
+Persistent and returned `MemoryContext.evidence_ids` retain the full audit union. The separately
+rendered **Selected proofs** section says which witnesses this delivery bought; a reference outside
+the bundle is not additional delivered evidence. Item and media costs count materialized records
+once; character costs also charge the union of certificate lines and their heading. Consent and
+candidate conflict completion remain mandatory. An excerpt cannot discharge a proof obligation.
+
+Search reads at most 256 ancestry nodes and 4096 clause-member rows per anchor, retains at most 64
+witnesses, and bounds clause visits and joins to 4096 per search. Its cost heuristic is not optimal
+packing; omitted alternatives are reported under `unknowns`. If it cannot certify the required
+support or fit the complete union, the claim is withheld. `scope.known_at` retains full-closure
+delivery: a current assessment cannot certify a historical state. The opt-in changes no stored
+records, disk schema, or default selection behavior.
 
 ## Exact raw excerpts
 
@@ -121,6 +145,7 @@ the untouched goal prevent a general semantic-equivalence claim for compact text
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
 | `freshness` | `None` | Keep only memories anchored within this `timedelta` of `reference_at` |
 | `max_latency_ms` | `None` | Deadline in milliseconds; optional stages are skipped once it passes |
+| `selected_proofs` | `False` | Deliver explicit count and confidence witnesses instead of every OR alternative for current knowledge |
 
 The freshness anchor is event end, then event start, then creation time. Every field is validated
 on construction: `max_chars`, `max_items` and `max_latency_ms` are positive integers,

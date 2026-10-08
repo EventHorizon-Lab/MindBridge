@@ -691,6 +691,7 @@ def _budget(arguments: argparse.Namespace) -> ContextBudget:
         min_confidence=arguments.min_confidence,
         freshness=_freshness_delta(arguments.freshness_seconds),
         max_latency_ms=arguments.max_latency_ms,
+        selected_proofs=arguments.selected_proofs,
     )
 
 
@@ -2232,6 +2233,11 @@ def _compile_command(
         help="deadline after which optional compilation stages are skipped, in milliseconds",
     )
     command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
+    command.add_argument(
+        "--selected-proofs",
+        action="store_true",
+        help="deliver complete count and confidence certificates instead of every alternative source",
+    )
     command.add_argument("--scope", metavar="JSON", help="temporal/spatial scope, @PATH, or -")
     command.add_argument(
         "--allow-partial-sources",

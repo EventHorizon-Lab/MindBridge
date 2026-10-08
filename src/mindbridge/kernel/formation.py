@@ -75,6 +75,41 @@ def formation_evidence_active(record: MemoryRecord) -> bool:
     )
 
 
+def _history_identity_refusal(
+    proposal: FormationProposal, source: FormationInput, evidence: Sequence[MemoryRecord]
+) -> bool:
+    """A known historical name requires a cited, still-standing naming witness.
+
+    This conservative check never rewrites prose or treats it as a host control operation.
+    Anonymous events and newly introduced entity proposals remain available to the former.
+    """
+    subject = canonical_subject(proposal.subject)
+    if subject is None or proposal.kind is MemoryKind.ENTITY:
+        return False
+    known = any(
+        record.context is not None
+        and record.context.kind is MemoryKind.ENTITY
+        and canonical_subject(record.context.subject) == subject
+        for record in source.history
+    )
+    if not known:
+        return False
+    witnesses = [
+        record
+        for record in evidence
+        if record.context is not None
+        and record.context.kind is MemoryKind.ENTITY
+        and canonical_subject(record.context.subject) == subject
+        and formation_evidence_active(record)
+    ]
+    identities = {
+        record.context.identity_id
+        for record in witnesses
+        if record.context is not None and record.context.identity_id is not None
+    }
+    return not witnesses or len(identities) > 1
+
+
 def _cited_sources(pairs: Sequence[tuple[PreparedMemory, str | None, float]]) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
@@ -702,7 +737,14 @@ class Formation(Traced):
                 evidence_ids = _proposal_sources(
                     proposal, inputs_by_id[source.id], inputs_by_id, evidence_by_id
                 )
-                if evidence_ids is None:
+                if evidence_ids is None or (
+                    self._settings.formation_history_max_rows
+                    and _history_identity_refusal(
+                        proposal,
+                        inputs_by_id[source.id],
+                        tuple(evidence_by_id[item] for item in evidence_ids),
+                    )
+                ):
                     refused += 1
                     continue
                 # One derived opinion the model grounded wrongly -- an affect cue naming a

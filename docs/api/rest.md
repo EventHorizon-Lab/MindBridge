@@ -165,7 +165,7 @@ Request fields and defaults are:
 | `ConsentRequest` | required `state` (`granted`, `withheld`, or `withdrawn`); optional `note` |
 | `RetentionRequest` | `dry_run=false` |
 | `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope`; `allow_partial_sources=false` |
-| `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; optional `max_media_items` (`0` for a text-only bundle); optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
+| `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; `selected_proofs=false`; optional `max_media_items` (`0` for a text-only bundle); optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
 | `SettleRequest` | `limit=100`; `max_attempts=3`; optional `memory_ids` with 1–100 IDs |
 | `AnalyzeRequest` | required `memory_id` |
 | `IdentityRegisterRequest` | required `identity_id`, `name`; optional `relationship` |
@@ -285,6 +285,13 @@ array naming what the request implied and the bundle does not carry. The
 [compiler reference](../context-compilation.md) owns section, selection, unknown, and conflict
 semantics.
 
+`budget.selected_proofs` defaults to `false`. Enabling it adds complete current-knowledge witnesses
+in the response's `proofs` array, while retaining every hit's full `context.evidence_ids` audit
+union. Each proof has `anchor_id` and `nodes`; each node has `memory_id`, `confidence`, `sources`,
+and nullable `capture_id`. Certificate text and records spend the same character, item, and media
+budgets. Historical `scope.known_at` keeps full provenance. Disabled or historical delivery returns
+an empty `proofs` array. No endpoint changes.
+
 `captureMemory` commits without calling any model; the returned `MemoryResponse` is the same
 content-addressed record `createMemory` would return for identical input. It is durable and
 readable through `getMemory` immediately and invisible to `searchMemories` until settled.
@@ -353,7 +360,7 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `RecordConsentResponse` | `operation`, or `null` when the same statement already stands |
 | `ExportResponse` | `exported_at`, `identity_id`, `identities`, `records`, `operations` |
 | `RetentionResponse` | `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `cascade_memory_ids`, `asset_ids`, `capture_memory_ids`, `deleted` |
-| `ContextBudgetResponse` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
+| `ContextBudgetResponse` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms`, `selected_proofs` |
 | `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknownResponse` | `kind`, `detail` |
 | `TextSpanPieceResponse` | `role`, half-open `start_codepoint`, `end_codepoint`, exact `source_text`, `sha256` |

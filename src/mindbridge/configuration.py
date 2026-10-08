@@ -156,6 +156,8 @@ class OpenAIGenerationConfig(_OpenAICompletionConfig):
     # floor its endpoint needs. Answer-only, like `video_limit`, so it is not on the shared
     # completion base that formation also reads.
     min_video_seconds: _PositiveFloat | None = None
+    media_policy: Literal["all", "on_demand"] = "all"
+    media_max_items: Annotated[int, Field(strict=True, ge=1, le=8)] = 2
 
 
 class OpenAIFormationConfig(_OpenAICompletionConfig):
@@ -442,6 +444,10 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
         values["generation_video_limit"] = config.video_limit
     if config.min_video_seconds is not None:
         values["generation_min_video_seconds"] = config.min_video_seconds
+    if config.media_policy != "all":
+        values["generation_media_policy"] = config.media_policy
+    if config.media_max_items != 2:
+        values["generation_media_max_items"] = config.media_max_items
     return _openai_factory(values)
 
 

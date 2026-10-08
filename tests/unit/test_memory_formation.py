@@ -21,8 +21,10 @@ from mindbridge import (
     FormationInput,
     FormationProposal,
     Memory,
+    MemoryIntent,
     MemoryKind,
     MemoryNotFoundError,
+    MemoryOperation,
     Modality,
     ModelError,
     ModelInput,
@@ -69,6 +71,65 @@ class PreferenceFormer:
 
     def close(self) -> None:
         pass
+
+
+@pytest.mark.parametrize("withdrawn,cite_name", [(False, False), (False, True), (True, False)])
+def test_history_named_events_require_a_standing_cited_name(
+    tmp_path: Path,
+    withdrawn: bool,
+    cite_name: bool,
+) -> None:
+    class NamedEventFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    (
+                        FormationProposal(
+                            kind=MemoryKind.ENTITY, subject="Ana", content="The person is Ana"
+                        ),
+                    ),
+                )
+            source = inputs[0]
+            naming = next(
+                record
+                for record in source.history
+                if record.context is not None and record.context.kind is MemoryKind.ENTITY
+            )
+            witnesses = (source.memory_id, naming.id) if cite_name else (source.memory_id,)
+            return (
+                (
+                    FormationProposal(
+                        kind=MemoryKind.EVENT,
+                        subject="Ana",
+                        content="Ana entered the room",
+                        evidence_ids=witnesses,
+                    ),
+                    FormationProposal(kind=MemoryKind.EVENT, content="A person entered the room"),
+                ),
+            )
+
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=NamedEventFormer(),
+        minimum_relevance=0,
+        formation_history_max_rows=8,
+    ) as memory:
+        memory.add("A person is introduced as Ana")
+        name = next(
+            record
+            for record in memory.list(limit=20).items
+            if record.context is not None and record.context.kind is MemoryKind.ENTITY
+        )
+        if withdrawn:
+            memory.apply(MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(name.id,)))
+        memory.add("A person enters the room")
+        contents = {record.content for record in memory.list(limit=30).items}
+        assert "A person entered the room" in contents
+        assert ("Ana entered the room" in contents) is (cite_name and not withdrawn)
 
 
 def test_new_observation_forms_typed_memories_once_without_changing_source_identity(

@@ -43,6 +43,7 @@ from mindbridge.types import (
     AbstentionReason,
     AnswerPolicy,
     ContextBudget,
+    ContextProof,
     ContextUnknownKind,
     FaceObservation,
     IdentityErasure,
@@ -343,6 +344,7 @@ class ContextBudgetResult(_ToolResult):
     min_confidence: float
     freshness_seconds: float | None
     max_latency_ms: int | None
+    selected_proofs: bool
 
 
 class ContextConflictResult(_ToolResult):
@@ -429,6 +431,7 @@ class ContextBundleResult(_ToolResult):
     elapsed_ms: int
     deadline_exceeded: bool
     excerpts: tuple[ContextExcerptResult, ...] = ()
+    proofs: tuple[ContextProof, ...] = ()
     rendered: str
 
 

@@ -91,7 +91,7 @@ and `history_truncated` fields. The proposal citation contract now accepts that 
 history. History stays off by default. `AsyncMemory` forwards the same construction settings.
 The OpenAI formation prompt changes its recipe fingerprint; existing formation completion marks
 belong to their original recipe. No disk schema, dependencies, REST endpoints or MCP tools change.
-Evaluation output schema advances to `18` and the runner recipe to `v17`; prior answer caches are
+Evaluation output schema advances to `18` and the runner recipe to `v18`; prior answer caches are
 separated from the new evidence prompt.
 
 ## Remaining experimental decisions
@@ -103,9 +103,38 @@ default. Explicit retirement and forgetting checks do not turn ordinary withdraw
 control-plane operation.
 
 The per-node proof cache and global propagation limit still make support a conservative lower
-bound under truncation. Demand-directed certificates and a separately verifiable selected-proof
-protocol remain research work; persistent `evidence_ids` are never rewritten to make a bundle fit.
-Preference improvements need paired, held-out evaluation. Media rereading remains on the existing
-bounded generation path; an automatic diagnostic reread policy requires evidence that it improves
-detail accuracy without increasing identity errors and cost. The rejudge tool has offline tests;
+bound under truncation. Current-knowledge certificate delivery now has an explicit opt-in protocol;
+persistent `evidence_ids` are never rewritten to make a bundle fit. The cost heuristic and semantic
+answer-gap completion still need controlled comparisons. Preference improvements need paired,
+held-out evaluation. A bounded, opt-in diagnostic media policy is implemented; it still requires
+evidence that it improves detail accuracy without increasing identity errors and cost.
+The rejudge tool has offline tests;
 the historical ICM model scoring run has not been repeated by this patch.
+
+## Selected proof and diagnostic media implementation
+
+`ContextBudget.selected_proofs` defaults off. When enabled, SQLite supplies bounded authoritative
+AND assessments and raw capture groups; complete acyclic certificates preserve the separately
+required support count and confidence. Selection buys their union, which may require different
+witnesses, and completes the confidence obligations of intermediate delivered assertions.
+Certificate text, full records and media all spend the ordinary budgets. Competing-value and
+consent obligations remain. The public `ContextProof` and `ContextProofNode` values are delivered
+in the additive `ContextBundle.proofs` field across Python, REST, MCP and CLI. Historical
+`scope.known_at` retains the full closure path. This is bounded heuristic packing, not optimal
+selection or semantic completion of every answer gap.
+
+History-enabled formation now requires a cited standing entity witness for a subject known from
+historical entity records. Retired or uncited names cannot justify a new named event; anonymous
+events remain available. Private history payloads expose available support and supersession
+aliases and omitted support counts. Current identity binding refuses multiple competing names
+on one identity. These checks do not interpret ordinary prose as a host name or consent operation,
+and forgotten records remain excluded from background.
+
+`OpenAIModels(generation_media_policy="on_demand")` makes at most one bounded text-only diagnostic
+call before eligible-media answers. Valid requests select only supplied attachment indices and
+two default gap reasons. Invalid envelopes select no extra media. The item cap defaults to two
+and stays between one and eight; existing bytes and video caps remain. A separate model span,
+using the caller's tracer provider, meters diagnostic requests and tokens without overwriting
+answer usage. Provider media fallback preserves original omissions and exhaustive ordering,
+and never performs a second diagnosis. The default media policy remains `all`. No benchmarks
+were launched to validate accuracy, formation success, preference adherence, or cost improvements.

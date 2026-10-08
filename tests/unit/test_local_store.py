@@ -2451,6 +2451,21 @@ def test_provisional_identities_name_the_people_no_assertion_names(tmp_path: Pat
         }
 
 
+def test_competing_names_on_one_identity_cannot_bind_either_subject(tmp_path: Path) -> None:
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        seen = _video_asset(store, "seen")
+        identity_id = _face_identity(store, seen, (1.0, 0.0))
+        store.records.write_memories(
+            (
+                _naming_assertion("name-a", identity_id, "Alice", recorded_at=recorded_at),
+                _naming_assertion("name-b", identity_id, "Bob", recorded_at=recorded_at),
+            )
+        )
+        assert store.identities.identity_for_subject("Alice") is None
+        assert store.identities.identity_for_subject("Bob") is None
+
+
 def test_retiring_evidence_re_derives_the_columns_the_survivors_agree_on(tmp_path: Path) -> None:
     """The evidence projection owns the inherited columns, not only confidence and visibility.
 

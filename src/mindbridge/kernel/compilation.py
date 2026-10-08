@@ -14,13 +14,21 @@ from time import perf_counter
 
 from opentelemetry.trace import Tracer
 
-from mindbridge.context import EvidenceClosure, NamedActorLink, _rejection, compile_context
+from mindbridge.context import (
+    EvidenceClosure,
+    NamedActorLink,
+    _rejection,
+    bundle_cost,
+    compile_context,
+)
 from mindbridge.exceptions import ValidationError
 from mindbridge.kernel.content import PreparedContent, verified_context_excerpt
 from mindbridge.kernel.contracts import Backends
+from mindbridge.kernel.corroboration import SupportSummary, independent_support
 from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.lifecycle import Lifecycle
 from mindbridge.kernel.materialization import Materializer
+from mindbridge.kernel.proofs import certificates, select_certificates
 from mindbridge.kernel.retrieval import RERANK_CANDIDATES, Retrieval
 from mindbridge.kernel.runtime import Storage, translate_storage_errors
 from mindbridge.kernel.speech import Speech
@@ -37,6 +45,7 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextExcerpt,
+    ContextProof,
     ContextUnknown,
     ContextUnknownKind,
     EvidenceBasis,
@@ -537,6 +546,14 @@ class Compilation(Traced):
     ) -> tuple[tuple[EvidenceClosure, ...], tuple[ContextUnknown, ...]]:
         """Hydrate finite, scoped transitive provenance for ranked compilation anchors."""
         started_at = perf_counter() if started_at is None else started_at
+        if budget.selected_proofs and (scope is None or scope.known_at is None):
+            return self._selected_closures(
+                anchors,
+                budget=budget,
+                reference_at=reference_at,
+                scope=scope,
+                started_at=started_at,
+            )
         by_id = {anchor.id: anchor for anchor in anchors}
         frontier = tuple(
             source_id
@@ -655,6 +672,132 @@ class Compilation(Traced):
             for reason, count in sorted(reasons.items())
         )
         return tuple(closures), unknowns
+
+    def _selected_closures(  # noqa: C901 - enforce every intermediate's delivery obligations
+        self,
+        anchors: Sequence[SearchHit],
+        *,
+        budget: ContextBudget,
+        reference_at: datetime,
+        scope: RetrievalScope | None,
+        started_at: float,
+    ) -> tuple[tuple[EvidenceClosure, ...], tuple[ContextUnknown, ...]]:
+        """Complete count and confidence obligations before atomically pricing their union."""
+        closures: list[EvidenceClosure] = []
+        unavailable = 0
+        truncated = False
+        for anchor in anchors:
+            if (
+                budget.max_latency_ms is not None
+                and (perf_counter() - started_at) * 1000 > budget.max_latency_ms
+            ):
+                unavailable += 1
+                continue
+            with translate_storage_errors("read delivery certificates"):
+                nodes, records, clipped = self._store.semantics.delivery_evidence(
+                    anchor.id, scope=scope
+                )
+            truncated |= clipped
+            hits = {
+                record.memory_id: self._hydrator.search_hit(
+                    record, anchor.score if record.memory_id == anchor.id else 0.0
+                )
+                for record in records
+            }
+            ranked = {hit.id: hit for hit in anchors}
+            eligible = {
+                memory_id: node
+                for memory_id, node in nodes.items()
+                if memory_id in hits
+                and _rejection(hits[memory_id], budget, reference_at) is None
+                and (
+                    memory_id not in ranked
+                    or (
+                        hits[memory_id].context == ranked[memory_id].context
+                        and hits[memory_id].content == ranked[memory_id].content
+                    )
+                )
+            }
+            costs = {memory_id: bundle_cost(hits[memory_id]) for memory_id in eligible}
+            pending = [anchor.id]
+            examined: set[str] = set()
+            members: set[str] = {anchor.id}
+            selected: dict[ContextProof, None] = {}
+            complete = True
+            while pending:
+                memory_id = pending.pop()
+                if memory_id in examined:
+                    continue
+                examined.add(memory_id)
+                if memory_id not in eligible or len(members) > budget.max_items:
+                    complete = False
+                    break
+                node = eligible[memory_id]
+                if node.root_group is not None and not node.assessments:
+                    continue
+                if (
+                    budget.max_latency_ms is not None
+                    and (perf_counter() - started_at) * 1000 > budget.max_latency_ms
+                ):
+                    complete = False
+                    break
+                full_support = independent_support(nodes, memory_id)
+                context = hits[memory_id].context
+                needs_pair = (
+                    context is not None
+                    and context.basis
+                    not in {EvidenceBasis.USER_STATEMENT, EvidenceBasis.RESPONSE_FEEDBACK}
+                    and (
+                        context.kind is MemoryKind.TRAIT
+                        or (context.kind is MemoryKind.ENTITY and context.identity_id is not None)
+                    )
+                )
+                required = SupportSummary(
+                    count=max(2 if needs_pair else 1, full_support.count),
+                    confidence=0.0 if context is None else context.confidence,
+                    truncated=full_support.truncated or clipped,
+                )
+                witnesses, clipped_search = certificates(eligible, memory_id)
+                truncated |= clipped_search or full_support.truncated
+                bought = select_certificates(witnesses, required, costs)
+                if not bought:
+                    complete = False
+                    break
+                selected.update(dict.fromkeys(bought))
+                for proof in bought:
+                    for step in proof.nodes:
+                        members.add(step.memory_id)
+                        if step.memory_id not in examined:
+                            pending.append(step.memory_id)
+            if not complete or len(members) > budget.max_items:
+                unavailable += 1
+                continue
+            closures.append(
+                EvidenceClosure(
+                    hits[anchor.id],
+                    (
+                        hits[anchor.id],
+                        *(hits[memory_id] for memory_id in sorted(members - {anchor.id})),
+                    ),
+                    tuple(selected),
+                )
+            )
+        unknowns = []
+        if unavailable:
+            unknowns.append(
+                ContextUnknown(
+                    kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+                    detail=f"{unavailable} ranked assertions lacked deliverable count and confidence certificates",
+                )
+            )
+        if truncated:
+            unknowns.append(
+                ContextUnknown(
+                    kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+                    detail="bounded certificate search may have omitted valid alternatives",
+                )
+            )
+        return tuple(closures), tuple(unknowns)
 
     def _co_derived_events(
         self,

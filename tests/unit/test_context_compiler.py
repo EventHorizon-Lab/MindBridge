@@ -2039,6 +2039,7 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
         "min_confidence": 0.0,
         "freshness_seconds": 86400.0,
         "max_latency_ms": None,
+        "selected_proofs": False,
     }
     assert len(document["facts"]) == 1  # type: ignore[arg-type]
     assert "Budget: " in str(document["rendered"])

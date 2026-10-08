@@ -509,6 +509,25 @@ def test_builtin_openai_generation_config_maps_friendly_names_to_the_sdk_adapter
     }
 
 
+def test_builtin_openai_generation_maps_on_demand_media_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    marker = cast(GenerationBackend, object())
+
+    def build(**values: object) -> GenerationBackend:
+        captured.update(values)
+        return marker
+
+    monkeypatch.setattr(recipes_module, "_owned_openai_models", build)
+    spec = configuration.OpenAIGenerationConfig(
+        provider="openai", media_policy="on_demand", media_max_items=3
+    )
+    assert configuration._build_generation(spec) is marker
+    assert captured["generation_media_policy"] == "on_demand"
+    assert captured["generation_media_max_items"] == 3
+
+
 def test_builtin_openai_generation_stream_is_explicitly_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

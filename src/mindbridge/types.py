@@ -2121,8 +2121,12 @@ class ContextBudget:
     # optional ones. It never interrupts work already in flight, so an exceeded deadline is
     # reported on the bundle rather than raised.
     max_latency_ms: int | None = None
+    # Full provenance remains the default; selected delivery carries explicit certificates.
+    selected_proofs: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.selected_proofs, bool):
+            raise ValidationError("budget selected_proofs must be a boolean")
         object.__setattr__(self, "max_chars", _positive_int(self.max_chars, "budget max_chars"))
         object.__setattr__(self, "max_items", _positive_int(self.max_items, "budget max_items"))
         if self.max_media_items is not None:
@@ -2158,6 +2162,7 @@ class ContextBudget:
         the one rename between this projection and the dataclass.
         """
         return {
+            "selected_proofs": self.selected_proofs,
             "max_chars": self.max_chars,
             "max_items": self.max_items,
             "max_media_items": self.max_media_items,
@@ -2528,6 +2533,107 @@ class ContextPresentation:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ContextProofNode:
+    """One complete AND assessment, or a capture leaf, in a delivery certificate.
+
+    Assessments come from SQLite, not from the flattened ``evidence_ids`` union. Confidence
+    is the assessment's score; a leaf's ``capture_id`` identifies shared capture provenance.
+    """
+
+    memory_id: str
+    confidence: float
+    sources: tuple[str, ...] = ()
+    capture_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "memory_id", _text(self.memory_id, "proof memory_id"))
+        object.__setattr__(self, "sources", _memory_ids(self.sources, "proof sources"))
+        object.__setattr__(self, "confidence", _unit_interval(self.confidence, "proof confidence"))
+        object.__setattr__(self, "capture_id", _optional_text(self.capture_id, "proof capture_id"))
+        if bool(self.sources) == (self.capture_id is not None) or self.confidence == 0.0:
+            raise ValidationError(
+                "a proof node needs positive confidence and either sources or a capture"
+            )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ContextProof:
+    """An acyclic, complete witness for one included assertion, separate from its audit union."""
+
+    anchor_id: str
+    nodes: tuple[ContextProofNode, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "anchor_id", _text(self.anchor_id, "proof anchor_id"))
+        nodes = tuple(self.nodes)
+        if not nodes or any(not isinstance(node, ContextProofNode) for node in nodes):
+            raise ValidationError("proof nodes must contain ContextProofNode values")
+        by_id = {node.memory_id: node for node in nodes}
+        if len(by_id) != len(nodes) or self.anchor_id not in by_id:
+            raise ValidationError("proof nodes must be unique and contain the anchor")
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(memory_id: str) -> None:
+            if memory_id in visiting or memory_id not in by_id:
+                raise ValidationError("a proof cannot contain a cycle or a missing AND member")
+            if memory_id in visited:
+                return
+            visiting.add(memory_id)
+            for source in by_id[memory_id].sources:
+                visit(source)
+            visiting.remove(memory_id)
+            visited.add(memory_id)
+
+        # Iteration in the producer is bounded; reject excessive user-supplied recursion here.
+        if len(nodes) > 256:
+            raise ValidationError("a proof cannot exceed 256 nodes")
+        visit(self.anchor_id)
+        if len(visited) != len(nodes):
+            raise ValidationError("proof nodes must all be reachable from the anchor")
+        object.__setattr__(self, "nodes", tuple(sorted(nodes, key=lambda node: node.memory_id)))
+
+    @property
+    def confidence(self) -> float:
+        return min(node.confidence for node in self.nodes)
+
+    @property
+    def footprint(self) -> frozenset[tuple[str, str]]:
+        return frozenset(
+            ("capture", node.capture_id)
+            if node.capture_id is not None
+            else ("node", node.memory_id)
+            for node in self.nodes
+            if node.memory_id != self.anchor_id or node.capture_id is not None
+        )
+
+    def independent_of(self, other: ContextProof) -> bool:
+        if self.anchor_id != other.anchor_id:
+            return False
+        left = next(node.sources for node in self.nodes if node.memory_id == self.anchor_id)
+        right = next(node.sources for node in other.nodes if node.memory_id == other.anchor_id)
+        return set(left) != set(right) and self.footprint.isdisjoint(other.footprint)
+
+    def render(self, *, symbols: Sequence[ContextSymbol] = ()) -> str:
+        def identifier(memory_id: str) -> str:
+            return (
+                _symbol(memory_id, ContextSymbolNamespace.MEMORY, symbols) if symbols else memory_id
+            )
+
+        steps = "; ".join(
+            f"[{identifier(node.memory_id)}] <- "
+            + (
+                ", ".join(f"[{identifier(source)}]" for source in node.sources)
+                if node.sources
+                else f"capture [{identifier(node.capture_id or '')}]"
+            )
+            + f" @{node.confidence:.17g}"
+            for node in self.nodes
+        )
+        return f"- Proof [{identifier(self.anchor_id)}]: {steps}"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBundle:
     """One bounded, structured context view compiled for a goal."""
 
@@ -2554,8 +2660,9 @@ class ContextBundle:
     elapsed_ms: int
     deadline_exceeded: bool
     excerpts: tuple[ContextExcerpt, ...] = ()
+    proofs: tuple[ContextProof, ...] = ()
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 - validate the complete certificate delivery contract
         # The affect section is the one whose entries carry more than a hit does, and every
         # transport reads that extra without asking. A plain hit here would serialize as an
         # affect cue with an empty hop, so the type is enforced rather than defaulted.
@@ -2565,6 +2672,72 @@ class ContextBundle:
             raise ValidationError("excerpts must contain ContextExcerpt values")
         if {hit.id for hit in self.hits} & {excerpt.source_memory_id for excerpt in self.excerpts}:
             raise ValidationError("a bundle cannot contain a full hit and excerpt of one source")
+        if any(not isinstance(proof, ContextProof) for proof in self.proofs):
+            raise ValidationError("proofs must contain ContextProof values")
+        if self.proofs and not self.budget.selected_proofs:
+            raise ValidationError("delivery certificates require selected_proofs")
+        hits = {hit.id: hit for hit in self.hits}
+        by_anchor: dict[str, list[ContextProof]] = {}
+        for proof in self.proofs:
+            by_anchor.setdefault(proof.anchor_id, []).append(proof)
+            for node in proof.nodes:
+                if node.memory_id not in hits:
+                    raise ValidationError("every proof node must be delivered as a full hit")
+                context = hits[node.memory_id].context
+                if node.sources and (
+                    context is None or not set(node.sources) <= set(context.evidence_ids)
+                ):
+                    raise ValidationError(
+                        "proof sources must belong to the authoritative evidence union"
+                    )
+                if node.capture_id is not None:
+                    if context is not None and (
+                        context.evidence_ids
+                        or (
+                            context.kind is not MemoryKind.OBSERVATION
+                            and context.basis
+                            not in {EvidenceBasis.USER_STATEMENT, EvidenceBasis.RESPONSE_FEEDBACK}
+                        )
+                    ):
+                        raise ValidationError("a derived assertion cannot be a capture leaf")
+                    if node.capture_id != (
+                        node.memory_id if context is None else context.source_id or node.memory_id
+                    ):
+                        raise ValidationError("proof capture_id must match its stored capture")
+        for memory_id, witnesses in by_anchor.items():
+            context = hits[memory_id].context
+            confidence = max(proof.confidence for proof in witnesses)
+            independent = False
+            for position, proof in enumerate(witnesses):
+                for other in witnesses[position + 1 :]:
+                    if proof.independent_of(other):
+                        independent = True
+                        confidence = max(
+                            confidence, 1.0 - (1.0 - proof.confidence) * (1.0 - other.confidence)
+                        )
+            if context is not None:
+                if confidence + 1e-12 < context.confidence:
+                    raise ValidationError(
+                        "selected witnesses must justify the delivered confidence"
+                    )
+                if (
+                    context.basis
+                    not in {EvidenceBasis.USER_STATEMENT, EvidenceBasis.RESPONSE_FEEDBACK}
+                    and (
+                        context.kind is MemoryKind.TRAIT
+                        or (context.kind is MemoryKind.ENTITY and context.identity_id is not None)
+                    )
+                    and not independent
+                ):
+                    raise ValidationError(
+                        "selected trait or naming evidence requires independent witnesses"
+                    )
+        if self.proofs:
+            for hit in self.hits:
+                if hit.context is not None and hit.context.evidence_ids and hit.id not in by_anchor:
+                    raise ValidationError(
+                        "every delivered derived assertion requires its own certificate"
+                    )
 
     @property
     def hits(self) -> tuple[SearchHit, ...]:
@@ -2598,6 +2771,9 @@ class ContextBundle:
         if self.excerpts:
             lines.extend(("", "## Partial sources"))
             lines.extend(render_excerpt_line(excerpt) for excerpt in self.excerpts)
+        if self.proofs:
+            lines.extend(("", "## Selected proofs"))
+            lines.extend(proof.render() for proof in self.proofs)
         if self.conflicts:
             lines.extend(("", "## Conflicts"))
             included_ids = {hit.id for hit in self.hits}
@@ -2686,7 +2862,7 @@ def _entry_symbol_references(
     return tuple(references)
 
 
-def _context_symbols(bundle: ContextBundle) -> tuple[ContextSymbol, ...]:
+def _context_symbols(bundle: ContextBundle) -> tuple[ContextSymbol, ...]:  # noqa: C901 - one ordered structural symbol scan
     full_memory_ids = {hit.id for hit in bundle.hits}
     partial_by_memory_id = {excerpt.source_memory_id: excerpt for excerpt in bundle.excerpts}
     ordered: list[tuple[ContextSymbolNamespace, str]] = []
@@ -2713,6 +2889,20 @@ def _context_symbols(bundle: ContextBundle) -> tuple[ContextSymbol, ...]:
                 memory_id,
                 ContextSymbolRole.CONFLICT,
             )
+    for proof in bundle.proofs:
+        for node in proof.nodes:
+            for memory_id in (
+                node.memory_id,
+                *node.sources,
+                *((node.capture_id,) if node.capture_id else ()),
+            ):
+                _add_context_symbol_reference(
+                    ordered,
+                    roles,
+                    ContextSymbolNamespace.MEMORY,
+                    memory_id,
+                    ContextSymbolRole.EVIDENCE,
+                )
 
     next_number = {ContextSymbolNamespace.MEMORY: 1, ContextSymbolNamespace.IDENTITY: 1}
     result: list[ContextSymbol] = []
@@ -2796,6 +2986,9 @@ def _compact_context_text(
     if bundle.excerpts:
         lines.extend(("", "## Partial sources"))
         lines.extend(_compact_excerpt_line(excerpt, symbols) for excerpt in bundle.excerpts)
+    if bundle.proofs:
+        lines.extend(("", "## Selected proofs"))
+        lines.extend(proof.render(symbols=symbols) for proof in bundle.proofs)
     if bundle.conflicts:
         lines.extend(("", "## Conflicts"))
         included_ids = {hit.id for hit in bundle.hits}
