@@ -238,7 +238,7 @@ from mindbridge.models.base import (
     VisionDescriptionBackend,
 )
 
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v16"
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v18"
 _BENCHMARK_SEARCH_REPLAY_SETUP_SPAN = "mindbridge.benchmark.search_replay_setup"
 
 
@@ -1422,6 +1422,7 @@ def _with_grounding_loss(
             sample,
             dropped_hits=grounding.dropped_hits,
             recall_shape=grounding.recall_shape,
+            grounding_request=grounding.request,
         )
         for sample in samples
     )
@@ -3116,6 +3117,7 @@ def _sample(
         cached=cached,
         metadata=question.metadata,
         prompt=tuple(str(part) for part in question.content) if log_samples else None,
+        source_question=question.source_question if log_samples else None,
         references=question.references if log_samples else None,
         evidence=evidence,
         excerpt_source_ids=excerpt_source_ids,

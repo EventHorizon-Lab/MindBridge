@@ -23,7 +23,7 @@ from mindbridge.benchmarks.eval_cache import EvidenceInterval
 from mindbridge.benchmarks.eval_config import DEFAULT_ARM
 from mindbridge.models.base import _is_generation_abort_rejection
 
-EVAL_SCHEMA_VERSION = 17
+EVAL_SCHEMA_VERSION = 18
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +204,7 @@ class SampleResult:
     ranked_source_ids: tuple[str, ...] = ()
     ranked_source_ids_complete: bool = False
     dropped_hits: int | None = None
+    grounding_request: Mapping[str, object] | None = None
     answer_policy: AnswerPolicy | None = None
     # The shape of the recall plan this answer was grounded on; None unless the run planned.
     recall_shape: str | None = None
@@ -217,6 +218,7 @@ class SampleResult:
     retrieval_diagnostic_error: FailureDetail | None = None
     cached: bool = False
     prompt: tuple[str, ...] | None = None
+    source_question: str | None = None
     references: tuple[str, ...] | None = None
     evidence: tuple[EvidenceInterval, ...] = ()
     # Partial sources stay separate so a scorer cannot silently credit an omitted span as if the
@@ -246,6 +248,7 @@ class SampleResult:
             "ranked_source_ids": self.ranked_source_ids,
             "ranked_source_ids_complete": self.ranked_source_ids_complete,
             "dropped_hits": self.dropped_hits,
+            "grounding_request": self.grounding_request,
             "recall_shape": self.recall_shape,
             "task": self.task,
             # The policy this sample's request carried; only the product arm reaches `ask`.
@@ -292,6 +295,8 @@ class SampleResult:
         }
         if self.prompt is not None:
             payload["prompt"] = self.prompt
+        if self.source_question is not None:
+            payload["source_question"] = self.source_question
         if self.references is not None:
             payload["references"] = self.references
         if self.judge_response is not None:

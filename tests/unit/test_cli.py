@@ -1045,6 +1045,7 @@ def test_remote_mode_compiles_over_v1(
         "what should I bring",
         "--max-items",
         "8",
+        "--selected-proofs",
         "--memory-type",
         "episodic",
         "--freshness-seconds",
@@ -1063,6 +1064,7 @@ def test_remote_mode_compiles_over_v1(
                 "budget": {
                     "max_chars": 16000,
                     "max_items": 8,
+                    "selected_proofs": True,
                     "max_media_items": None,
                     "memory_types": ["episodic"],
                     "min_confidence": 0.0,

@@ -72,11 +72,18 @@ class ModelInput:
 
 @dataclass(frozen=True, slots=True)
 class FormationInput:
-    """One committed observation presented to an automatic formation backend."""
+    """One formation target and optional read-only, text-only historical evidence.
+
+    History is background, not additional targets. A proposal must still cite its target;
+    a historical record may be cited only while its current version remains active.
+    ``history_truncated`` reports an incomplete window, never absence of counterevidence.
+    """
 
     memory_id: str
     content: ModelInput
     context: ObservationContext
+    history: tuple[MemoryRecord, ...] = ()
+    history_truncated: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.memory_id, str) or not self.memory_id.strip():
@@ -85,6 +92,20 @@ class FormationInput:
             raise ValidationError("formation input content must be a ModelInput")
         if not isinstance(self.context, ObservationContext):
             raise ValidationError("formation input context must be an ObservationContext")
+        try:
+            history = tuple(self.history)
+        except TypeError:
+            raise ValidationError("formation history must contain MemoryRecord values") from None
+        if any(not isinstance(record, MemoryRecord) for record in history):
+            raise ValidationError("formation history must contain MemoryRecord values")
+        identifiers = [record.id for record in history]
+        if self.memory_id in identifiers or len(set(identifiers)) != len(identifiers):
+            raise ValidationError("formation history IDs must be unique and exclude the target")
+        if any(record.assets or not record.content.strip() for record in history):
+            raise ValidationError("formation history must contain text without media assets")
+        if not isinstance(self.history_truncated, bool):
+            raise ValidationError("formation history_truncated must be a boolean")
+        object.__setattr__(self, "history", history)
 
 
 def _modalities(

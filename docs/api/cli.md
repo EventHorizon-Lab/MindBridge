@@ -151,6 +151,10 @@ they require the matching capability. `compile` mirrors the
 [`ContextBudget` defaults](../context-compilation.md#budget) and repeats `--memory-type` to keep
 more than one type; `--max-latency-ms` is a deadline the compiler checks between stages, and the
 printed bundle carries `elapsed_ms`, `deadline_exceeded`, and `unknowns` alongside its sections.
+`--selected-proofs` opts into current-knowledge count and confidence certificates, delivered in
+the additive `proofs` array and rendered section. It preserves full audit evidence IDs and charges
+proof text and materialized records together. Historical `--scope` with `known_at` retains full
+provenance. Without the option, `proofs` is empty.
 `--allow-partial-sources` explicitly enables digest-bound exact spans of eligible raw text parents
 when a full parent does not fit. It is off by default, which preserves full-record-only compilation
 and leaves the additive `excerpts` array empty. Each rendered excerpt line is labelled partial and

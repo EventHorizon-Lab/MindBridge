@@ -71,6 +71,8 @@ contract.
 
 ## Evaluate
 
+- [Memory reliability changes](research/2026-10-08-reliability-optimization.md) — formation history,
+  stale evidence guards, constraint candidates, request telemetry, and saved-prediction rejudging.
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
 - [Annotated example configuration](examples/eval.example.yaml) — every evaluation slot and the
   order in which a run uses it.

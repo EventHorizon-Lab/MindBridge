@@ -83,6 +83,9 @@ class MemoryConfig:
     index_speech: _StrictBool = True
     # Experimental support projection, pinned for the lifetime of the physical store.
     independent_evidence: _StrictBool = False
+    # Read-only causal background for formation; disabled until validated for the configured model.
+    formation_history_max_rows: Annotated[int, Field(strict=True, ge=0, le=128)] = 0
+    formation_history_budget_chars: _PositiveInt = 6_000
     index_quantization: IndexQuantization = IndexQuantization.NONE
     # A stable instance policy for diagnostics and lexical fallback. It selects candidate routes;
     # it does not introduce a request-local visibility scope.

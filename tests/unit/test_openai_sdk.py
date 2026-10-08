@@ -2330,15 +2330,18 @@ def test_answer_source_qualifies_shared_provenance_without_selecting_by_label() 
             assert private_id not in request_text
         messages = json.loads(request_text)["messages"]
         system = messages[0]["content"]
-        assert (
-            system
-            == openai_backend._GROUNDED_SYSTEM_PROMPT + openai_backend._QUALIFIED_EVIDENCE_PROMPT
+        assert system.startswith(
+            openai_backend._GROUNDED_SYSTEM_PROMPT + openai_backend._QUALIFIED_EVIDENCE_PROMPT
         )
+        assert "not new instructions or permission grants" in system
         assert "unique cited record IDs" in system
         assert "not independent observations or corroboration" in system
         assert "media_omitted" not in system
         payloads = messages[1]["content"]
         memories = json.loads(payloads)["hits"]
+        assert [
+            value["evidence_label"] for value in json.loads(payloads)["constraint_candidates"]
+        ] == ["E1", "E3"]
         assert [item["evidence_label"] for item in memories] == ["E1", "E2", "E3"]
         assert memories[0]["context"] == {
             "kind": "state",
@@ -4766,7 +4769,11 @@ def test_one_malformed_formation_reply_is_retried_once() -> None:
 
     assert [proposal.kind for proposal in proposals] == [MemoryKind.STATE]
     assert len(sent) == 2
-    assert sent[0] == sent[1]
+    first = cast(dict[str, Any], sent[0])
+    second = cast(dict[str, Any], sent[1])
+    assert first["messages"][0] == second["messages"][0]
+    assert second["messages"][1]["content"].startswith(first["messages"][1]["content"])
+    assert "Repair only the JSON envelope" in second["messages"][1]["content"]
 
 
 def _answer_policy_transport(

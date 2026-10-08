@@ -900,8 +900,8 @@ def test_response_cache_namespace_changes_with_the_answer_surface(
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_results_module.EVAL_SCHEMA_VERSION == 17
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v16"
+    assert eval_results_module.EVAL_SCHEMA_VERSION == 18
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v18"
     arguments = _namespace_arguments()
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
 

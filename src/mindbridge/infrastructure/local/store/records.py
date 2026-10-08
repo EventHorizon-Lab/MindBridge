@@ -57,6 +57,77 @@ from mindbridge.infrastructure.local.store.rows import (
 from mindbridge.types import EvidenceBasis, MemoryKind, SpatialContext
 
 
+def read_memories(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    valid_at: datetime | None = None,
+    known_at: datetime | None = None,
+    near: SpatialContext | None = None,
+    radius_m: float | None = None,
+    place_id: str | None = None,
+    identity_id: str | None = None,
+    active_only: bool = False,
+) -> tuple[StoredMemory, ...]:
+    """Hydrate scoped records inside the caller's authoritative read snapshot."""
+    if not memory_ids:
+        return ()
+    for memory_id in memory_ids:
+        require_identifier(memory_id, "memory_id")
+    require_optional_identifier(place_id, "place_id")
+    require_optional_identifier(identity_id, "identity_id")
+    place_clause = "" if place_id is None else "AND place_id = ?"
+    place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
+    rows: list[sqlite3.Row] = []
+    identity_clause, identity_parameters = identity_scope(connection, identity_id)
+    if identity_clause is None:
+        return ()
+    for offset in range(0, len(memory_ids), SQLITE_PARAMETER_BATCH):
+        batch = memory_ids[offset : offset + SQLITE_PARAMETER_BATCH]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        rows.extend(
+            connection.execute(
+                f"""
+                SELECT memory_id, content, modality, memory_type, metadata_json,
+                       occurred_at, occurred_end, last_accessed_at, access_count,
+                       created_at, updated_at, place_id, forgotten_at
+                FROM memory_records
+                WHERE memory_id IN ({placeholders})
+                {place_clause}
+                {identity_clause}
+                """,
+                (*batch, *place_parameters, *identity_parameters),
+            ).fetchall()
+        )
+    assets_by_memory = _read_memory_assets(connection, tuple(memory_ids))
+    contexts, semantic_ids = read_memory_contexts(
+        connection,
+        tuple(memory_ids),
+        valid_at=valid_at,
+        known_at=known_at,
+        near=near,
+        radius_m=radius_m,
+        active_only=active_only,
+    )
+    by_id = {
+        row_text(row, "memory_id"): memory_from_row(
+            row,
+            assets=assets_by_memory.get(row_text(row, "memory_id"), ()),
+            context=contexts.get(row_text(row, "memory_id")),
+        )
+        for row in rows
+        if memory_in_scope(
+            row,
+            active_only=active_only,
+            known_at=known_at,
+            near=near,
+            semantic_ids=semantic_ids,
+            scoped_ids=contexts.keys(),
+        )
+    }
+    return tuple(by_id[memory_id] for memory_id in memory_ids if memory_id in by_id)
+
+
 def write_embedding(
     connection: sqlite3.Connection,
     embedding: StoredEmbedding,
@@ -589,63 +660,18 @@ class MemoryRecords:
         `identity_id` scopes it to one person, accepting a merged alias, and is a hard filter for
         the same reason: it is the authoritative answer the search index only approximates.
         """
-        if not memory_ids:
-            return ()
-        for memory_id in memory_ids:
-            require_identifier(memory_id, "memory_id")
-        require_optional_identifier(place_id, "place_id")
-        require_optional_identifier(identity_id, "identity_id")
-        place_clause = "" if place_id is None else "AND place_id = ?"
-        place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
-        rows: list[sqlite3.Row] = []
         with self._connections.read_transaction() as connection:
-            identity_clause, identity_parameters = identity_scope(connection, identity_id)
-            if identity_clause is None:
-                return ()
-            for offset in range(0, len(memory_ids), SQLITE_PARAMETER_BATCH):
-                batch = memory_ids[offset : offset + SQLITE_PARAMETER_BATCH]
-                placeholders = ", ".join("?" for _memory_id in batch)
-                rows.extend(
-                    connection.execute(
-                        f"""
-                        SELECT memory_id, content, modality, memory_type, metadata_json,
-                               occurred_at, occurred_end, last_accessed_at, access_count,
-                               created_at, updated_at, place_id, forgotten_at
-                        FROM memory_records
-                        WHERE memory_id IN ({placeholders})
-                        {place_clause}
-                        {identity_clause}
-                        """,
-                        (*batch, *place_parameters, *identity_parameters),
-                    ).fetchall()
-                )
-            assets_by_memory = _read_memory_assets(connection, tuple(memory_ids))
-            contexts, semantic_ids = read_memory_contexts(
+            return read_memories(
                 connection,
-                tuple(memory_ids),
+                memory_ids,
                 valid_at=valid_at,
                 known_at=known_at,
                 near=near,
                 radius_m=radius_m,
+                place_id=place_id,
+                identity_id=identity_id,
                 active_only=active_only,
             )
-        by_id = {
-            row_text(row, "memory_id"): memory_from_row(
-                row,
-                assets=assets_by_memory.get(row_text(row, "memory_id"), ()),
-                context=contexts.get(row_text(row, "memory_id")),
-            )
-            for row in rows
-            if memory_in_scope(
-                row,
-                active_only=active_only,
-                known_at=known_at,
-                near=near,
-                semantic_ids=semantic_ids,
-                scoped_ids=contexts.keys(),
-            )
-        }
-        return tuple(by_id[memory_id] for memory_id in memory_ids if memory_id in by_id)
 
     def count_memories(
         self,
@@ -763,6 +789,59 @@ class MemoryRecords:
             )
             for row in rows
         )
+
+    def formation_history(
+        self, *, known_before: datetime, exclude_ids: Sequence[str], limit: int
+    ) -> tuple[StoredMemory, ...]:
+        """Read bounded causal background, including retired claims as counterevidence.
+
+        Records and version contexts share one read snapshot, without loading media. Forgotten
+        content is excluded even from background. Old assertions retain their status; this read
+        never promotes them back to active sources or uses metadata for isolation.
+        """
+        require_aware(known_before, "known_before")
+        if not 1 <= limit <= 129:
+            raise ValueError("formation history limit must be between 1 and 129")
+        with self._connections.read_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT memory_id, content, 'text' AS modality, memory_type, metadata_json,
+                       occurred_at, occurred_end, last_accessed_at, access_count,
+                       created_at, updated_at, place_id, forgotten_at
+                FROM memory_records
+                WHERE created_at <= ? AND forgotten_at IS NULL AND content <> ''
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1 FROM memory_semantics AS s
+                      WHERE s.memory_id = memory_records.memory_id
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM memory_versions AS v
+                      WHERE v.memory_id = memory_records.memory_id AND v.recorded_at <= ?
+                    )
+                  )
+                ORDER BY created_at DESC, memory_id DESC LIMIT ?
+                """,
+                (
+                    datetime_text(known_before),
+                    datetime_text(known_before),
+                    limit + len(exclude_ids),
+                ),
+            ).fetchall()
+            excluded = set(exclude_ids)
+            selected = tuple(row for row in rows if row_text(row, "memory_id") not in excluded)[
+                :limit
+            ]
+            identifiers = tuple(row_text(row, "memory_id") for row in selected)
+            contexts, semantic_ids = read_memory_contexts(
+                connection, identifiers, known_at=known_before
+            )
+            return tuple(
+                memory_from_row(row, assets=(), context=contexts.get(memory_id))
+                for row in selected
+                if (memory_id := row_text(row, "memory_id")) not in semantic_ids
+                or memory_id in contexts
+            )
 
     def reinforce_memories(self, memory_ids: Sequence[str], *, accessed_at: datetime) -> int:
         """Record one bounded retrieval reinforcement for each existing memory."""

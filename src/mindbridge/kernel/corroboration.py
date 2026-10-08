@@ -1,7 +1,7 @@
 """Bounded, capture-grounded AND/OR evidence proofs."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from heapq import heappop, heappush
 from itertools import combinations
 from math import isfinite
@@ -66,6 +66,20 @@ class _Budget:
         return True
 
 
+@dataclass
+class _ProofCache:
+    """Bounded proofs with constant-time admission for a previously unseen OR clause.
+
+    One top clause's alternatives must not occupy every slot before another top clause is
+    considered. The secondary indexes contain only retained keys; rejected proofs accumulate
+    no state. Eviction never changes the validity of previously propagated complete proofs.
+    """
+
+    entries: dict[_ProofKey, float] = field(default_factory=dict)
+    clauses: dict[tuple[str, ...], dict[_ProofKey, None]] = field(default_factory=dict)
+    redundant: dict[tuple[str, ...], None] = field(default_factory=dict)
+
+
 def _clauses(node: EvidenceNode) -> dict[tuple[str, ...], float]:
     clauses: dict[tuple[str, ...], float] = {}
     for assessment in node.assessments:
@@ -94,29 +108,40 @@ def _graph(
     return clauses, parents
 
 
-def _retain(
-    proofs: dict[_ProofKey, float], key: _ProofKey, confidence: float, budget: _Budget
-) -> bool:
-    if confidence <= proofs.get(key, 0.0):
+def _retain(proofs: _ProofCache, key: _ProofKey, confidence: float, budget: _Budget) -> bool:
+    if confidence <= proofs.entries.get(key, 0.0):
         return False
-    if key not in proofs and len(proofs) >= budget.max_proofs:
+    sources = key[0]
+    if key not in proofs.entries and len(proofs.entries) >= budget.max_proofs:
         budget.truncated = True
-        return False
-    proofs[key] = confidence
+        if sources in proofs.clauses or not proofs.redundant:
+            return False
+        redundant = next(iter(proofs.redundant))
+        group = proofs.clauses[redundant]
+        victim = next(reversed(group))
+        del proofs.entries[victim]
+        del group[victim]
+        if len(group) == 1:
+            del proofs.redundant[redundant]
+    proofs.entries[key] = confidence
+    group = proofs.clauses.setdefault(sources, {})
+    group[key] = None
+    if len(group) > 1:
+        proofs.redundant[sources] = None
     return True
 
 
 def _join(
-    partials: dict[_ProofKey, float],
-    antecedents: dict[_ProofKey, float],
+    partials: _ProofCache,
+    antecedents: _ProofCache,
     node_id: str,
     budget: _Budget,
-) -> dict[_ProofKey, float]:
-    joined: dict[_ProofKey, float] = {}
-    for (_, footprint), confidence in partials.items():
-        for (_, other), other_confidence in antecedents.items():
+) -> _ProofCache:
+    joined = _ProofCache()
+    for (_, footprint), confidence in partials.entries.items():
+        for (_, other), other_confidence in antecedents.entries.items():
             if not budget.spend():
-                return {}
+                return joined
             if ("node", node_id) in other:
                 continue
             _retain(joined, ((), footprint | other), min(confidence, other_confidence), budget)
@@ -126,40 +151,46 @@ def _join(
 def _derive(
     node_id: str,
     clauses: dict[tuple[str, ...], float],
-    proofs: dict[str, dict[_ProofKey, float]],
+    proofs: dict[str, _ProofCache],
     budget: _Budget,
 ) -> bool:
     changed = False
     for sources, confidence in clauses.items():
         if not budget.spend():
             break
-        if not sources or confidence == 0.0 or any(not proofs.get(s) for s in sources):
+        if (
+            not sources
+            or confidence == 0.0
+            or any(s not in proofs or not proofs[s].entries for s in sources)
+        ):
             continue
-        partials: dict[_ProofKey, float] = {((), frozenset({("node", node_id)})): confidence}
+        partials = _ProofCache()
+        _retain(partials, ((), frozenset({("node", node_id)})), confidence, budget)
         for source in sources:
             partials = _join(partials, proofs[source], node_id, budget)
-            if not partials:
+            if not partials.entries:
                 break
-        for (_, footprint), score in partials.items():
+        for (_, footprint), score in partials.entries.items():
             changed |= _retain(proofs[node_id], (sources, footprint), score, budget)
     return changed
 
 
-def _summarize(proofs: dict[_ProofKey, float], memory_id: str, budget: _Budget) -> SupportSummary:
-    count = int(bool(proofs))
-    confidence = max(proofs.values(), default=0.0)
-    candidates = [
-        (sources, footprint - {("node", memory_id)}, score)
-        for (sources, footprint), score in proofs.items()
-    ]
-    for (sources, footprint, score), (other_sources, other, other_score) in combinations(
-        candidates, 2
-    ):
-        if not budget.spend():
-            break
-        if sources != other_sources and footprint.isdisjoint(other):
-            count = 2
-            confidence = max(confidence, 1.0 - (1.0 - score) * (1.0 - other_score))
+def _summarize(proofs: _ProofCache, memory_id: str, budget: _Budget) -> SupportSummary:
+    count = int(bool(proofs.entries))
+    confidence = max(proofs.entries.values(), default=0.0)
+    groups: dict[tuple[str, ...], list[tuple[_Footprint, float]]] = {}
+    for (sources, footprint), score in proofs.entries.items():
+        groups.setdefault(sources, []).append((footprint - {("node", memory_id)}, score))
+    # Alternative proofs of the same top-level AND clause can never corroborate it. Group
+    # first, so they neither spend the pair budget nor hide a different clause behind it.
+    for group, other_group in combinations(groups.values(), 2):
+        for footprint, score in group:
+            for other, other_score in other_group:
+                if not budget.spend():
+                    return SupportSummary(count, confidence, budget.truncated)
+                if footprint.isdisjoint(other):
+                    count = 2
+                    confidence = max(confidence, 1.0 - (1.0 - score) * (1.0 - other_score))
     return SupportSummary(count, confidence, budget.truncated)
 
 
@@ -177,9 +208,11 @@ def independent_support(
     group is authoritative only when the node has no assessments. Missing roots,
     empty clauses, cycles, and zero confidence cannot manufacture support.
 
-    Input graph preparation is linear in the supplied reachable graph. Thereafter
+    Input graph preparation visits the supplied reachable graph and sorts clauses and IDs. Thereafter
     at most ``max_steps`` clause visits, proof joins, and pair comparisons occur;
-    each node and intermediate join retains at most ``max_proofs`` proofs.
+    each node and intermediate join retains at most ``max_proofs`` proofs. Constant-time
+    cache indexes admit a new top clause by replacing a redundant alternative when possible;
+    this still sets ``truncated`` and does not guarantee complete support or best confidence.
     Each join manipulates footprints bounded by the reachable graph size. The
     caller must separately bound graph loading. Deterministic worklist order and
     clause normalization make input permutations and duplicates equivalent.
@@ -188,13 +221,18 @@ def independent_support(
         raise ValueError("proof and work limits must be positive")
     budget = _Budget(max_steps, max_proofs)
     clauses, parents = _graph(nodes, memory_id)
-    proofs: dict[str, dict[_ProofKey, float]] = {node_id: {} for node_id in clauses}
+    proofs: dict[str, _ProofCache] = {node_id: _ProofCache() for node_id in clauses}
     pending: list[str] = []
     queued: set[str] = set()
     for node_id in sorted(clauses):
         node = nodes[node_id]
         if node.root_group is not None and not node.assessments and node.confidence > 0.0:
-            proofs[node_id][((), frozenset({("capture", node.root_group)}))] = node.confidence
+            _retain(
+                proofs[node_id],
+                ((), frozenset({("capture", node.root_group)})),
+                node.confidence,
+                budget,
+            )
             queued.update(parents.get(node_id, ()))
     for node_id in sorted(queued):
         heappush(pending, node_id)
@@ -209,4 +247,4 @@ def independent_support(
         if budget.remaining == 0:
             budget.truncated |= bool(pending)
             break
-    return _summarize(proofs.get(memory_id, {}), memory_id, budget)
+    return _summarize(proofs.get(memory_id, _ProofCache()), memory_id, budget)

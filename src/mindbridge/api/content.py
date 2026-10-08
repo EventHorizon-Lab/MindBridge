@@ -190,6 +190,7 @@ class ContextBudgetInput(StrictModel):
     # `ContextBudget.freshness` is a timedelta; JSON carries the same bound as seconds.
     freshness_seconds: Seconds | None = None
     max_latency_ms: Milliseconds | None = None
+    selected_proofs: bool = False
 
     @field_validator("freshness_seconds")
     @classmethod
@@ -219,6 +220,7 @@ def context_budget(request: ContextBudgetInput | None) -> ContextBudget | None:
             else timedelta(seconds=request.freshness_seconds)
         ),
         max_latency_ms=request.max_latency_ms,
+        selected_proofs=request.selected_proofs,
     )
 
 

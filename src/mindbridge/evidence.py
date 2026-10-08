@@ -8,10 +8,79 @@ unbounded provenance graph into the model's answer context.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from typing import cast
+from unicodedata import normalize
 
-from mindbridge.types import MemoryContext, SearchHit
+from mindbridge.types import MemoryContext, MemoryKind, SearchHit
 
 _MAX_EXACT_OMITTED_SOURCES = 64
+
+
+def answer_constraint_payloads(
+    hits: Sequence[SearchHit], payloads: Sequence[Mapping[str, object]]
+) -> list[dict[str, object]]:
+    """Source-qualified candidates for applying state, trait and host policy evidence.
+
+    This does not interpret prose, infer preferences, or authorize instructions. Conditions
+    and exceptions stay in the referenced evidence text. Values with overlapping validity
+    are flagged as competing candidates; recording order never selects a winner.
+    """
+    if len(hits) != len(payloads):
+        raise ValueError("constraint payloads must align with selected evidence")
+    selected: list[tuple[MemoryContext, dict[str, object]]] = []
+    for hit, payload in zip(hits, payloads, strict=True):
+        context = hit.context
+        if (
+            context is None
+            or context.kind not in {MemoryKind.STATE, MemoryKind.TRAIT, MemoryKind.RESPONSE_POLICY}
+            or context.subject is None
+            or context.predicate is None
+        ):
+            continue
+        candidate = {
+            "evidence_label": payload["evidence_label"],
+            **_context_payload(context),
+            "current_version": context.visible and context.retired_at is None,
+            "conditions_and_exceptions": "read the referenced evidence text",
+        }
+        selected.append((context, candidate))
+    by_key: dict[tuple[str, str], list[tuple[MemoryContext, dict[str, object]]]] = {}
+    for context, candidate in selected:
+        key = tuple(
+            normalize("NFKC", value).strip().casefold()
+            for value in (
+                context.subject or "",
+                context.predicate or "",
+            )
+        )
+        group = by_key.setdefault((key[0], key[1]), [])
+        for other, previous in group:
+            if (
+                context.value is None
+                or other.value is None
+                or context.value == other.value
+                or not candidate["current_version"]
+                or not previous["current_version"]
+                or (
+                    context.valid_until is not None
+                    and other.valid_from is not None
+                    and context.valid_until <= other.valid_from
+                )
+                or (
+                    other.valid_until is not None
+                    and context.valid_from is not None
+                    and other.valid_until <= context.valid_from
+                )
+            ):
+                continue
+            cast(list[object], candidate.setdefault("competing_evidence_labels", [])).append(
+                previous["evidence_label"]
+            )
+            cast(list[object], previous.setdefault("competing_evidence_labels", [])).append(
+                candidate["evidence_label"]
+            )
+        group.append((context, candidate))
+    return [candidate for _context, candidate in selected]
 
 
 def answer_evidence_payloads(

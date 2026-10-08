@@ -25,6 +25,7 @@ from mindbridge.types import (
     ContextBundle,
     ContextConflict,
     ContextExcerpt,
+    ContextProof,
     ContextUnknown,
     ContextUnknownKind,
     EvidenceBasis,
@@ -129,6 +130,7 @@ class EvidenceClosure:
 
     anchor: SearchHit
     members: tuple[SearchHit, ...]
+    proofs: tuple[ContextProof, ...] = ()
 
     def __post_init__(self) -> None:
         members = tuple(dict.fromkeys(self.members))
@@ -302,6 +304,7 @@ def compile_context(
                 )
                 for member in closure.members
             ),
+            proofs=closure.proofs,
         )
         for closure in closures or ()
         if any(hit.id == closure.anchor.id for hit in candidates)
@@ -310,7 +313,10 @@ def compile_context(
     all_singletons = len(closure_by_anchor) == len(candidates) and all(
         len(closure.members) == 1 for closure in closure_by_anchor.values()
     )
-    closed_mode = closures is not None and not (all_singletons and not has_conflicts)
+    closed_mode = closures is not None and (
+        any(closure.proofs for closure in closure_by_anchor.values())
+        or not (all_singletons and not has_conflicts)
+    )
     selected_closures, peer_withheld = (
         _expand_conflict_closures(candidates, closure_by_anchor) if closed_mode else ((), 0)
     )
@@ -327,10 +333,10 @@ def compile_context(
                 ),
             ),
         )
-    sections, selected_excerpts = (
+    sections, selected_excerpts, selected_proofs = (
         _select_closures(selected_closures, budget, overhead, excerpt_candidates)
         if closed_mode
-        else _select(candidates, budget, overhead, excerpt_candidates)
+        else (*_select(candidates, budget, overhead, excerpt_candidates), ())
     )
     # The deadline is checked here, between section assembly and the optional enrichment that
     # follows it. Nothing already computed is discarded and no stage is cut in half, so a bundle
@@ -355,14 +361,15 @@ def compile_context(
             EvidenceClosure(
                 anchor=candidate_by_id[closure.anchor.id],
                 members=tuple(candidate_by_id.get(member.id, member) for member in closure.members),
+                proofs=closure.proofs,
             )
             for closure in selected_closures
         )
         # Affect hops annotate rather than support records, so closed selection stays unchanged.
-        sections, selected_excerpts = (
+        sections, selected_excerpts, selected_proofs = (
             _select_closures(selected_closures, budget, overhead, excerpt_candidates)
             if closed_mode
-            else _select(candidates, budget, overhead, excerpt_candidates)
+            else (*_select(candidates, budget, overhead, excerpt_candidates), ())
         )
     # Every candidate in this section was converted above; the branch keeps the declared type
     # total rather than asserting it.
@@ -411,7 +418,7 @@ def compile_context(
     # `max_chars`: `_bundle_chars` already bounds that at or below `max_chars`, so this can
     # never push the total over it. A named identity is never also reported provisional, even
     # if a stale `provisional` entry still names it.
-    base_chars = _bundle_chars(overhead, sections, selected_excerpts)
+    base_chars = _bundle_chars(overhead, sections, selected_excerpts, selected_proofs)
     named_actors = _named_actors(selected_evidence, named)
     provisional_actors = _provisional_actors(
         selected_evidence,
@@ -475,6 +482,7 @@ def compile_context(
             budget.max_latency_ms is not None and elapsed_ms > budget.max_latency_ms
         ),
         excerpts=selected_excerpts,
+        proofs=selected_proofs,
     )
 
 
@@ -588,6 +596,7 @@ def _expand_conflict_closures(  # noqa: C901 - fixed-point conflict closure is o
         if closure is None:
             continue
         members = {member.id: member for member in closure.members}
+        proofs = dict.fromkeys(closure.proofs)
         # Conflict edges are equivalence edges rather than provenance: following them does not
         # create a bad cycle.  Iterate to a fixed point so a dependency which is itself one side
         # of an eligible candidate conflict cannot enter alone.
@@ -616,8 +625,9 @@ def _expand_conflict_closures(  # noqa: C901 - fixed-point conflict closure is o
                 member_context = member.context
                 if member_context is not None and member_context.lineage_id is not None:
                     pending.extend(representatives.get(member_context.lineage_id, ()))
+            proofs.update(dict.fromkeys(peer.proofs))
         if members:
-            expanded.append(EvidenceClosure(anchor, tuple(members.values())))
+            expanded.append(EvidenceClosure(anchor, tuple(members.values()), tuple(proofs)))
         else:
             withheld += 1
     return tuple(expanded), withheld
@@ -628,7 +638,7 @@ def _select_closures(
     budget: ContextBudget,
     overhead: int,
     excerpts: Mapping[str, ContextExcerpt] = MappingProxyType({}),
-) -> tuple[dict[str, tuple[SearchHit, ...]], tuple[ContextExcerpt, ...]]:
+) -> tuple[dict[str, tuple[SearchHit, ...]], tuple[ContextExcerpt, ...], tuple[ContextProof, ...]]:
     """Greedily admit ranked evidence closures, counting each materialized hit once.
 
     Unlike the singleton selector, the diversity half-round is deliberately absent: an anchor's
@@ -638,6 +648,7 @@ def _select_closures(
     taken: set[str] = set()
     media = 0
     selected_excerpts: dict[str, ContextExcerpt] = {}
+    selected_proofs: dict[ContextProof, None] = {}
     for closure in closures:
         marginal = tuple(member for member in closure.members if member.id not in taken)
         replacing = {member.id for member in marginal if member.id in selected_excerpts}
@@ -655,6 +666,7 @@ def _select_closures(
             overhead,
             {name: tuple(section) for name, section in proposed_sections.items()},
             proposed_excerpts,
+            tuple(dict.fromkeys((*selected_proofs, *closure.proofs))),
         )
         full_fits = (
             item_count <= budget.max_items
@@ -667,6 +679,7 @@ def _select_closures(
                 selected_excerpts.pop(memory_id)
             taken.update(member.id for member in marginal)
             media += media_cost
+            selected_proofs.update(dict.fromkeys(closure.proofs))
             continue
         if (
             len(closure.members) != 1
@@ -685,6 +698,7 @@ def _select_closures(
                 overhead,
                 {name: tuple(section) for name, section in sections.items()},
                 proposed_excerpts,
+                tuple(selected_proofs),
             )
             > budget.max_chars
         ):
@@ -693,6 +707,7 @@ def _select_closures(
     return (
         {name: tuple(section) for name, section in sections.items()},
         tuple(selected_excerpts.values()),
+        tuple(selected_proofs),
     )
 
 
@@ -714,6 +729,7 @@ def _bundle_chars(
     overhead: int,
     sections: Mapping[str, tuple[SearchHit, ...]],
     excerpts: Sequence[ContextExcerpt] = (),
+    proofs: Sequence[ContextProof] = (),
 ) -> int:
     """Return what this bundle charged against `max_chars`, priced exactly as `_select` did."""
     return (
@@ -726,6 +742,11 @@ def _bundle_chars(
         + (
             _heading_cost("partial sources") + sum(excerpt_cost(excerpt) for excerpt in excerpts)
             if excerpts
+            else 0
+        )
+        + (
+            _heading_cost("selected proofs") + sum(len(proof.render()) + 1 for proof in proofs)
+            if proofs
             else 0
         )
     )

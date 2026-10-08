@@ -662,6 +662,7 @@ def test_the_context_budget_transport_defaults_come_from_the_sdk_value() -> None
     """`ContextBudget()` is the one source of the published default, on both surfaces."""
     budget = ContextBudget()
     expected = {
+        "selected_proofs": budget.selected_proofs,
         "max_chars": budget.max_chars,
         "max_items": budget.max_items,
         "max_media_items": budget.max_media_items,

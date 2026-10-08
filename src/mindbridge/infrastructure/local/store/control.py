@@ -29,6 +29,7 @@ from mindbridge.infrastructure.local.store._lineage import (
     require_active_memories,
     require_every,
     require_unretired_memories,
+    require_visible_memories,
     restore_memory_versions,
     retire_evidence_clauses,
     retire_memory_evidence,
@@ -271,6 +272,7 @@ class OperationLog:
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        require_visible: Sequence[str] = (),
         naming_projection_factory: NamingProjectionFactory | None = None,
     ) -> StoredOperation | None:
         """Apply one already-validated operation and its log row in one transaction.
@@ -286,6 +288,8 @@ class OperationLog:
         the callers that need the current version of a record to still stand -- a `REINFORCE`
         target must not have been corrected in between -- which `require_active` must not check
         globally, because the host's own `forget()` may forget an already-corrected record.
+        `require_visible` checks cited premises, not reinforcement targets: their latest
+        recorded version must remain visible and unretired, and the record un-forgotten.
         """
         for memory_id, source_memory_id in reinforce:
             require_identifier(memory_id, "memory_id")
@@ -297,6 +301,7 @@ class OperationLog:
                 return None
             require_active_memories(connection, require_active)
             require_unretired_memories(connection, require_unretired)
+            require_visible_memories(connection, require_visible)
             naming_before = naming_snapshot(
                 connection,
                 (*(memory_id for memory_id, _source in reinforce), *correct_ids, *forget_ids),

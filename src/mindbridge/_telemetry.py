@@ -68,6 +68,10 @@ EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
 GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
+GROUNDING_RECORD_IDS = "mindbridge.grounding.record_ids"
+GROUNDING_ASSET_IDS = "mindbridge.grounding.asset_ids"
+GROUNDING_TEXT_BYTES = "mindbridge.grounding.text_bytes"
+GROUNDING_MEDIA_FALLBACK = "mindbridge.grounding.media_fallback"
 # Proposals the model adapter could not read, counted on the model span, and proposals the kernel
 # refused for how they were grounded, accumulated over a whole operation. They answer different
 # questions -- a backend returning garbage, against a backend grounding an opinion wrongly -- so
@@ -236,6 +240,9 @@ class _FormationRefusals:
 _CURRENT_MODEL_USAGE: ContextVar[_ModelUsage | None] = ContextVar(
     "mindbridge_model_usage", default=None
 )
+_CURRENT_MODEL_TRACER: ContextVar[Tracer | None] = ContextVar(
+    "mindbridge_model_tracer", default=None
+)
 _CURRENT_OPERATION_USAGE: ContextVar[_OperationUsage | None] = ContextVar(
     "mindbridge_operation_usage", default=None
 )
@@ -331,6 +338,7 @@ def model_span(
         operation = _CURRENT_OPERATION_USAGE.get()
         usage = _ModelUsage()
         token = _CURRENT_MODEL_USAGE.set(usage)
+        tracer_token = _CURRENT_MODEL_TRACER.set(tracer)
         try:
             yield span
         finally:
@@ -340,6 +348,15 @@ def model_span(
                     operation.add(usage)
             finally:
                 _CURRENT_MODEL_USAGE.reset(token)
+                _CURRENT_MODEL_TRACER.reset(tracer_token)
+
+
+@contextmanager
+def nested_model_span(name: str, *, attributes: Mapping[str, AttributeValue]) -> Iterator[Span]:
+    """Meter an adapter's diagnostic request separately, using the caller's tracer provider."""
+    tracer = _CURRENT_MODEL_TRACER.get() or trace.get_tracer(TRACER_NAME)
+    with model_span(tracer, name, attributes=attributes) as span:
+        yield span
 
 
 def mark_model_requests(count: int, *, token_usage_expected: int | None = None) -> None:

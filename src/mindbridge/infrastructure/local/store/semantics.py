@@ -17,6 +17,7 @@ from mindbridge.infrastructure.local.store._codec import (
     row_text,
 )
 from mindbridge.infrastructure.local.store._connections import Connections
+from mindbridge.infrastructure.local.store._corroboration import _load_nodes
 from mindbridge.infrastructure.local.store._identity import (
     reproject_named_identities,
     resolve_identity_id,
@@ -28,6 +29,7 @@ from mindbridge.infrastructure.local.store._lineage import (
     refresh_multi_source_projections,
     require_active_memories,
     require_unretired_memories,
+    require_visible_memories,
     set_forgotten,
     validate_formation_links,
     version_retired,
@@ -41,6 +43,7 @@ from mindbridge.infrastructure.local.store._operations import active_operation_i
 from mindbridge.infrastructure.local.store.errors import StaleOperationError
 from mindbridge.infrastructure.local.store.records import (
     MemoryRecords,
+    read_memories,
     replace_memory_embeddings,
     write_embedding,
     write_memory,
@@ -54,7 +57,8 @@ from mindbridge.infrastructure.local.store.rows import (
     require_aware,
     require_identifier,
 )
-from mindbridge.types import SpatialContext
+from mindbridge.kernel.corroboration import EvidenceNode
+from mindbridge.types import RetrievalScope, SpatialContext
 
 
 class Semantics:
@@ -68,6 +72,30 @@ class Semantics:
     ) -> None:
         self._connections = connections
         self._records = records
+
+    def delivery_evidence(
+        self, memory_id: str, *, scope: RetrievalScope | None = None
+    ) -> tuple[dict[str, EvidenceNode], tuple[StoredMemory, ...], bool]:
+        """Read bounded current assessments and scoped records in one SQLite snapshot.
+
+        Historical compilation uses the existing full closure path: current assessments cannot
+        attest a past certificate. Scope and visibility apply to every delivered record.
+        """
+        require_identifier(memory_id, "memory_id")
+        with self._connections.read_transaction() as connection:
+            nodes, truncated = _load_nodes(connection, memory_id)
+            records = read_memories(
+                connection,
+                tuple(nodes),
+                valid_at=None if scope is None else scope.valid_at,
+                known_at=None if scope is None else scope.known_at,
+                near=None if scope is None else scope.near,
+                radius_m=None if scope is None else scope.radius_m,
+                place_id=None if scope is None else scope.place_id,
+                identity_id=None if scope is None else scope.identity_id,
+                active_only=True,
+            )
+        return nodes, records, truncated
 
     def apply_formation(  # noqa: C901 - one atomic formation transaction
         self,
@@ -84,6 +112,7 @@ class Semantics:
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        require_visible: Sequence[str] = (),
         projection_identity_id: str | None = None,
         projection_memories: Iterable[StoredMemory] = (),
         projection_embeddings: Iterable[StoredEmbedding] = (),
@@ -102,8 +131,11 @@ class Semantics:
         `require_active` names memories that must still exist and still be un-forgotten inside
         this transaction; if any moved since the caller validated it, nothing is written and
         `StaleOperationError` is raised. `require_unretired` names memories whose current version
-        must additionally still stand, which is what a cited derived source needs and what
-        `require_active` deliberately does not check.
+        must additionally still stand, without excluding hidden reinforcement targets.
+        `require_active` deliberately does not check version retirement.
+        `require_visible` is stricter formation evidence: the record must still exist,
+        be un-forgotten, and have a visible, unretired latest recorded version, if typed.
+        Unlike reinforcement targets, inferred premises cannot remain hidden at commit.
 
         The lineage rule the kernel applies to a `STATE` or user-stated `TRAIT` supersedes the
         current version of every other record in the same lineage with overlapping validity,
@@ -144,6 +176,7 @@ class Semantics:
                 return False
             require_active_memories(connection, require_active)
             require_unretired_memories(connection, require_unretired)
+            require_visible_memories(connection, require_visible)
             naming_before = naming_snapshot(
                 connection,
                 (

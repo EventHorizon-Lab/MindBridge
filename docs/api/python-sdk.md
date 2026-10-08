@@ -86,6 +86,8 @@ Memory(
     evidence_expansion_max_rows: int = 24,
     decay_half_life_days: float | None = None,
     reinforce_on_answer: bool = True,
+    formation_history_max_rows: int = 0,
+    formation_history_budget_chars: int = 6000,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
     face_similarity: float = 0.363,
@@ -492,6 +494,14 @@ reports `elapsed_ms`, `deadline_exceeded`, and the `unknowns` the request implie
 does not carry. `ask` is unchanged. [Context compilation](../context-compilation.md) owns the
 contract.
 
+`ContextBudget(selected_proofs=True)` enables current-knowledge delivery certificates in
+`bundle.proofs`. Each `ContextProof(anchor_id, nodes)` is a complete acyclic witness;
+`ContextProofNode(memory_id, confidence, sources=(), capture_id=None)` identifies an AND assessment
+or a capture leaf. The compiler charges certificate text and the materialized record union,
+preserves each record's full `evidence_ids`, and includes separate count and confidence witnesses.
+Historical `scope.known_at` uses full provenance. See
+[selected certificates](../context-compilation.md#selected-delivery-certificates) for limits.
+
 When `allow_partial_sources=True`, `bundle.excerpts` contains separately typed `ContextExcerpt`
 values when a verified dense text part of a newly written raw observation fits but its complete
 parent does not. The default `False` preserves full-record-only compilation and skips selector
@@ -772,8 +782,9 @@ active search result for `query`, else the newest `limit` active records. Forgot
 records never reach the backend. The evidence gather and the applies hold the formation lock; the
 backend round trip deliberately does not, so slow reasoning over media evidence does not stall a
 concurrent `add()`. Correctness does not rest on that lock: every proposal is re-checked inside
-its own apply transaction and refused as `"stale"` if a target moved while the backend was
-thinking. Kernel-committed identity operations -- the corroborated cross-modal merge, its
+its own apply transaction and refused as `"stale"` if a target or cited source became ineligible
+while the backend was thinking. Kernel-committed identity operations -- the corroborated
+cross-modal merge, its
 `unlink_identity` split, `forget_identity`'s erasure, and `register_identity`/`register_speaker`'s
 naming assertion -- take the same formation lock around their own commit, so none of them lands
 while an apply pass is in progress either. The backend proposes `MemoryOperation` values; the kernel
@@ -852,7 +863,11 @@ Multi-target operations are all or nothing. A proposal whose targets are not all
 rejected whole -- `"unknown_target"`, `"not_derived"`, or `"already_forgotten"` -- so an applied
 row's `target_ids` are always the IDs the operation actually acted on. The apply transaction
 re-checks the preconditions validation read: a target or cited source that was forgotten,
-corrected, deleted, or linked in between makes the proposal `"stale"` with nothing written. There
+corrected, deleted, or linked in between makes the proposal `"stale"` with nothing written.
+Consolidation, identification and reinforcement also recheck that cited premises remain visible
+and unretired. Support withdrawn while reasoning may hide a claim without retiring it; it can
+no longer seed a new operation. This source check does not exclude an unretired hidden
+reinforcement target, which may still receive valid support. There
 is no expected-revision token to supply; the in-transaction re-check is the whole guarantee.
 
 `target_ids` on a `CONSOLIDATE` is **consolidation forgetting**: sources the new derived record
@@ -1086,13 +1101,14 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 125 supported names exported by `mindbridge`:
+These are the 127 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemoryPlugins`, `resolve_memory_config` |
 | Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `AnswerChunk`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextExcerpt`, `ContextPresentation`, `ContextSymbol`, `ContextCitation`, `TextSpanSelector`, `TextSpanPiece`, `ContextConflict`, `ContextUnknown`, `AffectCue`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport`, `ConsentClaim`, `ExportBundle`, `RetentionPolicy`, `RetentionReport` |
+| Delivery certificates | `ContextProof`, `ContextProofNode` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums and literal aliases | `AnswerPolicy`, `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `ContextSymbolNamespace`, `ContextSymbolCoverage`, `ContextSymbolRole`, `AbstentionReason`, `IndexQuantization`, `RetrievalMode`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -1136,7 +1152,9 @@ The principal immutable values are:
 | `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `identity_id`, `spatial`, `cue_modality`, `valence`, `arousal` |
 | `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id`, `identity_id` |
 | `RetrievalMode` | `hybrid`, `dense`, `lexical` instance candidate policy |
-| `ContextBudget` | `max_chars`, `max_items`, `max_media_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
+| `ContextBudget` | `max_chars`, `max_items`, `max_media_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms`, `selected_proofs` |
+| `ContextProof` | `anchor_id`, complete `nodes`; derived `confidence`, `footprint`, `independent_of()`, and `render()` |
+| `ContextProofNode` | `memory_id`, `confidence`, `sources`, `capture_id` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
 | `NamedActor` | `identity_id`, `name`, `memory_ids`, `naming_assertion_id`: an identity a currently visible naming assertion names, reached through a compiled bundle's `actors` evidence rather than the assertion itself |
@@ -1148,7 +1166,7 @@ The principal immutable values are:
 | `ContextSymbol` | request-local `symbol`, `namespace`, `stable_id`, `coverage`, structural `roles`, and `selector` only for partial memory coverage |
 | `ContextCitation` | decoded `memory_id`, full or partial `coverage`, and `selector` exactly when partial; reference-only construction is rejected |
 | `ContextPresentation` | compact `text`, typed `symbols`, exact `chars`; pure `resolve()` identity decoding and eligibility-checking `resolve_citation()` |
-| `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `excerpts`; `hits` property, stable-ID `render()`, and opt-in `compact()` |
+| `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `excerpts`, `proofs`; `hits` property, stable-ID `render()`, and opt-in `compact()` |
 | `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `consent`, `identity`, `rationale` |
 | `IdentityClaim` | `identity_id`, `name`, `relationship` |
 | `IdentityChange` | `identity_id`, `moved_ids` |
@@ -1261,8 +1279,9 @@ ConsolidationBackend.consolidate(
 ```
 
 `FormationProposal.evidence_ids`, when supplied, is an ordered, nonempty, unique tuple of
-`FormationInput.memory_id` values from that exact call. It must include the proposal's primary
-input. The kernel records one tuple as one conjunctive clause and treats separately emitted clauses
+`FormationInput.memory_id` values from that exact call or active records in that primary input's
+`history`. It must include the proposal's primary input; another target's private history is not
+an allowed source. The kernel records one tuple as one conjunctive clause and treats separately emitted clauses
 as alternatives. Deleting any member retires its whole conjunction. `None` retains the legacy
 singleton link to the primary input alone. A model declaration is provenance metadata, not a
 verified proof of complete or independent support.
@@ -1285,6 +1304,13 @@ bundled caption prompt.
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal
 against the source modality and spatial frame, assigns identity, links evidence, and commits.
+`FormationInput.history` is a tuple of text-only `MemoryRecord` values; `history_truncated`
+reports an incomplete window. History IDs are unique and exclude the primary target. Custom
+formers can ignore the default empty history; enabling it requires a former that can reason over
+the supplied state and cite the actual sources. Retired background may inform interpretation but
+cannot support a new affirmative proposal. Cited history is revalidated atomically at commit.
+Jointly cited sources retain place and metadata only when every cited source agrees on the entire
+value, including the whole metadata mapping. Uncited background does not affect inheritance.
 `consolidate` receives the bounded evidence set the kernel chose and may cite only IDs from it;
 like a former it proposes and never writes storage. An `IDENTIFY` proposal carries an
 `IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
@@ -1318,11 +1344,12 @@ recall program produced the hits as every record its predicate matched, in time 
 than as a ranking -- the bundled adapter uses it to describe the evidence order to the reader,
 which is the one thing about the hits a prompt cannot infer from the hits.
 
-The bundled OpenAI former receives compact observation aliases, enriched content and assets, plus
+For the primary observation, the bundled OpenAI former receives compact aliases, enriched content and assets, plus
 the observation basis, confidence, explicit validity bounds, and spatial frame/anchor. It does not
 receive a separate occurrence timestamp, identity registry, or actor roster. Speaker or face IDs
 and projected names are visible only when prior speech/face enrichment rendered them into the
-observation content. After the proposal returns, the kernel mechanically binds its textual subject
+observation content. Opt-in read-only history separately carries recorded and occurrence times,
+typed validity and current-version status. After the proposal returns, the kernel mechanically binds its textual subject
 to a current visible name, inherits the primary source's occurrence as a missing validity start,
 and propagates source ID, place, metadata, and spatial context. Relative-time or unnamed-actor
 resolution that needs fields absent from the model payload therefore remains a formation limit;
@@ -1347,7 +1374,7 @@ routed with no text at all looks like.
 | `SpeechAnalysis` | `turns`, `speakers` |
 | `FaceEmbedding` | `face_label`, `values`, `bounding_box`, `observed_at_ms` |
 | `FaceAnalysis` | `faces` |
-| `FormationInput` | `memory_id`, `content`, `context` |
+| `FormationInput` | `memory_id`, `content`, `context`, `history=()`, `history_truncated=False` |
 | `FormationProposal` | `kind`, `content`, `basis`, `subject`, `predicate`, `value`, `confidence`, `valid_from`, `valid_until`, `spatial`, `cue_modality`, `valence`, `arousal`, optional `evidence_ids` |
 
 ### Bundled adapters
@@ -1459,6 +1486,8 @@ OpenAIModels(
     generation_video_limit: int | None = 8,
     generation_extra_body: Mapping[str, object] | None = None,
     generation_stream: bool = False,
+    generation_media_policy: Literal["all", "on_demand"] = "all",
+    generation_media_max_items: int = 2,
 )
 ```
 

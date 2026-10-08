@@ -11,6 +11,7 @@ import builtins
 import hashlib
 import json
 import logging
+from collections import ChainMap
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from mindbridge.exceptions import MindBridgeError, ModelError
 from mindbridge.infrastructure.local.store import (
     CONSENT_PREDICATE,
     NamingProjectionFactory,
+    StaleOperationError,
     StoredEmbedding,
     StoredMemory,
     StoredOperation,
@@ -39,6 +41,7 @@ from mindbridge.kernel.content import (
 )
 from mindbridge.kernel.contracts import Backends
 from mindbridge.kernel.embedding import DOCUMENT_TASK, Embedding
+from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.lifecycle import OperationAssets
 from mindbridge.kernel.materialization import Materializer
 from mindbridge.kernel.projection import Projection
@@ -63,6 +66,78 @@ _LOGGER = logging.getLogger(__name__)
 
 
 _EMPTY_METADATA_JSON = "{}"
+
+
+def formation_evidence_active(record: MemoryRecord) -> bool:
+    context = record.context
+    return record.forgotten_at is None and (
+        context is None or (context.visible and context.retired_at is None)
+    )
+
+
+def _history_identity_refusal(
+    proposal: FormationProposal, source: FormationInput, evidence: Sequence[MemoryRecord]
+) -> bool:
+    """A known historical name requires a cited, still-standing naming witness.
+
+    This conservative check never rewrites prose or treats it as a host control operation.
+    Anonymous events and newly introduced entity proposals remain available to the former.
+    """
+    subject = canonical_subject(proposal.subject)
+    if subject is None or proposal.kind is MemoryKind.ENTITY:
+        return False
+    known = any(
+        record.context is not None
+        and record.context.kind is MemoryKind.ENTITY
+        and canonical_subject(record.context.subject) == subject
+        for record in source.history
+    )
+    if not known:
+        return False
+    witnesses = [
+        record
+        for record in evidence
+        if record.context is not None
+        and record.context.kind is MemoryKind.ENTITY
+        and canonical_subject(record.context.subject) == subject
+        and formation_evidence_active(record)
+    ]
+    identities = {
+        record.context.identity_id
+        for record in witnesses
+        if record.context is not None and record.context.identity_id is not None
+    }
+    return not witnesses or len(identities) > 1
+
+
+def _cited_sources(pairs: Sequence[tuple[PreparedMemory, str | None, float]]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            source_id
+            for prepared, _source, _confidence in pairs
+            if isinstance(prepared.context, MemoryContext)
+            for source_id in prepared.context.evidence_ids
+        )
+    )
+
+
+def _proposal_sources(
+    proposal: FormationProposal,
+    source: FormationInput,
+    batch: Mapping[str, FormationInput],
+    records: Mapping[str, MemoryRecord],
+) -> tuple[str, ...] | None:
+    evidence = (source.memory_id,) if proposal.evidence_ids is None else proposal.evidence_ids
+    history_ids = {record.id for record in source.history}
+    if source.memory_id not in evidence or any(
+        item not in batch and item not in history_ids for item in evidence
+    ):
+        raise ModelError(
+            "formation proposal cited an observation outside its batch",
+            reason="response_invalid",
+            stage="form",
+        )
+    return evidence if all(formation_evidence_active(records[item]) for item in evidence) else None
 
 
 # Naming a person is a claim the host asserts, so its recipe names the kernel rule that produced
@@ -512,6 +587,7 @@ class Formation(Traced):
         materializer: Materializer,
         embedding: Embedding,
         projection: Projection,
+        hydrator: Hydrator,
     ) -> None:
         super().__init__(tracer)
         self._formation_lock = storage.formation_lock
@@ -522,6 +598,46 @@ class Formation(Traced):
         self._materializer = materializer
         self._embedding = embedding
         self._projection = projection
+        self._hydrator = hydrator
+
+    def _history_for(
+        self, source: MemoryRecord, excluded: Sequence[str]
+    ) -> tuple[tuple[MemoryRecord, ...], bool]:
+        limit = self._settings.formation_history_max_rows
+        if limit == 0:
+            return (), False
+        with translate_storage_errors("read formation history"):
+            stored = self._store.records.formation_history(
+                known_before=source.created_at, exclude_ids=excluded, limit=limit + 1
+            )
+        history: builtins.list[MemoryRecord] = []
+        remaining = self._settings.formation_history_budget
+        truncated = len(stored) > limit
+        for record in stored[:limit]:
+            if len(record.content) > remaining:
+                # Do not hide a recent correction to make room for a shorter old assertion.
+                truncated = True
+                break
+            hydrated = self._hydrator.memory_record(record)
+            history.append(hydrated)
+            remaining -= len(record.content)
+        return tuple(reversed(history)), truncated
+
+    def _formation_inputs(self, sources: Sequence[MemoryRecord]) -> tuple[FormationInput, ...]:
+        excluded = tuple(source.id for source in sources)
+        result = []
+        for source in sources:
+            history, truncated = self._history_for(source, excluded)
+            result.append(
+                FormationInput(
+                    memory_id=source.id,
+                    content=ModelInput(text=source.content, assets=source.assets),
+                    context=observation_from_record(source),
+                    history=history,
+                    history_truncated=truncated,
+                )
+            )
+        return tuple(result)
 
     def form_sources(
         self,
@@ -551,14 +667,7 @@ class Formation(Traced):
         )
         if not pending:
             return
-        all_inputs = tuple(
-            FormationInput(
-                memory_id=source.id,
-                content=ModelInput(text=source.content, assets=source.assets),
-                context=observation_from_record(source),
-            )
-            for source in pending
-        )
+        all_inputs = self._formation_inputs(pending)
         inputs = tuple(
             value
             for value in all_inputs
@@ -607,8 +716,15 @@ class Formation(Traced):
         pairs: builtins.list[tuple[PreparedMemory, str, float]] = []
         inputs_by_id = {value.memory_id: value for value in inputs}
         formed_sources = tuple(source for source in pending if source.id in inputs_by_id)
+        batch_records = {source.id: source for source in formed_sources}
         refused = 0
         for source in formed_sources:
+            # One ID can have different states at different observations' causal cutoffs. Never
+            # let another target's background overwrite the snapshot this proposal actually saw.
+            evidence_by_id = ChainMap(
+                batch_records,
+                {record.id: record for record in inputs_by_id[source.id].history},
+            )
             proposals = proposals_by_id.get(source.id, ())
             # Application data and the symbolic place travel with the knowledge formed from them:
             # a host that filters recall by metadata expects the tag on the observation to hold
@@ -617,17 +733,20 @@ class Formation(Traced):
             # place-scoped question sees the raw observation and none of the entities, states, or
             # relations formed from it. One source agrees with itself; a record several sources
             # share keeps only what they all say, which `_commit_formation` settles.
-            place_id, metadata = agreed_inheritance((source,))
             for proposal in proposals:
-                evidence_ids = (
-                    (source.id,) if proposal.evidence_ids is None else proposal.evidence_ids
+                evidence_ids = _proposal_sources(
+                    proposal, inputs_by_id[source.id], inputs_by_id, evidence_by_id
                 )
-                if source.id not in evidence_ids or not set(evidence_ids) <= set(inputs_by_id):
-                    raise ModelError(
-                        "formation proposal cited an observation outside its batch",
-                        reason="response_invalid",
-                        stage="form",
+                if evidence_ids is None or (
+                    self._settings.formation_history_max_rows
+                    and _history_identity_refusal(
+                        proposal,
+                        inputs_by_id[source.id],
+                        tuple(evidence_by_id[item] for item in evidence_ids),
                     )
+                ):
+                    refused += 1
+                    continue
                 # One derived opinion the model grounded wrongly -- an affect cue naming a
                 # modality the source never carried, a pose in another frame -- must not cost the
                 # caller the observation it came from. `add` commits the source before formation
@@ -645,6 +764,9 @@ class Formation(Traced):
                     )
                     refused += 1
                     continue
+                place_id, metadata = agreed_inheritance(
+                    tuple(evidence_by_id[item] for item in evidence_ids)
+                )
                 prepared = prepare_memory(
                     self._materializer.prepare(proposal.content, operation),
                     occurred_at=source.occurred_at,
@@ -680,13 +802,32 @@ class Formation(Traced):
                 )
         grounded, conflicting = _grounded_formation_pairs(pairs)
         record_formation_refusals(refused + conflicting)
-        self.commit(
-            grounded,
-            formed_sources,
-            assets=operation,
-            completed_at=now,
-            joint_evidence_clauses=True,
-        )
+        self._commit_targets(grounded, formed_sources, operation=operation, completed_at=now)
+
+    def _commit_targets(
+        self,
+        grounded: Sequence[tuple[PreparedMemory, str | None, float]],
+        targets: Sequence[MemoryRecord],
+        *,
+        operation: OperationAssets,
+        completed_at: datetime,
+    ) -> None:
+        try:
+            self.commit(
+                grounded,
+                targets,
+                assets=operation,
+                completed_at=completed_at,
+                joint_evidence_clauses=True,
+                require_active=tuple(source.id for source in targets),
+                require_visible=_cited_sources(grounded),
+            )
+        except StaleOperationError as error:
+            raise ModelError(
+                "formation evidence changed before commit; the observation remains stored",
+                reason="response_invalid",
+                stage="form",
+            ) from error
 
     def commit(
         self,
@@ -700,6 +841,7 @@ class Formation(Traced):
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        require_visible: Sequence[str] = (),
         projection_identity_id: str | None = None,
         joint_evidence_clauses: bool = False,
         projection_factory: Callable[
@@ -839,6 +981,7 @@ class Formation(Traced):
                     forget_ids=forget_ids,
                     require_active=require_active,
                     require_unretired=require_unretired,
+                    require_visible=require_visible,
                     projection_identity_id=projection_identity_id,
                     projection_memories=projection_memories,
                     projection_embeddings=projection_embeddings,

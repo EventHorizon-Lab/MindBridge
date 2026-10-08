@@ -655,11 +655,20 @@ class IdentityRegistry:
         if canonical is None:
             return None
         with self._connections.connection() as connection:
+            assertions = visible_naming_assertions(connection)
             matches = {
                 row_text(row, "identity_id")
-                for row in visible_naming_assertions(connection)
+                for row in assertions
                 if canonical_subject(optional_row_text(row, "subject")) == canonical
             }
+            if len(matches) == 1:
+                identity_id = next(iter(matches))
+                if any(
+                    row_text(row, "identity_id") == identity_id
+                    and canonical_subject(optional_row_text(row, "subject")) != canonical
+                    for row in assertions
+                ):
+                    return None
         return matches.pop() if len(matches) == 1 else None
 
     def provisional_identities(

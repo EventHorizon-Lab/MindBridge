@@ -1982,6 +1982,117 @@ def test_evidence_forgotten_between_validation_and_apply_is_stale(
         ]
 
 
+@pytest.mark.parametrize("independent", [False, True])
+@pytest.mark.parametrize("intent", [MemoryIntent.CONSOLIDATE, MemoryIntent.REINFORCE])
+@pytest.mark.parametrize("change", ["hidden", "corrected", "unchanged"])
+def test_control_commit_rechecks_source_visibility_without_rejecting_hidden_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    independent: bool,
+    intent: MemoryIntent,
+    change: str,
+) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path, consolidator, independent_evidence=independent) as memory:
+        first, second, third, extra = _observations(memory, "first", "second", "third", "extra")
+        source = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(first.id,),
+                proposal=_trait("Ana", "patient"),
+            )
+        ).created_ids[0]
+        support = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.REINFORCE,
+                target_ids=(source,),
+                evidence_ids=(second.id,),
+            )
+        )
+        visible = memory.get(source).context
+        assert visible is not None and visible.visible
+        target = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(third.id,),
+                proposal=_trait("Ana", "careful"),
+            )
+        ).created_ids[0]
+        before = memory.get(target).context
+        assert before is not None and not before.visible
+        operation = (
+            MemoryOperation(
+                intent=intent,
+                target_ids=(extra.id,),
+                evidence_ids=(source, extra.id),
+                proposal=FormationProposal(
+                    kind=MemoryKind.EVENT,
+                    content="A new conclusion from the patient claim.",
+                    subject="Ana",
+                ),
+            )
+            if intent is MemoryIntent.CONSOLIDATE
+            else MemoryOperation(
+                intent=intent,
+                target_ids=(target,),
+                evidence_ids=(source, extra.id),
+            )
+        )
+        interleaved: list[str] = []
+
+        def change_source() -> None:
+            if interleaved:
+                return
+            interleaved.append(change)
+            if change == "hidden":
+                assert memory.rollback(support.operation_id)
+            elif change == "corrected":
+                memory.apply(MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(source,)))
+
+        original_formation = Semantics.apply_formation
+        original_control = OperationLog.apply_control_operation
+
+        def before_formation(self: Semantics, *args: object, **kwargs: object) -> bool:
+            change_source()
+            return cast(bool, cast(Any, original_formation)(self, *args, **kwargs))
+
+        def before_control(
+            self: OperationLog, *args: object, **kwargs: object
+        ) -> StoredOperation | None:
+            change_source()
+            return cast(StoredOperation | None, cast(Any, original_control)(self, *args, **kwargs))
+
+        if intent is MemoryIntent.CONSOLIDATE:
+            monkeypatch.setattr(Semantics, "apply_formation", before_formation)
+        else:
+            monkeypatch.setattr(OperationLog, "apply_control_operation", before_control)
+        consolidator._scripts.append((operation,))
+        report = memory.consolidate(evidence_ids=(source, target, extra.id))
+        assert interleaved == [change]
+        if change == "unchanged":
+            assert report.rejected == () and len(report.operations) == 1
+            if intent is MemoryIntent.REINFORCE:
+                after = memory.get(target).context
+                assert after is not None and after.visible
+                assert set(after.evidence_ids) == {third.id, source, extra.id}
+            else:
+                assert memory.get(extra.id).forgotten_at is not None
+            return
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["stale"]
+        assert memory.get(target).context == before
+        assert memory.get(extra.id).forgotten_at is None
+        assert not any(
+            record.content == "A new conclusion from the patient claim."
+            for record in memory.list().items
+        )
+        assert not any(row.operation == operation for row in memory.operations())
+        invalidated = memory.get(source).context
+        assert invalidated is not None
+        assert (invalidated.retired_at is not None) == (change == "corrected")
+        assert change != "hidden" or not invalidated.visible
+
+
 # ---------------------------------------------------------------------------------------------
 # Durable triggers
 

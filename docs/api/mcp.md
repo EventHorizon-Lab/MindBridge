@@ -281,10 +281,10 @@ Successful calls populate MCP `structuredContent`:
 | `ReinforceResult` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |
-| `ContextBudgetResult` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
+| `ContextBudgetResult` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms`, `selected_proofs` |
 | `ContextConflictResult` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknownResult` | `kind`, `detail` |
-| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResult` array `affect`, the mixed `actors` array of `SearchHitResult` and `ProvisionalActorResult`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, separately typed `excerpts`, `rendered` |
+| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResult` array `affect`, the mixed `actors` array of `SearchHitResult` and `ProvisionalActorResult`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, separately typed `excerpts`, `proofs`, `rendered` |
 | `ContextExcerptResult` | `source_memory_id`, structured `matched_index_id`, partial `content`, digest-bound `selector`, score, source timestamps, `memory_type`, `context`, `place_id`; the rendered line warns that omitted text may qualify it |
 | `TextSpanSelectorResult` | parent and embedding-input digests, recipe version, and ordered exact `TextSpanPieceResult` values with role, half-open code-point offsets, source text, and piece digest |
 | `ProvisionalActorResult` | `identity_id`, `memory_ids` |
@@ -293,6 +293,13 @@ Successful calls populate MCP `structuredContent`:
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids` |
 | `IdentityErasure` | `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
+
+The compile tool accepts `budget.selected_proofs=false`. Opting in delivers the same complete
+`ContextProof` witnesses as the [REST context response](rest.md#contract), in an additive
+`proofs` array. Each witness has `anchor_id` and complete `nodes` with `memory_id`, `confidence`,
+`sources`, and nullable `capture_id`. The full evidence audit union stays on every hit. Certificate
+text and its records are budgeted together; `scope.known_at` retains full provenance. Other
+deliveries return `proofs=[]`. The MCP surface still contains fifteen tools.
 
 The last four are the SDK dataclasses `Memory.speech`, `Memory.faces`, `Memory.identity`, and
 `Memory.forget_identity` return, published field for field rather than reshaped:
