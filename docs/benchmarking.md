@@ -69,13 +69,18 @@ Reference answers, target character IDs, evidence annotations, `characters.json`
 speaker-labeled transcripts never enter the model input. Evidence annotations may be incomplete;
 retrieval recall against them is a diagnostic, not exhaustive proof coverage.
 
-The scorer uses the pinned upstream semantic-equivalence prompt and exact `Yes` verdict parser.
+The scorer sends only the pinned upstream semantic-equivalence prompt as a user message and uses
+the exact `Yes` verdict parser. Protocol `icm_semantic_equivalence_10f02babe3c7_user_only_v2`
+removes an unintended M3 system message from the earlier adapter; scores from that earlier
+protocol require rejudging before comparison with this protocol.
 Its released default judge is `gemini-3-flash-preview`; another judge is marked as a proxy.
 Generation backends that turn video into frames do not thereby receive native audio or implement
 face/voice identity binding. Report effective modalities and identity configuration with results.
 
 Use `--tasks icm-bench --download` with the normal evaluator. Downloads include a video tar archive
-and its extracted clips. Data is CC BY-NC-SA 4.0; the upstream code is MIT, and the copied judge
+and its extracted clips. Once extracted, the tar archive can be removed for `--no-download` runs;
+the extracted clips and annotation inputs must remain available.
+Data is CC BY-NC-SA 4.0; the upstream code is MIT, and the copied judge
 prompt retains its Apache-2.0 notice. See the [official repository](https://github.com/Shidu-Ren/ICM-Bench).
 
 ## Run an evaluation

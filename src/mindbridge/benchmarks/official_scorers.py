@@ -115,7 +115,7 @@ class JudgePlan:
 
 
 _PROTOCOLS = {
-    "icm-bench": "icm_semantic_equivalence_10f02babe3c7",
+    "icm-bench": "icm_semantic_equivalence_10f02babe3c7_user_only_v2",
     "locomo-refined": "locomo_refined_judge_887091190789",
     "m3-bench": "m3_agent_judge_0e3e41939bd8_system_v1",
     "video-mme-v2": "video_mme_v2_6e4bebb03202",
@@ -604,23 +604,29 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
             candidate_metrics=candidate_metrics,
         )
     reference = references[0]
-    if family in {"m3-bench", "icm-bench"}:
-        template = SEMANTIC_EQUIVALENCE_PROMPT if family == "icm-bench" else _M3_PROMPT
-        prompt = template.format(
+    if family == "icm-bench":
+        prompt = SEMANTIC_EQUIVALENCE_PROMPT.format(
+            question=question,
+            ground_truth_answer=reference,
+            agent_answer=prediction,
+        )
+        return JudgePlan(protocol, "icm", ((JudgeMessage("user", prompt),),), 8192)
+    if family == "m3-bench":
+        prompt = _M3_PROMPT.format(
             question=question,
             ground_truth_answer=reference,
             agent_answer=prediction,
         )
         return JudgePlan(
             protocol,
-            "icm" if family == "icm-bench" else "m3",
+            "m3",
             (
                 (
                     JudgeMessage("system", "You are an expert in video understanding."),
                     JudgeMessage("user", prompt),
                 ),
             ),
-            8192 if family == "icm-bench" else 2048,
+            2048,
         )
     if family == "egotempo":
         prompt = _EGOTEMPO_PROMPT.format(question=question, answer=reference, prediction=prediction)

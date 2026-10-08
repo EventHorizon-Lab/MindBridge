@@ -22,6 +22,7 @@ from mindbridge import (
     AnswerResult,
     Memory,
     Modality,
+    ModelInput,
     OpenAIModels,
     RetrievalMode,
     SearchHit,
@@ -34,7 +35,6 @@ from mindbridge.benchmarks.complementary import (
 )
 from mindbridge.benchmarks.icm_bench import load_icm_bench
 from mindbridge.benchmarks.official_scorers import judge_plan, parse_judge_response
-from mindbridge.models.base import ModelInput
 
 ROOT = Path.home() / ".local/share/openresearch/benchmark-cache/mindbridge"
 BASELINE = ROOT / "icm-four-baseline-20260917"

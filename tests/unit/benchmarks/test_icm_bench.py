@@ -7,11 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge.benchmarks.download import _extract_tar
+from mindbridge.benchmarks._official.icm_prompt import SEMANTIC_EQUIVALENCE_PROMPT
+from mindbridge.benchmarks.download import _extract_tar, acquire_media
 from mindbridge.benchmarks.eval import _prefix_end
 from mindbridge.benchmarks.eval_adapters import load_task
 from mindbridge.benchmarks.icm_bench import load_icm_bench
-from mindbridge.benchmarks.official_scorers import judge_plan, parse_judge_response
+from mindbridge.benchmarks.official_scorers import JudgeMessage, judge_plan, parse_judge_response
 from mindbridge.benchmarks.task_catalog import TASKS
 
 
@@ -87,7 +88,18 @@ def test_icm_scorer_uses_exact_yes_verdict() -> None:
         "icm-bench", question="Who?", references=("Li",), prediction="Li.", metadata={}
     )
     assert plan is not None
-    assert "logically inferred" in plan.calls[0][1].content
+    assert plan.calls == (
+        (
+            JudgeMessage(
+                "user",
+                SEMANTIC_EQUIVALENCE_PROMPT.format(
+                    question="Who?", ground_truth_answer="Li", agent_answer="Li."
+                ),
+            ),
+        ),
+    )
+    assert plan.protocol == "icm_semantic_equivalence_10f02babe3c7_user_only_v2"
+    assert plan.max_tokens == 8192
     assert parse_judge_response(plan, " Yes. ") == {"accuracy": 1.0}
     assert parse_judge_response(plan, "not yes") == {"accuracy": 0.0}
 
@@ -120,3 +132,43 @@ def test_tar_extraction_is_resumable(tmp_path: Path) -> None:
     _extract_tar(archive, announce=None)
     _extract_tar(archive, announce=None)
     assert (tmp_path / "videos/clip_000.mp4").read_bytes() == b"data"
+
+
+def test_icm_offline_media_does_not_require_retaining_tar(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    release = tmp_path / "icm-bench"
+    archive = release / "videos.tar"
+    with tarfile.open(archive, "w") as volume:
+        item = tarfile.TarInfo("videos/clip_000.mp4")
+        item.size = 4
+        volume.addfile(item, io.BytesIO(b"data"))
+    assert acquire_media(TASKS["icm-bench"], tmp_path, download=False) == release
+    archive.unlink()
+    assert acquire_media(TASKS["icm-bench"], tmp_path, download=False) == release
+    unit = load_task(TASKS["icm-bench"], root=tmp_path, verify_digest=False).units[0]
+    assert len(unit.memories) == 3
+
+
+def test_icm_offline_media_still_requires_non_archive_inputs(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    (tmp_path / "icm-bench/videos/metadata.jsonl").unlink()
+    with pytest.raises(FileNotFoundError, match=r"metadata\.jsonl"):
+        acquire_media(
+            TASKS["icm-bench"],
+            tmp_path,
+            patterns=("videos.tar", "videos/metadata.jsonl"),
+            download=False,
+        )
+
+
+def test_icm_download_still_requires_requested_tar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fixture(tmp_path)
+
+    def empty_download(*args: object) -> None:
+        pass
+
+    monkeypatch.setattr("mindbridge.benchmarks.download._snapshot", empty_download)
+    with pytest.raises(FileNotFoundError, match=r"download did not produce: videos\.tar"):
+        acquire_media(TASKS["icm-bench"], tmp_path)

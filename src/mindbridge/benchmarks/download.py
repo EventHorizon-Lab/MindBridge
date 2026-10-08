@@ -114,7 +114,8 @@ def acquire_media(
     missing = tuple(
         pattern
         for pattern in selected
-        if not tuple(destination.glob(pattern)) and (download or not pattern.endswith(".zip"))
+        if not tuple(destination.glob(pattern))
+        and (download or not pattern.endswith((".zip", ".tar")))
     )
     if missing and not allow_missing:
         action = "download did not produce" if download else "offline media is missing"
