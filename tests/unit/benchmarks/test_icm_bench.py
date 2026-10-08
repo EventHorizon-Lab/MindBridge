@@ -11,7 +11,7 @@ from mindbridge.benchmarks._official.icm_prompt import SEMANTIC_EQUIVALENCE_PROM
 from mindbridge.benchmarks.download import _extract_tar, acquire_media
 from mindbridge.benchmarks.eval import _prefix_end
 from mindbridge.benchmarks.eval_adapters import load_task
-from mindbridge.benchmarks.icm_bench import load_icm_bench
+from mindbridge.benchmarks.icm_bench import ICM_NO_ASR_CLIPS, load_icm_bench
 from mindbridge.benchmarks.official_scorers import JudgeMessage, judge_plan, parse_judge_response
 from mindbridge.benchmarks.task_catalog import TASKS
 
@@ -48,7 +48,9 @@ def _fixture(root: Path) -> Path:
         (media / f"{clip}.mp4").write_bytes(b"fixture video")
     transcripts = root / "icm-bench/resources/asr_transcripts"
     transcripts.mkdir(parents=True)
-    (transcripts / "clip_001.srt").write_text("Observed speech, no speaker label")
+    for position, clip in enumerate(clips):
+        if position not in ICM_NO_ASR_CLIPS:
+            (transcripts / f"{clip}.srt").write_text("Observed speech, no speaker label")
     (root / "icm-bench/characters.json").write_text("FORBIDDEN CHARACTERS")
     return path
 
@@ -63,6 +65,22 @@ def test_icm_causal_prefix_calibration_and_no_label_leakage(tmp_path: Path) -> N
     assert "Observed speech" in inputs
     assert "SECRET" not in inputs and "FORBIDDEN" not in inputs
     assert unit.questions[0].metadata["evidence_ids"] == ("clip_001",)
+    assert unit.memories[0].content[0] == "Video clip_000"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "unexpected", "directory"])
+def test_icm_rejects_incomplete_transcript_roster(tmp_path: Path, mutation: str) -> None:
+    _fixture(tmp_path)
+    transcripts = tmp_path / "icm-bench/resources/asr_transcripts"
+    if mutation == "unexpected":
+        (transcripts / "clip_839.srt").write_text("extra transcript")
+    else:
+        required = transcripts / "clip_001.srt"
+        required.unlink()
+        if mutation == "directory":
+            required.mkdir()
+    with pytest.raises(ValueError, match="speakerless ASR roster mismatch"):
+        load_task(TASKS["icm-bench"], root=tmp_path, verify_digest=False, limit=1)
 
 
 @pytest.mark.parametrize(

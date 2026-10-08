@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import httpx2 as httpx
 import pytest
@@ -53,14 +55,26 @@ def _driver() -> ModuleType:
     return module
 
 
-def test_paired_trial_uses_one_shared_plan_and_keeps_labels_out(tmp_path: Path) -> None:
+@pytest.mark.parametrize("order", list(itertools.permutations(("rank", "relevance", "coverage"))))
+def test_paired_trial_uses_one_shared_plan_and_keeps_labels_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: tuple[str, ...]
+) -> None:
     driver = _driver()
     requests: list[dict[str, object]] = []
+    clock = [0.0]
+    monkeypatch.setattr(driver, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(driver, "ARMS", order)
+    monkeypatch.setattr(
+        driver,
+        "random",
+        SimpleNamespace(Random=lambda seed: SimpleNamespace(shuffle=lambda arms: None)),
+    )
 
     def respond(request: httpx.Request) -> httpx.Response:
         data = json.loads(request.content)
         requests.append(data)
         if "response_format" in data:
+            clock[0] += 50.0
             payload = json.loads(data["messages"][1]["content"])
             assert "HIDDEN_REFERENCE" not in str(payload)
             text = json.dumps(
@@ -104,6 +118,21 @@ def test_paired_trial_uses_one_shared_plan_and_keeps_labels_out(tmp_path: Path) 
         ),
     ) as client:
         models = _FakeModels()
+        original_answer = models.answer
+
+        def timed_answer(
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
+            clock[0] += 2.0
+            return original_answer(
+                question, hits, answer_policy=answer_policy, exhaustive=exhaustive
+            )
+
+        monkeypatch.setattr(models, "answer", timed_answer)
         reader = driver.SelectorBackend(
             models,
             client,
@@ -133,6 +162,100 @@ def test_paired_trial_uses_one_shared_plan_and_keeps_labels_out(tmp_path: Path) 
     assert len(models.answer_calls) == 3
     assert len({tuple(row["candidate_ids"]) for row in rows}) == 1
     assert "HIDDEN_REFERENCE" not in repr(models.answer_calls)
+    assert all(row["seconds"] == 2.0 for row in rows)
+    assert {row["arm"]: row["shared_selector_seconds"] for row in rows} == {
+        "rank": 0.0,
+        "relevance": 50.0,
+        "coverage": 50.0,
+    }
+    saved = [json.loads(line) for line in (tmp_path / "predictions.jsonl").read_text().splitlines()]
+    assert [row["shared_selector_seconds"] for row in saved] == [
+        row["shared_selector_seconds"] for row in rows
+    ]
+
+
+@pytest.mark.parametrize("field", ["question", "reference_answer"])
+def test_trial_checks_pinned_question_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    driver = _driver()
+    row = {
+        "question_id": "same-id",
+        "question": "Who?",
+        "reference_answer": "Li",
+        "category": "Long-Term Identity Profile Inference",
+        "target_character_ids": ["Li"],
+        "evidence_video_ids": ["clip_001"],
+        "before_clip": None,
+    }
+    path = tmp_path / "qa_test.jsonl"
+    path.write_text(json.dumps(row))
+    monkeypatch.setitem(
+        driver.TASKS,
+        "icm-bench",
+        replace(driver.TASKS["icm-bench"], digest=driver.dataset_digest(path)),
+    )
+    assert driver.frozen_questions(path)["same-id"].reference_answer == "Li"
+    row[field] = "changed"
+    path.write_text(json.dumps(row))
+    with pytest.raises(RuntimeError, match="question dataset changed"):
+        driver.frozen_questions(path)
+
+
+@pytest.mark.parametrize("changed", [None, "assets/video.mp4", "zvec/index"])
+def test_trial_freezes_assets_and_index_with_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str | None
+) -> None:
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[3] / "benchmarks"))
+    tree_manifest = importlib.import_module("paired_replay").tree_manifest
+
+    driver = _driver()
+    source = tmp_path / "source"
+    for name in ("state.sqlite3", ".mindbridge.lock", "assets/video.mp4", "zvec/index"):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"original")
+    manifest = tree_manifest(source)
+    recipe = {
+        "source_sqlite_sha256": driver.dataset_digest(source / "state.sqlite3"),
+        "source_tree_sha256": manifest["sha256"],
+    }
+    destination = tmp_path / "copy"
+    if changed is not None:
+        (source / changed).write_bytes(b"modified")
+        assert driver.dataset_digest(source / "state.sqlite3") == recipe["source_sqlite_sha256"]
+        with pytest.raises(RuntimeError, match="store tree changed"):
+            driver.copy_baseline(source, destination, recipe)
+        assert not destination.exists()
+    else:
+        assert driver.copy_baseline(source, destination, recipe) == manifest
+        assert tree_manifest(destination) == manifest
+
+
+def test_trial_rejects_snapshot_changed_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[3] / "benchmarks"))
+    tree_manifest = importlib.import_module("paired_replay").tree_manifest
+
+    driver = _driver()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "state.sqlite3").write_bytes(b"original")
+    (source / ".mindbridge.lock").touch()
+    recipe = {
+        "source_sqlite_sha256": driver.dataset_digest(source / "state.sqlite3"),
+        "source_tree_sha256": tree_manifest(source)["sha256"],
+    }
+    original_copy = driver.shutil.copytree
+
+    def changed_copy(source: Path, destination: Path) -> None:
+        original_copy(source, destination)
+        (destination / "state.sqlite3").write_bytes(b"modified")
+
+    monkeypatch.setattr(driver.shutil, "copytree", changed_copy)
+    with pytest.raises(RuntimeError, match="changed while copying"):
+        driver.copy_baseline(source, tmp_path / "copy", recipe)
 
 
 def test_media_audit_hashes_payload_without_logging_media_bytes() -> None:

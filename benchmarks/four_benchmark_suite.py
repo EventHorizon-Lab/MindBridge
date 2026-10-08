@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 from mindbridge.benchmarks.download import acquire_inputs, acquire_media
+from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.task_catalog import TASKS
 
 
@@ -101,11 +102,19 @@ def main() -> int:
             output = workspace / "results" / task
             report = output / "results.jsonl"
             if report.is_file():
-                entry = {"task": task, "exit_code": 0, "output": str(output)}
+                status = json.loads(report.read_text()).get("status")
+                entry = {
+                    "task": task,
+                    "exit_code": int(status != "completed"),
+                    "output": str(output),
+                }
                 results.append(entry)
                 print("TASK_STATUS " + json.dumps(entry), flush=True)
                 print("TASK_RESULT " + report.read_text(), flush=True)
                 continue
+            run_id = recipe["suite_id"] + "-" + task
+            data_root = workspace / "stores" / task
+            run_path = BenchmarkRun.path_for(data_root, task, run_id)
             command = [
                 sys.executable,
                 "-m",
@@ -119,15 +128,17 @@ def main() -> int:
                 "--benchmarks-root",
                 str(root),
                 "--data-root",
-                str(workspace / "stores" / task),
+                str(data_root),
                 "--output-path",
                 str(output),
                 "--run-id",
-                recipe["suite_id"] + "-" + task,
+                run_id,
                 "--use-cache",
                 str(workspace / "responses" / task),
             ]
-            if (output / "samples.partial.jsonl").is_file():
+            if (output.is_dir() and any(output.iterdir())) or (
+                run_path.is_dir() and any(run_path.iterdir())
+            ):
                 command.append("--resume")
             if recipe["phase"] == "prepare":
                 command.extend(["--check-integrity", "--no-download"])

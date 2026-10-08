@@ -13,6 +13,8 @@ from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmpty
 
 ICM_ADAPTER_VERSION = "icm_video_speakerless_asr_v1"
 ICM_DATA_REVISION = "8670eef08e3a172e3951984cec33a8f4a9ae96a7"
+# The pinned release publishes no speakerless transcript for these ten clips.
+ICM_NO_ASR_CLIPS = frozenset({0, 51, 168, 287, 331, 468, 517, 669, 722, 786})
 
 
 def clip_position(value: str) -> int:

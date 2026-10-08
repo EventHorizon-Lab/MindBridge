@@ -1251,14 +1251,26 @@ def _emit(
     return 0
 
 
-if __name__ == "__main__":
-    # A committed suite recipe preserves this experiment tree's fixed launch command.
-    if Path(__file__).with_name("complementary_trial.json").is_file():
+def launch(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Select a committed research suite.")
+    parser.add_argument(
+        "--suite",
+        choices=("complementary", "four-benchmark", "support-coverage"),
+        default="complementary",
+    )
+    args, remaining = parser.parse_known_args(argv)
+    if args.suite == "support-coverage":
+        return main(remaining)
+    if remaining:
+        parser.error("unrecognized arguments: " + " ".join(remaining))
+    if args.suite == "complementary":
         from complementary_trial import main as complementary_main
 
-        raise SystemExit(complementary_main())
-    if Path(__file__).with_name("four_benchmark_suite.json").is_file():
-        from four_benchmark_suite import main as suite_main
+        return complementary_main()
+    from four_benchmark_suite import main as suite_main
 
-        raise SystemExit(suite_main())
-    raise SystemExit(main())
+    return suite_main()
+
+
+if __name__ == "__main__":
+    raise SystemExit(launch())

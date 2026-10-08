@@ -676,7 +676,7 @@ def _icm_bench(
     limit: Limit,
     offset: int,
 ) -> tuple[EvalUnit, ...]:
-    from mindbridge.benchmarks.icm_bench import clip_position, load_icm_bench
+    from mindbridge.benchmarks.icm_bench import ICM_NO_ASR_CLIPS, clip_position, load_icm_bench
 
     release = root / "icm-bench"
     rows = [
@@ -687,11 +687,21 @@ def _icm_bench(
     clips = sorted((str(row["video_id"]) for row in rows), key=clip_position)
     if clips != [f"clip_{position:03d}" for position in range(839)]:
         raise ValueError("ICM timeline must contain exactly clip_000 through clip_838")
+    transcripts = release / "resources/asr_transcripts"
+    expected = {
+        f"clip_{position:03d}.srt" for position in range(839) if position not in ICM_NO_ASR_CLIPS
+    }
+    actual = {path.name for path in transcripts.glob("*.srt") if path.is_file()}
+    if actual != expected:
+        raise ValueError(
+            f"ICM speakerless ASR roster mismatch: missing {sorted(expected - actual)}, "
+            f"unexpected {sorted(actual - expected)}"
+        )
     questions = _selected(load_icm_bench(dataset), limit, offset)
     memories = []
     for clip in clips:
         position = clip_position(clip)
-        transcript = release / "resources/asr_transcripts" / f"{clip}.srt"
+        transcript = transcripts / f"{clip}.srt"
         # Speaker-labeled transcripts and characters.json are scorer-only resources.
         text = f"Video {clip}"
         if transcript.is_file():

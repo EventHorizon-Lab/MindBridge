@@ -62,6 +62,8 @@ The JSON response reports `unit_count`, `question_count`, `dataset_sha256`, and
 The `icm-bench` task pins the public `ryanren0330/ICM-Bench` release. Its input is raw video
 plus the release's speakerless ASR, including the initial calibration video. Recall and Retrieval
 questions see clips through `before_clip` inclusively; Profile questions see the full album.
+The adapter requires all 829 published speakerless ASR files; only the ten clips without
+transcripts in the pinned release may omit them.
 The runner incrementally ingests these prefixes in one physically isolated store. Clip positions
 are causal ordering coordinates, not video offsets or wall-clock dates.
 
@@ -82,6 +84,29 @@ and its extracted clips. Once extracted, the tar archive can be removed for `--n
 the extracted clips and annotation inputs must remain available.
 Data is CC BY-NC-SA 4.0; the upstream code is MIT, and the copied judge
 prompt retains its Apache-2.0 notice. See the [official repository](https://github.com/Shidu-Ren/ICM-Bench).
+
+### Committed research recipes
+
+Select the paired complementary trial or four-benchmark suite explicitly:
+
+```bash
+uv run --frozen python benchmarks/support_coverage.py --suite complementary
+uv run --frozen python benchmarks/support_coverage.py --suite four-benchmark
+```
+
+The launcher defaults to `complementary`. Use `--suite support-coverage` to reach the original
+support-coverage runner and pass its usual arguments. These research scripts require the local
+model environment file and dataset caches; the complementary trial also requires the ingested
+baseline snapshot. They do not reproduce the experiment on a fresh machine.
+
+The four-benchmark suite reuses final reports with their recorded success or failure status and
+resumes interrupted output or store directories, including ingestion before any samples exist.
+The complementary trial rejects nonempty output directories and verifies the pinned question
+digest and complete baseline tree, including assets and the derived index, before using the copy.
+The corrected trial uses suite ID `complementary-evidence-20261008-v2` to preserve historical runs.
+Its per-arm `seconds` excludes shared selector work; `shared_selector_seconds` charges that work
+to each reranking arm and is zero for the original ranking arm, regardless of execution order.
+Historical scores still require rejudging under the corrected ICM protocol.
 
 ## Run an evaluation
 

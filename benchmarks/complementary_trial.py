@@ -33,8 +33,10 @@ from mindbridge.benchmarks.complementary import (
     select_evidence,
     selector_payload,
 )
-from mindbridge.benchmarks.icm_bench import load_icm_bench
+from mindbridge.benchmarks.eval_adapters import dataset_digest
+from mindbridge.benchmarks.icm_bench import ICMQuestion, load_icm_bench
 from mindbridge.benchmarks.official_scorers import judge_plan, parse_judge_response
+from mindbridge.benchmarks.task_catalog import TASKS
 
 ROOT = Path.home() / ".local/share/openresearch/benchmark-cache/mindbridge"
 BASELINE = ROOT / "icm-four-baseline-20260917"
@@ -152,7 +154,6 @@ class SelectorBackend:
                 ],
             )
             raw = response.choices[0].message.content or ""
-            self.selector_seconds = time.perf_counter() - started
             error_type = None
             try:
                 self.plan = parse_plan(raw, len(pool))
@@ -169,6 +170,7 @@ class SelectorBackend:
                     "error": error_type,
                 },
             )
+            self.selector_seconds = time.perf_counter() - started
         elif payload != self.payload:
             raise RuntimeError("paired arms observed different candidate content/order")
         self.pool = pool
@@ -263,6 +265,7 @@ def evaluate(
             answer_policy="best_effort" if case["dataset"] == "icm-profile-dev" else "strict",
             link_identities=False,
         )
+        selector_elapsed = reader.selector_seconds - selector_before
         predictions.append(
             {
                 "case": case["id"],
@@ -271,8 +274,8 @@ def evaluate(
                 "arm": arm,
                 "prediction": answer.answer,
                 "abstained": answer.abstained,
-                "seconds": time.perf_counter() - start,
-                "shared_selector_seconds": reader.selector_seconds - selector_before,
+                "seconds": time.perf_counter() - start - selector_elapsed,
+                "shared_selector_seconds": 0.0 if arm == "rank" else reader.selector_seconds,
                 "plan_valid": reader.plan is not None,
                 "candidate_ids": [source(h) for h in reader.pool],
                 "selected_ids": [source(h) for h in reader.selected],
@@ -310,6 +313,27 @@ def evaluate(
     return predictions
 
 
+def frozen_questions(path: Path) -> dict[str, ICMQuestion]:
+    if dataset_digest(path) != TASKS["icm-bench"].digest:
+        raise RuntimeError("ICM question dataset changed since protocol freeze")
+    return {q.question_id: q for q in load_icm_bench(path)}
+
+
+def copy_baseline(source: Path, destination: Path, recipe: dict[str, Any]) -> dict[str, object]:
+    from paired_replay import _closed_store_lock, tree_manifest
+
+    with _closed_store_lock(source):
+        if dataset_digest(source / "state.sqlite3") != recipe["source_sqlite_sha256"]:
+            raise RuntimeError("baseline snapshot changed since protocol freeze")
+        manifest = tree_manifest(source)
+        if manifest["sha256"] != recipe["source_tree_sha256"]:
+            raise RuntimeError("baseline store tree changed since protocol freeze")
+        shutil.copytree(source, destination)
+        if tree_manifest(destination) != manifest:
+            raise RuntimeError("baseline store changed while copying")
+    return manifest
+
+
 def run_cases(
     recipe: dict[str, Any],
     output: Path,
@@ -318,8 +342,9 @@ def run_cases(
     audit: Audit,
     vision: OpenAIModels,
 ) -> list[dict[str, Any]]:
-    from paired_replay import _closed_store_lock
+    from paired_replay import _closed_store_lock, tree_manifest
 
+    questions = frozen_questions(BASELINE / "datasets/icm-bench/annotations/qa_test.jsonl")
     fixture_bytes = Path(__file__).with_name("complementary_scenarios.json").read_bytes()
     if hashlib.sha256(fixture_bytes).hexdigest() != recipe["fixture_sha256"]:
         raise RuntimeError("diagnostic fixture changed since protocol freeze")
@@ -340,21 +365,14 @@ def run_cases(
     if len(stores) != 1:
         raise RuntimeError("expected exactly one frozen ICM baseline store")
     copied = output / "stores/icm-profile"
-    with _closed_store_lock(stores[0].parent):
-        source_hash = hashlib.sha256(stores[0].read_bytes()).hexdigest()
-        if source_hash != recipe["source_sqlite_sha256"]:
-            raise RuntimeError("baseline snapshot changed since protocol freeze")
-        shutil.copytree(stores[0].parent, copied)
-    questions = {
-        q.question_id: q
-        for q in load_icm_bench(BASELINE / "datasets/icm-bench/annotations/qa_test.jsonl")
-    }
+    manifest = copy_baseline(stores[0].parent, copied, recipe)
     print(
         "STORE_SNAPSHOT "
         + json.dumps(
             {
                 "parent_run": "a5f37edc-3a12-4f05-b294-a2da79de09fa",
-                "sqlite_sha256": source_hash,
+                "sqlite_sha256": recipe["source_sqlite_sha256"],
+                "store_tree": manifest,
             }
         ),
         flush=True,
@@ -373,8 +391,9 @@ def run_cases(
                 "gold": list(q.evidence_video_ids),
             }
             results.extend(evaluate(memory, reader, audit, case, output))
-    if hashlib.sha256(stores[0].read_bytes()).hexdigest() != source_hash:
-        raise RuntimeError("original baseline changed during the experiment")
+    with _closed_store_lock(stores[0].parent):
+        if tree_manifest(stores[0].parent) != manifest:
+            raise RuntimeError("original baseline changed during the experiment")
     return results
 
 
