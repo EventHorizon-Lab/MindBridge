@@ -231,7 +231,7 @@ formation machinery.
 
 ### M3-Agent and robot episodic memory
 
-**Primary sources.** [ICLR 2026 paper](https://openreview.net/forum?id=PMz29A7Muq) and official
+**Primary sources.** [ICLR 2026 paper](https://arxiv.org/abs/2508.09736) and official
 repository at
 [`0e3e419`](https://github.com/bytedance-seed/m3-agent/tree/0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c),
 inspected 2026-09-08.

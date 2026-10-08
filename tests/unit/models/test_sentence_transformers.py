@@ -408,6 +408,60 @@ def test_embeddinggemma2_loader_uses_safe_precision(monkeypatch: pytest.MonkeyPa
     ]
 
 
+@pytest.mark.parametrize("dimension", (128, 256, 512))
+def test_other_embeddinggemma2_checkpoints_require_mrl_metadata(dimension: int) -> None:
+    encoder = RecordingEncoder([[1.0] * dimension], native_dimension=768)
+    encoder.config = SimpleNamespace(model_type="embedding_gemma2")
+
+    with pytest.raises(ModelError, match="advertised Matryoshka"):
+        SentenceTransformersEmbedder(
+            encoder,
+            model_id="org/embeddinggemma-2-finetuned",
+            revision=REVISION,
+            dimension=dimension,
+        )
+
+
+def test_other_embeddinggemma2_checkpoint_keeps_advertised_mrl_dimensions() -> None:
+    encoder = RecordingEncoder(
+        [[1.0] * 128], native_dimension=768, matryoshka_dimensions=(128, 768)
+    )
+    encoder.config.model_type = "embedding_gemma2"
+    model_id = "org/embeddinggemma-2-finetuned"
+
+    embedder = SentenceTransformersEmbedder(
+        encoder, model_id=model_id, revision=REVISION, dimension=128
+    )
+    assert embedder.embedding_dimension == 128
+    with pytest.raises(ModelError, match="advertised Matryoshka"):
+        SentenceTransformersEmbedder(encoder, model_id=model_id, revision=REVISION, dimension=256)
+
+
+def test_injected_embeddinggemma2_keeps_its_video_decoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def decoder(path: object) -> object:
+        return path
+
+    video_processor = SimpleNamespace(fetch_videos=decoder)
+    module = SimpleNamespace(processor=SimpleNamespace(video_processor=video_processor))
+
+    class VideoEncoder(RecordingEncoder):
+        def __getitem__(self, _index: int) -> object:
+            return module
+
+    def unexpected_import(name: str) -> object:
+        raise AssertionError(f"injected encoder must not import {name}")
+
+    monkeypatch.setattr(sentence_transformers, "import_module", unexpected_import)
+    SentenceTransformersEmbedder(
+        VideoEncoder([[1.0, 0.0]]), model_id="google/embeddinggemma-2", revision=REVISION
+    )
+
+    assert video_processor.fetch_videos is decoder
+    assert video_processor.fetch_videos("clip.mp4") == "clip.mp4"
+
+
 def test_embeddinggemma2_video_decoder_uses_pyav_and_keeps_sampling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -423,14 +477,15 @@ def test_embeddinggemma2_video_decoder_uses_pyav_and_keeps_sampling(
         calls.append((path, kwargs))
         return path, {"fps": 2}
 
-    monkeypatch.setattr(
-        sentence_transformers,
-        "import_module",
-        lambda _name: SimpleNamespace(load_video=load_video),
-    )
-    SentenceTransformersEmbedder(
-        VideoEncoder([[1.0, 0.0]]), model_id="google/embeddinggemma-2", revision=REVISION
-    )
+    def importer(name: str) -> object:
+        if name == "sentence_transformers":
+            return SimpleNamespace(SentenceTransformer=lambda *_args, **_kwargs: encoder)
+        assert name == "transformers.video_utils"
+        return SimpleNamespace(load_video=load_video)
+
+    encoder = VideoEncoder([[1.0, 0.0]])
+    monkeypatch.setattr(sentence_transformers, "import_module", importer)
+    SentenceTransformersEmbedder.load("google/embeddinggemma-2", revision=REVISION)
 
     def sample(_metadata: object) -> list[int]:
         return [0]
