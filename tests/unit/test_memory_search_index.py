@@ -22,9 +22,11 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import TracebackType
 from typing import ClassVar, cast
 
 import pytest
@@ -1655,7 +1657,9 @@ def test_a_stated_name_carries_to_every_later_clip_of_the_same_voice(tmp_path: P
         ]
 
 
-def test_a_stated_name_never_replaces_the_one_a_host_registered(tmp_path: Path) -> None:
+def test_a_stated_name_never_replaces_the_one_a_host_registered(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A name is what the index keys a person under, so a mishearing must not propagate.
 
     The fact came from a model reading a transcript. Letting it overwrite a standing name would
@@ -1683,6 +1687,56 @@ def test_a_stated_name_never_replaces_the_one_a_host_registered(tmp_path: Path) 
         assert [record.operation.intent for record in memory.operations()] == [
             MemoryIntent.IDENTIFY
         ]
+        assert "keeping the registered name" in caplog.text
+        assert "Lily" not in caplog.text
+        assert "Mei" not in caplog.text
+
+
+def test_a_staged_name_rechecks_the_profile_after_a_concurrent_host_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Memory(tmp_path, embedder=_Embedder(), transcriber=_Diarised()) as memory:
+        first = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        identity_id = _speaker_identity(memory, first.id, "speaker_1")
+        lock = memory._storage.formation_lock
+        entering = threading.Event()
+
+        class NotifyingLock:
+            def __enter__(self) -> None:
+                entering.set()
+                lock.acquire()
+
+            def __exit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc_value: BaseException | None,
+                traceback: TracebackType | None,
+            ) -> None:
+                lock.release()
+
+        monkeypatch.setattr(memory._identities, "_formation_lock", NotifyingLock())
+        errors: list[BaseException] = []
+
+        def bind() -> None:
+            try:
+                with memory._lifecycle.operation() as operation:
+                    operation.speaker_names[identity_id] = "ModelName"
+                    memory._identities.bind_speaker_names(operation)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=bind)
+        try:
+            with lock:
+                worker.start()
+                assert entering.wait(5)
+                memory.register_identity(identity_id, "HostName")
+        finally:
+            worker.join(5)
+        assert not worker.is_alive()
+        assert errors == []
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name == "HostName"
 
 
 def test_a_stated_name_with_a_few_words_is_bound_in_full(tmp_path: Path) -> None:

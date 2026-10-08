@@ -256,13 +256,9 @@ class Records(Traced):
             capture_ids: tuple[str, ...] = ()
             if policy.capture_failure_days is not None:
                 cutoff = now - timedelta(days=policy.capture_failure_days)
-                with translate_storage_errors("list pending captures"):
-                    capture_ids = tuple(
-                        capture.memory_id
-                        for capture in self._store.captures.pending_captures(
-                            limit=_RETENTION_PAGE_SIZE
-                        )
-                        if capture.attempts > 0 and capture.enqueued_at < cutoff
+                with translate_storage_errors("list failed captures"):
+                    capture_ids = self._store.captures.failed_capture_ids(
+                        enqueued_before=cutoff, limit=_RETENTION_PAGE_SIZE
                     )
             direct_ids = (*media_ids, *forgotten_ids)
             with translate_storage_errors("predict retention cascade"):

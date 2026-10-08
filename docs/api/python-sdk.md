@@ -1077,8 +1077,10 @@ AsyncVisionStream.consume(
 `SceneBoundary`. `StreamContext` is an `ObservationContext`, a callable sampled once per completed
 observation, or `None`. Up to `max_streams` independent `stream_id` values may be active.
 `capture=True` commits each final through `capture` instead of `add`, so acknowledgement leaves
-the model path and every `StreamCommit` reports `pending_settlement=True`; the host then owes
-`settle` before those records are searchable. The default stays the strong `add`. See
+the model path: automatic retrieval is skipped, and every `StreamCommit` reports
+`pending_settlement=True`, `prefetch=None`, and `retrieval_error=None`. The host then owes
+`settle` before those records are searchable. Use `AsyncOmniPrefetch` separately if speculative
+retrieval is needed. The default stays the strong `add`. See
 [omni streaming and interaction memory](../omni-streaming-and-interaction-memory.md) for event
 semantics and complete examples.
 

@@ -1109,6 +1109,7 @@ class OpenAIModels:
             answer_policy=answer_policy,
             stream=True,
         )
+        stream_completed = False
         try:
             finish_reason: object = None
             emitted = False
@@ -1154,6 +1155,21 @@ class OpenAIModels:
                     emitted = True
                     answer_parts.append(content)
                     yield content
+            _record_finish_reason(finish_reason)
+            if finish_reason == "length":
+                raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR, stage="generate")
+            streamed = "".join(answer_parts)
+            if finish_reason == "content_filter" or not streamed.strip():
+                raise ModelError(
+                    "generation response was invalid", reason="response_invalid", stage="generate"
+                )
+            result = _answer_result(
+                streamed,
+                grounded,
+                answer_policy=answer_policy,
+                forced=_forced_abstention(answer_policy, hits, grounded),
+            )
+            stream_completed = True
         except ModelError:
             raise
         except Exception as error:
@@ -1163,27 +1179,25 @@ class OpenAIModels:
                 stage="generate",
             ) from error
         finally:
-            if usage_response is not None:
-                _record_openai_usage(
-                    usage_response,
-                    input_modalities=modalities,
-                    output_modalities=frozenset({Modality.TEXT}),
-                    request_count=request_count,
-                )
-        _record_finish_reason(finish_reason)
-        if finish_reason == "length":
-            raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR, stage="generate")
-        if finish_reason == "content_filter" or not emitted:
-            raise ModelError(
-                "generation response was invalid", reason="response_invalid", stage="generate"
-            )
-        streamed = "".join(answer_parts)
-        result = _answer_result(
-            streamed,
-            grounded,
-            answer_policy=answer_policy,
-            forced=_forced_abstention(answer_policy, hits, grounded),
-        )
+            try:
+                close = getattr(responses, "close", None)
+                if callable(close):
+                    close()
+            except Exception as error:
+                if stream_completed:
+                    raise ModelError(
+                        "generation response cleanup failed",
+                        reason=_provider_reason(error),
+                        stage="generate",
+                    ) from error
+            finally:
+                if usage_response is not None:
+                    _record_openai_usage(
+                        usage_response,
+                        input_modalities=modalities,
+                        output_modalities=frozenset({Modality.TEXT}),
+                        request_count=request_count,
+                    )
         # Only `best_effort` reports an answer of its own. Under `strict` the streamed deltas
         # stay the answer they have always been, marker and all, so nothing about the default
         # path moves.

@@ -754,7 +754,8 @@ def test_a_stream_killed_before_its_flush_is_drained_by_the_next_open(tmp_path: 
 async def test_a_captured_final_acknowledges_before_the_models_and_settles_later(
     tmp_path: Path,
 ) -> None:
-    memory = AsyncMemory(Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0))
+    embedder = RecordingEmbedder(frozenset({Modality.TEXT}))
+    memory = AsyncMemory(Memory(tmp_path, embedder=embedder, minimum_relevance=0))
     try:
         commits = [
             value
@@ -768,6 +769,9 @@ async def test_a_captured_final_acknowledges_before_the_models_and_settles_later
 
         (commit,) = commits
         assert commit.pending_settlement is True
+        assert commit.prefetch is None
+        assert commit.retrieval_error is None
+        assert embedder.inputs == []
         assert [row.memory_id for row in await memory.pending_captures()] == [commit.record.id]
         assert await memory.search("red toolbox") == ()
 
