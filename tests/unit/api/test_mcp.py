@@ -1165,6 +1165,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
             {
                 "goal": "  What should I bring?  ",
                 "budget": {
+                    "selected_proofs": True,
                     "max_chars": 2_000,
                     "max_items": 8,
                     "memory_types": ["episodic", "semantic"],
@@ -1185,6 +1186,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
             "What should I bring?",
             ContextBudget(
                 max_chars=2_000,
+                selected_proofs=True,
                 max_items=8,
                 memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
                 min_confidence=0.5,
@@ -1201,6 +1203,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert bundle is not None
     assert bundle["goal"] == "What should I bring?"
     assert bundle["budget"] == {
+        "selected_proofs": True,
         "max_chars": 2_000,
         "max_items": 8,
         "max_media_items": None,
@@ -1240,6 +1243,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert bundle["frames"] == ["home/map"]
     assert bundle["places"] == ["kitchen"]
     assert bundle["relationships"] == [] and bundle["scene"] == []
+    assert bundle["proofs"] == []
     assert bundle["omitted"] == 3
     assert bundle["chars"] == 42
     assert (bundle["elapsed_ms"], bundle["deadline_exceeded"]) == (7, False)
@@ -1258,6 +1262,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert "/private/mindbridge/assets" not in json.dumps(bundle)
     assert defaulted.structured_content is not None
     assert defaulted.structured_content["budget"] == {
+        "selected_proofs": False,
         "max_chars": 16_000,
         "max_items": 24,
         "max_media_items": None,

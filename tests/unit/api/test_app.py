@@ -1378,6 +1378,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
             json={
                 "goal": "  What should I bring?  ",
                 "budget": {
+                    "selected_proofs": True,
                     "max_chars": 2_000,
                     "max_items": 8,
                     "memory_types": ["episodic", "semantic"],
@@ -1397,6 +1398,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
             "What should I bring?",
             ContextBudget(
                 max_chars=2_000,
+                selected_proofs=True,
                 max_items=8,
                 memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
                 min_confidence=0.5,
@@ -1411,6 +1413,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     bundle = response.json()
     assert bundle["goal"] == "What should I bring?"
     assert bundle["budget"] == {
+        "selected_proofs": True,
         "max_chars": 2_000,
         "max_items": 8,
         "max_media_items": None,
@@ -1453,6 +1456,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     assert bundle["frames"] == ["home/map"]
     assert bundle["places"] == ["kitchen"]
     assert bundle["relationships"] == [] and bundle["scene"] == []
+    assert bundle["proofs"] == []
     assert bundle["omitted"] == 3
     assert bundle["chars"] == 42
     assert (bundle["elapsed_ms"], bundle["deadline_exceeded"]) == (7, False)
@@ -1536,6 +1540,7 @@ def test_the_context_route_defaults_to_the_sdk_budget() -> None:
     assert response.status_code == 200
     assert memory.calls == [("compile", "What should I bring?", None, None, None, False)]
     assert response.json()["budget"] == {
+        "selected_proofs": False,
         "max_chars": 16_000,
         "max_items": 24,
         "max_media_items": None,

@@ -1065,7 +1065,7 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 125 supported names exported by `mindbridge`:
+These are the 127 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
