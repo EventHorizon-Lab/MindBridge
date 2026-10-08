@@ -816,6 +816,43 @@ number would measure the generator's prior knowledge of the scripts rather than 
 
 ## Reported performance and resource metrics
 
+Evaluation schema version `18` adds `grounding_request` to each sample and, with `--log-samples`,
+the original `source_question`. The runner recipe is `mindbridge_eval_official_v17`, so previous
+answer caches are not reused under the new prompt and evidence projection.
+`grounding_request` describes the last **prepared** generation request: retained `record_ids`,
+original `asset_ids`, UTF-8 `text_bytes`, `media_fallback`, and span `successful` status. Text bytes
+cover the user evidence parts, excluding the system prompt, JSON request envelope, and encoded
+media. A provider's media rejection followed by text fallback replaces the original asset list.
+Preparation does not prove the provider read a video frame; span success does not mean the answer
+was correct. Cached answers and backends without these attributes report `null` instead of
+reconstructing an assumed request from retrieved candidates.
+
+### Rejudge saved ICM predictions
+
+Use the corrected, user-only ICM judge protocol on logged predictions without re-ingestion or
+answer generation:
+
+```bash
+uv run --locked python -m mindbridge.benchmarks.rejudge_icm \
+  --predictions old-icm-samples.jsonl --annotations icm-questions.jsonl \
+  --output icm-rejudged.json --model gpt-4o-mini
+```
+
+The input must contain only `icm-bench` rows with logged reference answers. Original annotations
+are joined by question ID and checked against saved references and, when available, original
+question text. For older samples without that text, `question_binding=legacy_id_and_reference`
+marks the weaker check; the generation prompt is never treated as the original judge question.
+The output retains the prediction, prediction hash, old score and old protocol, and records the
+new protocol, model and input file hashes. A previous `JudgeError` can be rejudged; failed
+generation or ingestion is skipped. Judge failures are unscored, empty predictions score zero,
+and an existing output is never overwritten. Compare scores within one judge protocol and
+explicitly account for skipped and failed samples in the denominator.
+
+The command uses `OPENAI_API_KEY`; `--api-key-env` selects another environment variable and
+`--base-url` selects an OpenAI-compatible endpoint. Only judge calls reach the endpoint. No media,
+memory database, embedder, former or answerer is opened. A non-official judge model is labelled in
+the output; it cannot establish an official score.
+
 Every task and arm row in `results.jsonl` carries a `performance` object. Distributions retain every
 observation and report exact count, average, p50, p95, and p99 values. Throughput divides successful
 work by the union of successful active intervals, so concurrency overlap is counted once and idle

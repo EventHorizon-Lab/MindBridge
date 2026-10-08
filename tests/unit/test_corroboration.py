@@ -65,6 +65,13 @@ def test_alternatives_of_one_top_assessment_are_only_one_witness() -> None:
     assert independent_support(nodes, "target") == SupportSummary(1, 0.8, False)
 
 
+def test_same_clause_alternatives_do_not_consume_the_corroboration_pair_budget() -> None:
+    nodes = {f"root-{i}": EvidenceNode(f"capture-{i}") for i in range(10)}
+    nodes["summary"] = derived(*((name,) for name in nodes))
+    nodes["target"] = derived(("summary",))
+    assert independent_support(nodes, "target", max_steps=40) == SupportSummary(1, 0.8, False)
+
+
 def test_joint_clause_combines_complete_alternative_proofs() -> None:
     nodes = {name: EvidenceNode(name) for name in "abcd"}
     nodes.update(

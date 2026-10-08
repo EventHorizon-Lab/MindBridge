@@ -2,14 +2,85 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import cast
 
-from mindbridge.evidence import answer_evidence_payloads
+from mindbridge.evidence import answer_constraint_payloads, answer_evidence_payloads
 from mindbridge.models import openai_sdk as openai_backend
 from mindbridge.types import EvidenceBasis, MemoryContext, MemoryKind, SearchHit
 
 NOW = datetime(2026, 9, 7, tzinfo=timezone.utc)
+
+
+def test_constraint_candidates_preserve_scope_and_report_competing_values() -> None:
+    source = _hit("vegetarian", evidence_ids=("capture",))
+    assert source.context is not None
+    vegetarian = replace(
+        source,
+        content="Ada prefers vegetarian lunches, except when travelling.",
+        context=replace(
+            source.context,
+            kind=MemoryKind.TRAIT,
+            subject="Ada",
+            predicate="meal_preference",
+            value="vegetarian",
+            valid_from=NOW,
+        ),
+    )
+    assert vegetarian.context is not None
+    fish = replace(
+        vegetarian,
+        id="fish",
+        content="Ada prefers fish lunches.",
+        context=replace(vegetarian.context, value="fish"),
+    )
+    assert fish.context is not None
+    other = replace(fish, id="other-person", context=replace(fish.context, subject="Bea"))
+    hits = (vegetarian, fish, other)
+    payloads = answer_evidence_payloads(hits)
+    first, second, third = answer_constraint_payloads(hits, payloads)
+    assert first["evidence_label"] == "E1"
+    assert first["subject"] == "Ada"
+    assert first["valid_from"] == NOW.isoformat()
+    assert "read" in str(first["conditions_and_exceptions"])
+    assert first["competing_evidence_labels"] == ["E2"]
+    assert second["competing_evidence_labels"] == ["E1"]
+    assert "competing_evidence_labels" not in third
+    assert "except when travelling" in str(payloads[0]["content"])
+    assert vegetarian.context is not None and vegetarian.context.evidence_ids == ("capture",)
+
+
+def test_retired_or_nonoverlapping_constraints_are_not_current_competitors() -> None:
+    first = _hit("first")
+    assert first.context is not None
+    later = datetime(2026, 9, 8, tzinfo=timezone.utc)
+    first = replace(
+        first,
+        context=replace(
+            first.context,
+            kind=MemoryKind.STATE,
+            subject="Ada",
+            predicate="preference",
+            value="first",
+            valid_from=NOW,
+            valid_until=later,
+        ),
+    )
+    assert first.context is not None
+    second = replace(
+        first,
+        id="second",
+        context=replace(first.context, value="second", valid_from=later, valid_until=None),
+    )
+    assert second.context is not None
+    retired = replace(
+        second, id="retired", context=replace(second.context, value="obsolete", retired_at=later)
+    )
+    hits = (first, second, retired)
+    values = answer_constraint_payloads(hits, answer_evidence_payloads(hits))
+    assert not any("competing_evidence_labels" in value for value in values)
+    assert values[-1]["current_version"] is False
 
 
 def _hit(

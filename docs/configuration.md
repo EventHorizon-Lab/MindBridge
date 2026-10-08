@@ -193,6 +193,23 @@ over the whole operation by `mindbridge.formation.refused_proposals`. See
 [memory types, time, and decay](memory-types-time-and-decay.md) for the resulting typed records and
 visibility rules.
 
+`formation_history_max_rows` enables a bounded, read-only text history window. Its default is
+`0` (off); choose at most `128` rows and set `formation_history_budget_chars` (default `6000`)
+to bound their combined content. The window ends at the target observation's recording time,
+excludes this batch's targets and forgotten records, and includes retirement status for typed
+records. History is background, never another formation target. The window retains whole records;
+an oversized recent record stops selection instead of being skipped to expose older claims.
+`history_truncated` means counterevidence may be missing. This is a recent-window policy, not
+semantic history search or a guarantee that natural-language retractions are understood.
+
+The OpenAI adapter aliases background records as `history_N`, preserves their event and validity
+times, and permits a proposal to cite only its target, this batch, and its own active history.
+The kernel checks cited records again in the commit transaction. If a cited record was forgotten
+or retired during formation, derived records do not commit and a `ModelError` with
+`reason="response_invalid"`, `stage="form"` reports that the observation remains stored.
+The formation prompt change changes `formation_space`; existing derived records remain available.
+Reprocessing the same source under the new recipe may create additional derived records.
+
 ## Visual descriptions
 
 The `vision` slot is omitted by default and, like `formation`, must stay omitted unless the
@@ -376,6 +393,8 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
 | `independent_evidence` | `False` | Experimental capture-grounded AND/OR corroboration for formation and consolidation; fixed when a store is created. See [independent evidence](memory-types-time-and-decay.md#experimental-independent-evidence) |
+| `formation_history_max_rows` | `0` | Read-only text history records per formation target; `0` disables, maximum `128` |
+| `formation_history_budget_chars` | `6000` | Combined history content characters per target; positive, whole records only, excludes protocol overhead |
 | `speaker_similarity` | `0.78` | Voice identity match threshold (uncalibrated; see below) |
 | `speaker_margin` | `0.05` | Voice identity ambiguity margin |
 | `face_similarity` | `0.363` | Face identity match threshold |

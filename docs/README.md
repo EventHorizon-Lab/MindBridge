@@ -82,6 +82,8 @@ have one place to stay current.
 
 ## Evaluate
 
+- [Memory reliability changes](research/2026-10-08-reliability-optimization.md) — formation history,
+  stale evidence guards, constraint candidates, request telemetry, and saved-prediction rejudging.
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
 - [Memory backend audit](research/memory-backend-audit-2026-09-07.md) — source-level capability,
   competitor, benchmark-trust, and research-gate review dated 2026-09-07.

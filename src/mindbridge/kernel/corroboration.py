@@ -148,18 +148,19 @@ def _derive(
 def _summarize(proofs: dict[_ProofKey, float], memory_id: str, budget: _Budget) -> SupportSummary:
     count = int(bool(proofs))
     confidence = max(proofs.values(), default=0.0)
-    candidates = [
-        (sources, footprint - {("node", memory_id)}, score)
-        for (sources, footprint), score in proofs.items()
-    ]
-    for (sources, footprint, score), (other_sources, other, other_score) in combinations(
-        candidates, 2
-    ):
-        if not budget.spend():
-            break
-        if sources != other_sources and footprint.isdisjoint(other):
-            count = 2
-            confidence = max(confidence, 1.0 - (1.0 - score) * (1.0 - other_score))
+    groups: dict[tuple[str, ...], list[tuple[_Footprint, float]]] = {}
+    for (sources, footprint), score in proofs.items():
+        groups.setdefault(sources, []).append((footprint - {("node", memory_id)}, score))
+    # Alternative proofs of the same top-level AND clause can never corroborate it. Group
+    # first, so they neither spend the pair budget nor hide a different clause behind it.
+    for group, other_group in combinations(groups.values(), 2):
+        for footprint, score in group:
+            for other, other_score in other_group:
+                if not budget.spend():
+                    return SupportSummary(count, confidence, budget.truncated)
+                if footprint.isdisjoint(other):
+                    count = 2
+                    confidence = max(confidence, 1.0 - (1.0 - score) * (1.0 - other_score))
     return SupportSummary(count, confidence, budget.truncated)
 
 

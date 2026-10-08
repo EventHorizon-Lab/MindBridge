@@ -68,6 +68,10 @@ EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
 GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
+GROUNDING_RECORD_IDS = "mindbridge.grounding.record_ids"
+GROUNDING_ASSET_IDS = "mindbridge.grounding.asset_ids"
+GROUNDING_TEXT_BYTES = "mindbridge.grounding.text_bytes"
+GROUNDING_MEDIA_FALLBACK = "mindbridge.grounding.media_fallback"
 # Proposals the model adapter could not read, counted on the model span, and proposals the kernel
 # refused for how they were grounded, accumulated over a whole operation. They answer different
 # questions -- a backend returning garbage, against a backend grounding an opinion wrongly -- so

@@ -25,8 +25,12 @@ from mindbridge._telemetry import (
     CAPTURE_TIME_TO_SEARCHABLE,
     EMBEDDING_TASK,
     GEN_AI_TTFC,
+    GROUNDING_ASSET_IDS,
     GROUNDING_HITS_DROPPED,
     GROUNDING_MEDIA_ELIDED,
+    GROUNDING_MEDIA_FALLBACK,
+    GROUNDING_RECORD_IDS,
+    GROUNDING_TEXT_BYTES,
     MODEL_MODULE,
     MODEL_REQUEST_COUNT,
     MODEL_RESPONSE_MODELS,
@@ -123,6 +127,7 @@ class SampleGrounding:
     dropped_hits: int
     media_elided_hits: int
     recall_shape: str | None = None
+    request: Mapping[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -1221,6 +1226,18 @@ class EvaluationTelemetry(SpanProcessor):
                     # The last plan a replanned question ran is the one its answer was grounded
                     # on, so a later round overwrites an earlier one.
                     grounding = replace(grounding, recall_shape=shape)
+                if GROUNDING_RECORD_IDS in attributes:
+                    grounding = replace(
+                        grounding,
+                        request={
+                            "measurement": "last_prepared_generation_request",
+                            "record_ids": _string_tuple_attribute(attributes, GROUNDING_RECORD_IDS),
+                            "asset_ids": _string_tuple_attribute(attributes, GROUNDING_ASSET_IDS),
+                            "text_bytes": _int_attribute(attributes, GROUNDING_TEXT_BYTES),
+                            "media_fallback": attributes.get(GROUNDING_MEDIA_FALLBACK) is True,
+                            "successful": span.status.status_code is not StatusCode.ERROR,
+                        },
+                    )
                 self._samples[sample] = grounding
 
     def result(

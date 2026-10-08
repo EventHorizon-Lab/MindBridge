@@ -764,6 +764,34 @@ class MemoryRecords:
             for row in rows
         )
 
+    def formation_history(
+        self, *, known_before: datetime, exclude_ids: Sequence[str], limit: int
+    ) -> tuple[StoredMemory, ...]:
+        """Read bounded causal background, including retired claims as counterevidence.
+
+        Forgotten content is excluded even from background. Old assertions retain their status;
+        this read never promotes them back to active sources or uses metadata for isolation.
+        """
+        require_aware(known_before, "known_before")
+        if not 1 <= limit <= 129:
+            raise ValueError("formation history limit must be between 1 and 129")
+        with self._connections.read_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT memory_id FROM memory_records
+                WHERE created_at <= ? AND forgotten_at IS NULL AND content <> ''
+                ORDER BY created_at DESC, memory_id DESC LIMIT ?
+                """,
+                (datetime_text(known_before), limit + len(exclude_ids)),
+            ).fetchall()
+            excluded = set(exclude_ids)
+            identifiers = tuple(
+                row_text(row, "memory_id")
+                for row in rows
+                if row_text(row, "memory_id") not in excluded
+            )[:limit]
+        return self.read_memories(identifiers, known_at=known_before)
+
     def reinforce_memories(self, memory_ids: Sequence[str], *, accessed_at: datetime) -> int:
         """Record one bounded retrieval reinforcement for each existing memory."""
         unique_ids = tuple(dict.fromkeys(memory_ids))

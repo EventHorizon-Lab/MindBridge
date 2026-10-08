@@ -33,6 +33,8 @@ class Settings:
     identity_link_min_assets: int
     index_speech: bool
     independent_evidence: bool
+    formation_history_max_rows: int
+    formation_history_budget: int
     minimum_relevance: float
     ambiguity_margin: float
     evidence_budget: int | None
@@ -67,6 +69,8 @@ def resolve_settings(
     *,
     index_speech: bool,
     independent_evidence: bool,
+    formation_history_max_rows: int,
+    formation_history_budget_chars: int,
     index_quantization: IndexQuantization,
     retrieval_mode: RetrievalMode,
     minimum_relevance: float,
@@ -103,6 +107,10 @@ def resolve_settings(
         identity_link_min_assets=positive_int(identity_link_min_assets, "identity_link_min_assets"),
         index_speech=strict_bool(index_speech, "index_speech"),
         independent_evidence=strict_bool(independent_evidence, "independent_evidence"),
+        formation_history_max_rows=_history_max_rows(formation_history_max_rows),
+        formation_history_budget=positive_int(
+            formation_history_budget_chars, "formation_history_budget_chars"
+        ),
         minimum_relevance=unit_interval(minimum_relevance, "minimum_relevance"),
         ambiguity_margin=unit_interval(ambiguity_margin, "ambiguity_margin"),
         evidence_budget=None
@@ -130,3 +138,9 @@ def resolve_settings(
     if not isinstance(settings.retention, RetentionPolicy):
         raise ValidationError("retention must be a RetentionPolicy value")
     return settings
+
+
+def _history_max_rows(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 128:
+        raise ValidationError("formation_history_max_rows must be between 0 and 128")
+    return value

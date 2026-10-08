@@ -71,6 +71,8 @@ Memory(
     evidence_budget_chars: int | None = 24_000,
     decay_half_life_days: float | None = None,
     reinforce_on_answer: bool = True,
+    formation_history_max_rows: int = 0,
+    formation_history_budget_chars: int = 6000,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
     face_similarity: float = 0.363,
@@ -1206,8 +1208,9 @@ ConsolidationBackend.consolidate(
 ```
 
 `FormationProposal.evidence_ids`, when supplied, is an ordered, nonempty, unique tuple of
-`FormationInput.memory_id` values from that exact call. It must include the proposal's primary
-input. The kernel records one tuple as one conjunctive clause and treats separately emitted clauses
+`FormationInput.memory_id` values from that exact call or active records in that primary input's
+`history`. It must include the proposal's primary input; another target's private history is not
+an allowed source. The kernel records one tuple as one conjunctive clause and treats separately emitted clauses
 as alternatives. Deleting any member retires its whole conjunction. `None` retains the legacy
 singleton link to the primary input alone. A model declaration is provenance metadata, not a
 verified proof of complete or independent support.
@@ -1230,6 +1233,13 @@ bundled caption prompt.
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal
 against the source modality and spatial frame, assigns identity, links evidence, and commits.
+`FormationInput.history` is a tuple of text-only `MemoryRecord` values; `history_truncated`
+reports an incomplete window. History IDs are unique and exclude the primary target. Custom
+formers can ignore the default empty history; enabling it requires a former that can reason over
+the supplied state and cite the actual sources. Retired background may inform interpretation but
+cannot support a new affirmative proposal. Cited history is revalidated atomically at commit.
+Jointly cited sources retain place and metadata only when every cited source agrees on the entire
+value, including the whole metadata mapping. Uncited background does not affect inheritance.
 `consolidate` receives the bounded evidence set the kernel chose and may cite only IDs from it;
 like a former it proposes and never writes storage. An `IDENTIFY` proposal carries an
 `IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
@@ -1243,11 +1253,12 @@ recall program produced the hits as every record its predicate matched, in time 
 than as a ranking -- the bundled adapter uses it to describe the evidence order to the reader,
 which is the one thing about the hits a prompt cannot infer from the hits.
 
-The bundled OpenAI former receives compact observation aliases, enriched content and assets, plus
+For the primary observation, the bundled OpenAI former receives compact aliases, enriched content and assets, plus
 the observation basis, confidence, explicit validity bounds, and spatial frame/anchor. It does not
 receive a separate occurrence timestamp, identity registry, or actor roster. Speaker or face IDs
 and projected names are visible only when prior speech/face enrichment rendered them into the
-observation content. After the proposal returns, the kernel mechanically binds its textual subject
+observation content. Opt-in read-only history separately carries recorded and occurrence times,
+typed validity and current-version status. After the proposal returns, the kernel mechanically binds its textual subject
 to a current visible name, inherits the primary source's occurrence as a missing validity start,
 and propagates source ID, place, metadata, and spatial context. Relative-time or unnamed-actor
 resolution that needs fields absent from the model payload therefore remains a formation limit;
@@ -1272,7 +1283,7 @@ routed with no text at all looks like.
 | `SpeechAnalysis` | `turns`, `speakers` |
 | `FaceEmbedding` | `face_label`, `values`, `bounding_box`, `observed_at_ms` |
 | `FaceAnalysis` | `faces` |
-| `FormationInput` | `memory_id`, `content`, `context` |
+| `FormationInput` | `memory_id`, `content`, `context`, `history=()`, `history_truncated=False` |
 | `FormationProposal` | `kind`, `content`, `basis`, `subject`, `predicate`, `value`, `confidence`, `valid_from`, `valid_until`, `spatial`, `cue_modality`, `valence`, `arousal`, optional `evidence_ids` |
 
 ### Bundled adapters

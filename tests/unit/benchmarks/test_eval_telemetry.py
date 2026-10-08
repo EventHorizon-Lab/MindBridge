@@ -12,8 +12,12 @@ from opentelemetry.trace import StatusCode
 import mindbridge.benchmarks.eval_telemetry as eval_telemetry
 from mindbridge._telemetry import (
     GEN_AI_TTFC,
+    GROUNDING_ASSET_IDS,
     GROUNDING_HITS_DROPPED,
     GROUNDING_MEDIA_ELIDED,
+    GROUNDING_MEDIA_FALLBACK,
+    GROUNDING_RECORD_IDS,
+    GROUNDING_TEXT_BYTES,
     MODEL_MODULE,
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
@@ -38,6 +42,58 @@ from mindbridge.benchmarks.eval_telemetry import (
     DIAGNOSTIC_PURPOSE,
     EvaluationTelemetry,
 )
+
+
+def test_grounding_request_tracks_final_fallback_without_guessing_cached_input() -> None:
+    telemetry = EvaluationTelemetry()
+    try:
+        with (
+            telemetry.tracer.start_as_current_span(
+                BENCHMARK_ANSWER_SPAN,
+                attributes={
+                    BENCHMARK_TASK: "fixture",
+                    BENCHMARK_SAMPLE: "q1",
+                    SPAN_KIND: "benchmark",
+                },
+            ),
+            telemetry.tracer.start_as_current_span(
+                "mindbridge.model.generation",
+                attributes={
+                    SPAN_KIND: "model",
+                    MODEL_MODULE: "generation",
+                    GROUNDING_RECORD_IDS: ("r1",),
+                    GROUNDING_ASSET_IDS: ("video",),
+                    GROUNDING_TEXT_BYTES: 9,
+                    GROUNDING_MEDIA_FALLBACK: False,
+                },
+            ) as span,
+        ):
+            span.set_attribute(GROUNDING_ASSET_IDS, ())
+            span.set_attribute(GROUNDING_TEXT_BYTES, 13)
+            span.set_attribute(GROUNDING_MEDIA_FALLBACK, True)
+        with telemetry.tracer.start_as_current_span(
+            BENCHMARK_ANSWER_SPAN,
+            attributes={
+                BENCHMARK_TASK: "fixture",
+                BENCHMARK_SAMPLE: "cached",
+                SPAN_KIND: "benchmark",
+            },
+        ):
+            pass
+        grounding = telemetry.sample_grounding("q1")
+        assert grounding is not None
+        assert grounding.request == {
+            "measurement": "last_prepared_generation_request",
+            "record_ids": ("r1",),
+            "asset_ids": (),
+            "text_bytes": 13,
+            "media_fallback": True,
+            "successful": True,
+        }
+        cached = telemetry.sample_grounding("cached")
+        assert cached is not None and cached.request is None
+    finally:
+        telemetry.close()
 
 
 def test_telemetry_distributions_retain_every_observation() -> None:

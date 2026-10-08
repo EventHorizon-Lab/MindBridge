@@ -146,6 +146,8 @@ class Memory:
         former: FormationBackend | None = None,
         consolidator: ConsolidationBackend | None = None,
         independent_evidence: bool = _DEFAULT_CONFIG.independent_evidence,
+        formation_history_max_rows: int = _DEFAULT_CONFIG.formation_history_max_rows,
+        formation_history_budget_chars: int = _DEFAULT_CONFIG.formation_history_budget_chars,
         index_speech: bool = _DEFAULT_CONFIG.index_speech,
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         retrieval_mode: RetrievalMode = _DEFAULT_CONFIG.retrieval_mode,
@@ -176,6 +178,8 @@ class Memory:
         self._settings = resolve_settings(
             index_speech=index_speech,
             independent_evidence=independent_evidence,
+            formation_history_max_rows=formation_history_max_rows,
+            formation_history_budget_chars=formation_history_budget_chars,
             index_quantization=index_quantization,
             retrieval_mode=retrieval_mode,
             minimum_relevance=minimum_relevance,
@@ -350,6 +354,7 @@ class Memory:
             materializer=materializer,
             embedding=embedding,
             projection=self._projection,
+            hydrator=self._hydrator,
         )
         self._identities = Identities(
             tracer=tracer,
