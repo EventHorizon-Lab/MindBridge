@@ -27,13 +27,13 @@ embedding:
   dimension: 1024
 ```
 
-Set the participant's Memory System Key in the environment and start the adapter. Uvicorn is
-supplied by the launch environment, as with the [REST deployment](deployment.md):
+Set the participant's Memory System Key in the environment and start the adapter. The `server`
+extra includes Uvicorn for this launch command:
 
 ```bash
 export MINDBRIDGE_AML_API_KEY="..."
 
-uv run --frozen --with uvicorn mindbridge-bench eval serve \
+uv run --frozen mindbridge-bench eval serve \
   --config .benchmarks/configs/aml.yaml \
   --data-root .benchmarks/aml \
   --host 127.0.0.1 \

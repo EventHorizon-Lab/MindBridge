@@ -1768,6 +1768,7 @@ all = [
     { name = "torchvision", version = "0.26.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "uvicorn" },
 ]
 benchmarks = [
     { name = "httpx" },
@@ -1810,6 +1811,7 @@ openai = [
 server = [
     { name = "fastapi" },
     { name = "starlette" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -1883,6 +1885,8 @@ requires-dist = [
     { name = "tqdm", marker = "extra == 'benchmarks'", specifier = ">=4.66,<5" },
     { name = "transformers", marker = "extra == 'all'", specifier = ">=5.18,<6" },
     { name = "transformers", marker = "extra == 'local'", specifier = ">=5.18,<6" },
+    { name = "uvicorn", marker = "extra == 'all'", specifier = ">=0.35,<1" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.35,<1" },
     { name = "zvec", specifier = ">=0.7,<0.8" },
 ]
 provides-extras = ["all", "benchmarks", "observability", "openai", "face", "local", "server", "mcp"]

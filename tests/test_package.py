@@ -312,7 +312,7 @@ def test_dependency_surface_is_exact() -> None:
             "torchvision",
             "transformers",
         },
-        "server": {"fastapi", "starlette"},
+        "server": {"fastapi", "starlette", "uvicorn"},
         "mcp": {"mcp"},
     }
     declared = set(EXTRAS) | {_name(item) for item in DEPENDENCIES}
