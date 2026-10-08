@@ -772,10 +772,8 @@ class Formation(Traced):
                 assets=operation,
                 completed_at=completed_at,
                 joint_evidence_clauses=True,
-                require_active=tuple(
-                    dict.fromkeys((*_cited_sources(grounded), *(source.id for source in targets)))
-                ),
-                require_unretired=_cited_sources(grounded),
+                require_active=tuple(source.id for source in targets),
+                require_visible=_cited_sources(grounded),
             )
         except StaleOperationError as error:
             raise ModelError(
@@ -796,6 +794,7 @@ class Formation(Traced):
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        require_visible: Sequence[str] = (),
         projection_identity_id: str | None = None,
         joint_evidence_clauses: bool = False,
         projection_factory: Callable[
@@ -935,6 +934,7 @@ class Formation(Traced):
                     forget_ids=forget_ids,
                     require_active=require_active,
                     require_unretired=require_unretired,
+                    require_visible=require_visible,
                     projection_identity_id=projection_identity_id,
                     projection_memories=projection_memories,
                     projection_embeddings=projection_embeddings,

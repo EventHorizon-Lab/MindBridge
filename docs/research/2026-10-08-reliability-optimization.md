@@ -10,7 +10,8 @@ proof-search prototypes into the default compiler.
   aliases. Whole-record character and row limits expose truncation. Validity, retirement and
   event time travel with background text; media is not reopened for history selection.
 - Formation proposals must cite the current target and only allowed batch or private-history
-  records. Cited evidence is checked for forgetting and retirement inside the SQLite commit.
+  records. Cited evidence is checked for forgetting, latest-version visibility and retirement
+  inside the SQLite commit.
   A stale commit fails without derived writes; the original observation stays durable. Joint
   evidence retains only agreed place and whole metadata values.
 - The existing one-shot JSON repair preserves string requests as strings rather than splitting
@@ -30,6 +31,26 @@ proof-search prototypes into the default compiler.
 See [configuration](../configuration.md#automatic-memory-formation),
 [SDK contracts](../api/python-sdk.md), and
 [rejudging](../benchmarking.md#rejudge-saved-icm-predictions) for use and compatibility details.
+
+## Follow-up repairs
+
+A wide OR branch could fill the bounded cache with alternatives of one top-level clause before
+a distinct clause arrived. Cache admission now replaces a redundant alternative to retain a
+previously unseen top clause when space can be recovered. All indexes contain only retained
+proofs, and admission does constant-time bookkeeping. Eviction still marks the result truncated;
+it does not guarantee an exact result, the best confidence, or invariance under renaming IDs.
+
+When the work budget expires during a join, completed joins survive. Remaining antecedents must
+still be joined, so an unfinished AND prefix cannot become evidence. An independent exhaustive
+test enumerates clause assignments on small graphs to check that bounded support and confidence
+never exceed the exact result. SDK regressions cover wide OR history, shared captures and rollback.
+
+Formation now checks the latest recorded evidence version inside its commit transaction. A trait
+that becomes hidden after an independent support is rolled back cannot seed a new automatic
+claim. This leaves host reinforcement of hidden targets available and permits past events as
+evidence; visibility is separate from temporal validity. Failure uses the existing formation
+model error and preserves the newly captured observation. No additional public or disk contracts
+change in these follow-up repairs.
 
 ## Compatibility
 

@@ -16,7 +16,9 @@ from mindbridge import (
     FormationProposal,
     Memory,
     MemoryContext,
+    MemoryIntent,
     MemoryKind,
+    MemoryOperation,
     MemoryRecord,
     ModelError,
     ModelInput,
@@ -34,13 +36,14 @@ class HistoryFormer:
     def __init__(self) -> None:
         self.inputs: list[FormationInput] = []
         self.before_return: Callable[[], object] | None = None
+        self.history_content = "Ada is the visitor."
 
     def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
         self.inputs.extend(inputs)
         results = []
         for target in inputs:
             historical = next(
-                (r for r in target.history if r.content == "Ada is the visitor."), None
+                (r for r in target.history if r.content == self.history_content), None
             )
             results.append(
                 ()
@@ -129,6 +132,48 @@ def test_forgetting_a_cited_history_during_model_call_prevents_atomic_commit(
         former.before_return = lambda: memory.forget((original.id,))
         with pytest.raises(ModelError, match="evidence changed"):
             memory.add("She left her notebook.")
+        records = memory.list().items
+        assert any(record.content == "She left her notebook." for record in records)
+        assert not any(record.content == "Ada left her notebook." for record in records)
+
+
+def test_withdrawing_support_that_hides_history_prevents_atomic_commit(tmp_path: Path) -> None:
+    former = HistoryFormer()
+    former.history_content = "Ada is patient."
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=former,
+        independent_evidence=True,
+        formation_history_max_rows=16,
+    ) as memory:
+        roots = (memory.add("First independent event."), memory.add("Second independent event."))
+        proposal = FormationProposal(
+            kind=MemoryKind.TRAIT,
+            content=former.history_content,
+            subject="Ada",
+            predicate="disposition",
+            value="patient",
+            confidence=0.6,
+        )
+        first = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE, evidence_ids=(roots[0].id,), proposal=proposal
+            )
+        )
+        second = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE, evidence_ids=(roots[1].id,), proposal=proposal
+            )
+        )
+        history_id = first.created_ids[0]
+        standing = memory.get(history_id).context
+        assert standing is not None and standing.visible
+        former.before_return = lambda: memory.rollback(second.operation_id)
+        with pytest.raises(ModelError, match="evidence changed"):
+            memory.add("She left her notebook.")
+        hidden = memory.get(history_id).context
+        assert hidden is not None and not hidden.visible and hidden.retired_at is None
         records = memory.list().items
         assert any(record.content == "She left her notebook." for record in records)
         assert not any(record.content == "Ada left her notebook." for record in records)

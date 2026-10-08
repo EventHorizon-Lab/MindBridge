@@ -28,6 +28,7 @@ from mindbridge.infrastructure.local.store._lineage import (
     refresh_multi_source_projections,
     require_active_memories,
     require_unretired_memories,
+    require_visible_memories,
     set_forgotten,
     validate_formation_links,
     version_retired,
@@ -84,6 +85,7 @@ class Semantics:
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        require_visible: Sequence[str] = (),
         projection_identity_id: str | None = None,
         projection_memories: Iterable[StoredMemory] = (),
         projection_embeddings: Iterable[StoredEmbedding] = (),
@@ -102,8 +104,11 @@ class Semantics:
         `require_active` names memories that must still exist and still be un-forgotten inside
         this transaction; if any moved since the caller validated it, nothing is written and
         `StaleOperationError` is raised. `require_unretired` names memories whose current version
-        must additionally still stand, which is what a cited derived source needs and what
-        `require_active` deliberately does not check.
+        must additionally still stand, without excluding hidden reinforcement targets.
+        `require_active` deliberately does not check version retirement.
+        `require_visible` is stricter formation evidence: the record must still exist,
+        be un-forgotten, and have a visible, unretired latest recorded version, if typed.
+        Unlike reinforcement targets, inferred premises cannot remain hidden at commit.
 
         The lineage rule the kernel applies to a `STATE` or user-stated `TRAIT` supersedes the
         current version of every other record in the same lineage with overlapping validity,
@@ -144,6 +149,7 @@ class Semantics:
                 return False
             require_active_memories(connection, require_active)
             require_unretired_memories(connection, require_unretired)
+            require_visible_memories(connection, require_visible)
             naming_before = naming_snapshot(
                 connection,
                 (

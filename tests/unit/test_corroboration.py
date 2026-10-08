@@ -168,6 +168,35 @@ def test_proof_cap_reports_a_conservative_lower_bound() -> None:
     assert result == SupportSummary(1, 0.8, True)
 
 
+@pytest.mark.parametrize("swap_names", [False, True])
+def test_one_wide_clause_cannot_fill_the_cache_before_an_independent_clause(
+    swap_names: bool,
+) -> None:
+    nodes = {f"raw-{i}": EvidenceNode(f"capture-{i}") for i in range(70)}
+    wide, separate = ("z-wide", "a-separate") if swap_names else ("a-wide", "z-separate")
+    nodes[wide] = derived(*((name,) for name in nodes))
+    nodes[separate] = EvidenceNode("independent")
+    nodes["target"] = derived((wide,), (separate,))
+    result = independent_support(nodes, "target")
+    assert result.count == 2
+    assert result.confidence == pytest.approx(0.96)
+    assert result.truncated
+
+
+def test_budget_exhaustion_keeps_already_completed_joint_proofs() -> None:
+    nodes = {name: EvidenceNode(name) for name in ("a", "b1", "b2")}
+    nodes["b"] = derived(("b1",), ("b2",))
+    nodes["target"] = derived(("a", "b"))
+    assert independent_support(nodes, "target", max_steps=7) == SupportSummary(1, 0.8, True)
+
+
+def test_budget_exhaustion_does_not_keep_a_prefix_of_a_joint_proof() -> None:
+    nodes = {name: EvidenceNode(name) for name in ("a", "b1", "b2", "c")}
+    nodes["b"] = derived(("b1",), ("b2",))
+    nodes["target"] = derived(("a", "b", "c"))
+    assert independent_support(nodes, "target", max_steps=7) == SupportSummary(0, 0.0, True)
+
+
 def test_capped_result_is_deterministic_under_input_permutation() -> None:
     nodes = {name: EvidenceNode(name) for name in "abcd"}
     nodes.update(

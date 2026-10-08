@@ -1052,6 +1052,40 @@ def require_unretired_memories(connection: sqlite3.Connection, memory_ids: Seque
             raise StaleOperationError(f"{memory_id} has no current version")
 
 
+def require_visible_memories(connection: sqlite3.Connection, memory_ids: Sequence[str]) -> None:
+    """Require the latest recorded version to remain usable as formation evidence.
+
+    A surviving, unretired inferred claim can lose visibility when support is withdrawn.
+    Reinforcement may target that hidden claim; automatic formation must not cite it as a
+    standing premise. Validity is deliberately separate: past events can support new claims.
+    """
+    for memory_id in dict.fromkeys(memory_ids):
+        require_identifier(memory_id, "memory_id")
+        row = connection.execute(
+            """
+            SELECT r.forgotten_at, v.visible, v.retired_at
+            FROM memory_records AS r
+            LEFT JOIN memory_versions AS v ON v.memory_id = r.memory_id
+              AND v.version = (
+                SELECT version FROM memory_versions
+                WHERE memory_id = r.memory_id
+                ORDER BY recorded_at DESC, version DESC LIMIT 1
+              )
+            WHERE r.memory_id = ?
+            """,
+            (memory_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["forgotten_at"] is not None
+            or (
+                row["visible"] is not None
+                and (not bool(row["visible"]) or row["retired_at"] is not None)
+            )
+        ):
+            raise StaleOperationError(f"{memory_id} is no longer visible evidence")
+
+
 def require_every(changed: Sequence[str], requested: Sequence[str], effect: str) -> None:
     """Fail the transaction unless every requested target actually took the effect."""
     if set(changed) != set(requested):

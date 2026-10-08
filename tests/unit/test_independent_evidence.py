@@ -130,6 +130,28 @@ def test_or_reinforcement_preserves_existing_independent_proof(tmp_path: Path) -
         assert _visible(memory, target)
 
 
+@pytest.mark.parametrize("shared_capture", [False, True])
+def test_wide_or_history_keeps_a_distinct_support_clause_and_withdrawal(
+    tmp_path: Path, shared_capture: bool
+) -> None:
+    with _open(tmp_path) as memory:
+        roots = tuple(
+            _root(memory, f"event {i}", "shared" if shared_capture else None) for i in range(70)
+        )
+        wide = _derive(memory, (roots[0],), "wide summary").created_ids[0]
+        for root in roots[1:]:
+            _derive(memory, (root,), "wide summary")
+        separate = _root(memory, "separate event", "shared" if shared_capture else None)
+        target = _derive(memory, (wide,), "patient", trait=True).created_ids[0]
+        second = _derive(memory, (separate,), "patient", trait=True)
+        context = memory.get(target).context
+        assert context is not None
+        assert context.visible is not shared_capture
+        assert context.confidence == pytest.approx(0.6 if shared_capture else 0.84)
+        assert memory.rollback(second.operation_id)
+        assert not _visible(memory, target)
+
+
 def test_nested_provenance_refreshes_without_scalar_group_change(tmp_path: Path) -> None:
     with _open(tmp_path) as memory:
         a, b, c, d = tuple(_root(memory, name) for name in ("a", "b", "c", "d"))

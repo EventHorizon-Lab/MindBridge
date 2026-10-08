@@ -204,8 +204,9 @@ semantic history search or a guarantee that natural-language retractions are und
 
 The OpenAI adapter aliases background records as `history_N`, preserves their event and validity
 times, and permits a proposal to cite only its target, this batch, and its own active history.
-The kernel checks cited records again in the commit transaction. If a cited record was forgotten
-or retired during formation, derived records do not commit and a `ModelError` with
+The kernel checks cited records again in the commit transaction. If a cited record was forgotten,
+or its latest recorded version became hidden or retired during formation, derived records do not
+commit and a `ModelError` with
 `reason="response_invalid"`, `stage="form"` reports that the observation remains stored.
 The formation prompt change changes `formation_space`; existing derived records remain available.
 Reprocessing the same source under the new recipe may create additional derived records.
