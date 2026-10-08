@@ -1,5 +1,8 @@
 # Competitor memory backends: evidence and transfer decisions
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 **Research date:** 2026-09-08
 
 **Scope:** primary papers, official repositories, and official documentation. Repository claims are

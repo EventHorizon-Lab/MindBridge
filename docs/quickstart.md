@@ -7,23 +7,23 @@ time.
 
 ## 1. Install MindBridge
 
-The SDK supports Python 3.10 through 3.14. Install every optional integration when you want a
-feature-complete development environment:
+The SDK supports Python 3.10 through 3.14. In an existing Python project, install the local surface
+used by the first example:
 
 ```bash
-uv add "mindbridge[all]"
+uv add "mindbridge[local]"
 ```
 
 With `pip`:
 
 ```bash
-python -m pip install "mindbridge[all]"
+python -m pip install "mindbridge[local]"
 ```
 
-For the first example alone, the smaller local installation is enough:
+For every optional integration, install the union of extras instead:
 
 ```bash
-uv add "mindbridge[local]"
+uv add "mindbridge[all]"
 ```
 
 | Install | Choose it when |
@@ -36,6 +36,10 @@ uv add "mindbridge[local]"
 `mindbridge[all]` installs dependencies; it does not configure providers, download benchmark
 datasets, or supply YuNet and SFace model files. Install the smallest surface that fits your
 deployment once you know which capabilities it needs.
+
+If you are starting without a Python project, run `uv init` in an empty working directory before
+`uv add`. For development from this repository, use the locked setup in
+[CONTRIBUTING.md](../CONTRIBUTING.md) instead of adding a second installed copy of MindBridge.
 
 ## 2. Store and retrieve one memory
 

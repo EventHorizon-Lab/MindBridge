@@ -24,6 +24,9 @@ REST, MCP, and command-line interfaces.
 > multi-tenant service. The current release is an embedded library with Python, REST, MCP, and CLI
 > interfaces; the product itself is not defined by one integration language.
 
+This checkout declares package version `0.2.0`. Start with the
+[documentation index](docs/README.md) for current guides and API contracts.
+
 ## Why MindBridge
 
 MindBridge pursues three measurable advantages over alternative memory stacks:
@@ -121,7 +124,7 @@ MindBridge supports Python 3.10 through 3.14. Install only the surfaces you use:
 | `local` | You want bundled local embedding or speech | Jina, Sentence Transformers, and FunASR |
 | `openai` | You use OpenAI or an OpenAI-compatible endpoint | Official SDK adapter and media request handling |
 | `face` | You need local face analysis | OpenCV detection and recognition |
-| `server` | You expose REST | FastAPI, Starlette, and Uvicorn |
+| `server` | You expose REST | FastAPI and Starlette; install an ASGI server separately |
 | `mcp` | You expose agent tools | MCP server transport |
 | `observability` | You export traces | OpenTelemetry SDK |
 | `benchmarks` | You run evaluations | Download, parsing, scoring, YAML/Parquet, and telemetry dependencies |
@@ -291,7 +294,7 @@ If you use MindBridge in academic or technical work, cite the version or commit 
 ## Acknowledgements
 
 MindBridge builds on SQLite, Zvec, Pydantic, and OpenTelemetry. Optional surfaces integrate
-Sentence Transformers and Jina, FunASR, OpenCV, the official OpenAI SDK, FastAPI/Uvicorn, and MCP.
+Sentence Transformers and Jina, FunASR, OpenCV, the official OpenAI SDK, FastAPI/Starlette, and MCP.
 We thank their maintainers and research communities. Benchmark sources, revisions, protocol notes,
 and retained licenses are listed in [Benchmarking](docs/benchmarking.md) and the bundled
 [scorer notices](src/mindbridge/benchmarks/_official/NOTICE.md).

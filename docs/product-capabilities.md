@@ -60,15 +60,18 @@ MindBridge adds the following product properties beyond a raw vector-search comp
 
 | Area | What ships today | Requirement | Owning documentation |
 | --- | --- | --- | --- |
-| Capture | `add`, transactional `add_many`, incremental `add_stream`, and async capture reducers | An embedding backend is required; media handling depends on the selected route | [Core concepts](concepts.md#content-becomes-a-record) |
+| Capture | `add`, transactional `add_many`, incremental `add_stream`, deferred `capture`/`settle`, and async capture reducers | An embedding backend is required; media handling depends on the selected route | [Core concepts](concepts.md#content-becomes-a-record) |
 | Formation | Optional source-grounded typed memories with lineage, evidence, validity, visibility, and supersession | A `FormationBackend`; disabled when omitted | [Memory formation](configuration.md#automatic-memory-formation) |
 | Storage | SQLite records and FP32 embeddings, SHA-256 media CAS, durable index outbox, and Zvec projection | One writable local `data_dir` | [Architecture](architecture.md#durable-state) |
 | Retrieval | Dense and lexical candidates, composite retrieval keys, memory-type filters, event-time overlap, bitemporal and spatial scope, relevance and ambiguity gates | The configured embedder must support a valid route for the query | [Memory types, time, and decay](memory-types-time-and-decay.md) |
 | Evidence | Ranked `SearchHit` records, typed source evidence for formed memories, and opt-in bounded retrieval traces | Core; richer typed evidence requires formation | [Python retrieval contract](api/python-sdk.md#memory-operations) |
+| Context | Evidence-closed `ContextBundle` with typed sections, conflicts, unknowns, and optional exact raw excerpts | No generation backend required | [Context compilation](context-compilation.md) |
+| Memory management | Explicit consolidation, correction, reinforcement, cognitive forgetting, operation history, and rollback | Proposal generation needs a `ConsolidationBackend`; the host schedules the loop | [Memory management](api/python-sdk.md#memory-management-operations) |
 | Answer | Grounded `ask` with explicit abstention and the canonical hits actually used | A `GenerationBackend` | [Core concepts](concepts.md#retrieval-can-return-no-evidence) |
 | Reinforcement | Explicit positive feedback plus automatic reinforcement of evidence cited by `ask`; optional recency decay | Core policy; automatic answer reinforcement is configurable | [Decay and reinforcement](memory-types-time-and-decay.md#decay-and-reinforcement) |
 | Omni-modal analysis | Native modality routing, transcription fallback, speech analysis, visual-description hook, and face analysis | Route-specific embedding, speech, vision, or face backends | [Configuration](configuration.md) |
 | Identity | Durable voice and face exemplars, local identity resolution, names and relationships, corroborated face/voice linking, unlinking, and person erasure | A `SpeechBackend` and/or `FaceBackend` for observations | [Cross-modal identity binding](api/python-sdk.md#cross-modal-identity-binding) |
+| Data-subject operations | Host-recorded consent, subject export, biometric erasure, and explicit retention passes | Host authority; network routes require opt-in; consent is not an access-control filter | [Data-subject rights](api/python-sdk.md#data-subject-rights) |
 | Interaction | Speculative recall over changing observations; final-boundary persistence for generic, audio, and vision streams | `AsyncMemory` and application-supplied capture events | [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) |
 | Operations | Capability reporting, pagination, deletion, index rebuild and optimization, backup/restore procedures, and OpenTelemetry spans | Exporting telemetry requires an SDK/exporter configured by the host | [Operations](operations.md) |
 

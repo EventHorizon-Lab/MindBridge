@@ -1,5 +1,8 @@
 # Round 2 acceptance scenario: the household companion
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../../README.md) and the [research archive](../../research/README.md).
+
 The round is done when this scenario runs end to end against the public SDK with fake backends,
 and every assertion below holds. The scenario is the specification; the API exists to serve it.
 

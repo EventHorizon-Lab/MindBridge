@@ -197,6 +197,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
         description=__doc__,
+        epilog="Use `mindbridge-bench eval serve --help` for the Agent Memory Leaderboard API.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", default="mindbridge", help="evaluation adapter")

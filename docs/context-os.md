@@ -4,6 +4,11 @@ This page defines MindBridge's long-term product and architecture direction. It 
 that every behavior below is implemented or public. [Architecture](architecture.md) owns current
 implementation invariants, and the API references own current contracts.
 
+Scheduling remains host authority: `capture()` does not schedule `settle()`, and configuring a
+consolidator does not start a loop. A host may call `deliberate()` explicitly or enable the
+[serving-process timer](configuration.md#running-the-loop-inside-a-server-process). That timer
+does not add a network control-plane route or settle captured records.
+
 > MindBridge is an embodied-native, agentic context operating system. It turns continuous
 > multimodal experience into governed, task-ready context for agents.
 

@@ -1,5 +1,8 @@
 # Timeline neighbor-window risk review
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 **Status:** architecture hypothesis only; not implemented or benchmark-validated.
 
 **Question:** if `ObservationContext` gains an explicit `TimelineSpan`, how can an anchor retrieve

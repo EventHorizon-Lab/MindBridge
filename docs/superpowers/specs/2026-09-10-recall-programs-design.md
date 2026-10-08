@@ -1,5 +1,8 @@
 # Recall programs, identity-anchored keys, and completeness-aware grounding
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../../README.md) and the [research archive](../../research/README.md).
+
 Design for autoresearch round r0910 (2026-09-10). Baseline `af98692e` (mindbridge-v03 tip).
 Models: Qwen3.8-27B (`qwen3.8-27b` at inner-prism) answerer/judge, tencent/WeMM-Embedding-2B (2048-d),
 FunASR speech. Priority benchmarks: ATM-Bench (main, hard; sgm and raw), M3-Bench-Robot; then MemLens,

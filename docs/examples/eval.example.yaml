@@ -2,6 +2,7 @@
 #
 # Copy it, edit it, and pass it to the harness:
 #
+#   mkdir -p .benchmarks/configs
 #   cp docs/examples/eval.example.yaml .benchmarks/configs/my-run.yaml
 #   mindbridge-bench eval --tasks locomo-refined --config .benchmarks/configs/my-run.yaml
 #
@@ -105,7 +106,7 @@ generation:
   # only to impose one. Note that a thinking model needs its reasoning budget inside any ceiling
   # you set, or every response ends as `finish_reason=length`.
   # max_tokens: 4096
-  # Cap on how many media evidence items one answer may carry.
+  # Cap on how many video evidence items one answer may carry; question media has priority.
   video_limit: 8
   # Anything else the endpoint accepts in the request body. This is where a thinking model is
   # turned off -- reasoning models otherwise spend their whole budget before answering. It is the
@@ -142,8 +143,8 @@ settings:
   minimum_relevance: 0.10
   # How close the top two hits must be before retrieval is treated as ambiguous. Default 0.01.
   ambiguity_margin: 0.01
-  # Character budget for evidence handed to the answerer. Default unset, which grounds on exactly
-  # `limit`; a budget only widens that window and never bounds it.
+  # Character budget for evidence handed to the answerer. SDK default 24000; None grounds on
+  # exactly `limit`. A budget only widens that window and never bounds it.
   evidence_budget_chars: 12000
   # `reinforce_on_answer` is deliberately absent: the runner forces it off whatever this file
   # says, because reinforcing mid-run makes one question's retrieval depend on which earlier
@@ -151,8 +152,8 @@ settings:
 
 # =============================================================================================
 # Harness-only section. These have no field in `MindBridgeConfig` and must not gain one:
-# credentials are deliberately kept out of the product schema, and judging, corpus acquisition,
-# server observation, and regression budgets exist only in the benchmark harness.
+# judge credentials, corpus acquisition, server observation, and regression budgets exist only
+# in the benchmark harness. Product endpoint credentials stay with their own slots above.
 # =============================================================================================
 benchmark:
   # Nothing about the generation endpoint lives here -- not even the short-video floor, which is
@@ -215,6 +216,8 @@ benchmark:
     # ContextBudget the compile arm compiles against; defaults match the SDK's own ContextBudget.
     compile_max_items: 24
     compile_max_chars: 16000
+    # Opt into exact raw excerpts when complete parents do not fit the compile-arm budget.
+    compile_allow_partial_sources: false
     # How memories reach the store: add (Memory.add_many/add, the strong default) or capture
     # (Memory.capture then Memory.settle -- exercises the fast plane so capture acknowledgement
     # and time-to-searchable are measured from a real run instead of reading empty).
@@ -233,6 +236,8 @@ benchmark:
 
     # How many memories one question may retrieve. Capped at 100.
     recall_limit: 20
+    # null keeps each task's answer protocol; strict or best_effort overrides it for the run.
+    answer_policy: null
 
     # One integer, or three, or four. One value fills all four slots.
     seed: 0

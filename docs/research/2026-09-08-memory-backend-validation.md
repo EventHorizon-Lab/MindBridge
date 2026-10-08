@@ -1,5 +1,8 @@
 # Memory backend validation
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Date: 2026-09-08
 
 This review compared the working tree with the frozen pre-change source in

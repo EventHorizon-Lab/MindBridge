@@ -1,5 +1,8 @@
 # Memory competitor source ledger (2026-09-07)
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 This is a source-first audit, not a leaderboard. “Observed” means the claim follows from the
 pinned source path or a committed artifact. “Author-reported” means the artifact was not
 independently rerun here. Costs count calls made by the memory layer; answer and judge calls are

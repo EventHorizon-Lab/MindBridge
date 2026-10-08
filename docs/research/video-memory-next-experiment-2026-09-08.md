@@ -1,5 +1,8 @@
 # Next experiment for raw-video memory
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Status: historical EgoLife exact-cosine and representative-selection diagnostics completed before
 the project owner removed EgoLifeQA from product acceptance; temporal closure is a proposal; no new
 product architecture is implemented.

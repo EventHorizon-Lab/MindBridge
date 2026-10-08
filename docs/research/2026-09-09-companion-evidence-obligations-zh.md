@@ -1,5 +1,8 @@
 # MindBridge Memory Backend 增量研究：证据闭包、竞争事实与情感来源
 
+> 历史研究或设计记录：结论、命令和“当前”均以文中固定的日期与版本为准。
+> 当前使用说明见[文档入口](../README.md)；实验状态见[研究档案](README.md)。
+
 ## 研究边界与证据口径
 
 本报告承接 MindBridge 2026-09-07 至 2026-09-09 的代码审计、竞品研究和因果实验，不重复把已经实现的能力写成待建路线。当前基线已经包括：typed raw `Observation → FormationProposal → ENTITY/EVENT/STATE/RELATION/AFFECT/TRAIT/RESPONSE_POLICY`；双时态、identity/scope 资格约束；`(A AND B) OR C` 的持久化 provenance；预算内原子 evidence closure；同 lineage 的候选内冲突处理；SQLite 权威存储与可重建索引。

@@ -12,6 +12,11 @@ nothing to the store. `ask()` is unchanged and remains the grounded-generation s
 
 ## Contract
 
+Compilation uses the configured instance retrieval mode. It does not run `ask()`'s recall
+planning or evidence expansion and makes no generation call. `allow_partial_sources=True` and
+`bundle.compact()` are separate opt-ins: the first changes source selection, while the second
+formats an already-selected bundle and leaves its budget accounting intact.
+
 ```text
 compile(
     goal: ContentInput,

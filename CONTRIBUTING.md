@@ -140,6 +140,12 @@ for commands and paths. Use UTF-8, LF endings, and a trailing newline. Examples 
 against the current public API. Keep `docs/README.md` current when adding, renaming, or removing a
 page.
 
+Keep the [research archive](docs/research/README.md) indexed when adding dated reports or design
+records. Preserve original measurements, source pins, rejected hypotheses, and verbatim protocols.
+Historical examples may require their frozen checkout; current guides must use the public API in
+this checkout. A documentation review should compare signatures, defaults, exports, transport
+switches, and example configurations against their implementations, not only check Markdown.
+
 ## Pull requests
 
 Use a concise imperative commit subject such as `Add index recovery test`. A pull request should:
