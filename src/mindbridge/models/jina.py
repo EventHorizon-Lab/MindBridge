@@ -10,6 +10,7 @@ from types import FunctionType, MethodType
 from typing import cast
 
 from mindbridge.exceptions import ModelError, ValidationError
+from mindbridge.models._media import fetch_videos as _fetch_videos
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.models.sentence_transformers import (
     _ST_LOCK,
@@ -313,7 +314,7 @@ def _configure_jina_video(module: object) -> None:
         videos: object,
         sample_indices_fn: Callable[..., object] | None = None,
     ) -> object:
-        return _fetch_jina_videos(load_video, videos, sample_indices_fn)
+        return _fetch_videos(load_video, videos, sample_indices_fn)
 
     try:
         setattr(module, "_encode_composite_parts", MethodType(isolated, module))  # noqa: B010
@@ -334,20 +335,6 @@ def _configure_jina_video(module: object) -> None:
 
 def _video_path(value: object) -> object:
     return value
-
-
-def _fetch_jina_videos(
-    load_video: Callable[..., object],
-    videos: object,
-    sample_indices_fn: Callable[..., object] | None,
-) -> object:
-    if isinstance(videos, list):
-        decoded = (
-            cast(tuple[object, object], _fetch_jina_videos(load_video, video, sample_indices_fn))
-            for video in videos
-        )
-        return list(zip(*decoded, strict=False))
-    return load_video(videos, backend="pyav", sample_indices_fn=sample_indices_fn)
 
 
 def _request(
