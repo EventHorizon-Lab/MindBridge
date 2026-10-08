@@ -504,13 +504,28 @@ complete-hit behavior and simply loses this additional grounding. The additive `
 present and empty when the opt-in is disabled or no eligible excerpt fits.
 
 `bundle.compact()` is an opt-in Python presentation that aliases only structurally formatted
-memory and identity IDs. The returned `ContextPresentation` must remain paired with the request.
-Its `resolve()` method only decodes an alias; it does not establish delivery, evidence, consent, or
-scope. Use `resolve_citation()` to accept a full or partial memory citation: reference-only and
-identity aliases are rejected, while a partial citation retains its exact selector. Compaction
-happens after selection and does not change `bundle.chars`, the grounding budget, or evidence
-closure. Stored content and the goal remain verbatim, so text-plus-symbol-table reversibility does
-not guarantee semantic equivalence for arbitrary prompts containing runtime memory IDs.
+memory IDs as `mN` and identity IDs as `iN`. The frozen `ContextPresentation` contains `text`, its
+exact `chars`, and ordered `ContextSymbol` values retaining stable IDs, namespaces, coverage, and
+structural roles. References can receive symbols even when their records were not delivered;
+identity symbols are always `reference_only`.
+
+Retain the exact presentation with its request: two presentations can assign `m1` to different
+records. Symbols are request-local and cannot replace stable IDs in `get`, `delete`, or `reinforce`.
+`presentation.resolve(symbol, namespace=...)` requires a `ContextSymbolNamespace` and only decodes
+an alias; it does not establish delivery, evidence, consent, or scope. Unknown symbols and namespace
+mismatches raise `ValidationError`.
+
+Use `resolve_citation(symbol)` to accept a full or partial memory citation: reference-only and
+identity aliases are rejected, while a partial citation retains its exact `TextSpanSelector`.
+A partial citation cannot satisfy a full-record evidence dependency or become an evidence-clause
+member. Compaction aliases an excerpt's parent ID but leaves matched index IDs, offsets, and
+selector digests as structured provenance.
+
+Compaction happens after selection and does not change `bundle.chars`, the grounding budget,
+evidence closure, or the existing `render()`, `hits`, and `document()` output. Stored content,
+the goal, conflict values, and diagnostic prose remain verbatim, so text-plus-symbol-table
+reversibility does not guarantee semantic equivalence for arbitrary prompts containing runtime
+memory IDs. REST, MCP, CLI, and product answer generation do not select compact presentation.
 
 `bundle.affect` carries `AffectCue` rather than `SearchHit`: the same hit fields plus
 `event_ids`, the active events formed from the same observations the cue cites in its own

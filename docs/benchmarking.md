@@ -1406,32 +1406,6 @@ ingest through `add` or `add_many`, query through `search` or `ask`, score publi
 close the instance before archiving artifacts. The local-index command is the only documented
 direct-adapter exception.
 
-## Local-index microbenchmark
-
-The synthetic benchmark isolates the SQLite-to-Zvec storage path:
-
-```bash
-mindbridge-bench local-index \
-  --data-dir .benchmarks/local-index/trial-001 \
-  --rows 1000 \
-  --dimension 128 \
-  --queries 20 \
-  --k 10 \
-  --seed 42 \
-  --quantization none
-```
-
-`--data-dir` must be empty. The JSON result reports ingest and optimization time, recall at `k`
-against exact search, query latency percentiles and throughput, plus SQLite, Zvec, and total bytes.
-Run each quantization mode against a separate directory.
-
-This command deliberately measures local adapters directly, which is the narrow storage
-microbenchmark exception in `AGENTS.md`, not a second product API. Its JSON therefore labels
-itself with `scope: storage_microbenchmark` and an `excludes` list. Its `ingest_seconds` is a
-synthetic-vector storage number and is not the product ingest figure: it never embeds, routes a
-modality, prepares media, grounds an answer, or touches `Memory`. The product ingest latency and
-throughput come from the `ingest` block of an `eval` run, which drives the public SDK.
-
 ## Artifact safety
 
 Benchmark directories may contain licensed dataset content, embeddings, prompts, and responses.

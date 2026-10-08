@@ -13,6 +13,7 @@ the repository. An archived command may require those artifacts or an older chec
 
 | Record | Scope |
 | --- | --- |
+| [Compact context presentation prototype](compact-context-prototype.md) | Frozen prototype and conv30 measurement; current contract lives in the SDK reference |
 | [Memory backend evaluation — 2026-09-08](2026-09-08-memory-backend-evaluation.md) | Dated analysis or results; retain the stated evidence limits |
 | [Memory backend research for MindBridge](2026-09-08-memory-backend-research.md) | Dated analysis or results; retain the stated evidence limits |
 | [Memory backend validation](2026-09-08-memory-backend-validation.md) | Dated analysis or results; retain the stated evidence limits |
@@ -65,7 +66,7 @@ configuration references own the shipped signatures, defaults, and transport cov
   remains opt-in and store-pinned. Structural success is not proof of improved natural recall.
 - [Exact excerpts](../context-compilation.md#exact-raw-excerpts) are an explicit compilation option;
   a partial source does not satisfy a full-record evidence dependency.
-- [Compact presentation](../compact-context-prototype.md) is an opt-in Python formatter. Its
+- [Compact presentation](../api/python-sdk.md#memory-operations) is an opt-in Python formatter. Its
   frozen measurement does not establish downstream quality for other models or prompts.
 - [Recall policies](../configuration.md#local-memory-settings) document the shipped planning and
   expansion settings; historical proposals may describe different budgets.
