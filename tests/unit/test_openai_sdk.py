@@ -2516,7 +2516,18 @@ def test_stream_answer_closes_the_provider_response(ending: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "ending", ["completed", "model_error", "transport_error", "invalid", "abandoned"]
+    "ending",
+    [
+        "completed",
+        "model_error",
+        "transport_error",
+        "invalid",
+        "abandoned",
+        "length",
+        "content_filter",
+        "empty",
+        "whitespace",
+    ],
 )
 def test_stream_answer_close_failure_preserves_errors_and_records_usage(ending: str) -> None:
     cleanup_error = httpx.ReadError("response cleanup failed")
@@ -2533,7 +2544,11 @@ def test_stream_answer_close_failure_preserves_errors_and_records_usage(ending: 
             yield SimpleNamespace(
                 choices=[
                     SimpleNamespace(
-                        index=0, delta=SimpleNamespace(content="Hello."), finish_reason="stop"
+                        index=0,
+                        delta=SimpleNamespace(
+                            content={"empty": "", "whitespace": " "}.get(ending, "Hello.")
+                        ),
+                        finish_reason=ending if ending in {"length", "content_filter"} else "stop",
                     )
                 ],
                 usage={"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
@@ -2558,20 +2573,27 @@ def test_stream_answer_close_failure_preserves_errors_and_records_usage(ending: 
     try:
         with provider.get_tracer("test").start_as_current_span("model"):
             stream = _model(cast(Any, client)).stream_answer("What is hello?", (hit,))
-            assert next(stream) == "Hello."
+            if ending != "empty":
+                assert next(stream) == (" " if ending == "whitespace" else "Hello.")
             if ending == "abandoned":
                 stream.close()
             else:
                 with pytest.raises(ModelError) as failure:
                     tuple(stream)
                 assert failure.value.stage == "generate"
+                assert type(failure.value) is (
+                    ModelOutputTruncatedError if ending == "length" else ModelError
+                )
                 if ending == "model_error":
                     assert failure.value is original_error
                 elif ending == "transport_error":
                     assert failure.value.reason == "timeout"
                     assert failure.value.__cause__ is original_error
-                elif ending == "invalid":
-                    assert failure.value.reason == "response_invalid"
+                elif ending in {"invalid", "length", "content_filter", "empty", "whitespace"}:
+                    assert failure.value.reason == (
+                        "output_truncated" if ending == "length" else "response_invalid"
+                    )
+                    assert failure.value.__cause__ is None
                 else:
                     assert failure.value.reason == "connection_failed"
                     assert failure.value.__cause__ is cleanup_error
@@ -2582,6 +2604,13 @@ def test_stream_answer_close_failure_preserves_errors_and_records_usage(ending: 
     assert attributes is not None
     assert attributes["gen_ai.usage.input_tokens"] == 8
     assert attributes["gen_ai.usage.output_tokens"] == 2
+    assert attributes.get(GEN_AI_FINISH_REASONS) == {
+        "completed": ("stop",),
+        "length": ("length",),
+        "content_filter": ("content_filter",),
+        "empty": ("stop",),
+        "whitespace": ("stop",),
+    }.get(ending)
 
 
 def test_stream_answer_records_exact_grounding_and_multimodal_usage(
