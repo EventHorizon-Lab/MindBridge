@@ -16,8 +16,9 @@ uv sync --locked --default-index https://pypi.org/simple \
 
 Use a dedicated benchmark directory and the existing evaluation configuration format. Only
 configured ingestion and retrieval backends run; the adapter disables `generation` and ignores
-the `benchmark:` section and the configuration's `data_dir`. An omitted embedding section uses
-the evaluation runner's pinned default. A minimal configuration is:
+generation environment settings, the `benchmark:` section, and the configuration's `data_dir`.
+An omitted embedding section uses the evaluation runner's pinned default. A minimal configuration
+is:
 
 ```yaml
 embedding:
@@ -48,8 +49,11 @@ is set, authentication still applies.
 Expose the service through your HTTPS deployment and register its `/add`, `/search`, and
 `/health` URLs with AML. The loopback launch above is for local validation; AML needs a publicly
 reachable deployment. Run one server process per data root. All users share loaded model weights,
-and each request opens and closes its own user's store. Advertise concurrency based on your
-deployed models and storage capacity.
+and the launcher claims the root before loading or warming models, so an existing owner causes
+an immediate failure without model work. Each request opens and closes its own user's store.
+Add fingerprints, source serialization, and durable adapter writes run in worker threads while
+the user's lock remains held; Add waits for them before acknowledging success. Advertise
+concurrency based on your deployed models and storage capacity.
 
 ## Request and response format
 

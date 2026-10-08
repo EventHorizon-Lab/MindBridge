@@ -11,7 +11,7 @@ import hmac
 import json
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
@@ -19,7 +19,7 @@ from typing import Annotated, Literal, TypeAlias
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
-from mindbridge import AsyncMemory, Blob, MindBridgeConfig, SearchHit
+from mindbridge import AsyncMemory, Blob, MemoryRecord, MindBridgeConfig, SearchHit
 from mindbridge.api.content import StrictModel
 from mindbridge.api.errors import register_error_handlers
 from mindbridge.benchmarks.eval_artifacts import _atomic_replace, _json_bytes
@@ -148,6 +148,37 @@ def _directory(path: Path) -> Path:
     return path
 
 
+def _write_receipt(receipt: Path, fingerprint: str, *, complete: bool) -> None:
+    _atomic_replace([(receipt, _json_bytes({"fingerprint": fingerprint, "complete": complete}))])
+
+
+def _prepare_add(receipt: Path, request: AddRequest) -> tuple[str, bool]:
+    _directory(receipt.parent)
+    fingerprint = hashlib.sha256(_json_bytes(request.model_dump(mode="json"))).hexdigest()
+    prior = json.loads(receipt.read_bytes()) if receipt.exists() else None
+    if prior is not None and prior["fingerprint"] != fingerprint:
+        raise HTTPException(422, "request_id was already used with a different payload")
+    complete = prior is not None and bool(prior["complete"])
+    if not complete:
+        _write_receipt(receipt, fingerprint, complete=False)
+    return fingerprint, complete
+
+
+def _persist_sources(
+    directory: Path, records: Sequence[MemoryRecord], messages: Sequence[_Message]
+) -> None:
+    _directory(directory)
+    _atomic_replace(
+        [
+            (
+                directory / f"{record.id}.json",
+                _json_bytes(message.model_dump(mode="json")["content"]),
+            )
+            for record, message in zip(records, messages, strict=True)
+        ]
+    )
+
+
 def _fallback_content(hit: SearchHit) -> object:
     if not hit.assets:
         return hit.content
@@ -178,6 +209,7 @@ def create_app(  # noqa: C901 - Add and Search share authorization and per-user 
     data_root: Path,
     memory_factory: Callable[[Path], AsyncMemory],
     api_key: str | None,
+    data_root_lock: DataDirectoryLock | None = None,
 ) -> FastAPI:
     """Serve the benchmark contract using one physically isolated store per user ID."""
     root = data_root.expanduser().resolve()
@@ -185,7 +217,7 @@ def create_app(  # noqa: C901 - Add and Search share authorization and per-user 
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        owner = DataDirectoryLock(root)
+        owner = DataDirectoryLock(root) if data_root_lock is None else data_root_lock
         try:
             yield
         finally:
@@ -214,17 +246,10 @@ def create_app(  # noqa: C901 - Add and Search share authorization and per-user 
     @app.post("/add", dependencies=[Depends(authorize)])
     async def add(request: AddRequest) -> dict[str, object]:
         user = _digest(request.user_id)
-        fingerprint = hashlib.sha256(_json_bytes(request.model_dump(mode="json"))).hexdigest()
         async with locks.setdefault(user, asyncio.Lock()):
-            receipts = _directory(root / "requests" / user)
-            receipt = receipts / f"{_digest(request.request_id)}.json"
-            prior = json.loads(receipt.read_bytes()) if receipt.exists() else None
-            if prior is not None and prior["fingerprint"] != fingerprint:
-                raise HTTPException(422, "request_id was already used with a different payload")
-            if prior is None or not prior["complete"]:
-                _atomic_replace(
-                    [(receipt, _json_bytes({"fingerprint": fingerprint, "complete": False}))]
-                )
+            receipt = root / "requests" / user / f"{_digest(request.request_id)}.json"
+            fingerprint, complete = await asyncio.to_thread(_prepare_add, receipt, request)
+            if not complete:
                 memory = await asyncio.to_thread(memory_factory, root / "users" / user)
                 async with memory:
                     records = await memory.add_many(
@@ -240,19 +265,10 @@ def create_app(  # noqa: C901 - Add and Search share authorization and per-user 
                             for index, message in enumerate(request.messages)
                         ],
                     )
-                    sources = _directory(root / "sources" / user)
-                    _atomic_replace(
-                        [
-                            (
-                                sources / f"{record.id}.json",
-                                _json_bytes(message.model_dump(mode="json")["content"]),
-                            )
-                            for record, message in zip(records, request.messages, strict=True)
-                        ]
+                    await asyncio.to_thread(
+                        _persist_sources, root / "sources" / user, records, request.messages
                     )
-                _atomic_replace(
-                    [(receipt, _json_bytes({"fingerprint": fingerprint, "complete": True}))]
-                )
+                await asyncio.to_thread(_write_receipt, receipt, fingerprint, complete=True)
         return {
             "success": True,
             "request_id": request.request_id,
@@ -331,21 +347,25 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     from mindbridge.benchmarks.eval import _BackendPool
     from mindbridge.benchmarks.model_config import ModelConfig
 
-    pool = _BackendPool(
-        ModelConfig.from_environment(),
-        device=None,
-        batch_size=64,
-        needs_speech=False,
-        seed=0,
-        memory_config=config,
-    )
-    try:
+    with ExitStack() as cleanup:
+        root = arguments.data_root.expanduser().resolve()
+        owner = DataDirectoryLock(root)
+        cleanup.callback(owner.close)
+        pool = _BackendPool(
+            ModelConfig(),
+            device=None,
+            batch_size=64,
+            needs_speech=False,
+            seed=0,
+            memory_config=config,
+        )
+        cleanup.callback(pool.close)
         uvicorn.run(
-            create_app(data_root=arguments.data_root, memory_factory=pool.memory, api_key=api_key),
+            create_app(
+                data_root=root, memory_factory=pool.memory, api_key=api_key, data_root_lock=owner
+            ),
             host=arguments.host,
             port=arguments.port,
             access_log=False,
         )
-    finally:
-        pool.close()
     return 0

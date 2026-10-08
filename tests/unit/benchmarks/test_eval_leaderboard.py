@@ -6,7 +6,9 @@ import base64
 import shutil
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
+from threading import Event
 from typing import cast
 
 import pytest
@@ -16,8 +18,8 @@ from fastapi.testclient import TestClient
 from mindbridge import AsyncMemory, Memory, MindBridgeConfig, Modality
 from mindbridge.benchmarks import eval as evaluation
 from mindbridge.benchmarks import eval_leaderboard as aml
-from mindbridge.benchmarks.eval_artifacts import _atomic_replace
-from mindbridge.infrastructure.local._lock import DataDirectoryInUseError
+from mindbridge.benchmarks.eval_artifacts import _atomic_replace, _json_bytes
+from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
 from mindbridge.models.base import EmbedTask, ModelInput
 
 PNG = base64.b64decode(
@@ -248,6 +250,52 @@ def test_concurrent_users_and_same_user_retries(tmp_path: Path) -> None:
         assert [row["content"] for row in search(client, "b")] == ["b likes red."]
 
 
+@pytest.mark.parametrize("stage", ["serialization", "write"])
+def test_slow_source_persistence_does_not_block_other_users(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    started = Event()
+    release = Event()
+    text = "Alice's favorite color is red."
+
+    def pause() -> None:
+        started.set()
+        assert release.wait(10), "source persistence was never released"
+
+    def serialize(value: object) -> bytes:
+        if stage == "serialization" and value == text:
+            pause()
+        return _json_bytes(value)
+
+    def write(files: Sequence[tuple[Path, bytes]]) -> None:
+        if stage == "write" and files[0][0].parent == tmp_path / "sources" / aml._digest("slow"):
+            pause()
+        _atomic_replace(files)
+
+    monkeypatch.setattr(aml, "_json_bytes", serialize)
+    monkeypatch.setattr(aml, "_atomic_replace", write)
+    app = aml.create_app(data_root=tmp_path, memory_factory=memory_factory, api_key="secret")
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=3) as workers:
+        pending = workers.submit(
+            client.post, "/add", headers=HEADERS, json=payload(text, user="slow")
+        )
+        try:
+            assert started.wait(5), "Add never reached source persistence"
+            assert not pending.done(), "Add must wait for durable source persistence"
+            assert workers.submit(client.get, "/health").result(timeout=2).status_code == 200
+            other = workers.submit(
+                client.post, "/add", headers=HEADERS, json=payload("Bob likes blue.", user="other")
+            )
+            assert other.result(timeout=2).status_code == 200
+            assert (
+                workers.submit(search, client, "other").result(timeout=2)[0]["content"]
+                == "Bob likes blue."
+            )
+        finally:
+            release.set()
+        assert pending.result(timeout=5).status_code == 200
+
+
 def test_missing_index_rebuild_uses_stored_embeddings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -269,8 +317,17 @@ def test_missing_index_rebuild_uses_stored_embeddings(
         assert (directory / "zvec").is_dir()
 
 
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {},
+        {"MINDBRIDGE_TIMEOUT_SECONDS": "invalid"},
+        {"MINDBRIDGE_GENERATION_MODEL": ""},
+        {"MINDBRIDGE_GENERATION_MODALITIES": "unsupported"},
+    ],
+)
 def test_cli_loads_config_runs_server_and_closes_backends(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment: dict[str, str]
 ) -> None:
     import uvicorn
 
@@ -284,6 +341,11 @@ def test_cli_loads_config_runs_server_and_closes_backends(
 
     class Pool:
         def __init__(self, *args: object, **kwargs: object) -> None:
+            with (
+                pytest.raises(DataDirectoryInUseError),
+                closing(DataDirectoryLock(tmp_path / "data")),
+            ):
+                pass
             configs.append(cast(MindBridgeConfig, kwargs["memory_config"]))
 
         def memory(self, path: Path) -> AsyncMemory:
@@ -294,6 +356,8 @@ def test_cli_loads_config_runs_server_and_closes_backends(
 
     def run(app: object, **kwargs: object) -> None:
         assert kwargs == {"host": "127.0.0.1", "port": 8123, "access_log": False}
+        with pytest.raises(DataDirectoryInUseError), closing(DataDirectoryLock(tmp_path / "data")):
+            pass
         with TestClient(cast(FastAPI, app)) as client:
             assert client.post("/add", headers=HEADERS, json=payload()).status_code == 200
             assert len(search(client)) == 1
@@ -301,6 +365,8 @@ def test_cli_loads_config_runs_server_and_closes_backends(
     monkeypatch.setattr(evaluation, "_BackendPool", Pool)
     monkeypatch.setattr(uvicorn, "run", run)
     monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "secret")
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
     assert (
         evaluation.main(
             [
@@ -318,6 +384,76 @@ def test_cli_loads_config_runs_server_and_closes_backends(
     assert configs[0].generation is None
     assert configs[0].embedding.provider == "sentence-transformers"
     assert closed == [True]
+    with closing(DataDirectoryLock(tmp_path / "data")):
+        pass
+
+
+def test_cli_refuses_an_owned_root_before_loading_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configuration = tmp_path / "config.yaml"
+    configuration.write_text("{}\n", encoding="utf-8")
+
+    def load(*args: object, **kwargs: object) -> None:
+        raise AssertionError("an owned root must fail before any backend is loaded")
+
+    monkeypatch.setattr(evaluation, "_BackendPool", load)
+    with closing(DataDirectoryLock(tmp_path / "data")), pytest.raises(DataDirectoryInUseError):
+        aml.main(
+            [
+                "--config",
+                str(configuration),
+                "--data-root",
+                str(tmp_path / "data"),
+                "--public-smoke",
+            ]
+        )
+
+
+@pytest.mark.parametrize("stage", ["load", "serve"])
+def test_cli_releases_root_after_startup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    import uvicorn
+
+    configuration = tmp_path / "config.yaml"
+    configuration.write_text("{}\n", encoding="utf-8")
+    closed: list[bool] = []
+
+    class Pool:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            with (
+                pytest.raises(DataDirectoryInUseError),
+                closing(DataDirectoryLock(tmp_path / "data")),
+            ):
+                pass
+            if stage == "load":
+                raise RuntimeError("startup failed")
+
+        def memory(self, path: Path) -> AsyncMemory:
+            return memory_factory(path)
+
+        def close(self) -> None:
+            closed.append(True)
+
+    def run(app: object, **kwargs: object) -> None:
+        raise RuntimeError("startup failed")
+
+    monkeypatch.setattr(evaluation, "_BackendPool", Pool)
+    monkeypatch.setattr(uvicorn, "run", run)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        aml.main(
+            [
+                "--config",
+                str(configuration),
+                "--data-root",
+                str(tmp_path / "data"),
+                "--public-smoke",
+            ]
+        )
+    assert closed == ([True] if stage == "serve" else [])
+    with closing(DataDirectoryLock(tmp_path / "data")):
+        pass
 
 
 def test_second_owner_fails_and_different_roots_work(tmp_path: Path) -> None:
