@@ -169,9 +169,11 @@ per closed observation, because a capture stream outlives the observations it co
 
 `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream`, and `add_stream()` all accept
 `capture=True`, which commits each final through `capture()` instead of `add()`. That is the
-complete path from continuous observation to acknowledgement: speculative `UPDATE` retrieval, a
-`FINAL` acknowledged after the SQLite commit, and enrichment deferred to `settle()`. Every
-`StreamCommit` then reports `pending_settlement=True`, and the record stays out of `search()`
+complete path from continuous observation to acknowledgement: a `FINAL` acknowledged after the
+SQLite commit, and enrichment deferred to `settle()`. In capture mode, automatic `UPDATE` and
+`FINAL` retrieval is skipped so query models cannot delay the acknowledgement; use a separate
+`AsyncOmniPrefetch` for speculative retrieval. Every `StreamCommit` then reports
+`pending_settlement=True`, `prefetch=None`, and `retrieval_error=None`, and the record stays out of `search()`
 until the host settles it. A `StreamInput` transcript or description is folded in at capture time,
 so the deferred commit lands on the same content-addressed record the strong path would have
 written. The default is unchanged: without the flag, a final still commits through `add()` and is

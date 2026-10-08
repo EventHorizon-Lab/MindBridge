@@ -94,6 +94,8 @@ class AssetStore:
         _validate_media(modality, mime_type)
         source = Path(path).expanduser()
         flags = os.O_RDONLY
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):

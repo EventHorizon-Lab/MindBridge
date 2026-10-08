@@ -4,11 +4,45 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
 
 from mindbridge.infrastructure.local import AssetStore, AssetStoreError, AssetTooLargeError
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX named pipes")
+def test_a_named_pipe_is_rejected_without_waiting_for_a_writer(tmp_path: Path) -> None:
+    store = AssetStore(tmp_path)
+    source = tmp_path / "input.wav"
+    os.mkfifo(source)
+    done = threading.Event()
+    errors: list[Exception] = []
+
+    def materialize() -> None:
+        try:
+            store.materialize_path(source, modality="audio", mime_type="audio/wav")
+        except Exception as error:
+            errors.append(error)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=materialize)
+    worker.start()
+    promptly_rejected = done.wait(1)
+    try:
+        if not promptly_rejected:
+            # Unblock the buggy reader so a regression fails without leaving a hung thread.
+            descriptor = os.open(source, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(descriptor)
+    finally:
+        worker.join(5)
+    assert promptly_rejected
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "regular file" in str(errors[0])
 
 
 def test_bytes_and_path_deduplicate_to_one_private_file(tmp_path: Path) -> None:

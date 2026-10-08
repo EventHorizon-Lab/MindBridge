@@ -1163,6 +1163,9 @@ class OpenAIModels:
                 stage="generate",
             ) from error
         finally:
+            close = getattr(responses, "close", None)
+            if callable(close):
+                close()
             if usage_response is not None:
                 _record_openai_usage(
                     usage_response,

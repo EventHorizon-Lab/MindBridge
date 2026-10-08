@@ -2465,6 +2465,56 @@ def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+@pytest.mark.parametrize("ending", ["abandoned", "completed", "invalid"])
+def test_stream_answer_closes_the_provider_response(ending: str) -> None:
+    class Body(httpx.SyncByteStream):
+        closed = False
+
+        def __iter__(self) -> Iterator[bytes]:
+            for index, content, finish in (
+                (0, "Hello.", None),
+                (1 if ending == "invalid" else 0, "", "stop"),
+            ):
+                chunk = {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "answer-model",
+                    "choices": [
+                        {"index": index, "delta": {"content": content}, "finish_reason": finish}
+                    ],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+        def close(self) -> None:
+            self.closed = True
+
+    body = Body()
+    response = httpx.Response(200, stream=body, headers={"content-type": "text/event-stream"})
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return response
+
+    hit = SearchHit(id="memory_1", content="Hello is a greeting.", score=0.9, created_at=NOW)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        stream = _model(_sdk_client(client)).stream_answer("What is hello?", (hit,))
+        try:
+            assert next(stream) == "Hello."
+            if ending == "abandoned":
+                stream.close()
+            elif ending == "invalid":
+                with pytest.raises(ModelError):
+                    tuple(stream)
+            else:
+                assert tuple(stream) == ()
+            assert response.is_closed
+            assert body.closed
+        finally:
+            stream.close()
+            response.close()
+
+
 def test_stream_answer_records_exact_grounding_and_multimodal_usage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

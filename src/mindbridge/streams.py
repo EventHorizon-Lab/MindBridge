@@ -172,8 +172,8 @@ class AsyncCaptureStream:
     """Reduce associated capture streams into retrieval and durable memories.
 
     `capture=True` commits each `FINAL` through `Memory.capture()` instead of `Memory.add()`, so
-    the acknowledgement leaves the model path and every `StreamCommit` reports
-    `pending_settlement`. The host then owes `settle()`; the default stays the strong `add()`.
+    automatic retrieval is skipped and every `StreamCommit` reports `pending_settlement` with
+    `prefetch=None`. The host then owes `settle()`; the default stays the strong `add()`.
     """
 
     def __init__(
@@ -214,7 +214,8 @@ class AsyncCaptureStream:
                 if event.phase is StreamPhase.UPDATE:
                     prefetch = self._prefetch_for(prefetches, stream_id)
                     assert event.item is not None and not isinstance(event.item, StreamInput)
-                    prefetch.submit(event.item)
+                    if not self._capture:
+                        prefetch.submit(event.item)
                     continue
                 if event.phase is StreamPhase.CANCEL:
                     cancelled_prefetch = (
@@ -226,16 +227,15 @@ class AsyncCaptureStream:
                 assert event.item is not None
                 prefetch = self._prefetch_for(prefetches, stream_id)
                 item = event.item
-                final_content = self._final_query(item)
                 retrieval_error: Exception | None = None
                 retrieval: PrefetchResult | None = None
-                try:
-                    retrieval = await prefetch.finalize(final_content)
-                except Exception as error:
-                    retrieval_error = error
-                    # finalize() drains its own worker only once it has started closing, so an
-                    # early rejection would otherwise abandon a search already in flight.
-                    await prefetch.close()
+                if not self._capture:
+                    try:
+                        retrieval = await prefetch.finalize(self._final_query(item))
+                    except Exception as error:
+                        retrieval_error = error
+                        # An early rejection can leave an UPDATE search in flight.
+                        await prefetch.close()
                 prefetches.pop(stream_id, None)
                 # ponytail: FINAL is the commit point; a cancellable storage transaction would
                 # be needed to revoke it safely once the worker thread has started.
@@ -271,7 +271,6 @@ class AsyncCaptureStream:
                         pending_settlement=self._capture,
                     )
                 else:
-                    assert retrieval is not None
                     yield StreamCommit(
                         record=record,
                         prefetch=retrieval,
