@@ -30,6 +30,10 @@ reducers only when explicit finality is available. Every reducer takes an `Async
 `async_memory` below; the synchronous snippets assume an open `memory` plus already-read immutable
 media bytes.
 
+Partial query snapshots must be immutable: prefetch rejects `Path` atoms, whose bytes could
+change while a search is running. Read a capture frame into `Blob` or use an existing `AssetRef`.
+Completed durable writes still accept ordinary local `Path` content through the SDK.
+
 Everything on this page except `ask_stream()` streams input into memory; `ask_stream()` is the one
 that streams an answer out, and it is a delivery choice rather than a capture lifecycle. Its
 contract lives with the other recall operations in the
@@ -169,9 +173,11 @@ per closed observation, because a capture stream outlives the observations it co
 
 `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream`, and `add_stream()` all accept
 `capture=True`, which commits each final through `capture()` instead of `add()`. That is the
-complete path from continuous observation to acknowledgement: speculative `UPDATE` retrieval, a
-`FINAL` acknowledged after the SQLite commit, and enrichment deferred to `settle()`. Every
-`StreamCommit` then reports `pending_settlement=True`, and the record stays out of `search()`
+complete path from continuous observation to acknowledgement: a `FINAL` acknowledged after the
+SQLite commit, and enrichment deferred to `settle()`. In capture mode, automatic `UPDATE` and
+`FINAL` retrieval is skipped so query models cannot delay the acknowledgement; use a separate
+`AsyncOmniPrefetch` for speculative retrieval. Every `StreamCommit` then reports
+`pending_settlement=True`, `prefetch=None`, and `retrieval_error=None`, and the record stays out of `search()`
 until the host settles it. A `StreamInput` transcript or description is folded in at capture time,
 so the deferred commit lands on the same content-addressed record the strong path would have
 written. The default is unchanged: without the flag, a final still commits through `add()` and is

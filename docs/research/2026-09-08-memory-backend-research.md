@@ -1,5 +1,8 @@
 # Memory backend research for MindBridge
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 **Research date:** 2026-09-08 (Asia/Shanghai)
 
 **Scope:** primary-source review for MindBridge's P0 backend/emotion/identity, P1 agentic/omni,

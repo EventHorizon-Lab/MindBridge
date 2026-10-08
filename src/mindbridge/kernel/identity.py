@@ -719,32 +719,26 @@ class Identities(Traced):
         bound = 0
         refused = 0
         for identity_id, name in bindings.items():
-            with translate_storage_errors("read identity profile"):
-                profile = self._store.identities.identity_profile(identity_id)
-            try:
-                proposed = None if profile is None else validated_identity_name(name)
-            except ValidationError:
-                proposed = None
-            if profile is None or proposed is None:
-                # The identity a staged name resolved to has since vanished (merged or deleted),
-                # or the stated name failed validation. Either way the fact named nobody, which
-                # is worth counting apart from a silent `continue` even though there is nobody
-                # left to warn about by name.
-                operation.speaker_names_refused += 1
-                continue
-            if profile.name == proposed:
-                continue
-            if profile.name is not None:
-                refused += 1
-                _LOGGER.warning(
-                    "a distilled fact called identity %s %r, which is already called %r; "
-                    "keeping the registered name",
-                    profile.identity_id,
-                    proposed,
-                    profile.name,
-                )
-                continue
             with self._formation_lock, self._write_lock:
+                with translate_storage_errors("read identity profile"):
+                    profile = self._store.identities.identity_profile(identity_id)
+                try:
+                    proposed = None if profile is None else validated_identity_name(name)
+                except ValidationError:
+                    proposed = None
+                if profile is None or proposed is None:
+                    # A merged/deleted identity or invalid name named nobody.
+                    operation.speaker_names_refused += 1
+                    continue
+                if profile.name == proposed:
+                    continue
+                if profile.name is not None:
+                    refused += 1
+                    _LOGGER.warning(
+                        "a distilled name conflicts with an existing name; "
+                        "keeping the registered name"
+                    )
+                    continue
                 self._assert_identity_name(
                     profile.identity_id,
                     proposed,

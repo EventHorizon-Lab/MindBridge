@@ -61,6 +61,9 @@ setting. In particular the `faces` command needs a face analyzer, which is built
 files rather than a named recipe, so it has no flag: compose it in an application and select that
 application with `--app`.
 
+There is no `--answer-policy` flag. The product CLI uses the SDK's `strict` answer policy in both
+local and remote mode. Use the Python SDK or REST `AnswerRequest` for `best_effort`.
+
 Composition, model identity, credentials, and settings are documented in
 [configuration](../configuration.md).
 
@@ -363,7 +366,7 @@ exit 130 use their conventional plain stderr diagnostics.
 ### Operations without a remote route
 
 Every command whose operation has a `/v1` route runs under `--url`; the `--url` column above is
-the complete list. Eleven commands exit 10 with `unsupported_in_remote_mode` because the
+the complete list. Twelve commands exit 10 with `unsupported_in_remote_mode` because the
 operation has no route at all, not because the CLI declines to send one:
 
 - The control plane is SDK-only by [documented design](../context-os.md): `consolidation-candidates`,

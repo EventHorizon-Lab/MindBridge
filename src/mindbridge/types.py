@@ -1646,11 +1646,11 @@ class PrefetchResult:
 
 @dataclass(frozen=True, slots=True)
 class StreamCommit:
-    """One durable final observation plus retrieval success or a visible retrieval failure.
+    """One durable final observation, with retrieval skipped when awaiting settlement.
 
     `pending_settlement` is true when the reducer committed through `capture` rather than `add`:
     the record is durable and readable but has no vectors yet, so it stays invisible to `search`
-    until the host calls `settle`.
+    until the host calls `settle`. Both `prefetch` and `retrieval_error` may then be `None`.
     """
 
     record: MemoryRecord
@@ -1667,7 +1667,9 @@ class StreamCommit:
         if self.prefetch is not None and not isinstance(self.prefetch, PrefetchResult):
             raise ValidationError("stream prefetch result is invalid")
         error = _optional_text(self.retrieval_error, "stream retrieval_error")
-        if (self.prefetch is None) == (error is None):
+        if (self.prefetch is not None and error is not None) or (
+            self.prefetch is None and error is None and not self.pending_settlement
+        ):
             raise ValidationError("stream commit requires either prefetch or retrieval_error")
         object.__setattr__(self, "retrieval_error", error)
         object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))

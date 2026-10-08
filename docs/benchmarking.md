@@ -13,6 +13,10 @@ quality claims; use the utilities only for their narrower artifact or storage pu
 Never point a benchmark at an application's live `data_dir`. One physical directory has one live
 MindBridge owner, and each independent benchmark unit needs its own new directory.
 
+For participant-hosted Add/Search evaluation, use `mindbridge-bench eval serve`. See the
+[Agent Memory Leaderboard adapter](agent-memory-leaderboard.md) for configuration, authentication,
+ordered image content, physical user isolation, and retry behavior.
+
 ## Install and inspect tasks
 
 From a repository checkout, install the model and dataset extras used by the evaluation harness:
@@ -120,8 +124,10 @@ uv run --frozen mindbridge-bench eval \
   --output-path .benchmarks/results/locomo
 ```
 
-The resulting `results.jsonl` reports `unit_count`, `question_count`, `dataset_sha256`, and
-`evaluation_sha256` for each selected task.
+The resulting `results.jsonl` contains task/arm aggregates with `question_count`,
+`dataset_sha256`, and `evaluation_sha256`. `--check-integrity` additionally reports the selected
+input `unit_count`; it is not a field of the scored task aggregate. Read the
+[artifact reference](#results-and-reproducibility) before consuming results programmatically.
 
 Some datasets omit the clock used to interpret relative phrases such as "this morning". For a
 reproducible run, supply a timezone-aware fallback without changing questions that already carry a
@@ -258,8 +264,10 @@ annotated [example configuration](examples/eval.example.yaml) for every field an
 
 `benchmark.run` mirrors these flags: `tasks`, `arms`, `full_context_chars`, `compile_max_items`,
 `compile_max_chars`, `ingest`, `limit`, `offset`, `seed`, `bootstrap_samples`, `batch_size`,
+`compile_allow_partial_sources`,
 `repeat_index`, `max_batch_size`, `unit_concurrency`,
 `request_concurrency`, `judge_concurrency`, `recall_limit`, `device`, `device_lock`, `use_cache`,
+`answer_policy`,
 `run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `stream_results`,
 `download`,
 `allow_unverified_data`, `verbosity`, `quiet`, `compare`, `fail_on_regression`,
@@ -274,6 +282,11 @@ in the file. `--config`, the literal `--model mindbridge`, and the `--list-tasks
 shorthand: `--model-args` writes generation endpoint settings, `--gen-kwargs` writes
 `generation.max_tokens` and `generation.extra_body`, and `--judge-model-args` writes
 `benchmark.judge`.
+
+`--deliberate` and `--fallback-reference-at` also remain command-line-only;
+they are not accepted keys in `benchmark.run`. The product CLI `mindbridge ask` has no
+`--answer-policy` flag: this override belongs to the evaluator, while product REST and SDK
+requests carry their own policy. Keep the command used for an experiment with its artifacts.
 
 A reproducible run pins generation temperature to zero and uses the run seed, so
 `generation.temperature` and `generation.seed` are rejected. Disable model thinking through the
@@ -1433,32 +1446,6 @@ Custom behavior benchmarks must use only the public SDK: create a directory, con
 ingest through `add` or `add_many`, query through `search` or `ask`, score public return values, and
 close the instance before archiving artifacts. The local-index command is the only documented
 direct-adapter exception.
-
-## Local-index microbenchmark
-
-The synthetic benchmark isolates the SQLite-to-Zvec storage path:
-
-```bash
-mindbridge-bench local-index \
-  --data-dir .benchmarks/local-index/trial-001 \
-  --rows 1000 \
-  --dimension 128 \
-  --queries 20 \
-  --k 10 \
-  --seed 42 \
-  --quantization none
-```
-
-`--data-dir` must be empty. The JSON result reports ingest and optimization time, recall at `k`
-against exact search, query latency percentiles and throughput, plus SQLite, Zvec, and total bytes.
-Run each quantization mode against a separate directory.
-
-This command deliberately measures local adapters directly, which is the narrow storage
-microbenchmark exception in `AGENTS.md`, not a second product API. Its JSON therefore labels
-itself with `scope: storage_microbenchmark` and an `excludes` list. Its `ingest_seconds` is a
-synthetic-vector storage number and is not the product ingest figure: it never embeds, routes a
-modality, prepares media, grounds an answer, or touches `Memory`. The product ingest latency and
-throughput come from the `ingest` block of an `eval` run, which drives the public SDK.
 
 ## Artifact safety
 

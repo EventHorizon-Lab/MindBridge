@@ -1,5 +1,8 @@
 # Memory backend evaluation — 2026-09-08
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 This report records a multi-phase diagnostic evaluation of memory formation, evidence persistence,
 context compilation, and answer behavior. For the original compiler-v3 phase, the product baseline
 is the exact initial dirty-tree snapshot in

@@ -1,5 +1,8 @@
 # Historical out-of-scope EgoLife diagnostics
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Status: historical appendix; excluded from MindBridge product acceptance and future optimization.
 
 The fixed Ego100 raw-causal comparison and later read-only diagnostics below were executed during

@@ -87,6 +87,11 @@ request-rate policy, through its gateway, service mesh, or FastAPI/Starlette mid
 [deployment](../deployment.md) for supported process shapes and [operations](../operations.md) for
 shutdown and recovery.
 
+The [single-process deployment example](../deployment.md#rest-owner) keeps memory and its
+caller-owned model client in context managers around the server. Use that lifecycle when turning
+the adapter snippet above into a runnable service. Installing `server` alone does not install an
+ASGI server.
+
 ## Contract
 
 ### Content input

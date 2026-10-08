@@ -23,7 +23,7 @@ model runtimes and transports:
 | `local` | Jina and Sentence Transformers embedding, plus FunASR speech |
 | `openai` | Official OpenAI SDK adapter and media handling |
 | `face` | Local OpenCV face analysis |
-| `server` | FastAPI and Uvicorn REST serving |
+| `server` | FastAPI and Starlette REST adapter; bring your own ASGI server |
 | `mcp` | MCP server transport |
 | `observability` | OpenTelemetry SDK export support |
 | `benchmarks` | Benchmark download, parsing, scoring, and telemetry dependencies; datasets are downloaded separately |
@@ -73,6 +73,26 @@ host needs validation before opening storage.
 **Contract:** Unknown fields and providers are rejected. Numeric and Boolean values are strict;
 invalid values are not silently coerced. Declarative composition owns and closes every adapter it
 creates.
+
+### Loading a configuration file
+
+`Memory.from_config()` accepts a `MindBridgeConfig` or a mapping, not a filename. File decoding
+belongs to the host. JSON needs only the Python standard library:
+
+```python
+import json
+from pathlib import Path
+
+from mindbridge import Memory
+
+config = json.loads(Path("config.json").read_text(encoding="utf-8"))
+with Memory.from_config(config) as memory:
+    print(memory.capabilities.embedding_model)
+```
+
+For YAML, install a YAML parser in the host and decode with `yaml.safe_load()` before passing
+the mapping. MindBridge's product configuration does not depend on a YAML parser. The benchmark
+runner's `--config` flag handles YAML itself through the `benchmarks` extra.
 
 ### Provider fields
 

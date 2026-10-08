@@ -7,6 +7,7 @@ from datetime import datetime
 
 from mindbridge.infrastructure.local.store._codec import (
     SQLITE_PARAMETER_BATCH,
+    datetime_text,
     parse_datetime,
     prepare_write_batch,
     row_text,
@@ -138,6 +139,28 @@ class CaptureQueue:
                 """,
                 (error.strip() or None, memory_id),
             )
+
+    def failed_capture_ids(
+        self,
+        *,
+        enqueued_before: datetime,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        """Return aged failed captures, filtering before paging so fresh work cannot starve them."""
+        require_aware(enqueued_before, "enqueued_before")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        with self._connections.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT memory_id FROM capture_queue
+                WHERE attempts > 0 AND enqueued_at < ?
+                ORDER BY enqueued_at, memory_id
+                LIMIT ?
+                """,
+                (datetime_text(enqueued_before), limit),
+            ).fetchall()
+        return tuple(row_text(row, "memory_id") for row in rows)
 
     def pending_captures(
         self,

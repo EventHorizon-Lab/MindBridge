@@ -1,5 +1,8 @@
 # Baseline-2 decomposition — 2026-09-11
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Run: `mindbridge-bench eval --config .benchmarks/baseline_2.yaml`, run id `baseline-20260911`, code
 `origin/mindbridge-v03` at `112ef9a6`. Answerer and judge `qwen3.8-27b` (non-thinking, no
 `temperature` set), embedder `tencent/WeMM-Embedding-2B` (2048-d), speech FunASR, `recall_limit 12`,

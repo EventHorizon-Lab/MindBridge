@@ -1,5 +1,8 @@
 # Context OS round 2: identity as governed knowledge
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../../README.md) and the [research archive](../../research/README.md).
+
 Date: 2026-09-03. Base: the master merge on `claude/mindbridge-context-os-upgrade-0c41c9`
 (schema v11). This round makes naming a person an auditable, reversible, evidence-bearing
 operation, and binds the biometric identity registry to the semantic subject space.

@@ -1,5 +1,8 @@
 # Completing hybrid retrieval scores from durable memory
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Status: implementation frozen; ATM, cutoff-filtered raw/captioned M3, a separate clip-local speech
 M3 treatment, and artifact-disjoint LoCoMo-refined validation completed. A later LongMemEval
 full-500 attempt stopped during corpus formation and produced no QA result. This document makes no

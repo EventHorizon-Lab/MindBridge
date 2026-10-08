@@ -591,6 +591,25 @@ def test_retention_finalizes_cognitive_forgetting_and_abandons_failed_captures(
         assert [row.memory_id for row in memory.pending_captures()] == [queued.id]
 
 
+def test_failed_capture_retention_is_not_starved_by_unattempted_captures(tmp_path: Path) -> None:
+    with _memory(tmp_path, retention=RetentionPolicy(capture_failure_days=_AGED)) as memory:
+        unattempted = tuple(memory.capture(f"unattempted {index}").id for index in range(1000))
+        failed = memory.capture("failed after the first queue page")
+        memory._store.captures.record_capture_failure(failed.id, "model unavailable")
+
+        assert memory.apply_retention(dry_run=True).capture_memory_ids == (failed.id,)
+        assert memory.pending_captures(memory_ids=(failed.id,))
+        assert memory.apply_retention().capture_memory_ids == (failed.id,)
+        assert memory.pending_captures(memory_ids=(failed.id,)) == ()
+        assert memory.get(failed.id).id == failed.id
+        assert {
+            row.memory_id
+            for offset in range(0, len(unattempted), 100)
+            for row in memory.pending_captures(memory_ids=unattempted[offset : offset + 100])
+        } == set(unattempted)
+        assert memory.apply_retention().capture_memory_ids == ()
+
+
 def test_retention_dry_run_and_result_include_the_grounded_support_cascade(
     tmp_path: Path,
 ) -> None:
