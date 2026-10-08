@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import tarfile
 import zipfile
 from collections.abc import Callable, Sequence
 from fnmatch import fnmatchcase
@@ -109,15 +110,59 @@ def acquire_media(
     )
     for archive in archives:
         _extract_zip(archive, announce=announce)
+    _extract_selected_tars(destination, selected, announce)
     missing = tuple(
         pattern
         for pattern in selected
-        if not tuple(destination.glob(pattern)) and (download or not pattern.endswith(".zip"))
+        if not tuple(destination.glob(pattern))
+        and (download or not pattern.endswith((".zip", ".tar")))
     )
     if missing and not allow_missing:
         action = "download did not produce" if download else "offline media is missing"
         raise FileNotFoundError(f"{spec.name} {action}: {', '.join(missing)} under {destination}")
     return destination
+
+
+def _extract_selected_tars(
+    destination: Path, patterns: Sequence[str], announce: Callable[[str], None] | None
+) -> None:
+    for pattern in patterns:
+        if pattern.endswith(".tar"):
+            for archive in sorted(destination.glob(pattern)):
+                _extract_tar(archive, announce=announce)
+
+
+def _extract_tar(archive: Path, *, announce: Callable[[str], None] | None) -> None:
+    """Extract regular files atomically; reject links, duplicates and escaping paths."""
+    root = archive.parent.resolve()
+    with tarfile.open(archive) as volume:
+        entries = [entry for entry in volume.getmembers() if not entry.isdir()]
+        seen: set[Path] = set()
+        for entry in entries:
+            target = (root / entry.name).resolve()
+            if not entry.isfile() or not target.is_relative_to(root) or target in seen:
+                raise ValueError(f"unsafe tar member: {entry.name}")
+            seen.add(target)
+        if announce is not None:
+            announce(f"extracting {len(entries)} files from {archive}")
+        for entry in entries:
+            target = root / entry.name
+            if target.is_file() and target.stat().st_size == entry.size:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = volume.extractfile(entry)
+            if source is None:
+                raise ValueError(f"unreadable tar member: {entry.name}")
+            temporary: Path | None = None
+            try:
+                with source, NamedTemporaryFile(dir=target.parent, delete=False) as output:
+                    temporary = Path(output.name)
+                    shutil.copyfileobj(source, output)
+                os.replace(temporary, target)
+                temporary = None
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
 
 def _snapshot(repository: str, revision: str, patterns: Sequence[str], destination: Path) -> None:

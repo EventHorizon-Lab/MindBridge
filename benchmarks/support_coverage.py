@@ -106,7 +106,7 @@ _STALL_SECONDS = 900.0
 # that `--dataset` is unused. Changing this constant is how a branch measures a different corpus --
 # and the other two need extras (`face` for identity, `benchmarks` for Mem-Gallery's own `f1`) that
 # a tree's command has to install, which is a property of the tree rather than of this file.
-CORPUS: str = "longmemeval"
+CORPUS: str = "mem-gallery"
 # ATM-Bench is one store every question reads, so its questions are answered concurrently inside
 # one open rather than each getting a store of their own.
 ATM_QUESTIONS = 120
@@ -1251,5 +1251,26 @@ def _emit(
     return 0
 
 
+def launch(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Select a committed research suite.")
+    parser.add_argument(
+        "--suite",
+        choices=("complementary", "four-benchmark", "support-coverage"),
+        default="complementary",
+    )
+    args, remaining = parser.parse_known_args(argv)
+    if args.suite == "support-coverage":
+        return main(remaining)
+    if remaining:
+        parser.error("unrecognized arguments: " + " ".join(remaining))
+    if args.suite == "complementary":
+        from complementary_trial import main as complementary_main
+
+        return complementary_main()
+    from four_benchmark_suite import main as suite_main
+
+    return suite_main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(launch())

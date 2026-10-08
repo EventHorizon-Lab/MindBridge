@@ -24,6 +24,7 @@ AnswerSurface = Literal["ask", "compile"]
 BEST_EFFORT_TASKS = frozenset(
     {
         "m3-bench-robot",
+        "icm-bench",
         "mm-lifelong-day-test",
         "mm-lifelong-week-test",
         "mm-lifelong-month-train",

@@ -35,6 +35,7 @@ from mindbridge.benchmarks._official.clbench_judge import (
 from mindbridge.benchmarks._official.clbench_judge import (
     parse_grading_response as parse_clbench,
 )
+from mindbridge.benchmarks._official.icm_prompt import SEMANTIC_EQUIVALENCE_PROMPT
 from mindbridge.benchmarks._official.longmemeval_prompts import (
     build_answer_check_prompt as build_longmemeval_prompt,
 )
@@ -91,6 +92,7 @@ class JudgePlan:
     parser: Literal[
         "locomo",
         "m3",
+        "icm",
         "egotempo",
         "memlens",
         "mm_lifelong",
@@ -113,6 +115,7 @@ class JudgePlan:
 
 
 _PROTOCOLS = {
+    "icm-bench": "icm_semantic_equivalence_10f02babe3c7_user_only_v2",
     "locomo-refined": "locomo_refined_judge_887091190789",
     "m3-bench": "m3_agent_judge_0e3e41939bd8_system_v1",
     "video-mme-v2": "video_mme_v2_6e4bebb03202",
@@ -132,6 +135,7 @@ _PROTOCOLS = {
 }
 
 _OFFICIAL_JUDGE_MODELS = {
+    "icm-bench": "gemini-3-flash-preview",
     "locomo-refined": "qwen3-14b",
     "m3-bench": "gpt-4o-2024-11-20",
     "egotempo": "gemini-1.5-flash",
@@ -160,6 +164,7 @@ _OFFICIAL_JUDGE_MODELS = {
 # upstream number. The families that publish no deterministic metric beyond their judge output
 # are still listed, so an empty entry means "judge metrics only" rather than "not yet audited".
 _OFFICIAL_METRICS: dict[str, frozenset[str]] = {
+    "icm-bench": frozenset({"accuracy"}),
     # `evaluate.py` keeps the F1 and BLEU-1 of the accepted reference beside its judge label.
     "locomo-refined": frozenset({"llm_judge", "token_f1", "bleu_1"}),
     "m3-bench": frozenset({"accuracy"}),
@@ -222,6 +227,7 @@ _OFFICIAL_METRICS: dict[str, frozenset[str]] = {
 _OFFICIAL_METRIC_PREFIXES: dict[str, tuple[str, ...]] = {"personamem-v3": ("pr_",)}
 
 _JUDGE_METRICS = {
+    "icm-bench": frozenset({"accuracy"}),
     "locomo-refined": frozenset({"llm_judge"}),
     "m3-bench": frozenset({"accuracy"}),
     "egotempo": frozenset({"accuracy", "judge_score_0_5"}),
@@ -306,6 +312,7 @@ def task_primary_metric(task: str) -> str:
     if family is None:
         return "accuracy"
     return {
+        "icm-bench": "accuracy",
         "locomo-refined": "llm_judge",
         "m3-bench": "accuracy",
         "video-mme-v2": "rating",
@@ -471,7 +478,7 @@ def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer f
                 _bleu_1(normalized, reference, _locomo_tokens) for reference in references
             ),
         }
-    if family == "m3-bench" and not prediction:
+    if family in {"m3-bench", "icm-bench"} and not prediction:
         return {"accuracy": 0.0}
     if family == "memlens" and len(_memlens_prediction(prediction).split()) > 500:
         return {"accuracy": 0.0}
@@ -546,7 +553,7 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
         return None
     if family not in _JUDGE_METRICS:
         return None
-    if family == "m3-bench" and not prediction:
+    if family in {"m3-bench", "icm-bench"} and not prediction:
         return None
     if family == "atm-bench" and metadata.get("qtype") != "open_end":
         return None
@@ -597,6 +604,13 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
             candidate_metrics=candidate_metrics,
         )
     reference = references[0]
+    if family == "icm-bench":
+        prompt = SEMANTIC_EQUIVALENCE_PROMPT.format(
+            question=question,
+            ground_truth_answer=reference,
+            agent_answer=prediction,
+        )
+        return JudgePlan(protocol, "icm", ((JudgeMessage("user", prompt),),), 8192)
     if family == "m3-bench":
         prompt = _M3_PROMPT.format(
             question=question,
@@ -790,6 +804,8 @@ def parse_judge_response(  # noqa: C901 - mirrors seven incompatible upstream pa
         return {"llm_judge": float(label == "CORRECT")}
     if plan.parser == "m3":
         return {"accuracy": float("yes" in response.lower())}
+    if plan.parser == "icm":
+        return {"accuracy": float(response.strip().lower().rstrip(".") == "yes")}
     if plan.parser == "egotempo":
         match = re.search(r"\{.*?\}", response, re.DOTALL)
         if match is None:

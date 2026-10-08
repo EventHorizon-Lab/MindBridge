@@ -210,6 +210,7 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "CL-Bench",
         "EgoTempo",
         "ES-MemEval",
+        "ICM-Bench",
         "LoCoMo-Refined",
         "LongMemEval",
         "M3-Bench",
@@ -4044,6 +4045,7 @@ def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
 # and `personamem-v3` went a release reporting no breakdown at all. An empty
 # tuple means the family is expected to have no entry in the product table.
 _EXPECTED_BREAKDOWN_FIELDS: dict[str, tuple[str, ...]] = {
+    "icm-bench": ("category",),
     "locomo-refined": ("category",),
     "m3-bench": ("question_types",),
     "video-mme-v2": ("group_type", "level", "second_head", "third_head"),
@@ -4592,7 +4594,13 @@ def test_default_benchmarks_root_reaches_the_main_checkout_from_a_worktree(
     assert default_benchmarks_root(main) == main / ".benchmarks"
 
 
-def test_default_benchmarks_root_falls_back_outside_a_repository(tmp_path: Path) -> None:
+def test_default_benchmarks_root_falls_back_outside_a_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The host may itself put /tmp inside a repository. Model the no-marker condition.
+    is_dir, is_file = Path.is_dir, Path.is_file
+    monkeypatch.setattr(Path, "is_dir", lambda path: path.name != ".git" and is_dir(path))
+    monkeypatch.setattr(Path, "is_file", lambda path: path.name != ".git" and is_file(path))
     assert default_benchmarks_root(tmp_path) == Path(".benchmarks")
 
 
@@ -5819,7 +5827,7 @@ def test_run_arms_hands_every_task_to_the_completion_callback(tmp_path: Path) ->
 def test_only_the_tasks_whose_protocol_credits_no_abstention_ask_for_a_guess() -> None:
     """Pinned as a set: widening it silently turns a reported refusal into an invented answer.
 
-    M3-Bench-Robot and MM-Lifelong are both judged against a reference answer on a scale with no
+    M3-Bench-Robot, ICM-Bench and MM-Lifelong are judged against a reference answer on a scale with no
     abstention class, so a refusal there is a zero. Every other task measures abstention in some
     form -- LongMemEval and MEMLENS carry abstention abilities, ATM-Bench scores it as a class,
     LoCoMo's category 5 is adversarial -- so asking those for a guess would be a scoring change,
@@ -5834,6 +5842,7 @@ def test_only_the_tasks_whose_protocol_credits_no_abstention_ask_for_a_guess() -
     from mindbridge.benchmarks.task_catalog import TASKS
 
     assert {
+        "icm-bench",
         "m3-bench-robot",
         "mm-lifelong-day-test",
         "mm-lifelong-week-test",

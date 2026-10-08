@@ -70,6 +70,7 @@ _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
 # invisible in a results document, so `tests/unit/benchmarks/test_eval.py`
 # pins this table against the metadata the adapters actually emit.
 _BREAKDOWN_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "icm-bench": ("category",),
     "locomo-refined": ("category",),
     "m3-bench": ("question_types",),
     "video-mme-v2": ("group_type", "level", "second_head", "third_head"),

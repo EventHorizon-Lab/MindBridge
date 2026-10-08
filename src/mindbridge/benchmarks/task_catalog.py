@@ -9,6 +9,7 @@ from pathlib import Path
 
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
 from mindbridge.benchmarks.es_memeval import ES_MEMEVAL_ADAPTER_VERSION
+from mindbridge.benchmarks.icm_bench import ICM_ADAPTER_VERSION, ICM_DATA_REVISION
 from mindbridge.benchmarks.longmemeval import LONGMEMEVAL_ADAPTER_VERSION
 from mindbridge.benchmarks.openeqa import OPENEQA_ADAPTER_VERSION, OPENEQA_SPLITS
 from mindbridge.benchmarks.worldmemarena import WORLDMEMARENA_ADAPTER_VERSION
@@ -77,6 +78,7 @@ _SUPERMEMORY = (
 )
 _ATM = ("Jingbiao/ATM-Bench", "78e826dc07e97466b2f54443831ef9a83ab8b27c")
 _GALLERY = ("Ethan-Bei/Mem-Gallery", "af912daba984e896e253016b7c7e334ef92c2a6f")
+_ICM = ("ryanren0330/ICM-Bench", ICM_DATA_REVISION)
 _LONGMEMEVAL = ("xiaowu0162/longmemeval", "2ec2a557f339b6c0369619b1ed5793734cc87533")
 _ES_MEMEVAL = ("slptongji/ES-MemEval", "692624208acc077b8867698c1d6fcd998dee641a")
 _CLBENCH = ("tencent/CL-bench", "b28a5832a09b0d96c0cf4c22e90d7c60ede25b80")
@@ -149,6 +151,17 @@ def _task(
 TASKS: dict[str, TaskSpec] = {
     task.name: task
     for task in (
+        _task(
+            "icm-bench",
+            "ICM-Bench",
+            "icm-bench/annotations/qa_test.jsonl",
+            ICM_ADAPTER_VERSION,
+            _ICM,
+            digest="024f610839f812a95f1358320cb0aa02d222a2a90a8f22eb615dde3d7e47eff8",
+            auxiliary=("icm-bench/videos/metadata.jsonl", "icm-bench/resources/asr_transcripts"),
+            media="icm-bench/videos",
+            media_source=MediaSource("icm-bench", *_ICM, ("videos.tar",)),
+        ),
         _task(
             "locomo-refined",
             "LoCoMo-Refined",
