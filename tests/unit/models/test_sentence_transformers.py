@@ -326,7 +326,20 @@ def test_native_or_advertised_matryoshka_dimensions_define_the_space() -> None:
         )
 
 
+def test_injected_encoder_infers_its_revision_without_changing_vector_identity() -> None:
+    encoder = RecordingEncoder([[1.0, 0.0]])
+    encoder.config._commit_hash = REVISION
+    inferred = SentenceTransformersEmbedder(encoder, model_id="org/text")
+    pinned = SentenceTransformersEmbedder(encoder, model_id="org/text", revision=REVISION)
+    assert inferred.embedding_space == pinned.embedding_space
+    encoder.config._commit_hash = "b" * 40
+    updated = SentenceTransformersEmbedder(encoder, model_id="org/text")
+    assert updated.embedding_space != inferred.embedding_space
+
+
 def test_injected_encoder_requires_an_immutable_revision_and_positive_batch() -> None:
+    with pytest.raises(ValidationError, match="revision"):
+        SentenceTransformersEmbedder(RecordingEncoder([[1.0, 0.0]]), model_id="org/text")
     with pytest.raises(ValidationError, match="immutable"):
         SentenceTransformersEmbedder(
             RecordingEncoder([[1.0, 0.0]]),
@@ -502,6 +515,58 @@ def test_standard_loader_passes_the_immutable_revision_directly(
     assert encoder.batch_sizes == [9]
 
 
+def test_loader_resolves_an_omitted_revision_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    encoder = RecordingEncoder([[1.0, 0.0]])
+
+    def model_info(model_id: str) -> SimpleNamespace:
+        calls.append(model_id)
+        return SimpleNamespace(sha=REVISION)
+
+    def factory(model_id: str, **kwargs: object) -> RecordingEncoder:
+        calls.append((model_id, kwargs["revision"]))
+        return encoder
+
+    modules = {
+        "huggingface_hub": SimpleNamespace(model_info=model_info),
+        "sentence_transformers": SimpleNamespace(SentenceTransformer=factory),
+    }
+    monkeypatch.setattr(sentence_transformers, "import_module", modules.__getitem__)
+    inferred = SentenceTransformersEmbedder.load("org/text")
+    pinned = SentenceTransformersEmbedder(encoder, model_id="org/text", revision=REVISION)
+
+    assert calls == ["org/text", ("org/text", REVISION)]
+    assert inferred.embedding_space == pinned.embedding_space
+
+
+@pytest.mark.parametrize("sha", (None, "main", ""))
+def test_loader_rejects_unresolved_revisions_before_loading(
+    monkeypatch: pytest.MonkeyPatch, sha: str | None
+) -> None:
+    def imported(name: str) -> SimpleNamespace:
+        assert name == "huggingface_hub"
+        return SimpleNamespace(model_info=lambda _model: SimpleNamespace(sha=sha))
+
+    monkeypatch.setattr(sentence_transformers, "import_module", imported)
+    with pytest.raises(ModelError, match=r"resolve.*revision"):
+        SentenceTransformersEmbedder.load("org/text")
+
+
+def test_revision_resolution_maps_hub_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    def model_info(_model: str) -> None:
+        raise OSError("Hub unavailable")
+
+    monkeypatch.setattr(
+        sentence_transformers,
+        "import_module",
+        lambda _name: SimpleNamespace(model_info=model_info),
+    )
+    with pytest.raises(ModelError, match=r"resolve.*revision"):
+        SentenceTransformersEmbedder.load("org/text")
+
+
 def test_optional_dependency_and_mutable_revision_fail_before_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -519,6 +584,10 @@ def test_optional_dependency_and_mutable_revision_fail_before_execution(
     with pytest.raises(ModelError, match="local extra"):
         SentenceTransformersEmbedder.load("org/text", revision=REVISION)
     assert imported == ["sentence_transformers"]
+
+    with pytest.raises(ModelError, match="local extra"):
+        SentenceTransformersEmbedder.load("org/text")
+    assert imported == ["sentence_transformers", "huggingface_hub"]
 
 
 class GatedEncoder(RecordingEncoder):

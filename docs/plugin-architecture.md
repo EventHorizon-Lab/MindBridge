@@ -27,7 +27,11 @@ from mindbridge import Memory
 with Memory.from_config(
     {
         "data_dir": "./data",
-        "embedding": {"provider": "jina-omni"},
+        "embedding": {
+            "provider": "sentence-transformers",
+            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        },
         "speech": {"provider": "funasr"},
         "settings": {"index_speech": True},
     }

@@ -48,7 +48,10 @@ from mindbridge import Memory
 config = {
     "data_dir": "./data/mindbridge-quickstart",
     # The bundled Jina adapter embeds text, images, video, and audio locally.
-    "embedding": {"provider": "jina-omni"},
+    "embedding": {
+        "provider": "sentence-transformers",
+        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+    },
     # These two zeroes make this one-record tutorial deterministic.
     # Remove the settings block to use the production defaults.
     "settings": {

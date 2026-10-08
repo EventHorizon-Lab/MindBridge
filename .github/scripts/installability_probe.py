@@ -140,7 +140,7 @@ def _local() -> None:
     import cairosvg
     import torchaudio.functional
 
-    from mindbridge.models.jina import _require_local_extra
+    from mindbridge.models._jina import _require_local_extra
 
     for name in ("funasr", "librosa", "sentence_transformers", "soundfile", "torch"):
         importlib.import_module(name)
@@ -240,7 +240,7 @@ MODULES: dict[str, tuple[str, ...]] = {
     "face": ("mindbridge", "mindbridge.models.opencv_face"),
     "local": (
         "mindbridge.models.funasr",
-        "mindbridge.models.jina",
+        "mindbridge.models._jina",
         "mindbridge.models.sentence_transformers",
     ),
     "server": ("mindbridge.api", "mindbridge.api.app"),

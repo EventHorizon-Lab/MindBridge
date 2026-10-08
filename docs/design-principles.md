@@ -314,7 +314,7 @@ an owning reference for detail. A cell that stops being true is a defect in this
 | Concern | Current release | Product direction |
 | --- | --- | --- |
 | Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; deferred enrichment through `capture`/`settle`; async speculative omni recall | More capture formats normalize into the same canonical contract |
-| Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
+| Embedding | Caller explicitly supplies a backend; Sentence Transformers includes the pinned Jina v5 Omni recipe | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
 | Extensions | The explicit model protocols in [architecture](architecture.md#model-boundary), including `ConsolidationBackend` for the memory control plane, one of them optional; no registry. Declarative configuration builds a subset of the slots; the rest are object injection only | Optional domain capabilities after a real implementation establishes the contract |

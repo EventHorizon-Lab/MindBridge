@@ -239,7 +239,7 @@ forgotten person would require retaining the template that erasure destroys.
 
 ### 8. Continuous interaction
 
-`AsyncOmniPrefetch` coalesces evolving query snapshots and confirms one final revision. The generic
+`AsyncOmniPrefetch` coalesces evolving query snapshots and confirms the final snapshot. The generic
 `AsyncCaptureStream` treats updates as speculative retrieval, a final event as the durable write,
 and cancellation or incomplete end-of-stream as discard. `AsyncAudioStream` reduces PCM, VAD, ASR
 partials, and acoustic boundaries; `AsyncVisionStream` reduces encoded frames, descriptions, and
@@ -339,8 +339,8 @@ the kernel retains control of validation, record identity, durability, evidence,
 and lifecycle.
 
 Applications can compose those objects directly, group them in `MemoryPlugins`, or use
-`Memory.from_config` for the bundled provider catalog. Current bundled adapters cover Jina Omni and
-Sentence Transformers embedding, OpenAI-compatible
+`Memory.from_config` for the bundled provider catalog. Current bundled adapters cover
+Sentence Transformers embedding, including the pinned Jina Omni checkpoint, OpenAI-compatible
 embedding/generation/transcription/formation/vision/consolidation, FunASR speech, and OpenCV face
 analysis. Exact extras, provider fields, model revisions, and license constraints are maintained in
 [configuration](configuration.md).

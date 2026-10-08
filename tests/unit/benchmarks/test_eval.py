@@ -950,7 +950,7 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
 
     monkeypatch.setattr(openai, "OpenAI", Client)
     monkeypatch.setattr(eval_module, "OpenAIModels", Models)
-    monkeypatch.setattr(eval_module, "JinaOmniEmbedder", Embedder)
+    monkeypatch.setattr(eval_module, "SentenceTransformersEmbedder", Embedder)
 
     pool = eval_module._BackendPool(
         ModelConfig(), device="cuda", batch_size=8, needs_speech=False, seed=7
@@ -1081,7 +1081,12 @@ def test_configured_devices_are_locked_in_physical_order(
 ) -> None:
     config = MindBridgeConfig.model_validate(
         {
-            "embedding": {"provider": "jina-omni", "device": "cuda:0"},
+            "embedding": {
+                "provider": "sentence-transformers",
+                "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+                "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                "device": "cuda:0",
+            },
             "speech": {"provider": "funasr", "device": "cuda:1"},
         }
     )
@@ -1133,7 +1138,9 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
             {
                 "data_dir": "ignored-by-benchmark",
                 "embedding": {
-                    "provider": "jina-omni",
+                    "provider": "sentence-transformers",
+                    "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+                    "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
                     "device": "cpu",
                     "batch_size": 4,
                 },
@@ -4426,7 +4433,7 @@ def test_eval_config_defaults_absent_sections_instead_of_failing(
 
     assert config is not None
     assert config.generation is not None
-    assert config.embedding.provider in {"openai", "jina-omni"}
+    assert config.embedding.provider in {"openai", "sentence-transformers"}
 
 
 def test_eval_config_rejects_an_unknown_harness_key(tmp_path: Path) -> None:

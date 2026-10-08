@@ -141,7 +141,6 @@ async def test_partial_snapshots_are_speculative_and_only_final_is_durable(
         assert len(commits) == 1
         assert commits[0].record.content == "find the red toolbox"
         assert commits[0].prefetch is not None
-        assert commits[0].prefetch.revision == 2
         assert [item.content for item in (await memory.list()).items] == ["find the red toolbox"]
     finally:
         await memory.close()
@@ -205,7 +204,7 @@ async def test_interleaved_stream_events_keep_prefetch_and_commits_associated(
         ]
 
         assert [commit.stream_id for commit in commits] == ["left", "right"]
-        assert [commit.prefetch.revision for commit in commits if commit.prefetch] == [1, 1]
+        assert all(commit.prefetch is not None for commit in commits)
         assert {item.content for item in (await memory.list()).items} == {"alpha", "beta"}
     finally:
         await memory.close()
@@ -262,7 +261,7 @@ async def test_asr_partial_routes_pcm_to_text_embedding_and_preserves_audio(
         assert len(commits) == 1
         commit = commits[0]
         assert commit.stream_id == "headset"
-        assert commit.prefetch is not None and commit.prefetch.revision == 1
+        assert commit.prefetch is not None
         assert commit.record.modality is Modality.AUDIO
         assert "red toolbox" in commit.record.content
         assert commit.record.occurred_at == started_at

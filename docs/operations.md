@@ -251,13 +251,19 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 
-from mindbridge import JinaOmniEmbedder, Memory
+from mindbridge import SentenceTransformersEmbedder, Memory
 
 provider = TracerProvider()
 provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
 trace.set_tracer_provider(provider)
 
-with Memory("./data", embedder=JinaOmniEmbedder()) as memory:
+with Memory(
+    "./data",
+    embedder=SentenceTransformersEmbedder(
+        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+    ),
+) as memory:
     memory.add("Remember this")
     memory.search("Remember")
 

@@ -54,8 +54,9 @@
 # recover.
 embedding:
   # `openai` reaches any OpenAI-compatible server, including a local vLLM.
-  # Alternatives: `jina-omni` (bundled local omni-modal model, the default) and
-  # `sentence-transformers` (requires `model` and `revision`).
+  # Alternative: `sentence-transformers` (requires `model`; `revision` is optional).
+  # The default Jina model is jinaai/jina-embeddings-v5-omni-small-retrieval through it,
+  # pinned to revision e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4.
   provider: openai
   base_url: http://127.0.0.1:8000/v1
   # Local servers usually accept any non-empty string; omit the field to let the SDK read

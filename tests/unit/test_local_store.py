@@ -203,59 +203,6 @@ def _joint_state_memory(
     )
 
 
-def _install_legacy_identity_schema(
-    connection: sqlite3.Connection,
-    *,
-    with_name: bool,
-    embedding_required: bool = True,
-) -> None:
-    connection.executescript(
-        """
-        DROP TABLE face_observations;
-        DROP TABLE face_analyses;
-        DROP TABLE speech_segments;
-        DROP TABLE speech_analyses;
-        DROP TABLE identity_exemplars;
-        DROP TABLE identity_aliases;
-        DROP TABLE identities;
-        CREATE TABLE speech_analyses (
-            asset_id TEXT PRIMARY KEY REFERENCES media_assets (asset_id) ON DELETE CASCADE,
-            model_id TEXT NOT NULL,
-            space_id TEXT NOT NULL,
-            transcript TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        """
-    )
-    name_column = "name TEXT," if with_name else ""
-    centroid_column = "centroid BLOB NOT NULL," if embedding_required else "centroid BLOB,"
-    connection.executescript(
-        f"""
-        CREATE TABLE speaker_identities (
-            speaker_id TEXT PRIMARY KEY,
-            {name_column}
-            model_id TEXT NOT NULL,
-            space_id TEXT NOT NULL,
-            dimension INTEGER NOT NULL,
-            {centroid_column}
-            observations INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE speech_segments (
-            asset_id TEXT NOT NULL REFERENCES speech_analyses (asset_id) ON DELETE CASCADE,
-            position INTEGER NOT NULL,
-            start_ms INTEGER NOT NULL,
-            end_ms INTEGER NOT NULL,
-            transcript TEXT NOT NULL,
-            speaker_id TEXT REFERENCES speaker_identities (speaker_id) ON DELETE SET NULL,
-            identity_score REAL,
-            PRIMARY KEY (asset_id, position)
-        );
-        """
-    )
-
-
 def _video_asset(store: LocalStore, label: str) -> StoredAsset:
     """Write one memory that owns one fresh video asset."""
     asset = _asset(
@@ -1744,19 +1691,6 @@ def test_evidence_and_projection_share_one_transaction_time(tmp_path: Path) -> N
     assert before_retraction.confidence == pytest.approx(0.96)
     assert retracted.context.evidence_ids == (first.memory_id,)
     assert retracted.context.confidence == pytest.approx(0.8)
-
-
-# The intent vocabulary the whole migration chain has to end up admitting, spelled out rather
-# than read from the schema so a step that quietly narrows the CHECK fails here.
-_ADMITTED_INTENTS = (
-    "reinforce",
-    "consolidate",
-    "correct",
-    "forget",
-    "identify",
-    "merge",
-    "consent",
-)
 
 
 def test_pending_capture_filter_is_globally_oldest_first_across_sqlite_batches(
