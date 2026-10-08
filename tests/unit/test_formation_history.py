@@ -25,6 +25,7 @@ from mindbridge import (
     ObservationContext,
     ValidationError,
 )
+from mindbridge.infrastructure.local.store import records as stored_records
 from mindbridge.models.openai_sdk import _formation_content, _formation_results
 
 
@@ -115,6 +116,12 @@ def test_text_history_does_not_resolve_or_reopen_original_media(
         def unexpected_media(_asset: object) -> None:
             raise AssertionError("text history must not resolve original media")
 
+        with monkeypatch.context() as storage_patch:
+            storage_patch.setattr(stored_records, "_read_memory_assets", unexpected_media)
+            (text_history,) = memory._store.records.formation_history(
+                known_before=datetime.now(timezone.utc), exclude_ids=(), limit=1
+            )
+            assert text_history.modality == "text" and text_history.assets == ()
         monkeypatch.setattr(memory._hydrator, "asset_ref", unexpected_media)
         memory.add("She left her notebook.")
         (history,) = former.inputs[-1].history
@@ -177,6 +184,83 @@ def test_withdrawing_support_that_hides_history_prevents_atomic_commit(tmp_path:
         records = memory.list().items
         assert any(record.content == "She left her notebook." for record in records)
         assert not any(record.content == "Ada left her notebook." for record in records)
+
+
+def test_delayed_formation_reads_the_history_version_known_at_capture(tmp_path: Path) -> None:
+    former = HistoryFormer()
+    with Memory(
+        tmp_path, embedder=TinyEmbedder(), former=former, formation_history_max_rows=16
+    ) as memory:
+        source = memory.add("A named visitor arrived.")
+        history_id = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(source.id,),
+                proposal=FormationProposal(
+                    kind=MemoryKind.EVENT,
+                    content="Ada is the visitor.",
+                    subject="Ada",
+                    confidence=0.8,
+                ),
+            )
+        ).created_ids[0]
+        before = memory.get(history_id).context
+        assert before is not None
+        pending = memory.capture("She left her notebook.")
+        correction = memory.apply(
+            MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(history_id,))
+        )
+        assert memory.rollback(correction.operation_id)
+        restored = memory.get(history_id).context
+        assert restored is not None and restored.recorded_at > pending.created_at
+        assert memory.settle(memory_ids=(pending.id,)) == 1
+        history = next(record for record in former.inputs[-1].history if record.id == history_id)
+        assert history.context is not None
+        assert history.context.recorded_at == before.recorded_at
+        assert history.context.retired_at is None
+
+
+@pytest.mark.parametrize("first_visible", [False, True])
+def test_batch_grounding_uses_each_targets_own_history_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_visible: bool
+) -> None:
+    former = HistoryFormer()
+    with Memory(
+        tmp_path, embedder=TinyEmbedder(), former=former, formation_history_max_rows=16
+    ) as memory:
+        standing = memory.add("Ada is the visitor.")
+        assert standing.context is not None
+
+        def history_for(
+            source: MemoryRecord, _excluded: Sequence[str]
+        ) -> tuple[tuple[MemoryRecord, ...], bool]:
+            visible = first_visible if source.content == "first" else not first_visible
+            assert standing.context is not None
+            return (
+                (replace(standing, context=replace(standing.context, visible=visible)),),
+                False,
+            )
+
+        def form(inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+            return tuple(
+                (
+                    FormationProposal(
+                        kind=MemoryKind.EVENT,
+                        content=f"Ada saw {item.content.text}.",
+                        subject="Ada",
+                        evidence_ids=(item.memory_id, standing.id),
+                    ),
+                )
+                for item in inputs
+            )
+
+        monkeypatch.setattr(memory._formation, "_history_for", history_for)
+        monkeypatch.setattr(former, "form", form)
+        memory.add_many(("first", "second"))
+        formed = {
+            record.content for record in memory.list().items if record.content.startswith("Ada saw")
+        }
+        assert formed == {"Ada saw first." if first_visible else "Ada saw second."}
 
 
 def _history_input(*, retired: bool = False) -> FormationInput:
@@ -257,6 +341,63 @@ def test_adapter_does_not_accept_another_targets_private_history() -> None:
         }
     )
     assert _formation_results(response, (first, second)) == ((), ())
+
+
+@pytest.mark.parametrize("different_version", [False, True])
+def test_adapter_assigns_private_aliases_to_each_targets_snapshot_of_one_record(
+    different_version: bool,
+) -> None:
+    first = _history_input()
+    old = first.history[0]
+    assert old.context is not None
+    changed = (
+        replace(old, context=replace(old.context, confidence=0.5)) if different_version else old
+    )
+    second = replace(first, memory_id="second", history=(changed,))
+    payload = _formation_content((first, second))
+    assert isinstance(payload, str)
+    observations = json.loads(payload)["observations"]
+    aliases = tuple(item["read_only_history"][0]["observation_id"] for item in observations)
+    assert aliases[0] != aliases[1]
+    details = observations[1]["read_only_history"][0]["context"]
+    assert details["confidence"] == (0.5 if different_version else 1.0)
+    assert details["recorded_at"] == old.context.recorded_at.isoformat()
+    for private in (True, False):
+        response = json.dumps(
+            {
+                "items": [
+                    {
+                        "observation_id": f"observation_{index}",
+                        "proposals": [
+                            {
+                                "kind": "event",
+                                "content": "Ada left.",
+                                "confidence": 0.8,
+                                "evidence_observation_ids": [
+                                    f"observation_{index}",
+                                    aliases[index if private else 1 - index],
+                                ],
+                            }
+                        ],
+                    }
+                    for index in range(2)
+                ]
+            }
+        )
+        results = _formation_results(response, (first, second))
+        assert tuple(len(group) for group in results) == ((1, 1) if private else (0, 0))
+        if private:
+            assert results[0][0].evidence_ids == (first.memory_id, old.id)
+            assert results[1][0].evidence_ids == (second.memory_id, old.id)
+
+
+def test_formation_input_rejects_duplicate_snapshots_within_one_targets_history() -> None:
+    first = _history_input()
+    old = first.history[0]
+    assert old.context is not None
+    changed = replace(old, context=replace(old.context, confidence=0.5))
+    with pytest.raises(ValidationError, match="history IDs must be unique"):
+        replace(first, history=(old, changed))
 
 
 @pytest.mark.parametrize("rows", [-1, 129, True])

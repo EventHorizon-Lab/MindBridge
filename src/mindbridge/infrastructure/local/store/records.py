@@ -769,8 +769,9 @@ class MemoryRecords:
     ) -> tuple[StoredMemory, ...]:
         """Read bounded causal background, including retired claims as counterevidence.
 
-        Forgotten content is excluded even from background. Old assertions retain their status;
-        this read never promotes them back to active sources or uses metadata for isolation.
+        Records and version contexts share one read snapshot, without loading media. Forgotten
+        content is excluded even from background. Old assertions retain their status; this read
+        never promotes them back to active sources or uses metadata for isolation.
         """
         require_aware(known_before, "known_before")
         if not 1 <= limit <= 129:
@@ -778,19 +779,43 @@ class MemoryRecords:
         with self._connections.read_transaction() as connection:
             rows = connection.execute(
                 """
-                SELECT memory_id FROM memory_records
+                SELECT memory_id, content, 'text' AS modality, memory_type, metadata_json,
+                       occurred_at, occurred_end, last_accessed_at, access_count,
+                       created_at, updated_at, place_id, forgotten_at
+                FROM memory_records
                 WHERE created_at <= ? AND forgotten_at IS NULL AND content <> ''
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1 FROM memory_semantics AS s
+                      WHERE s.memory_id = memory_records.memory_id
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM memory_versions AS v
+                      WHERE v.memory_id = memory_records.memory_id AND v.recorded_at <= ?
+                    )
+                  )
                 ORDER BY created_at DESC, memory_id DESC LIMIT ?
                 """,
-                (datetime_text(known_before), limit + len(exclude_ids)),
+                (
+                    datetime_text(known_before),
+                    datetime_text(known_before),
+                    limit + len(exclude_ids),
+                ),
             ).fetchall()
             excluded = set(exclude_ids)
-            identifiers = tuple(
-                row_text(row, "memory_id")
-                for row in rows
-                if row_text(row, "memory_id") not in excluded
-            )[:limit]
-        return self.read_memories(identifiers, known_at=known_before)
+            selected = tuple(row for row in rows if row_text(row, "memory_id") not in excluded)[
+                :limit
+            ]
+            identifiers = tuple(row_text(row, "memory_id") for row in selected)
+            contexts, semantic_ids = read_memory_contexts(
+                connection, identifiers, known_at=known_before
+            )
+            return tuple(
+                memory_from_row(row, assets=(), context=contexts.get(memory_id))
+                for row in selected
+                if (memory_id := row_text(row, "memory_id")) not in semantic_ids
+                or memory_id in contexts
+            )
 
     def reinforce_memories(self, memory_ids: Sequence[str], *, accessed_at: datetime) -> int:
         """Record one bounded retrieval reinforcement for each existing memory."""

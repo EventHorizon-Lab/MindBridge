@@ -190,7 +190,9 @@ proposal item's own observation_id exactly once. Do not cite an alias outside th
 An observation may carry read_only_history and history_truncated. Historical records are
 background, not new observations: never return items for history_N. Use history to resolve
 pronouns and changes, and cite the history_N aliases actually needed as well as the current
-observation. Respect recorded time, validity, supersedes links, and retractions. Retired,
+observation. Each history alias belongs only to the observation that lists it; another observation
+may show a different version of the same record. Respect recorded time, validity, supersedes links,
+and retractions. Retired,
 invisible, or forgotten claims may explain an old belief but cannot support a current assertion.
 A later correction can invalidate an earlier name; never restore a withdrawn identity merely
 because an old record names it. An incomplete history is not proof that no correction exists.
@@ -2179,7 +2181,8 @@ def _formation_content(
         )
         if value.history or value.history_truncated:
             payload["read_only_history"] = [
-                _formation_history_payload(record, aliases[record.id]) for record in value.history
+                _formation_history_payload(record, aliases[position][record.id])
+                for record in value.history
             ]
             payload["history_truncated"] = value.history_truncated
         payloads.append(payload)
@@ -2193,18 +2196,21 @@ def _formation_content(
     return parts
 
 
-def _formation_aliases(inputs: Sequence[FormationInput]) -> dict[str, str]:
-    aliases = {value.memory_id: f"observation_{index}" for index, value in enumerate(inputs)}
-    histories: dict[str, MemoryRecord] = {}
+def _formation_aliases(inputs: Sequence[FormationInput]) -> tuple[dict[str, str], ...]:
+    observations = {value.memory_id: f"observation_{index}" for index, value in enumerate(inputs)}
+    result = []
+    history_position = 0
     for value in inputs:
-        for record in value.history:
-            if record.id in histories and histories[record.id] != record:
-                raise ValidationError("formation history has inconsistent records for one ID")
-            histories[record.id] = record
-    for memory_id in sorted(histories):
-        if memory_id not in aliases:
-            aliases[memory_id] = f"history_{len(aliases) - len(inputs)}"
-    return aliases
+        aliases: dict[str, str] = {}
+        histories = {record.id: record for record in value.history}
+        for memory_id in sorted(histories):
+            if memory_id in observations:
+                aliases[memory_id] = observations[memory_id]
+            else:
+                aliases[memory_id] = f"history_{history_position}"
+                history_position += 1
+        result.append(aliases)
+    return tuple(result)
 
 
 def _formation_history_payload(record: MemoryRecord, alias: str) -> dict[str, object]:
@@ -2223,6 +2229,8 @@ def _formation_history_payload(record: MemoryRecord, alias: str) -> dict[str, ob
             "subject": context.subject,
             "predicate": context.predicate,
             "value": context.value,
+            "confidence": context.confidence,
+            "recorded_at": context.recorded_at.isoformat(),
             "visible": context.visible,
             "retired": context.retired_at is not None,
             "valid_from": None if context.valid_from is None else context.valid_from.isoformat(),
@@ -2278,7 +2286,10 @@ def _formation_results(  # noqa: C901 - validates the strict batch witness envel
         raise _invalid_formation_response()
     expected = tuple(f"observation_{index}" for index, _value in enumerate(inputs))
     source_aliases = _formation_aliases(inputs)
-    ids_by_alias = {alias: memory_id for memory_id, alias in source_aliases.items()}
+    ids_by_alias = dict(zip(expected, (value.memory_id for value in inputs), strict=True))
+    ids_by_alias.update(
+        (alias, memory_id) for aliases in source_aliases for memory_id, alias in aliases.items()
+    )
     dropped = 0
     by_id: dict[str, tuple[FormationProposal, ...]] = {}
     for item in items:
@@ -2295,9 +2306,10 @@ def _formation_results(  # noqa: C901 - validates the strict batch witness envel
             raise _invalid_formation_response()
         if observation_id not in expected:
             raise _invalid_formation_response()
-        target = inputs[int(observation_id.removeprefix("observation_"))]
+        target_index = int(observation_id.removeprefix("observation_"))
+        target = inputs[target_index]
         allowed = set(expected) | {
-            source_aliases[record.id]
+            source_aliases[target_index][record.id]
             for record in target.history
             if record.forgotten_at is None
             and (

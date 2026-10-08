@@ -52,6 +52,25 @@ evidence; visibility is separate from temporal validity. Failure uses the existi
 model error and preserves the newly captured observation. No additional public or disk contracts
 change in these follow-up repairs.
 
+## Causal history repairs
+
+Non-active history reads now select a semantic version recorded by the target's capture time,
+rather than leaking a later restored version. Eligibility is applied before the row window, so
+an unknown later claim cannot displace an older known record. Background text and version
+contexts are hydrated in one SQLite read transaction without reading asset metadata.
+
+Each observation now has private history aliases and a separate grounding record map. Different
+snapshots of one ID may coexist in a model batch; another target's snapshot cannot change whether
+the proposal is accepted or which metadata it inherits. Conflicting copies within one target's
+history still fail validation. The prompt exposes version recording time and confidence and
+clarifies alias ownership, changing the OpenAI formation recipe fingerprint.
+
+The tests reproduce a delayed capture followed by correction and rollback, cross-target snapshot
+overwrites in both orders, private alias validation, and pre-window temporal filtering. This does
+not add a general state replay mechanism: text, metadata and confidence/visibility projections
+that the store updates in place retain their existing historical limitations. Commit-time
+visibility and retirement checks still guard current acceptance separately.
+
 ## Compatibility
 
 `Memory` and `MemoryConfig` gain two history settings; `FormationInput` gains defaulted `history`

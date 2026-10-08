@@ -143,6 +143,10 @@ def select_memory_contexts(  # noqa: C901 - one authoritative bitemporal selecti
         if memory_id in selected:
             continue
         recorded_at = parse_datetime(row_text(row, "recorded_at"))
+        # Historical background also needs the version known then, even when retired or hidden
+        # claims are intentionally included. Activity controls eligibility, not transaction time.
+        if known_at is not None and recorded_at > known_at:
+            continue
         retired_at = optional_datetime_from_row(row, "retired_at")
         row_valid_from = optional_datetime_from_row(row, "valid_from")
         row_valid_until = optional_datetime_from_row(row, "valid_until")

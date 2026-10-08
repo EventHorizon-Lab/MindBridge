@@ -204,10 +204,18 @@ semantic history search or a guarantee that natural-language retractions are und
 
 The OpenAI adapter aliases background records as `history_N`, preserves their event and validity
 times, and permits a proposal to cite only its target, this batch, and its own active history.
+History selects semantic versions recorded by the target's capture time, including retired
+versions as background. Records and contexts share one database read snapshot without loading
+media metadata. A typed record with no version known by that cutoff does not consume the row
+window. Each target owns its history aliases and grounding snapshot, even when another target
+reads a different version of the same record.
+
+This is version selection, not complete historical replay: stored text, metadata and in-place
+confidence/visibility projections retain the store's existing semantics.
 The kernel checks cited records again in the commit transaction. If a cited record was forgotten,
 or its latest recorded version became hidden or retired during formation, derived records do not
-commit and a `ModelError` with
-`reason="response_invalid"`, `stage="form"` reports that the observation remains stored.
+commit and a `ModelError` with `reason="response_invalid"`, `stage="form"` reports that the
+observation remains stored.
 The formation prompt change changes `formation_space`; existing derived records remain available.
 Reprocessing the same source under the new recipe may create additional derived records.
 

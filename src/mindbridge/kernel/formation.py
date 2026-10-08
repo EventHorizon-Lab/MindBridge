@@ -11,6 +11,7 @@ import builtins
 import hashlib
 import json
 import logging
+from collections import ChainMap
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -59,7 +60,6 @@ from mindbridge.types import (
     MemoryOperation,
     MemoryRecord,
     MemoryType,
-    Modality,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -93,8 +93,10 @@ def _proposal_sources(
     records: Mapping[str, MemoryRecord],
 ) -> tuple[str, ...] | None:
     evidence = (source.memory_id,) if proposal.evidence_ids is None else proposal.evidence_ids
-    allowed = set(batch) | {record.id for record in source.history}
-    if source.memory_id not in evidence or not set(evidence) <= allowed:
+    history_ids = {record.id for record in source.history}
+    if source.memory_id not in evidence or any(
+        item not in batch and item not in history_ids for item in evidence
+    ):
         raise ModelError(
             "formation proposal cited an observation outside its batch",
             reason="response_invalid",
@@ -581,9 +583,7 @@ class Formation(Traced):
                 # Do not hide a recent correction to make room for a shorter old assertion.
                 truncated = True
                 break
-            hydrated = self._hydrator.memory_record(
-                replace(record, assets=(), modality=Modality.TEXT.value)
-            )
+            hydrated = self._hydrator.memory_record(record)
             history.append(hydrated)
             remaining -= len(record.content)
         return tuple(reversed(history)), truncated
@@ -681,10 +681,15 @@ class Formation(Traced):
         pairs: builtins.list[tuple[PreparedMemory, str, float]] = []
         inputs_by_id = {value.memory_id: value for value in inputs}
         formed_sources = tuple(source for source in pending if source.id in inputs_by_id)
-        evidence_by_id = {source.id: source for source in formed_sources}
-        evidence_by_id.update((record.id, record) for value in inputs for record in value.history)
+        batch_records = {source.id: source for source in formed_sources}
         refused = 0
         for source in formed_sources:
+            # One ID can have different states at different observations' causal cutoffs. Never
+            # let another target's background overwrite the snapshot this proposal actually saw.
+            evidence_by_id = ChainMap(
+                batch_records,
+                {record.id: record for record in inputs_by_id[source.id].history},
+            )
             proposals = proposals_by_id.get(source.id, ())
             # Application data and the symbolic place travel with the knowledge formed from them:
             # a host that filters recall by metadata expects the tag on the observation to hold
