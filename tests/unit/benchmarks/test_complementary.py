@@ -71,3 +71,11 @@ def test_invalid_selector_output_is_rejected(mutation: str) -> None:
         data["answer"] = "guessed answer"
     with pytest.raises(ValueError):
         parse_plan(json.dumps(data), 3)
+
+
+@pytest.mark.parametrize("facet", ["first event", " FIRST EVENT ", "first\t event"])
+def test_duplicate_normalized_facets_are_rejected(facet: str) -> None:
+    data = json.loads(_plan())
+    data["facets"][1] = facet
+    with pytest.raises(ValueError, match="duplicate information need"):
+        parse_plan(json.dumps(data), 3)

@@ -233,6 +233,7 @@ def score(client: OpenAI, model: str, question: str, reference: str, prediction:
         model=model,
         temperature=0,
         max_tokens=8192,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         messages=[{"role": message.role, "content": message.content} for message in plan.calls[0]],
     )
     return parse_judge_response(plan, response.choices[0].message.content or "")["accuracy"]
@@ -408,7 +409,7 @@ def main() -> int:
     settings = _env()
     output = ROOT / recipe["suite_id"]
     output.mkdir(parents=True, exist_ok=True)
-    if (output / "predictions.jsonl").exists():
+    if any(output.iterdir()):
         raise RuntimeError("refusing to overwrite a trial; preserve partial evidence")
     print("TRIAL_RECIPE " + json.dumps(recipe), flush=True)
     print(

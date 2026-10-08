@@ -99,6 +99,13 @@ def main() -> int:
         path.chmod(0o600)
         for task in recipe["tasks"]:
             output = workspace / "results" / task
+            report = output / "results.jsonl"
+            if report.is_file():
+                entry = {"task": task, "exit_code": 0, "output": str(output)}
+                results.append(entry)
+                print("TASK_STATUS " + json.dumps(entry), flush=True)
+                print("TASK_RESULT " + report.read_text(), flush=True)
+                continue
             command = [
                 sys.executable,
                 "-m",
@@ -120,7 +127,7 @@ def main() -> int:
                 "--use-cache",
                 str(workspace / "responses" / task),
             ]
-            if output.exists():
+            if (output / "samples.partial.jsonl").is_file():
                 command.append("--resume")
             if recipe["phase"] == "prepare":
                 command.extend(["--check-integrity", "--no-download"])
@@ -128,7 +135,6 @@ def main() -> int:
             finished = subprocess.run(
                 command, check=False, env={**os.environ, "PYTHONUNBUFFERED": "1"}
             )
-            report = output / "results.jsonl"
             entry = {"task": task, "exit_code": finished.returncode, "output": str(output)}
             results.append(entry)
             print("TASK_STATUS " + json.dumps(entry), flush=True)

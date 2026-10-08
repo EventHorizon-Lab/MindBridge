@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
 
 import httpx2 as httpx
+import pytest
 from openai import OpenAI
 
 from mindbridge import AnswerPolicy, AnswerResult, Modality, SearchHit
@@ -71,6 +73,8 @@ def test_paired_trial_uses_one_shared_plan_and_keeps_labels_out(tmp_path: Path) 
                 }
             )
         else:
+            assert data["chat_template_kwargs"] == {"enable_thinking": False}
+            assert [message["role"] for message in data["messages"]] == ["user"]
             text = "Yes"
         return httpx.Response(
             200,
@@ -153,3 +157,23 @@ def test_trial_visual_backend_satisfies_memory_contract(tmp_path: Path) -> None:
         )
         with driver.open_memory(tmp_path / "store", models, reader, vision=vision):
             assert vision.vision_capabilities == frozenset({Modality.IMAGE, Modality.VIDEO})
+
+
+@pytest.mark.parametrize("artifact", ["store/partial.db", "http-audit.jsonl", "plans.jsonl"])
+def test_trial_rejects_partial_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str
+) -> None:
+    driver = _driver()
+    assert driver.__file__ is not None
+    recipe = json.loads(Path(driver.__file__).with_suffix(".json").read_text())
+    output = tmp_path / recipe["suite_id"]
+    partial = output / artifact
+    partial.parent.mkdir(parents=True)
+    partial.write_text("preserve this evidence")
+    support = ModuleType("support_coverage")
+    support._env = lambda: {}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "support_coverage", support)
+    monkeypatch.setattr(driver, "ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="refusing to overwrite a trial"):
+        driver.main()
+    assert partial.read_text() == "preserve this evidence"

@@ -685,8 +685,8 @@ def _icm_bench(
         if line.strip()
     ]
     clips = sorted((str(row["video_id"]) for row in rows), key=clip_position)
-    if not clips or clips[0] != "clip_000" or len(set(clips)) != len(clips):
-        raise ValueError("ICM timeline must have unique clips and a calibration clip")
+    if clips != [f"clip_{position:03d}" for position in range(839)]:
+        raise ValueError("ICM timeline must contain exactly clip_000 through clip_838")
     questions = _selected(load_icm_bench(dataset), limit, offset)
     memories = []
     for clip in clips:

@@ -45,6 +45,8 @@ def parse_plan(text: str, count: int) -> EvidencePlan:
         raise ValueError("selector must rate each candidate exactly once")
     if any(not facet.strip() for facet in plan.facets):
         raise ValueError("empty information need")
+    if len({" ".join(facet.split()).casefold() for facet in plan.facets}) != len(plan.facets):
+        raise ValueError("duplicate information need")
     for row in plan.records:
         if len(set(row.covers)) != len(row.covers) or any(
             facet < 0 or facet >= len(plan.facets) for facet in row.covers

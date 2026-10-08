@@ -42,7 +42,7 @@ def _fixture(root: Path) -> Path:
     path.write_text("\n".join(json.dumps(row) for row in rows))
     media = root / "icm-bench/videos"
     media.mkdir()
-    clips = [f"clip_{i:03d}" for i in range(3)]
+    clips = [f"clip_{i:03d}" for i in range(839)]
     (media / "metadata.jsonl").write_text("\n".join(json.dumps({"video_id": c}) for c in clips))
     for clip in clips:
         (media / f"{clip}.mp4").write_bytes(b"fixture video")
@@ -58,7 +58,7 @@ def test_icm_causal_prefix_calibration_and_no_label_leakage(tmp_path: Path) -> N
     unit = load_task(TASKS["icm-bench"], root=tmp_path, verify_digest=False).units[0]
     assert unit.memories[0].source_id == "clip_000"
     assert _prefix_end(unit.memories, unit.questions[0].cutoff_seconds) == 2
-    assert _prefix_end(unit.memories, unit.questions[1].cutoff_seconds) == 3
+    assert _prefix_end(unit.memories, unit.questions[1].cutoff_seconds) == 839
     inputs = repr([m.content for m in unit.memories]) + repr([q.content for q in unit.questions])
     assert "Observed speech" in inputs
     assert "SECRET" not in inputs and "FORBIDDEN" not in inputs
@@ -146,7 +146,27 @@ def test_icm_offline_media_does_not_require_retaining_tar(tmp_path: Path) -> Non
     archive.unlink()
     assert acquire_media(TASKS["icm-bench"], tmp_path, download=False) == release
     unit = load_task(TASKS["icm-bench"], root=tmp_path, verify_digest=False).units[0]
-    assert len(unit.memories) == 3
+    assert len(unit.memories) == 839
+
+
+@pytest.mark.parametrize("mutation", ["truncated", "gap", "duplicate", "extra", "calibration"])
+def test_icm_rejects_incomplete_or_invalid_timelines(tmp_path: Path, mutation: str) -> None:
+    _fixture(tmp_path)
+    metadata = tmp_path / "icm-bench/videos/metadata.jsonl"
+    rows = metadata.read_text().splitlines()
+    if mutation == "truncated":
+        rows.pop()
+    elif mutation == "gap":
+        rows.pop(400)
+    elif mutation == "duplicate":
+        rows.append(rows[-1])
+    elif mutation == "extra":
+        rows.append(json.dumps({"video_id": "clip_839"}))
+    else:
+        rows.pop(0)
+    metadata.write_text("\n".join(rows))
+    with pytest.raises(ValueError, match="exactly clip_000 through clip_838"):
+        load_task(TASKS["icm-bench"], root=tmp_path, verify_digest=False, limit=1)
 
 
 def test_icm_offline_media_still_requires_non_archive_inputs(tmp_path: Path) -> None:
