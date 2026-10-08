@@ -1,5 +1,8 @@
 # Context OS competitor brief: fast capture, memory control plane, context compiler
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../../README.md) and the [research archive](../../research/README.md).
+
 Research date 2026-09-03. This answers only questions raised by
 [the round 1 design](../specs/2026-09-03-context-os-round-1-design.md).
 Snapshots inspected: ByteDance-Seed/m3-agent `0e3e419` (`master`, 2026-02-12); MemTensor/MemOS

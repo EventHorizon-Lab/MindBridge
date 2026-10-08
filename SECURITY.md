@@ -38,9 +38,9 @@ service mesh, or ASGI authentication middleware.
 `/v1` bodies larger than 8 MiB are rejected before framework parsing, text is limited to 65,536
 characters, and canonical metadata is limited to 262,144 UTF-8 bytes.
 
-MindBridge has no user authentication, rate limiter, quota, key rotation store, or audit log. The
+MindBridge has no user authentication, rate limiter, quota, key rotation store, or access audit log. The
 gateway must provide the identity, authorization, TLS, rate-limit, and audit controls required by
-the deployment.
+the deployment. The memory-operation log records semantic changes; it is not a log of API access.
 
 ### MCP
 
@@ -60,6 +60,11 @@ transcription or speech backends receive audio and video; a face backend receive
 generation backend. Choose provider clients and retention policies appropriate for that data, and
 use HTTPS outside a trusted local network.
 
+Configured visual-description backends receive visual assets and available transcript context;
+formation receives committed observations; consolidation receives its bounded evidence window.
+`capture()` makes no model call, but a later `settle()` runs these configured stages. Local storage
+does not imply local inference: review every configured slot's endpoint.
+
 Stored text is untrusted model input. MindBridge separates it from the system instruction and asks
 the model to treat it as evidence, but it cannot guarantee that a model will resist prompt
 injection or hallucination. Applications should display or inspect `AnswerResult.hits` for
@@ -78,7 +83,9 @@ when secure deletion matters. Stop the owning process before copying or restorin
 ### Credentials and logs
 
 Keep gateway credentials separate from provider credentials. Provider SDK clients own credential
-loading and redaction; MindBridge does not copy model keys into its configuration. Error envelopes
+loading and redaction. Each declarative OpenAI slot also accepts an `api_key` as a masked
+`SecretStr`; the original configuration file still contains the secret. Keep real keys out of
+committed examples and prefer environment lookup or caller-owned clients. Error envelopes
 never serialize provider exception bodies or credentials. REST withholds storage, index, and
 internal error subjects; CLI and MCP retain SDK subjects, which can include filesystem paths. Do
 not log request bodies, authorization headers, memory content, metadata, or unredacted CLI/MCP

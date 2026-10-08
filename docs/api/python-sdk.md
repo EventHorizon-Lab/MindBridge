@@ -71,12 +71,19 @@ Memory(
     face_analyzer: FaceBackend | None = None,
     former: FormationBackend | None = None,
     consolidator: ConsolidationBackend | None = None,
+    independent_evidence: bool = False,
     index_speech: bool = True,
     index_quantization: IndexQuantization = IndexQuantization.NONE,
     retrieval_mode: RetrievalMode = RetrievalMode.HYBRID,
     minimum_relevance: float = 0.10,
     ambiguity_margin: float = 0.01,
     evidence_budget_chars: int | None = 24_000,
+    recall_planning: bool = False,
+    recall_set_budget_chars: int = 30_000,
+    recall_set_max_rows: int = 60,
+    recall_rounds: int = 2,
+    evidence_expansion: bool = False,
+    evidence_expansion_max_rows: int = 24,
     decay_half_life_days: float | None = None,
     reinforce_on_answer: bool = True,
     speaker_similarity: float = 0.78,
@@ -84,6 +91,10 @@ Memory(
     face_similarity: float = 0.363,
     face_margin: float = 0.05,
     identity_link_min_assets: int = 2,
+    memory_budget_records: int | None = None,
+    query_failure_window_seconds: float = 3600.0,
+    query_failure_history: int = 512,
+    retention: RetentionPolicy = RetentionPolicy(),
     tracer: opentelemetry.trace.Tracer | None = None,
 ) -> None
 ```
@@ -101,6 +112,14 @@ supported provider configuration fields live in [configuration](../configuration
 
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
+
+`recall_planning` and `evidence_expansion` are opt-in answer policies; neither changes plain
+`search()` or `compile()`. Recall planning adds generation calls and bounded SQLite reads;
+evidence expansion follows stored links without another model call. Their budgets and retry-round
+rules are defined in [local memory settings](../configuration.md#local-memory-settings).
+`memory_budget_records` and the query-failure settings govern control-plane candidates.
+`retention` is inert until `apply_retention()` runs. `independent_evidence` selects an experimental
+store-pinned projection and requires a fresh directory when changing an existing store's policy.
 
 `vision_describer` captions a visual memory so it has a full-text document at all; without one an
 image-only memory is reachable by the dense route alone. It is selected by the declarative `vision`
@@ -366,7 +385,7 @@ ask_stream(
     scope: RetrievalScope | None = None,
     link_identities: bool = True,
     answer_policy: AnswerPolicy = "strict",
-) -> Iterator[AnswerChunk]
+) -> Generator[AnswerChunk, None, AnswerResult]
 ```
 
 `reference_at` is the timezone-aware clock for relative time and decay. The current UTC time is
@@ -485,13 +504,28 @@ complete-hit behavior and simply loses this additional grounding. The additive `
 present and empty when the opt-in is disabled or no eligible excerpt fits.
 
 `bundle.compact()` is an opt-in Python presentation that aliases only structurally formatted
-memory and identity IDs. The returned `ContextPresentation` must remain paired with the request.
-Its `resolve()` method only decodes an alias; it does not establish delivery, evidence, consent, or
-scope. Use `resolve_citation()` to accept a full or partial memory citation: reference-only and
-identity aliases are rejected, while a partial citation retains its exact selector. Compaction
-happens after selection and does not change `bundle.chars`, the grounding budget, or evidence
-closure. Stored content and the goal remain verbatim, so text-plus-symbol-table reversibility does
-not guarantee semantic equivalence for arbitrary prompts containing runtime memory IDs.
+memory IDs as `mN` and identity IDs as `iN`. The frozen `ContextPresentation` contains `text`, its
+exact `chars`, and ordered `ContextSymbol` values retaining stable IDs, namespaces, coverage, and
+structural roles. References can receive symbols even when their records were not delivered;
+identity symbols are always `reference_only`.
+
+Retain the exact presentation with its request: two presentations can assign `m1` to different
+records. Symbols are request-local and cannot replace stable IDs in `get`, `delete`, or `reinforce`.
+`presentation.resolve(symbol, namespace=...)` requires a `ContextSymbolNamespace` and only decodes
+an alias; it does not establish delivery, evidence, consent, or scope. Unknown symbols and namespace
+mismatches raise `ValidationError`.
+
+Use `resolve_citation(symbol)` to accept a full or partial memory citation: reference-only and
+identity aliases are rejected, while a partial citation retains its exact `TextSpanSelector`.
+A partial citation cannot satisfy a full-record evidence dependency or become an evidence-clause
+member. Compaction aliases an excerpt's parent ID but leaves matched index IDs, offsets, and
+selector digests as structured provenance.
+
+Compaction happens after selection and does not change `bundle.chars`, the grounding budget,
+evidence closure, or the existing `render()`, `hits`, and `document()` output. Stored content,
+the goal, conflict values, and diagnostic prose remain verbatim, so text-plus-symbol-table
+reversibility does not guarantee semantic equivalence for arbitrary prompts containing runtime
+memory IDs. REST, MCP, CLI, and product answer generation do not select compact presentation.
 
 `bundle.affect` carries `AffectCue` rather than `SearchHit`: the same hit fields plus
 `event_ids`, the active events formed from the same observations the cue cites in its own
@@ -885,7 +919,7 @@ same as unrefuted. A later call replaces an earlier judgement. It reports `False
 contradiction recovery are `CONFIRMED` rates over `CONSOLIDATE` and `CORRECT` rows, and false
 retirement is the `REFUTED` rate over rows that forgot something.
 
-| `MemoryOutcome` | Means |
+| Outcome | Means |
 | --- | --- |
 | `CONFIRMED` | Later evidence bore the operation out |
 | `REFUTED` | Later evidence contradicted it |
@@ -1089,7 +1123,6 @@ The principal immutable values are:
 | `Page` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids`; the last two are derived from the current visible naming assertion, never stored |
-| `ProvisionalActor` | `identity_id`, `memory_ids`: a recognized person in a compiled bundle's `actors` whom no visible naming assertion names |
 | `IdentityErasure` | `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
 | `ConsentClaim` | `identity_id`, `state`, `note`: one person's own statement, carried on the `CONSENT` operation that records it |
 | `ExportBundle` | `exported_at`, `identity_id`, `identities`, `records`, `operations` |
@@ -1109,12 +1142,12 @@ The principal immutable values are:
 | `AffectCue` | every `SearchHit` field plus `event_ids`: one affect entry of a compiled bundle, carrying the events formed from the same observations the cue cites in its own `context.evidence_ids` |
 | `TextSpanPiece` | `role` (`context` or `body`), half-open `start_codepoint`, `end_codepoint`, exact `source_text`, and `sha256` |
 | `TextSpanSelector` | `parent_content_sha256`, `embedding_input_sha256`, `recipe_version`, ordered `pieces` |
-| `ContextExcerpt` | `source_memory_id`, structured `matched_index_id`, partial `content`, `selector`, `score`, creation and occurrence times, `memory_type`, `context`, `place_id` |
-| `ContextSymbol` | request-local `symbol`, `namespace`, stable ID, `coverage`, structural `roles`, and a selector only for partial memory coverage |
-| `ContextCitation` | decoded `memory_id`, full or partial `coverage`, and a selector exactly when partial; reference-only construction is rejected |
+| `ContextExcerpt` | `source_memory_id`, structured `matched_index_id`, partial `content`, `selector`, `score`, `created_at`, `occurred_at`, `occurred_end`, `memory_type`, `context`, `place_id` |
+| `ContextSymbol` | request-local `symbol`, `namespace`, `stable_id`, `coverage`, structural `roles`, and `selector` only for partial memory coverage |
+| `ContextCitation` | decoded `memory_id`, full or partial `coverage`, and `selector` exactly when partial; reference-only construction is rejected |
 | `ContextPresentation` | compact `text`, typed `symbols`, exact `chars`; pure `resolve()` identity decoding and eligibility-checking `resolve_citation()` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `excerpts`; `hits` property, stable-ID `render()`, and opt-in `compact()` |
-| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `identity`, `rationale` |
+| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `consent`, `identity`, `rationale` |
 | `IdentityClaim` | `identity_id`, `name`, `relationship` |
 | `IdentityChange` | `identity_id`, `moved_ids` |
 | `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `rolled_back_at`, `outcome`, `outcome_note` |
@@ -1150,16 +1183,24 @@ Enum values are:
 | Enum | Values |
 | --- | --- |
 | `Modality` | `text`, `image`, `video`, `audio`, `omni` |
+| `AnswerPolicy` (literal alias) | `strict`, `best_effort` |
 | `MemoryType` | `semantic`, `episodic`, `procedural` |
+| `RetrievalMode` | `hybrid`, `dense`, `lexical` |
 | `IndexQuantization` | `none`, `fp16`, `int8`, `rabitq` |
 | `AbstentionReason` | `no_evidence`, `insufficient_evidence` |
 | `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
 | `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
-| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify`, `merge` |
+| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify`, `consent`, `merge` |
+| `MemoryOutcome` | `confirmed`, `refuted` |
+| `ConsentState` | `granted`, `withheld`, `withdrawn` |
 | `MemoryTrigger` | `manual`, `evidence`, `feedback`, `contradiction`, `query_failure`, `pressure`, `idle` |
 | `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
 | `SpatialAnchor` | `observer`, `subject` |
+| `ContextUnknownKind` | `scope_empty`, `section_empty`, `budget_excluded`, `candidates_exhausted`, `modality_unsupported`, `stage_skipped`, `consent_withheld`, `evidence_unavailable` |
+| `ContextSymbolNamespace` | `memory`, `identity` |
+| `ContextSymbolCoverage` | `full`, `partial`, `reference_only` |
+| `ContextSymbolRole` | `hit`, `excerpt`, `evidence`, `affect_event`, `actor`, `observed_in`, `naming_assertion`, `conflict` |
 | `StreamPhase` | `update`, `final`, `cancel` |
 | `AudioBoundary` | `start`, `end`, `cancel` |
 | `VisionBoundary` | `start`, `end`, `cancel` |
@@ -1246,6 +1287,26 @@ against the source modality and spatial frame, assigns identity, links evidence,
 like a former it proposes and never writes storage. An `IDENTIFY` proposal carries an
 `IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
 evidence, and the kernel builds the typed assertion.
+
+Recall planning is an optional extension detected through `plan_recall` on the answerer. The
+bundled `OpenAIModels` implements it. The protocol and plan values live in `mindbridge.models.base`
+and `mindbridge.recall`; they are not root exports. Custom answerers may omit the extension:
+`recall_planning=True` then logs a warning at open and uses ordinary retrieval. See
+[the recall policy](../configuration.md#local-memory-settings) before implementing it.
+
+```text
+plan_recall(
+    question: str,
+    *,
+    reference_at: datetime,
+    corpus_digest: str,
+    attempted: str = "",
+) -> str | None
+```
+
+The return is the model's JSON text, not an executed plan. The kernel validates it and falls back
+to ordinary retrieval for an unusable plan. `attempted` describes a previous round and is empty
+on the first call.
 
 `answer_policy` and `exhaustive` are keyword-only and defaulted on both generation protocols, and
 MindBridge sends each one only when it is not its default. A backend written against the earlier
@@ -1365,7 +1426,8 @@ For `google/embeddinggemma-2`, the generic loader uses FP32 and supports `128`, 
 from the pinned checkpoint. See the [EmbeddingGemma 2 configuration](../configuration.md#embeddinggemma-2)
 for a complete example and input limits.
 
-`OpenAIModels` can fill embedding, generation, transcription, and formation capabilities. Pass the
+`OpenAIModels` can fill embedding, generation, transcription, visual description, formation, and
+consolidation capabilities. Pass the
 same object only to the slots it should serve:
 
 ```text
@@ -1394,6 +1456,7 @@ OpenAIModels(
     generation_min_video_seconds: float | None = None,
     generation_video_limit: int | None = 8,
     generation_extra_body: Mapping[str, object] | None = None,
+    generation_stream: bool = False,
 )
 ```
 
@@ -1407,6 +1470,10 @@ endpoints. Transcription prompt, keywords, and languages form the provider hint.
 `generation_min_video_seconds` converts shorter videos to four ordered stills when image generation
 capability is available; `generation_video_limit` caps retrieved evidence videos but not question
 media. `generation_extra_body` is forwarded to the SDK request.
+
+`generation_stream=True` makes synchronous `answer()` consume a provider stream internally;
+it does not change `AnswerResult` or deliver chunks to the caller. Use `Memory.ask_stream()` for
+incremental delivery. This direct adapter control is not a declarative configuration field.
 
 Its operation signatures widen the base protocols only by accepting plain text where useful:
 
@@ -1455,6 +1522,7 @@ recipes.embedder(name: str, *, load: bool = False) -> EmbeddingBackend
 recipes.answerer(name: str, *, load: bool = False) -> GenerationBackend
 recipes.former(name: str, *, load: bool = False) -> FormationBackend
 recipes.consolidator(name: str, *, load: bool = False) -> ConsolidationBackend
+recipes.vision(name: str, *, load: bool = False) -> VisionDescriptionBackend
 recipes.transcriber(
     name: str,
     *,

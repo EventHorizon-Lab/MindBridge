@@ -115,6 +115,11 @@ composition change keeps advertising the composition it was built with;
 
 ## Lifecycle and ownership
 
+Keep the injected owner in a `with Memory(...)` or `with Memory.from_config(...)` block around
+`server.run(...)`, as in the [deployment example](../deployment.md#mcp-owner). Withholding tool
+groups narrows what the agent can call; it does not provide client authentication or filesystem
+isolation. Use separate physical directories for independent memory domains.
+
 `build_mcp_server` borrows `memory`; it neither opens nor closes it. The host must keep the owner
 alive for the server lifetime and close it during shutdown. Do not run another `Memory`, REST, or
 MCP owner against the same physical `data_dir`. Composition and process ownership are defined in

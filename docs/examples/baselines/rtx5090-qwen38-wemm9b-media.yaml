@@ -2,6 +2,7 @@
 # ATM-Bench raw exercises image and video ingestion. Video-MME-v2 adds long-form video, so the
 # FunASR path is measured as ASR rather than replaced by a caption-only/SGM variant.
 # EMPTY is an explicit non-secret sentinel, so an ambient OPENAI_API_KEY is never forwarded.
+# The endpoints are deployment-specific. Replace them before using this profile elsewhere.
 
 embedding:
   provider: openai

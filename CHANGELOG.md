@@ -1373,6 +1373,14 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Documentation
 
+- Removed the duplicate local-index guide, consolidated compact-presentation contracts in the
+  SDK reference, archived the original prototype with its frozen measurement, and shortened the
+  resolved plugin-admission history. Research records remain outside the main documentation entry.
+- Reconciled SDK constructor settings, public consent values, adapter controls, and recipe
+  documentation with the current implementation. Corrected configuration-file loading examples,
+  REST installation dependencies, credential handling, and remote CLI coverage. Added capture
+  backlog and retention procedures and a complete index of dated research and design records.
+  Historical measurements, verbatim protocols, and third-party notices remain preserved.
 - `docs/affective-memory.md` states the affective-memory direction: affect is preserved as a
   sourced, timed, confidence-bearing hypothesis with a perspective rather than recognized as fact,
   with the four affect layers, the behaviour that exists at this release, the phased roadmap

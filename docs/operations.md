@@ -33,6 +33,26 @@ end-to-end canary against a separate directory so production memory is not pollu
 
 ## Backup
 
+### Capture backlog before a snapshot
+
+A stopped-owner backup preserves queued captures, including failed work. It does not make them
+searchable. Before stopping, inspect the queue through the existing owner:
+
+```python
+pending = memory.pending_captures(limit=100)
+for item in pending:
+    print(item.memory_id, item.awaiting, item.attempts, item.last_error)
+```
+
+`awaiting="enrichment"` means the record has no searchable vectors; `"formation"` means it is
+already searchable and owes typed formation only. The report is bounded: naming IDs asks about
+those records specifically. To finish a batch, call `memory.settle(limit=100)` from the host's
+approved model-work window. A failed batch may still settle other records; inspect the queue
+again after an error. Naming a failed ID in `settle(memory_ids=[...])` bypasses its retry ceiling.
+Neither startup nor shutdown drains this queue automatically.
+
+### Stopped-owner copy
+
 Use a stopped-owner snapshot:
 
 1. Stop the owner gracefully and verify that no process still holds the directory lock.
@@ -223,6 +243,19 @@ disk: measured against a freshly rebuilt `NONE` index over ten stores holding 5,
 retrieval gain. Read it as a memory and latency setting, not as a way to store less.
 
 ## Capacity
+
+Growth and deletion are separate policies. `memory_budget_records` creates a control-plane
+pressure signal; it does not itself delete records. A configured retention age is also inert until
+the host calls `apply_retention()`. Start with a dry run and review the direct and cascading IDs:
+
+```python
+report = memory.apply_retention(dry_run=True)
+print(report.deleted, report.asset_ids, report.capture_memory_ids)
+```
+
+Physical retention and `delete()` cannot be reversed by `rollback()`. Cognitive `forget()` can.
+See [retention configuration](configuration.md#retention-policy) and
+[data-subject rights](api/python-sdk.md#data-subject-rights) before scheduling deletion.
 
 Monitor:
 

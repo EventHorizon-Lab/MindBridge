@@ -1,5 +1,8 @@
 # Recall programs round — 2026-09-10/11
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Design: [recall programs spec](../superpowers/specs/2026-09-10-recall-programs-design.md). Code: branch
 `claude/mindbridge-memory-optimization-738edb` (tip after this round). Every number below is an internal,
 paired, per-question comparison on the same slice with the same store and seed, judged by `qwen3.8-27b`

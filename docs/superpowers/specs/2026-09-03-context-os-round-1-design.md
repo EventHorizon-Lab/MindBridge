@@ -1,5 +1,8 @@
 # Context OS round 1: fast capture, memory control plane, context compiler
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../../README.md) and the [research archive](../../research/README.md).
+
 Date: 2026-09-03. Status: approved for implementation by the team lead under the direction in
 [docs/context-os.md](../../context-os.md). This spec turns evolution gates 2, 3, and 4 of that page
 into concrete Python contracts. It does not change `add()`, `search()`, or `ask()` semantics.

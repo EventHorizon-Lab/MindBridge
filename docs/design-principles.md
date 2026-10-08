@@ -308,6 +308,10 @@ revisions must be reproducible before a result guides a default.
 
 ## Current release and direction
 
+The status table describes this checkout's `0.2.0` surface. Design specifications and measured
+results from earlier rounds live in the [research archive](research/README.md); their approved
+status or structural scores do not establish that every proposed path ships today.
+
 Every "current release" cell below is a statement about code that exists today, and each defers to
 an owning reference for detail. A cell that stops being true is a defect in this page.
 

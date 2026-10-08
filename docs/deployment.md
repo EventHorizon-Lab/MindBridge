@@ -83,40 +83,47 @@ The Jina adapter executes pinned upstream model code and uses non-commercial wei
 Install the server surface with the selected model extras:
 
 ```bash
-uv add "mindbridge[local,openai,server]"
+uv add "mindbridge[local,openai,server]" uvicorn
 ```
 
-Compose one caller-owned instance in `my_application.py`:
+Keep the owner and caller-owned client open around the ASGI server in `my_application.py`:
 
 ```python
 from openai import OpenAI
+import uvicorn
 
 from mindbridge import SentenceTransformersEmbedder, Memory, OpenAIModels
 from mindbridge.api import create_app
 
-client = OpenAI(timeout=30.0, max_retries=3)
-memory = Memory(
-    "/var/lib/mindbridge/assistant",
-    embedder=SentenceTransformersEmbedder(
-        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-        revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
-    ),
-    answerer=OpenAIModels(generation_client=client),
-)
-app = create_app(memory=memory)
+
+def main() -> None:
+    with OpenAI(timeout=30.0, max_retries=3) as client:
+        with Memory(
+            "/var/lib/mindbridge/assistant",
+            embedder=SentenceTransformersEmbedder(
+                model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+                revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            ),
+            answerer=OpenAIModels(generation_client=client),
+        ) as memory:
+            uvicorn.run(create_app(memory=memory), host="127.0.0.1", port=8000)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-Register framework shutdown handling for both `memory.close()` and `client.close()`, then run one
-worker under the deployment's own ASGI server. MindBridge does not depend on one, so install the
-chosen server alongside it:
+Run the single-process owner. The context managers close memory before the provider client when
+the server exits, including after an exception:
 
 ```bash
-uv add uvicorn
-uvicorn my_application:app --host 127.0.0.1 --port 8000 --workers 1
+uv run python my_application.py
 ```
 
-`create_app()` does not own or close either resource. It also adds no authentication,
-authorization, TLS, rate limiting, quota, or audit log. Bind to a trusted interface or put the app
+`create_app()` does not own or close either resource. For an importable ASGI app, arrange the same
+cleanup in the host's lifespan and run one worker. MindBridge does not depend on Uvicorn; it is the
+host-selected server in this example. The adapter adds no authentication,
+authorization, TLS, rate limiting, quota, or access audit log. Bind to a trusted interface or put the app
 behind the deployment's existing gateway or middleware. Keep `/healthz` protected consistently; it
 reports liveness and the live composition's capability declaration, not model or retrieval
 readiness. The app publishes thirteen product routes under `/v1`, or twenty-three when the host enables

@@ -1,5 +1,8 @@
 # Memory optimization: design and validation record
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 ## Material Passport
 
 - Origin Skill: academic-research-suite / experiment-agent

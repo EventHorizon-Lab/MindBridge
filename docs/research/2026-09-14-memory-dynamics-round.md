@@ -1,5 +1,8 @@
 # Memory dynamics round r0914 — 2026-09-14
 
+> Historical research or design record. Claims, commands, and “current” refer to the dated
+> snapshots below. See [current documentation](../README.md) and the [research archive](README.md).
+
 Pre-registered round on mechanism-level innovation inside the memory system itself. Round directory:
 `autoresearch/orchestrator-260914/`, lead worktree
 `.claude/worktrees/mindbridge-memory-mechanism-c767be` at `cf6aec4a` (carries r0913b compaction and

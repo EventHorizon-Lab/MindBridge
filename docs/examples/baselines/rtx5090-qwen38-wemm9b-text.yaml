@@ -1,5 +1,6 @@
 # Reference latency profile for the RTX 5090 benchmark client.
 # EMPTY is an explicit non-secret sentinel, so an ambient OPENAI_API_KEY is never forwarded.
+# The endpoints are deployment-specific. Replace them before using this profile elsewhere.
 
 embedding:
   provider: openai

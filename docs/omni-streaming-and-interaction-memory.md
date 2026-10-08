@@ -30,6 +30,10 @@ reducers only when explicit finality is available. Every reducer takes an `Async
 `async_memory` below; the synchronous snippets assume an open `memory` plus already-read immutable
 media bytes.
 
+Partial query snapshots must be immutable: prefetch rejects `Path` atoms, whose bytes could
+change while a search is running. Read a capture frame into `Blob` or use an existing `AssetRef`.
+Completed durable writes still accept ordinary local `Path` content through the SDK.
+
 Everything on this page except `ask_stream()` streams input into memory; `ask_stream()` is the one
 that streams an answer out, and it is a delivery choice rather than a capture lifecycle. Its
 contract lives with the other recall operations in the
