@@ -1053,10 +1053,10 @@ def require_unretired_memories(connection: sqlite3.Connection, memory_ids: Seque
 
 
 def require_visible_memories(connection: sqlite3.Connection, memory_ids: Sequence[str]) -> None:
-    """Require the latest recorded version to remain usable as formation evidence.
+    """Require the latest recorded version to remain usable as cited evidence.
 
     A surviving, unretired inferred claim can lose visibility when support is withdrawn.
-    Reinforcement may target that hidden claim; automatic formation must not cite it as a
+    Reinforcement may target that hidden claim; a new operation must not cite it as a
     standing premise. Validity is deliberately separate: past events can support new claims.
     """
     for memory_id in dict.fromkeys(memory_ids):

@@ -71,6 +71,19 @@ not add a general state replay mechanism: text, metadata and confidence/visibili
 that the store updates in place retain their existing historical limitations. Commit-time
 visibility and retirement checks still guard current acceptance separately.
 
+## Control-plane evidence repairs
+
+Consolidation, identification and reinforcement now recheck cited premises for visibility,
+retirement and forgetting inside their write transactions. A claim can remain stored and
+unretired after rollback withdraws enough support to hide it; that claim cannot seed a new
+operation. Reinforcement also rejects a source corrected between validation and commit.
+
+This reuses the formation evidence guard without applying it to reinforcement targets: an
+unretired hidden target can still receive valid support. A failed precondition uses the existing
+`stale` rejection and writes no derived record, evidence link, forgetting effect or operation
+log. Twelve SDK regressions cover source withdrawal, correction and unchanged sources, both
+projection policies, and consolidation versus reinforcement. No new public contracts change.
+
 ## Compatibility
 
 `Memory` and `MemoryConfig` gain two history settings; `FormationInput` gains defaulted `history`

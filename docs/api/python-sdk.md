@@ -732,8 +732,9 @@ active search result for `query`, else the newest `limit` active records. Forgot
 records never reach the backend. The evidence gather and the applies hold the formation lock; the
 backend round trip deliberately does not, so slow reasoning over media evidence does not stall a
 concurrent `add()`. Correctness does not rest on that lock: every proposal is re-checked inside
-its own apply transaction and refused as `"stale"` if a target moved while the backend was
-thinking. Kernel-committed identity operations -- the corroborated cross-modal merge, its
+its own apply transaction and refused as `"stale"` if a target or cited source became ineligible
+while the backend was thinking. Kernel-committed identity operations -- the corroborated
+cross-modal merge, its
 `unlink_identity` split, `forget_identity`'s erasure, and `register_identity`/`register_speaker`'s
 naming assertion -- take the same formation lock around their own commit, so none of them lands
 while an apply pass is in progress either. The backend proposes `MemoryOperation` values; the kernel
@@ -812,7 +813,11 @@ Multi-target operations are all or nothing. A proposal whose targets are not all
 rejected whole -- `"unknown_target"`, `"not_derived"`, or `"already_forgotten"` -- so an applied
 row's `target_ids` are always the IDs the operation actually acted on. The apply transaction
 re-checks the preconditions validation read: a target or cited source that was forgotten,
-corrected, deleted, or linked in between makes the proposal `"stale"` with nothing written. There
+corrected, deleted, or linked in between makes the proposal `"stale"` with nothing written.
+Consolidation, identification and reinforcement also recheck that cited premises remain visible
+and unretired. Support withdrawn while reasoning may hide a claim without retiring it; it can
+no longer seed a new operation. This source check does not exclude an unretired hidden
+reinforcement target, which may still receive valid support. There
 is no expected-revision token to supply; the in-transaction re-check is the whole guarantee.
 
 `target_ids` on a `CONSOLIDATE` is **consolidation forgetting**: sources the new derived record

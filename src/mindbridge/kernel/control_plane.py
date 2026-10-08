@@ -312,10 +312,10 @@ class ControlPlane(Traced):
             # media evidence stall every concurrent `add()`. Scheduling between latency-sensitive
             # work and slow reasoning is the point of the plane, so the lock covers the apply
             # transactions only. Correctness does not rest on the lock: every proposal is
-            # re-checked inside its own apply transaction (`require_active` and
-            # `require_unretired`) and refused as stale if a target moved while the backend was
-            # thinking. A model call that raised weighed nothing, so no marker is recorded and
-            # the candidate stays due.
+            # re-checked inside its own apply transaction: targets must remain eligible and
+            # cited premises visible. A source or target that moved while the backend was
+            # thinking is refused as stale. A model call that raised weighed nothing, so no
+            # marker is recorded and the candidate stays due.
             proposals = self._propose_operations(tuple(shown.values()), trigger=trigger)
             with self._formation_lock:
                 for operation in proposals:
@@ -865,6 +865,9 @@ class ControlPlane(Traced):
                     require_unretired=(
                         operation.target_ids if operation.intent is MemoryIntent.REINFORCE else ()
                     ),
+                    require_visible=(
+                        operation.evidence_ids if operation.intent is MemoryIntent.REINFORCE else ()
+                    ),
                     naming_projection_factory=self._formation.naming_projection_factory(assets),
                 )
             if logged is None:
@@ -976,10 +979,9 @@ class ControlPlane(Traced):
             operation=pending,
             forget_ids=operation.target_ids,
             # `shown` was read before this transaction opened; re-check inside it that every
-            # cited source still exists, is still active, and -- when it carries typed semantics
-            # -- still stands, so a source corrected in between makes the proposal stale.
-            require_active=operation.evidence_ids,
-            require_unretired=operation.evidence_ids,
+            # cited source still exists and is un-forgotten, visible and unretired. Withdrawal
+            # can hide a claim without retiring it, and neither state may seed a new assertion.
+            require_visible=operation.evidence_ids,
             # One consolidation operation presents one derived assertion over the complete cited
             # set. Treating those citations as singleton alternatives lets a summary that used A
             # and B survive with all of its prose after A is withdrawn. A later operation may add
@@ -1096,10 +1098,9 @@ class ControlPlane(Traced):
                 recipe=self._backends.consolidation_recipe,
                 operation=pending,
                 # Re-checked inside the apply transaction, because everything above was read
-                # before it opened: cited evidence a CORRECT retired in between makes the naming
+                # before it opened: forgotten, hidden or retired evidence makes the naming
                 # stale, and the dispatch turns that into a `stale` rejection.
-                require_active=operation.evidence_ids,
-                require_unretired=operation.evidence_ids,
+                require_visible=operation.evidence_ids,
                 projection_identity_id=identity_id,
                 projection_factory=projection,
             )
