@@ -1109,6 +1109,7 @@ class OpenAIModels:
             answer_policy=answer_policy,
             stream=True,
         )
+        stream_completed = False
         try:
             finish_reason: object = None
             emitted = False
@@ -1154,6 +1155,7 @@ class OpenAIModels:
                     emitted = True
                     answer_parts.append(content)
                     yield content
+            stream_completed = True
         except ModelError:
             raise
         except Exception as error:
@@ -1163,16 +1165,25 @@ class OpenAIModels:
                 stage="generate",
             ) from error
         finally:
-            close = getattr(responses, "close", None)
-            if callable(close):
-                close()
-            if usage_response is not None:
-                _record_openai_usage(
-                    usage_response,
-                    input_modalities=modalities,
-                    output_modalities=frozenset({Modality.TEXT}),
-                    request_count=request_count,
-                )
+            try:
+                close = getattr(responses, "close", None)
+                if callable(close):
+                    close()
+            except Exception as error:
+                if stream_completed:
+                    raise ModelError(
+                        "generation response cleanup failed",
+                        reason=_provider_reason(error),
+                        stage="generate",
+                    ) from error
+            finally:
+                if usage_response is not None:
+                    _record_openai_usage(
+                        usage_response,
+                        input_modalities=modalities,
+                        output_modalities=frozenset({Modality.TEXT}),
+                        request_count=request_count,
+                    )
         _record_finish_reason(finish_reason)
         if finish_reason == "length":
             raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR, stage="generate")

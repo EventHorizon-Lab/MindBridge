@@ -2515,6 +2515,75 @@ def test_stream_answer_closes_the_provider_response(ending: str) -> None:
             response.close()
 
 
+@pytest.mark.parametrize(
+    "ending", ["completed", "model_error", "transport_error", "invalid", "abandoned"]
+)
+def test_stream_answer_close_failure_preserves_errors_and_records_usage(ending: str) -> None:
+    cleanup_error = httpx.ReadError("response cleanup failed")
+    original_error = (
+        ModelError("original generation failure", reason="response_invalid", stage="generate")
+        if ending == "model_error"
+        else httpx.ReadTimeout("stream read timed out")
+    )
+
+    class FailingCloseStream:
+        close_calls = 0
+
+        def __iter__(self) -> Iterator[SimpleNamespace]:
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        index=0, delta=SimpleNamespace(content="Hello."), finish_reason="stop"
+                    )
+                ],
+                usage={"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
+            )
+            if ending in {"model_error", "transport_error"}:
+                raise original_error
+            if ending == "invalid":
+                yield SimpleNamespace(choices=[SimpleNamespace(index=1)])
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise cleanup_error
+
+    responses = FailingCloseStream()
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_request: responses))
+    )
+    hit = SearchHit(id="memory_1", content="Hello is a greeting.", score=0.9, created_at=NOW)
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    try:
+        with provider.get_tracer("test").start_as_current_span("model"):
+            stream = _model(cast(Any, client)).stream_answer("What is hello?", (hit,))
+            assert next(stream) == "Hello."
+            if ending == "abandoned":
+                stream.close()
+            else:
+                with pytest.raises(ModelError) as failure:
+                    tuple(stream)
+                assert failure.value.stage == "generate"
+                if ending == "model_error":
+                    assert failure.value is original_error
+                elif ending == "transport_error":
+                    assert failure.value.reason == "timeout"
+                    assert failure.value.__cause__ is original_error
+                elif ending == "invalid":
+                    assert failure.value.reason == "response_invalid"
+                else:
+                    assert failure.value.reason == "connection_failed"
+                    assert failure.value.__cause__ is cleanup_error
+    finally:
+        provider.shutdown()
+    assert responses.close_calls == 1
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes["gen_ai.usage.input_tokens"] == 8
+    assert attributes["gen_ai.usage.output_tokens"] == 2
+
+
 def test_stream_answer_records_exact_grounding_and_multimodal_usage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
