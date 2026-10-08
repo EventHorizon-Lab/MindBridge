@@ -12,6 +12,7 @@ import os
 import platform
 import random
 import re
+import sys
 import time
 from collections.abc import (
     Awaitable,
@@ -732,8 +733,13 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     argv: Sequence[str] | None = None, *, prog: str | None = None
 ) -> int:
     """Parse one reproducible evaluation sweep and write its artifacts."""
+    arguments_cli = list(sys.argv[1:] if argv is None else argv)
+    if arguments_cli[:1] == ["serve"]:
+        from mindbridge.benchmarks.eval_leaderboard import main as serve
+
+        return serve(arguments_cli[1:], prog=f"{prog or 'mindbridge-bench eval'} serve")
     parser = _build_parser(prog)
-    parsed = parser.parse_args(argv)
+    parsed = parser.parse_args(arguments_cli)
     # The configuration file can name the corpus root, so it is read before the listing and
     # before argument resolution derives the default output directory from that root.
     config_path = (
