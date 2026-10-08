@@ -1346,6 +1346,11 @@ that license covers the weights, not MindBridge. `DEFAULT_FUNASR_MODEL_ID` and
 `DEFAULT_FUNASR_RECIPE` publish the default speech recipe.
 `FunASRRecipe.auto_model_arguments() -> dict[str, object]` returns its standard FunASR composition.
 
+For `google/embeddinggemma-2`, the generic loader uses FP32 and supports `128`, `256`, `512`, or
+`768` dimensions without requiring optional Matryoshka metadata. Query and document prompts come
+from the pinned checkpoint. See the [EmbeddingGemma 2 configuration](../configuration.md#embeddinggemma-2)
+for a complete example and input limits.
+
 `OpenAIModels` can fill embedding, generation, transcription, and formation capabilities. Pass the
 same object only to the slots it should serve:
 

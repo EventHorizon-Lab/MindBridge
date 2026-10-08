@@ -7,17 +7,22 @@ import json
 import math
 import re
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from functools import partial
 from importlib import import_module
 from typing import Protocol, cast
 
 from mindbridge._telemetry import mark_model_requests, record_unmetered_model_usage
 from mindbridge.exceptions import ModelError, ValidationError
+from mindbridge.models._media import fetch_videos
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import AssetRef, Modality
 
 _ATOMIC_MODALITIES = (Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
 _STANDARD_RECIPE = "sentence-transformers-standard-input-v1"
+_EMBEDDINGGEMMA2_MODEL = "google/embeddinggemma-2"
+_EMBEDDINGGEMMA2_DIMENSIONS = (128, 256, 512, 768)
+_EMBEDDINGGEMMA2_RECIPE = "embeddinggemma2-text-prompts-pyav-v1"
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 # Some trust-remote-code models mutate shared Sentence Transformers state while importing.
 _ST_LOCK = threading.RLock()
@@ -80,11 +85,13 @@ class SentenceTransformersEmbedder:
             self._encode_document = encoder.encode_document
             self._model_id = _text(model_id, "model_id")
             self._revision = _revision(revision)
-            self._dimension, self._truncate_dim = _dimensions(encoder, dimension)
+            self._dimension, self._truncate_dim = _dimensions(encoder, dimension, self._model_id)
             self._batch_size = _positive_integer(batch_size, "batch_size")
             self._capabilities = self._discover_capabilities()
         self._space_id = _recipe_space(
-            self._input_recipe,
+            _EMBEDDINGGEMMA2_RECIPE
+            if self._model_id == _EMBEDDINGGEMMA2_MODEL
+            else self._input_recipe,
             self._model_id,
             self._revision,
             self._dimension,
@@ -158,6 +165,18 @@ class SentenceTransformersEmbedder:
         except (TypeError, ValueError):
             raise ValidationError("embedding task is invalid") from None
 
+        encoding_kwargs: dict[str, object] = {}
+        if self._model_id == _EMBEDDINGGEMMA2_MODEL:
+            prompts = getattr(self._encoder, "prompts", None)
+            name = "query" if selected_task is EmbedTask.QUERY else "document"
+            if not isinstance(prompts, Mapping) or not isinstance(prefix := prompts.get(name), str):
+                raise ModelError("EmbeddingGemma 2 does not declare its retrieval prompts")
+            # ST applies batch prompts to media too; this model prefixes text only.
+            batch = tuple(
+                ModelInput(text=prefix + value.text if value.text else "", assets=value.assets)
+                for value in batch
+            )
+            encoding_kwargs["prompt"] = ""
         prepared = [self._prepare(value) for value in batch]
         mark_model_requests(1 if batch else 0, token_usage_expected=0)
         with self._lock:
@@ -165,8 +184,9 @@ class SentenceTransformersEmbedder:
                 raise ModelError("embedding backend is closed")
             if not batch:
                 return ()
-            encode = (
-                self._encode_query if selected_task is EmbedTask.QUERY else self._encode_document
+            encode = cast(
+                Callable[..., _EmbeddingMatrix],
+                self._encode_query if selected_task is EmbedTask.QUERY else self._encode_document,
             )
             try:
                 matrix = encode(
@@ -175,6 +195,7 @@ class SentenceTransformersEmbedder:
                     normalize_embeddings=True,
                     truncate_dim=self._truncate_dim,
                     batch_size=self._batch_size,
+                    **encoding_kwargs,
                 )
             except Exception:
                 raise ModelError("embedding model failed") from None
@@ -248,17 +269,30 @@ def _load_encoder(
         ) from None
 
     try:
-        return factory(
+        # FP16 silently corrupts EmbeddingGemma 2 activations. FP32 also works on CPUs.
+        model_kwargs = {"dtype": "float32"} if model_id == _EMBEDDINGGEMMA2_MODEL else {}
+        encoder = factory(
             model_id,
             revision=revision,
             trust_remote_code=False,
             device=device,
+            **({"model_kwargs": model_kwargs} if model_kwargs else {}),
         )
+        if model_id == _EMBEDDINGGEMMA2_MODEL:
+            processor = getattr(_first_module(encoder), "processor", None)
+            video_processor = getattr(processor, "video_processor", None)
+            if video_processor is not None:
+                # Transformers defaults to torchcodec; PyAV is already in the local extra.
+                loader = import_module("transformers.video_utils").load_video
+                video_processor.fetch_videos = partial(fetch_videos, loader)
+        return encoder
     except Exception:
         raise ModelError("failed to load the embedding model") from None
 
 
-def _dimensions(encoder: _SentenceEncoder, requested: int | None) -> tuple[int, int | None]:
+def _dimensions(
+    encoder: _SentenceEncoder, requested: int | None, model_id: str
+) -> tuple[int, int | None]:
     try:
         native = encoder.get_embedding_dimension()
     except Exception:
@@ -273,6 +307,14 @@ def _dimensions(encoder: _SentenceEncoder, requested: int | None) -> tuple[int, 
         return requested, None
     advertised = _config_value(encoder, "matryoshka_dimensions")
     matryoshka = _config_value(encoder, "is_matryoshka")
+    # The upstream checkpoint documents MRL but omits these optional config fields.
+    if (
+        model_id == _EMBEDDINGGEMMA2_MODEL
+        and _config_value(encoder, "model_type") == "embedding_gemma2"
+        and native == 768
+    ):
+        advertised = _EMBEDDINGGEMMA2_DIMENSIONS
+        matryoshka = True
     if (
         requested > native
         or matryoshka is not True

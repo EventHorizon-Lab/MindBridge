@@ -142,6 +142,41 @@ MindBridge refuses unrecognized store metadata mismatches instead of mixing spac
 existing directory only for a supported bundled migration; see
 [store metadata mismatch](troubleshooting.md#store-metadata-mismatch).
 
+### EmbeddingGemma 2
+
+Install `mindbridge[local]` and select
+[Google EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) through the existing
+Sentence Transformers provider:
+
+```json
+{
+  "data_dir": "./data/embeddinggemma2",
+  "embedding": {
+    "provider": "sentence-transformers",
+    "model": "google/embeddinggemma-2",
+    "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+    "dimension": 768,
+    "device": "cpu",
+    "batch_size": 8
+  }
+}
+```
+
+The local extra requires Sentence Transformers 6.1 or newer and Transformers 5.18 or newer.
+The adapter loads this model in FP32; `device` can also be `cuda`. Queries and documents use the
+checkpoint's separate retrieval prompts for text automatically; media alone receives no prefix.
+Video decoding uses the existing PyAV dependency and preserves the model's frame sampling.
+This text-only prompt recipe has a distinct space ID from generic ST batch prompting.
+Text, images, audio, video, and ordered
+combinations use the same embedding space. Supported dimensions are `128`, `256`, `512`, and
+`768`; shortened vectors are normalized again. The model has an 8,192-token shared context;
+split larger inputs before embedding them.
+
+Applications injecting their own Sentence Transformer encoder must use FP32 or BF16, never FP16.
+This checkpoint uses Apache 2.0 weights and loads with `trust_remote_code=False`. It supplies
+embeddings only; generation, transcription, speaker recognition, and face recognition remain
+separate backends. Use a new data directory when switching from another embedding model.
+
 ## Automatic memory formation
 
 The optional `formation` slot builds the bundled OpenAI-compatible `FormationBackend`. It proposes

@@ -373,7 +373,7 @@ Three recent primary sources sharpen the validation boundary:
   orchestration, decoding and output handling as a searched harness configuration. Reference outputs
   are permitted in search-time scoring but excluded at test time. This is a useful design pattern and
   a leakage boundary that must be logged.
-- [PersonaMem](https://openreview.net/forum?id=6ox8XZGOqP) evaluates evolving user profiles over
+- [PersonaMem](https://arxiv.org/abs/2504.14225) evaluates evolving user profiles over
   multi-session interaction. It is relevant to personalization but does not validate face/voice
   identity or emotion inference.
 - For P1/P2, use route-specific multimodal suites: EM²Mem evaluates EgoLifeQA, Ego-R1 Bench and
@@ -536,7 +536,7 @@ identity proof.
   [official repository](https://github.com/xiaowu0162/LongMemEval).
 - Maharana, A., et al. (2024). [LoCoMo](https://arxiv.org/abs/2402.17753) and
   [official repository](https://github.com/snap-research/locomo).
-- Salemi, A., et al. (2025). [PersonaMem](https://openreview.net/forum?id=6ox8XZGOqP).
+- Jiang, B., et al. (2025). [PersonaMem](https://arxiv.org/abs/2504.14225).
 - Jin, Z., et al. (2026). [Mitigating Provenance-Role Collapse in Long-Term Agents via Typed Memory
   Representation (MemIR)](https://arxiv.org/abs/2605.25869).
 - Wu, M., & Zhu, P. (2026). [Agent Zero Memory: Provenance-Aware Long-Term Memory for LLM
