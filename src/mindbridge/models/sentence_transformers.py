@@ -85,16 +85,9 @@ class SentenceTransformersEmbedder:
             self._encode_document = encoder.encode_document
             self._model_id = _text(model_id, "model_id")
             self._revision = _revision(revision)
-            self._dimension, self._truncate_dim = _dimensions(encoder, dimension)
+            self._dimension, self._truncate_dim = _dimensions(encoder, dimension, self._model_id)
             self._batch_size = _positive_integer(batch_size, "batch_size")
             self._capabilities = self._discover_capabilities()
-            if self._model_id == _EMBEDDINGGEMMA2_MODEL:
-                processor = getattr(_first_module(encoder), "processor", None)
-                video_processor = getattr(processor, "video_processor", None)
-                if video_processor is not None:
-                    # Transformers defaults to torchcodec; PyAV is already in the local extra.
-                    loader = import_module("transformers.video_utils").load_video
-                    video_processor.fetch_videos = partial(fetch_videos, loader)
         self._space_id = _recipe_space(
             _EMBEDDINGGEMMA2_RECIPE
             if self._model_id == _EMBEDDINGGEMMA2_MODEL
@@ -278,18 +271,28 @@ def _load_encoder(
     try:
         # FP16 silently corrupts EmbeddingGemma 2 activations. FP32 also works on CPUs.
         model_kwargs = {"dtype": "float32"} if model_id == _EMBEDDINGGEMMA2_MODEL else {}
-        return factory(
+        encoder = factory(
             model_id,
             revision=revision,
             trust_remote_code=False,
             device=device,
             **({"model_kwargs": model_kwargs} if model_kwargs else {}),
         )
+        if model_id == _EMBEDDINGGEMMA2_MODEL:
+            processor = getattr(_first_module(encoder), "processor", None)
+            video_processor = getattr(processor, "video_processor", None)
+            if video_processor is not None:
+                # Transformers defaults to torchcodec; PyAV is already in the local extra.
+                loader = import_module("transformers.video_utils").load_video
+                video_processor.fetch_videos = partial(fetch_videos, loader)
+        return encoder
     except Exception:
         raise ModelError("failed to load the embedding model") from None
 
 
-def _dimensions(encoder: _SentenceEncoder, requested: int | None) -> tuple[int, int | None]:
+def _dimensions(
+    encoder: _SentenceEncoder, requested: int | None, model_id: str
+) -> tuple[int, int | None]:
     try:
         native = encoder.get_embedding_dimension()
     except Exception:
@@ -305,7 +308,11 @@ def _dimensions(encoder: _SentenceEncoder, requested: int | None) -> tuple[int, 
     advertised = _config_value(encoder, "matryoshka_dimensions")
     matryoshka = _config_value(encoder, "is_matryoshka")
     # The upstream checkpoint documents MRL but omits these optional config fields.
-    if _config_value(encoder, "model_type") == "embedding_gemma2" and native == 768:
+    if (
+        model_id == _EMBEDDINGGEMMA2_MODEL
+        and _config_value(encoder, "model_type") == "embedding_gemma2"
+        and native == 768
+    ):
         advertised = _EMBEDDINGGEMMA2_DIMENSIONS
         matryoshka = True
     if (
