@@ -7,7 +7,7 @@ from datetime import timedelta
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.infrastructure.local.store import RECALL_MAX_ROWS
-from mindbridge.kernel.contracts import index_recipe_for, validated_index_quantization
+from mindbridge.kernel.metadata import index_recipe_for, validated_index_quantization
 from mindbridge.kernel.validation import (
     positive_int,
     positive_seconds,

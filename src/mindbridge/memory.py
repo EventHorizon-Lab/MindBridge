@@ -46,11 +46,10 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.infrastructure.local.assets import AssetStore
-from mindbridge.infrastructure.local.zvec_index import ZvecIndex
+from mindbridge.infrastructure.local.zvec_index import ZvecIndex, validate_index_configuration
 from mindbridge.kernel.answering import ASYNC_QUEUE_TIME_MS, Answering
 from mindbridge.kernel.compilation import Compilation
 from mindbridge.kernel.contracts import (
-    STORE_METADATA_KEYS,
     close_quietly,
     declared_capabilities,
     resolve_backends,
@@ -66,13 +65,12 @@ from mindbridge.kernel.lifecycle import Lifecycle
 from mindbridge.kernel.materialization import Materializer
 from mindbridge.kernel.projection import Projection
 from mindbridge.kernel.records import Records
+from mindbridge.kernel.recovery import Recovery
 from mindbridge.kernel.retrieval import Retrieval
 from mindbridge.kernel.runtime import (
     Index,
     Storage,
-    ensure_store_metadata,
     open_store,
-    translate_storage_errors,
 )
 from mindbridge.kernel.settings import resolve_settings
 from mindbridge.kernel.speech import Speech
@@ -228,7 +226,6 @@ class Memory:
         )
         try:
             self._backends = resolve_backends(
-                index_quantization=self._settings.index_quantization,
                 embedder=embedder,
                 answerer=answerer,
                 transcriber=transcriber,
@@ -237,6 +234,12 @@ class Memory:
                 former=former,
                 consolidator=consolidator,
             )
+            try:
+                validate_index_configuration(
+                    self._backends.embedding_dimension, self._settings.index_quantization
+                )
+            except ValueError as error:
+                raise ValidationError(str(error)) from None
             assets = AssetStore(self.data_dir)
             self._storage = Storage(
                 store=self._store,
@@ -275,30 +278,12 @@ class Memory:
             )
             self._lifecycle.collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
-            index_missing = not index_path.exists()
-            index_rebuild, embedding_rebuild = ensure_store_metadata(
-                self._store, self._backends, self._settings, index_path
-            )
-            if embedding_rebuild:
-                _LOGGER.warning(
-                    "re-embedding stored memories for space %s", self._backends.space_id
-                )
-                embedding.reembed_memories()
-                self._store.set_metadata(STORE_METADATA_KEYS["space"], self._backends.space_id)
-                self._store.set_metadata(STORE_METADATA_KEYS["index"], self._settings.index_recipe)
-            if index_missing or index_rebuild:
-                with translate_storage_errors("checkpoint a missing search index"):
-                    queued = self._store.index.queue_all_embeddings()
-                # A store with nothing to project is the ordinary first open, not a rebuild:
-                # the index directory is always absent before `ZvecIndex` creates it below.
-                if queued:
-                    _LOGGER.info(
-                        "rebuilding the search index for %d embeddings "
-                        "(missing=%s, recipe changed=%s)",
-                        queued,
-                        index_missing,
-                        index_rebuild,
-                    )
+            Recovery(
+                storage=self._storage,
+                backends=self._backends,
+                settings=self._settings,
+                embedding=embedding,
+            ).prepare(index_path)
         except BaseException:
             close_quietly(*injected, self._store)
             raise

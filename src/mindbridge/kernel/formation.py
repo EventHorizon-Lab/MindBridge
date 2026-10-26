@@ -155,13 +155,6 @@ NAMING_PREDICATE = "identity"
 CONSENT_RECIPE = "mindbridge-identity-consent-v1"
 
 
-# Binding one voice to one face is the kernel's own corroboration rule over co-occurrence
-# evidence it counted, not a model's proposal, so the recipe names that rule. It is what makes
-# the MERGE row's lineage honest: the recognizer models produced the templates, this rule
-# decided the bind, and `rollback()` reverses it.
-IDENTITY_LINK_RECIPE = "mindbridge-identity-link-v1"
-
-
 def formation_memory_type(kind: MemoryKind) -> MemoryType:
     return KIND_MEMORY_TYPES.get(kind, MemoryType.SEMANTIC)
 

@@ -70,6 +70,12 @@ the model to treat it as evidence, but it cannot guarantee that a model will res
 injection or hallucination. Applications should display or inspect `AnswerResult.hits` for
 high-impact decisions.
 
+The bundled adapter checks provider refusals in buffered and streamed responses and reports
+`model_refused` without returning or logging the refusal text. A refusal is permanent for that
+request and is not retried as malformed JSON. Strict structured output, when selected, constrains
+response shape; it does not establish factual accuracy or authorize a persistent operation. The
+kernel still validates proposed changes against the supplied evidence and host policy.
+
 ### Storage, deletion, and backups
 
 SQLite is authoritative; Zvec is a rebuildable search projection, not an access-control layer.
@@ -90,6 +96,11 @@ never serialize provider exception bodies or credentials. REST withholds storage
 internal error subjects; CLI and MCP retain SDK subjects, which can include filesystem paths. Do
 not log request bodies, authorization headers, memory content, metadata, or unredacted CLI/MCP
 error envelopes in surrounding application code.
+
+Provider request IDs and returned model identity may be recorded on model traces for diagnosis.
+They do not contain the memory payload, but still belong in operator-controlled telemetry rather
+than public error reports. Real-service quality evaluations should use synthetic fixtures and
+store aggregate outcomes instead of response bodies.
 
 ## Deployment hardening
 

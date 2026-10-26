@@ -71,7 +71,6 @@ class ResponseCache:
         self.root_path = directory / "cache.db" if layered else requested
         self.write_path = directory / "runs" / run_id / "cache.db" if layered else self.root_path
         self.namespace = namespace
-        self._layered = layered
         self._closed = False
         self._root = _open(self.root_path, _RESPONSES_DDL)
         self._write = self._root if not layered else _open(self.write_path, _RESPONSES_DDL)

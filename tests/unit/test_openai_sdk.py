@@ -67,7 +67,6 @@ from mindbridge.models.base import (
     VisionDescriptionBackend,
 )
 from mindbridge.models.openai_sdk import (
-    DEFAULT_GENERATION_MODEL,
     UNKNOWN_ANSWER,
     OpenAIModels,
 )
@@ -206,6 +205,149 @@ def test_messages_embedding_uses_vllm_shape_without_dimensions(tmp_path: Path) -
 
     assert model.embedding_space == "embed-model:2:messages-v1:l2-v1"
     assert result[0] == pytest.approx((0.6, 0.8))
+
+
+@pytest.mark.parametrize(
+    ("task", "prefix"),
+    [
+        (EmbedTask.QUERY, "task: search result | query: "),
+        (EmbedTask.DOCUMENT, "title: none | text: "),
+    ],
+)
+def test_embeddinggemma2_messages_prefix_text_only_in_multimodal_batches(
+    tmp_path: Path, task: EmbedTask, prefix: str
+) -> None:
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
+    audio = _asset(tmp_path, "audio", Modality.AUDIO, "audio/wav", b"audio")
+    video = _asset(tmp_path, "video", Modality.VIDEO, "video/mp4", b"video")
+    inputs = (
+        ModelInput(text="find this"),
+        ModelInput(text="remember", assets=(image, audio, video)),
+        ModelInput(assets=(image, audio, video)),
+    )
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"index": 2, "embedding": [0, 5]},
+                    {"index": 0, "embedding": [3, 4]},
+                    {"index": 1, "embedding": [5, 0]},
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            embedding_client=_sdk_client(client),
+            embedding_model="google/embeddinggemma-2",
+            embedding_dimension=2,
+            embedding_request_format="messages",
+            embedding_capabilities=ALL_MODALITIES,
+        )
+        result = model.embed(inputs, task)
+
+    assert len(requests) == 1
+    payload = requests[0]
+    assert payload["add_special_tokens"] is True
+    assert "input" not in payload
+    assert "dimensions" not in payload
+    assert payload["model"] == "google/embeddinggemma-2"
+    messages = payload["messages"]
+    assert messages[0] == [
+        {"role": "user", "content": [{"type": "text", "text": prefix + "find this"}]}
+    ]
+    mixed = messages[1][0]["content"]
+    media = messages[2][0]["content"]
+    assert mixed[0] == {"type": "text", "text": prefix + "remember"}
+    assert (
+        mixed[1:]
+        == media
+        == [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+            {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,YXVkaW8="}},
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,dmlkZW8="}},
+        ]
+    )
+    assert inputs[0].text == "find this"
+    assert inputs[1].text == "remember"
+    assert inputs[2].text == ""
+    assert result[0] == pytest.approx((0.6, 0.8))
+    assert result[1] == pytest.approx((1.0, 0.0))
+    assert result[2] == pytest.approx((0.0, 1.0))
+    assert model.embedding_space == (
+        "google/embeddinggemma-2:2:embeddinggemma2-text-prompts-special-tokens-v1:l2-v1"
+    )
+
+
+def test_embeddinggemma2_media_only_singleton_keeps_explicit_space(tmp_path: Path) -> None:
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3, 4]}]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            embedding_client=_sdk_client(client),
+            embedding_model="google/embeddinggemma-2",
+            embedding_dimension=2,
+            embedding_request_format="messages",
+            embedding_capabilities=frozenset({Modality.IMAGE}),
+            embedding_space="application-pinned-space",
+        )
+        result = model.embed((ModelInput(assets=(image,)),))
+
+    assert requests == [
+        {
+            "model": "google/embeddinggemma-2",
+            "encoding_format": "float",
+            "add_special_tokens": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    assert result[0] == pytest.approx((0.6, 0.8))
+    assert model.embedding_space == "application-pinned-space"
+
+
+def test_embeddinggemma2_input_mode_keeps_generic_recipe() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3, 4]}]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            embedding_client=_sdk_client(client),
+            embedding_model="google/embeddinggemma-2",
+            embedding_dimension=2,
+        )
+        model.embed(("unchanged",), EmbedTask.QUERY)
+
+    assert requests == [
+        {
+            "model": "google/embeddinggemma-2",
+            "input": ["unchanged"],
+            "dimensions": 2,
+            "encoding_format": "float",
+        }
+    ]
+    assert model.embedding_space == "google/embeddinggemma-2:2:l2-v1"
 
 
 def test_embedding_retries_a_context_length_rejection_as_ordered_stills(
@@ -900,6 +1042,9 @@ def test_streamed_json_completion_rejects_valid_json_without_a_terminal_marker(
     tmp_path: Path,
 ) -> None:
     picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     def respond(_request: httpx.Request) -> httpx.Response:
         chunks = (
@@ -919,7 +1064,10 @@ def test_streamed_json_completion_rejects_valid_json_without_a_terminal_marker(
         body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
         return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
 
-    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        model_span(provider.get_tracer("missing-terminal"), "model", attributes={}),
+    ):
         model = OpenAIModels(
             _sdk_client(client),
             generation_model="caption-model",
@@ -932,6 +1080,10 @@ def test_streamed_json_completion_rejects_valid_json_without_a_terminal_marker(
 
     assert failure.value.reason == "response_invalid"
     assert failure.value.stage == "describe"
+    attributes = exporter.get_finished_spans()[0].attributes or {}
+    assert attributes[TOKEN_TOTAL] == 6
+    assert attributes[TOKEN_REPORTED_REQUEST_COUNT] == 2
+    provider.shutdown()
 
 
 def test_streamed_json_completion_closes_a_completed_stream() -> None:
@@ -1491,7 +1643,8 @@ def test_a_content_filtered_description_is_not_retried(tmp_path: Path) -> None:
         with pytest.raises(ModelError) as failure:
             model.describe((ModelInput(assets=(picture,)),))
 
-    assert failure.value.reason == "response_invalid"
+    assert failure.value.reason == "model_refused"
+    assert failure.value.retryable is False
     assert failure.value.stage == "describe"
     assert len(sent) == 1
 
@@ -1544,20 +1697,31 @@ def test_a_configured_sampler_still_wins_over_the_pinned_default(tmp_path: Path)
 
 
 def test_formation_space_identifies_every_generation_control() -> None:
-    baseline = OpenAIModels().formation_space
+    baseline = OpenAIModels(generation_model="compatible-model").formation_space
     variants = {
-        OpenAIModels(generation_seed=7).formation_space,
-        OpenAIModels(generation_temperature=0.2).formation_space,
-        OpenAIModels(generation_max_tokens=128).formation_space,
-        OpenAIModels(generation_extra_body={"reasoning": {"effort": "low"}}).formation_space,
+        OpenAIModels(generation_model="compatible-model", generation_seed=7).formation_space,
         OpenAIModels(
-            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})
+            generation_model="compatible-model", generation_temperature=0.2
+        ).formation_space,
+        OpenAIModels(
+            generation_model="compatible-model", generation_max_tokens=128
+        ).formation_space,
+        OpenAIModels(
+            generation_model="compatible-model",
+            generation_extra_body={"reasoning": {"effort": "low"}},
+        ).formation_space,
+        OpenAIModels(
+            generation_model="compatible-model",
+            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
         ).formation_space,
     }
 
     assert baseline not in variants
     assert len(variants) == 5
-    assert OpenAIModels(generation_seed=7).formation_space in variants
+    assert (
+        OpenAIModels(generation_model="compatible-model", generation_seed=7).formation_space
+        in variants
+    )
 
 
 def test_consolidation_numbers_evidence_and_resolves_cited_indices_to_ids() -> None:
@@ -1927,15 +2091,17 @@ def test_consolidation_prompt_spells_the_operation_keys_it_will_be_parsed_agains
         assert optional in prompt, optional
 
 
-def test_consolidation_names_the_unknown_key_and_quotes_the_reply() -> None:
-    """The rejection is total, so its message is the only account of why nothing was applied.
+def test_consolidation_names_the_unknown_key_without_exposing_the_reply() -> None:
+    """Structural diagnostics explain a rejected operation without exposing memory text.
 
     No alias is accepted: a key the field table does not carry is a proposal written against
-    some other contract. The error has to say which key and show the text, or the operator sees
-    only `applied=0` from a pass that in fact refused two well-reasoned corrections.
+    some other contract. The error names the bad field but keeps the private rationale and
+    serialized model response out of error envelopes and logs.
     """
     reply: dict[str, object] = {
-        "operations": [{"intent": "correct", "target": [0], "rationale": "contradicted"}]
+        "operations": [
+            {"intent": "correct", "target": [0], "rationale": "private correction evidence"}
+        ]
     }
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -1947,11 +2113,12 @@ def test_consolidation_names_the_unknown_key_and_quotes_the_reply() -> None:
             model.consolidate(_consolidation_evidence(), trigger=MemoryTrigger.MANUAL)
 
     assert failure.value.reason == "response_invalid"
-    assert "unknown key(s) target" in str(failure.value)
-    assert '"target": [0]' in str(failure.value)
+    assert "1 unknown field(s)" in str(failure.value)
+    assert '"target": [0]' not in str(failure.value)
+    assert "private correction evidence" not in str(failure.value)
 
 
-def test_consolidation_says_the_proposal_is_what_was_malformed() -> None:
+def test_consolidation_reports_a_malformed_proposal_without_exposing_its_content() -> None:
     """A proposal the formation parser cannot read is reported as a proposal, not as absence.
 
     The parser reports a bad shape by returning None, so a misspelled proposal key used to
@@ -1984,7 +2151,9 @@ def test_consolidation_says_the_proposal_is_what_was_malformed() -> None:
 
     assert failure.value.reason == "response_invalid"
     assert "proposal is not a valid formation proposal" in str(failure.value)
-    assert '"memory_type": "semantic"' in str(failure.value)
+    assert '"memory_type": "semantic"' not in str(failure.value)
+    assert "the kettle is on the worktop" not in str(failure.value)
+    assert "two mornings say the same thing" not in str(failure.value)
 
 
 def test_consolidation_operations_parse_when_the_reply_uses_the_documented_keys() -> None:
@@ -2016,18 +2185,25 @@ def test_consolidation_operations_parse_when_the_reply_uses_the_documented_keys(
 
 
 def test_consolidation_recipe_identifies_every_generation_control() -> None:
-    baseline = OpenAIModels().consolidation_recipe
+    baseline = OpenAIModels(generation_model="compatible-model").consolidation_recipe
     variants = {
-        OpenAIModels(generation_seed=7).consolidation_recipe,
-        OpenAIModels(generation_temperature=0.2).consolidation_recipe,
-        OpenAIModels(generation_max_tokens=128).consolidation_recipe,
-        OpenAIModels(generation_extra_body={"reasoning": {"effort": "low"}}).consolidation_recipe,
+        OpenAIModels(generation_model="compatible-model", generation_seed=7).consolidation_recipe,
+        OpenAIModels(
+            generation_model="compatible-model", generation_temperature=0.2
+        ).consolidation_recipe,
+        OpenAIModels(
+            generation_model="compatible-model", generation_max_tokens=128
+        ).consolidation_recipe,
+        OpenAIModels(
+            generation_model="compatible-model",
+            generation_extra_body={"reasoning": {"effort": "low"}},
+        ).consolidation_recipe,
     }
 
     assert baseline not in variants
     assert len(variants) == 4
     # A consolidation recipe is never mistaken for a formation space on the same model.
-    assert baseline != OpenAIModels().formation_space
+    assert baseline != OpenAIModels(generation_model="compatible-model").formation_space
 
 
 def test_consolidation_without_evidence_calls_no_model() -> None:
@@ -2090,28 +2266,32 @@ def test_vision_space_identifies_the_prompt_as_well_as_the_model(
     itself lands inside a searchable document. A space that tracked only the model would make an
     edited prompt serve captions written under the old one forever, with nothing to notice it.
     """
-    baseline = OpenAIModels().vision_space
-    assert baseline.startswith(f"{DEFAULT_GENERATION_MODEL}:mindbridge-vision-v2:")
+    baseline = OpenAIModels(generation_model="compatible-model").vision_space
+    assert baseline.startswith("compatible-model:mindbridge-vision-v2:")
     # Stable for one configuration: two identical compositions must share cached captions.
-    assert OpenAIModels().vision_space == baseline
+    assert OpenAIModels(generation_model="compatible-model").vision_space == baseline
     # Distinct from `formation_space`, which digests the same knobs under a different prompt.
-    assert baseline != OpenAIModels().formation_space
+    assert baseline != OpenAIModels(generation_model="compatible-model").formation_space
 
     variants = {
         OpenAIModels(generation_model="other-model").vision_space,
-        OpenAIModels(generation_seed=7).vision_space,
-        OpenAIModels(generation_temperature=0.2).vision_space,
-        OpenAIModels(generation_max_tokens=128).vision_space,
-        OpenAIModels(generation_extra_body={"reasoning": {"effort": "low"}}).vision_space,
+        OpenAIModels(generation_model="compatible-model", generation_seed=7).vision_space,
+        OpenAIModels(generation_model="compatible-model", generation_temperature=0.2).vision_space,
+        OpenAIModels(generation_model="compatible-model", generation_max_tokens=128).vision_space,
         OpenAIModels(
-            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})
+            generation_model="compatible-model",
+            generation_extra_body={"reasoning": {"effort": "low"}},
+        ).vision_space,
+        OpenAIModels(
+            generation_model="compatible-model",
+            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
         ).vision_space,
     }
     assert baseline not in variants
     assert len(variants) == 6
 
     monkeypatch.setattr(openai_backend, "_VISION_SYSTEM_PROMPT", "Describe it differently.")
-    assert OpenAIModels().vision_space != baseline
+    assert OpenAIModels(generation_model="compatible-model").vision_space != baseline
 
 
 def test_answer_marks_the_grounded_unknown_sentinel_as_insufficient_evidence() -> None:
@@ -2593,9 +2773,10 @@ def test_stream_answer_close_failure_preserves_errors_and_records_usage(ending: 
                     assert failure.value.reason == "timeout"
                     assert failure.value.__cause__ is original_error
                 elif ending in {"invalid", "length", "content_filter", "empty", "whitespace"}:
-                    assert failure.value.reason == (
-                        "output_truncated" if ending == "length" else "response_invalid"
-                    )
+                    assert failure.value.reason == {
+                        "length": "output_truncated",
+                        "content_filter": "model_refused",
+                    }.get(ending, "response_invalid")
                     assert failure.value.__cause__ is None
                 else:
                     assert failure.value.reason == "connection_failed"
@@ -4135,7 +4316,11 @@ def _search_hit() -> SearchHit:
         ),
         (_raise_timeout, "timeout", True),
         (_raise_connect_error, "connection_failed", True),
-        (lambda request: httpx.Response(500, json={"error": {"message": "upstream"}}), None, False),
+        (
+            lambda request: httpx.Response(500, json={"error": {"message": "upstream"}}),
+            "provider_unavailable",
+            True,
+        ),
     ],
 )
 def test_provider_failures_keep_their_cause_and_the_sdk_classification(

@@ -54,7 +54,7 @@ config = {
     "generation": {
         "provider": "openai",
         "model": "gpt-5-mini",
-        "temperature": 0.1,
+        "response_format": "json_schema",
     },
     "settings": {
         "minimum_relevance": 0.10,
@@ -102,10 +102,10 @@ In this table, connection fields are `base_url`, `api_key`, `timeout`, and `max_
 | --- | --- | --- |
 | `embedding: sentence-transformers` | `model` | `revision=None`, `dimension=None`, `device=None`, `batch_size=32` |
 | `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
-| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
-| `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
-| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
-| `consolidation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
+| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
+| `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
+| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
+| `consolidation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
 | `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
@@ -117,6 +117,31 @@ representations mask it, but a configuration file still contains a secret. Prefe
 lookup or a caller-owned client when the file could be committed or shared.
 Every `base_url` must be an absolute `http://` or `https://` URL; a bare host name is rejected
 during configuration validation rather than at the first model request.
+
+Use an SDK base URL ending in `/v1`, not the complete `/chat/completions` URL: the SDK appends the
+operation path. For an endpoint supporting strict structured output, select
+`response_format="json_schema"`. The adapter then sends a strict JSON Schema for formation,
+consolidation, visual descriptions, media diagnosis, and recall planning. Free-text answers remain
+text. The compatible-server default is `json_object`; it guarantees JSON syntax, not the shape or
+meaning of a response. Both modes retain local validation, and a configured strict schema is never
+silently downgraded. See OpenAI's [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs).
+
+Sampling controls are model-dependent. Known reasoning models do not receive incompatible automatic
+`temperature` or `seed` settings; explicitly configuring unsupported controls raises
+`ValidationError` before inference. The public `max_tokens` field remains the output budget and is
+sent as `max_completion_tokens` for reasoning models, including their reasoning tokens; other
+compatible models retain `max_tokens`. Leave headroom for reasoning when budgeting visible
+answers. Model snapshots make quality comparisons reproducible; changing a model or prompt still
+requires the [quality gate](operations.md#model-quality-gate).
+
+The adapter recognizes GPT-5/GPT-6 reasoning names and snapshots and the `o1`, `o3`, and `o4`
+families. GPT-5 Chat names and unrelated compatible model names retain generic sampling controls.
+Later reasoning models that support non-reasoning requests may use temperature with
+`extra_body={"reasoning_effort": "none"}`; the original GPT-5 family, GPT-6 Astra, and GPT-6.1 Sol
+cannot use this combination. GPT-5.1 and GPT-5.2 aliases and dated snapshots default to `none`, so
+temperature also works without explicitly setting effort on those models. Seeds are rejected for
+known reasoning models. `extra_body` cannot
+override the model, messages, response format, or streaming controls; configure their named options.
 
 Atomic capability declarations contain only `text`, `image`, `video`, and `audio`. OpenAI
 embedding requires at least one modality. Jina dimensions are `32`, `64`, `128`, `256`, `512`, or
@@ -226,6 +251,42 @@ This checkpoint uses Apache 2.0 weights and loads with `trust_remote_code=False`
 embeddings only; generation, transcription, speaker recognition, and face recognition remain
 separate backends. Use a new data directory when switching from another embedding model.
 
+#### EmbeddingGemma 2 through vLLM
+
+Install `mindbridge[openai]` on the application side and deploy vLLM separately using the
+[serving instructions](deployment.md#embeddinggemma-2-model-server). Select its OpenAI-compatible
+embeddings endpoint with the existing `openai` provider:
+
+```json
+{
+  "data_dir": "./data/embeddinggemma2-vllm",
+  "embedding": {
+    "provider": "openai",
+    "model": "google/embeddinggemma-2",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "api_key": "EMPTY",
+    "dimension": 768,
+    "modalities": ["text", "image", "audio", "video"],
+    "request_format": "messages"
+  }
+}
+```
+
+Use the exact model name `google/embeddinggemma-2`: in messages mode, MindBridge recognizes this
+name and prefixes query text with `"task: search result | query: "` and document text with
+`"title: none | text: "`. Pure media receives no prefix; mixed inputs preserve text and attachment
+order. The request enables the checkpoint's BOS/EOS special tokens and sends inline data URLs
+for images, audio, and video. Server aliases do not enable this model-specific recipe.
+
+The dimension above validates the native 768-dimensional response; messages mode does not request
+Matryoshka truncation. Keep the checkpoint's own chat template on the server. This recipe has its
+own vector-space identity, separate from generic messages requests and the local Sentence
+Transformers recipe. Use a fresh data directory when switching; existing unprompted EmbeddingGemma
+2 messages stores fail the metadata check. A custom `space` overrides that identity and must
+describe the actual server checkpoint and input recipe. Pin the server's model revision for
+reproducible deployment. HTTP fixture tests verify request construction and SDK wiring; live vLLM
+numerical parity has not been tested in this checkout.
+
 ## Automatic memory formation
 
 The optional `formation` slot builds the bundled OpenAI-compatible `FormationBackend`. It proposes
@@ -260,8 +321,11 @@ with Memory.from_config(
 
 An OpenAI-compatible local server can fill this slot without another adapter. It must implement
 `POST <base_url>/chat/completions`, accept `response_format={"type": "json_object"}`, and return one
-standard choice with a non-empty `message.content`. A `finish_reason` of `length` raises
+standard choice with a non-empty `message.content`, or a provider refusal. Select `json_schema`
+instead when the server supports the strict schema contract. A `finish_reason` of `length` raises
 `ModelOutputTruncatedError`; increase `max_tokens` instead of accepting partial proposals.
+An explicit provider refusal raises `ModelError(reason="model_refused")` and is not retried as
+malformed JSON. Truncation, refusal, and schema validation apply to streamed responses as well.
 
 Formation stays off when the slot is omitted. Configuring `generation` does not enable it, and the
 two slots use separate clients so they may select different models, endpoints, and credentials.
@@ -390,7 +454,7 @@ Three things bound what it costs and what it can do:
 - A throttled or overloaded endpoint is waited out before that fail-open, not straight through it.
   A batch refused as `rate_limited`, with a timeout, on a dropped connection, or with a 5xx is
   described again after 1 s, 4 s, and 16 s; a refusal that an identical request cannot clear --
-  `quota_exhausted`, `auth_failed`, `request_rejected` -- is not retried at all, with one narrow
+  `quota_exhausted`, `auth_failed`, `model_refused`, `request_rejected` -- is not retried at all, with one narrow
   exception: a `request_rejected` whose provider message says generation itself was aborted
   while producing the JSON reply ("Model output became abnormal ... generation was aborted ...
   Please retry") is retried the same way, because an identical request there routinely succeeds
@@ -406,9 +470,10 @@ Three things bound what it costs and what it can do:
   `mindbridge.vision.retried_batches` rather than summed into `failed_batches` -- the two answer
   different questions, "how many memories lost their caption" against "what did a long ingest pay
   waiting one out".
-- Captions are not reproducible. The request pins `temperature` 0 and a fixed `seed` unless the
-  slot sets its own, but a measured endpoint returned four different completions for four
-  identical requests at those values. A caption becomes indexed text, so anything that needs two
+- Captions are not reproducible. Models supporting sampling controls receive `temperature` 0 and
+  a fixed `seed` unless the slot sets its own; known reasoning models receive neither automatic
+  control. A measured compatible endpoint returned four different completions for four identical
+  requests at those values. A caption becomes indexed text, so anything that needs two
   ingests of one corpus to build the same documents has to cache descriptions by asset digest;
   the benchmark harness does exactly that.
 
@@ -432,7 +497,8 @@ with Memory.from_config(
         "consolidation": {
             "provider": "openai",
             "model": "gpt-5-mini",
-            "modalities": ["text", "image", "audio"],
+            "modalities": ["text", "image"],
+            "response_format": "json_schema",
             "max_tokens": 4096,
         },
     }
@@ -492,7 +558,7 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `index_speech` | `True` | Persist configured speech analysis during `add` |
-| `index_quantization` | `none` | Zvec projection mode: `none`, `fp16`, `int8`, or `rabitq` |
+| `index_quantization` | `none` | Zvec 0.8 projection mode: `none`, `fp16`, unrotated `int8`, or `rabitq`; changing modes rebuilds from stored embeddings |
 | `retrieval_mode` | `hybrid` | Instance candidate policy: `hybrid`, `dense`, or lexical-only `lexical`; lexical ranks by native normalized full-text relevance (RRF when both text fields apply); use physically isolated stores when comparing modes |
 | `minimum_relevance` | `0.10` | Floor on query-relevant evidence before retention and reinforcement ranking |
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |

@@ -1253,35 +1253,6 @@ def retire_memory_evidence(
     return tuple(dict.fromkeys(changed))
 
 
-def retire_evidence_clauses(
-    connection: sqlite3.Connection,
-    clauses: Sequence[tuple[str, str]],
-    *,
-    retired_at: datetime,
-) -> tuple[str, ...]:
-    """Retire precisely the clauses an operation introduced, preserving alternatives."""
-    changed: list[str] = []
-    for memory_id, clause_id in clauses:
-        tx_time = _retire_active_evidence_clause(
-            connection,
-            memory_id,
-            clause_id,
-            retired_at=retired_at,
-        )
-        if tx_time is None:
-            continue
-        _rebuild_flat_evidence_from_clauses(connection, memory_id, changed_at=tx_time)
-        changed.append(memory_id)
-    for memory_id in dict.fromkeys(changed):
-        refresh_evidence_projection(
-            connection,
-            memory_id,
-            _next_semantic_transaction_time(connection, retired_at, (memory_id,)),
-        )
-    restamp_dependent_evidence(connection, tuple(dict.fromkeys(changed)), retired_at)
-    return tuple(dict.fromkeys(changed))
-
-
 def evidence_clause_changes_are_current(
     connection: sqlite3.Connection,
     changes: Sequence[StoredEvidenceClauseChange],

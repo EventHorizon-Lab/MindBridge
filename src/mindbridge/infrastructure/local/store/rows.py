@@ -323,11 +323,6 @@ class StoredOperation:
     # Evidence rows this operation actually inserted. Rollback retires exactly these, so a link
     # that predated the operation survives it.
     linked: tuple[tuple[str, str], ...] = ()
-    # Complete support clauses this operation inserted or reactivated. Unlike `linked`, this
-    # preserves a conjunction for rollback rather than treating each member as an alternative.
-    # Kept for logs written by the incomplete schema-17 development build; new rows use the
-    # before/after snapshots below.
-    linked_clauses: tuple[tuple[str, str], ...] = ()
     clause_changes: tuple[StoredEvidenceClauseChange, ...] = ()
     # `(memory_id, version)` pairs this operation's own lineage rule superseded: the current
     # versions of the other records in the derived record's lineage whose validity it overlapped.
@@ -355,9 +350,6 @@ class StoredOperation:
         for memory_id, source_memory_id in self.linked:
             require_identifier(memory_id, "memory_id")
             require_identifier(source_memory_id, "source_memory_id")
-        for memory_id, clause_id in self.linked_clauses:
-            require_identifier(memory_id, "memory_id")
-            validated_sha256(clause_id)
         if not all(
             isinstance(change, StoredEvidenceClauseChange) for change in self.clause_changes
         ):

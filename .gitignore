@@ -1,4 +1,7 @@
 .venv/
+# Isolated environments created by the CI installability and wheel checks.
+/.install-venv/
+/.wheel-venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -19,6 +22,8 @@ dist/
 # this rule covering the whole directory. The committed template lives at
 # docs/examples/eval.example.yaml instead.
 .benchmarks/
+# Default output of the credentialed model-quality CLI.
+/model-quality.json
 
 # Autoresearch workspaces and generated artifacts are local-only.
 /autoresearch/
@@ -34,6 +39,8 @@ review-receipts/
 # The subagent-driven-development skill assumes this directory is ignored; it holds working
 # notes for one plan and nothing another checkout needs.
 .superpowers/
+# Keep completed agent plans and superseded specifications out of product documentation.
+/docs/superpowers/
 
 # Agent-created linked worktrees are local-only.
 /.claude/worktrees/

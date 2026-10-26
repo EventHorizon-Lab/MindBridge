@@ -79,6 +79,10 @@ New behavior needs the smallest test that fails when it regresses:
 - Integration tests only for real external model services.
 - Benchmark tests for deterministic isolation and metric calculation.
 
+Prompt, model, and retrieval-policy changes also need task-specific quality-evaluation evidence.
+Record the model revision, input fixtures, pass criteria, and any real-service checks not run;
+passing mocked transport tests alone does not establish model quality.
+
 Use a fresh `tmp_path` for every local store. Test that a second owner of the same directory fails
 immediately and that different directories work concurrently. Retrieval tests must verify that
 SQLite hydration drops stale Zvec IDs and that a missing index rebuilds without re-embedding
@@ -94,6 +98,11 @@ is a breaking change and needs tests and documentation in the same patch.
 
 The product API has no implicit scoping identifiers. Metadata is application data, not an access
 control or isolation boundary.
+
+Validate model output structurally and semantically before it can affect durable state. Stored
+content and retrieved evidence are untrusted data, never authority to change runtime policy.
+Keep credentials, memory content, model response bodies, and provider exception bodies out of
+ordinary logs; use trace and provider request IDs for diagnosis.
 
 ## Commits and pull requests
 

@@ -185,7 +185,13 @@ The default generation endpoint is OpenAI-compatible. These environment variable
 
 `--model-args` overrides `generation_model`, `base_url`, `timeout_seconds`, and
 `generation_min_video_seconds`. `--gen-kwargs` accepts deterministic generation controls; the
-runner enforces temperature zero, sampling off, and a seed matching `--seed`.
+runner enforces temperature zero, sampling off, and a seed matching `--seed` where the model
+supports them. Known reasoning families omit unsupported default sampling controls and provider
+seeds; supported generic models retain both. Reasoning requests use `max_completion_tokens` for
+the configured output limit. Reported `generation_temperature` and `generation_seed` are `null`
+when omitted. The run seed still controls dataset selection and local random baselines; it cannot
+guarantee deterministic output from a provider that does not accept a seed. Explicit unsupported
+controls in `generation.extra_body` fail validation.
 
 Open-ended tasks use a judge. Without separate judge settings, the judge reuses the generation
 endpoint. Configure an official or deliberately chosen judge independently:
@@ -288,7 +294,7 @@ they are not accepted keys in `benchmark.run`. The product CLI `mindbridge ask` 
 `--answer-policy` flag: this override belongs to the evaluator, while product REST and SDK
 requests carry their own policy. Keep the command used for an experiment with its artifacts.
 
-A reproducible run pins generation temperature to zero and uses the run seed, so
+A run owns supported generation temperature and seed settings, so
 `generation.temperature` and `generation.seed` are rejected. Disable model thinking through the
 generation block instead:
 
@@ -681,8 +687,9 @@ it has at least two frames. A shorter output is re-encoded from the same bounded
 with its native cadence, audio mapping, and geometry so no synthetic frame or event time is
 introduced. A consumer whose video processor needs two frames reports a genuine one-frame input as
 unsupported at its own boundary rather than changing the generic prepared-media representation.
-During a cache-version migration, a legacy one-frame derivative is rebuilt instead of reused because
-the former one-frame-per-second sampling may have discarded real source frames.
+Only the current `ffmpeg-v2` cache namespace is reused. Older `ffmpeg-v1` derivatives are ignored
+and recomputed from their sources; they can be deleted to recover disk space. Current completed
+entries remain reusable, including genuine one-frame inputs.
 
 M3-Bench-web's official release publishes YouTube URLs rather than a durable web-video archive.
 When `yt-dlp` identifies a video as permanently unavailable (for example, private, removed, or
@@ -830,8 +837,9 @@ number would measure the generator's prior knowledge of the scripts rather than 
 
 ## Reported performance and resource metrics
 
-Evaluation schema version `18` adds `grounding_request` to each sample and, with `--log-samples`,
-the original `source_question`. The runner recipe is `mindbridge_eval_official_v17`, so previous
+Evaluation schema version `19` removes deprecated performance aliases listed below. Version `18`
+introduced `grounding_request` to each sample and, with `--log-samples`, the original
+`source_question`. The runner recipe is `mindbridge_eval_official_v18`, so previous
 answer caches are not reused under the new prompt and evidence projection.
 `grounding_request` describes the last **prepared** generation request: retained `record_ids`,
 original `asset_ids`, UTF-8 `text_bytes`, `media_fallback`, and span `successful` status. Text bytes
@@ -889,6 +897,29 @@ gaps do not inflate the denominator. TTFT and token-per-call distributions also 
 | `nodes` | Count, compute time, active time, throughput, average, p50/p95/p99, status, parent operation, purpose, model identity, response identity, fingerprint, embedding task, batch size, and modalities for every operation, stage, and model span. |
 | `token_usage` | Total and per-module request counts, exactness, input/output/cached/reasoning tokens, modality totals, per-call distribution, and observed output tokens per model-compute second. |
 
+Benchmark performance JSON now emits only the explicit metric names. Consumers of older result
+documents must update these removed fields:
+
+| Removed field | Current field |
+| --- | --- |
+| `performance.search` | `performance.ask_retrieval_core` |
+| `ingest.call_count` | `ingest.success_count` |
+| `ingest.item_count` | `ingest.accepted_item_count` |
+| `ingest.compute_seconds` | `ingest.successful_compute_seconds` |
+| `ingest.wall_seconds` | `ingest.active_seconds` |
+| `ingest.call_latency_ms`, `ingest.item_latency_ms` | `ingest.successful_batch_latency_ms`; per-item amortized work is `ingest.amortized_compute_ms_per_accepted_item` |
+| `ingest.items_per_second` | `ingest.items_per_active_second` |
+| Latency-block `wall_seconds`, `throughput_per_second` | `active_seconds`, `throughput_per_active_second` |
+| `answer.time_to_first_token_ms` | `answer.generation_time_to_first_token_ms` |
+| `asr.call_count`, `asr.ratio_call_count` | `asr.invocation_count`, `asr.ratio_invocation_count` |
+
+The accompanying `deprecated_fields` objects are removed. This changes the benchmark result
+schema; stored result files are not rewritten. Resource measurement `wall_seconds` retains its
+existing meaning as the measured resource window.
+
+Controls that require the current schema, including blind baselines and sample comparison, need
+new schema-19 output. Do not relabel older result files to bypass those checks.
+
 `ingest` ends only after the SQLite commit and the Zvec apply, so an accepted item is searchable
 when its measured call completes; the Zvec flush and outbox acknowledgement are batched behind the
 call and are not part of its latency. Failed attempts stay in attempt
@@ -942,8 +973,7 @@ post-answer warm-store replay of each fresh product question through public `Mem
 selected tasks finish their formal answers before this run-global second pass begins. It is the
 metric used by `retrieval_e2e_latency_p95` performance budgets. It does not claim to be the
 retrieval performed by the answer. `ask_retrieval_core` measures that real in-answer retrieval
-path. The old `performance.search` field remains only as a deprecated alias of
-`ask_retrieval_core`.
+path.
 
 `search_e2e.planned_count` is the number of eligible fresh product questions, including requests
 whose persisted unit could not be reopened. `attempt_count`, `success_count`, and `error_count`
@@ -955,13 +985,12 @@ successful caller-latency observation.
 `asr.real_time_factor` is successful transcription compute seconds divided by the audio duration
 reported by the same successful calls, so lower is better and values below one are faster than real
 time. `asr.realtime_speedup` is the inverse. Both headline ratios are `null` unless every
-successful span reports a positive finite duration; `ratio_complete`, `ratio_call_count`, and the
+successful span reports a positive finite duration; `ratio_complete`, `ratio_invocation_count`, and the
 `reported_subset_*` ratios expose partial coverage without presenting it as complete. Failed-call
 latency remains visible in `inference_latency_ms` but cannot contaminate either ratio. Local FunASR
 uses the complete input audio-stream duration, including silence and tail, and counts the input
 again when an invalid batch reply triggers per-asset fallback inference. `invocation_count` counts
-transcription spans while `request_count` includes those internal fallback model calls;
-`call_count` remains a deprecated alias of `invocation_count`.
+transcription spans while `request_count` includes those internal fallback model calls.
 
 Token totals are never estimated. `complete` covers total tokens, while input, output, cached
 input, and reasoning output each have their own `*_complete` flag. An unavailable component is
@@ -1248,7 +1277,7 @@ Prompts, references, and raw judge responses are retained only with `--log-sampl
 option as sensitive: benchmark artifacts can contain source content, retrieved evidence, and model
 responses.
 
-The runner fixes seeds and generation temperature, records model endpoints and scorer protocols,
+The runner fixes supported seeds and generation temperature, records model endpoints and scorer protocols,
 and marks whether each metric used the required official judge. `measurement_protocol` records
 fresh-store state, actual embedding warmups, repeat index, cache exclusions, and uncontrolled
 remote-server state. A provider may still change an unversioned model, so publishable runs should

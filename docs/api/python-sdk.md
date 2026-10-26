@@ -104,7 +104,9 @@ Memory(
 `embedder` is required. With a speech-capable `SpeechBackend`, the default `index_speech=True`
 stores transcripts and resolved speaker names with new memories; setting it to `False` defers that
 analysis until `speech()` is called. `index_quantization` changes only the rebuildable vector
-index; supported values are `none`, `fp16`, `int8`, and `rabitq`. `retrieval_mode` selects the
+index; supported values are `none`, `fp16`, `int8`, and `rabitq`. Zvec 0.8 INT8 uses unrotated
+cosine quantization; recognized 0.7 projections rebuild from stored embeddings on first open.
+`retrieval_mode` selects the
 instance candidate route: `hybrid` is the default, `dense` disables full-text candidates, and
 `lexical` disables query embedding and dense candidates and ranks by native normalized full-text
 relevance. An embedder remains required because ingestion still writes durable vector embeddings.
@@ -1488,6 +1490,7 @@ OpenAIModels(
     generation_seed: int | None = None,
     generation_temperature: float | None = None,
     generation_max_tokens: int | None = None,
+    generation_response_format: Literal["json_object", "json_schema"] = "json_object",
     generation_min_video_seconds: float | None = None,
     generation_video_limit: int | None = 8,
     generation_extra_body: Mapping[str, object] | None = None,
@@ -1508,9 +1511,21 @@ endpoints. Transcription prompt, keywords, and languages form the provider hint.
 capability is available; `generation_video_limit` caps retrieved evidence videos but not question
 media. `generation_extra_body` is forwarded to the SDK request.
 
+`generation_response_format="json_schema"` sends strict schemas for structural model operations:
+formation, consolidation, visual descriptions, media diagnosis, and recall planning. The default
+`"json_object"` supports compatible endpoints that implement JSON mode. Both retain local
+validation, and selecting strict output does not change free-text answers. A rejected strict
+schema is reported rather than silently retried with a weaker protocol.
+
+Known reasoning models omit unsupported automatic sampling controls and reject explicitly configured
+unsupported `generation_temperature` or `generation_seed` before inference. Their
+`generation_max_tokens` is serialized as `max_completion_tokens`, including non-visible reasoning
+tokens; generic compatible models keep `max_tokens`. See the
+[configuration reference](../configuration.md#provider-fields) for protocol and model constraints.
+
 `generation_stream=True` makes synchronous `answer()` consume a provider stream internally;
 it does not change `AnswerResult` or deliver chunks to the caller. Use `Memory.ask_stream()` for
-incremental delivery. This direct adapter control is not a declarative configuration field.
+incremental delivery. Declarative OpenAI completion slots expose the same control as `stream`.
 
 Its operation signatures widen the base protocols only by accepting plain text where useful:
 
@@ -1587,9 +1602,15 @@ All stable exceptions derive from `MindBridgeError`:
 | `IndexUnavailableError` | `index_unavailable` | `None` |
 
 Every error may carry `reason`, `stage`, and `subject`. `retryable` is true only when `reason` is
-`connection_failed`, `data_dir_in_use`, `flush_failed`, `index_missing`, `rate_limited`, or
+`connection_failed`, `data_dir_in_use`, `flush_failed`, `index_missing`, `provider_unavailable`, `rate_limited`, or
 `timeout`; it is never inferred from the message. `ModelOutputTruncatedError` is a deterministic
 `ModelError`, and `IndexUnavailableError` is a `StorageError`.
+
+The bundled OpenAI adapter reports explicit provider refusals as `model_refused` without returning
+the refusal text. This is distinct from `response_invalid` and is not retried as malformed output.
+`provider_unavailable` identifies temporary upstream server failures after the SDK's retry budget;
+`quota_exhausted` covers exhausted credits and provider spend or usage limits, which require an
+operator change rather than an identical retry. See the [shared error vocabulary](rest.md#codes-and-reasons).
 
 Stable input bounds are:
 

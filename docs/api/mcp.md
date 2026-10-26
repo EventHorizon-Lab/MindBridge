@@ -349,6 +349,11 @@ Stable SDK codes are `mindbridge_error`, `validation_error`, `memory_not_found`,
 `storage_error`, and `index_unavailable`; unexpected failures use `internal_error`. Reasons and
 retryability use the [shared vocabulary](rest.md#codes-and-reasons).
 
+An explicit model refusal is `model_error/model_refused` with `retryable=false`; the provider's
+refusal text is withheld. Temporary upstream failures use `provider_unavailable` with
+`retryable=true`, while exhausted credits and spend/usage limits use permanent `quota_exhausted`.
+The client must still bound retries rather than interpreting `retryable` as a retry loop.
+
 Unlike unauthenticated REST, the MCP adapter retains `subject` for every SDK code to support owner
 diagnostics. That is safe only for trusted clients; a network host must protect or redact the error
 envelope at its outer boundary. Provider exceptions, credentials, and unexpected implementation

@@ -1,4 +1,6 @@
 {
+  // This git-ignored upstream model checkout is downloaded locally, not project documentation.
+  "ignores": ["WeMM-Embedding-2B/**"],
   "config": {
     "MD013": false,
     // A reference organised one section per dataset repeats the same sub-structure under each

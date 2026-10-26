@@ -56,11 +56,13 @@ REASON_STATUS: Mapping[str, int] = {
     "asset_unavailable": status.HTTP_502_BAD_GATEWAY,
     "asset_changed": status.HTTP_502_BAD_GATEWAY,
     "model_failed": status.HTTP_502_BAD_GATEWAY,
+    "model_refused": status.HTTP_502_BAD_GATEWAY,
     # Every retryable reason lands here, and `test_every_retryable_reason_says_503` proves it:
     # an agent that reads 503 plus `Retry-After` must not have to also read the reason.
     "connection_failed": status.HTTP_503_SERVICE_UNAVAILABLE,
     "timeout": status.HTTP_503_SERVICE_UNAVAILABLE,
     "rate_limited": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "provider_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
     "data_dir_in_use": status.HTTP_503_SERVICE_UNAVAILABLE,
     "flush_failed": status.HTTP_503_SERVICE_UNAVAILABLE,
     "index_missing": status.HTTP_503_SERVICE_UNAVAILABLE,

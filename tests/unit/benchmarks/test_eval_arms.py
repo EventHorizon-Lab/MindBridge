@@ -35,6 +35,7 @@ from mindbridge import (
     ModelError,
     ModelInput,
     SearchHit,
+    ValidationError,
 )
 from mindbridge._telemetry import (
     RECALL_COMPLETE,
@@ -1423,8 +1424,30 @@ def test_answer_retrieval_candidate_limit_matches_budget_policy() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("model", "extra_body", "controls"),
+    (
+        ("compatible-model", None, {"temperature": 0.0, "seed": 11, "max_tokens": 64}),
+        ("gpt-5-mini", None, {"max_completion_tokens": 64}),
+        ("gpt-5.1", None, {"temperature": 0.0, "max_completion_tokens": 64}),
+        (
+            "gpt-5.1-2025-11-13",
+            None,
+            {"temperature": 0.0, "max_completion_tokens": 64},
+        ),
+        ("gpt-5.1", {"reasoning_effort": "high"}, {"max_completion_tokens": 64}),
+        (
+            "gpt-5.4",
+            {"reasoning_effort": "none"},
+            {"temperature": 0.0, "max_completion_tokens": 64},
+        ),
+    ),
+)
 def test_baseline_generator_uses_the_configured_generation_model(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    extra_body: dict[str, object] | None,
+    controls: dict[str, object],
 ) -> None:
     import openai
 
@@ -1447,12 +1470,18 @@ def test_baseline_generator_uses_the_configured_generation_model(
     monkeypatch.setattr(openai, "AsyncOpenAI", Client)
     generator = eval_arms_module._BaselineGenerator(
         ModelConfig(
-            generation_model="gpt-5-mini",
+            generation_model=model,
             generation_base_url="http://generate/v1",
             generation_api_key="secret",
         ),
         seed=11,
         gen_kwargs="max_tokens=64,enable_thinking=false",
+        generation=MindBridgeConfig.model_validate(
+            {
+                "embedding": {"provider": "openai"},
+                "generation": {"provider": "openai", "model": model, "extra_body": extra_body},
+            }
+        ),
     )
 
     blind = asyncio.run(generator.answer("who signed it?", None))
@@ -1480,11 +1509,13 @@ def test_baseline_generator_uses_the_configured_generation_model(
     }
     assert blind == stuffed == stuffed_with_text_hit == "Ada"
     for request in requests[1:]:
-        assert request["model"] == "gpt-5-mini"
-        assert request["temperature"] == 0.0
-        assert request["seed"] == 11
-        assert request["max_tokens"] == 64
-        assert request["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert request["model"] == model
+        assert set(request) == {"model", "messages", "extra_body"} | controls.keys()
+        assert {name: request[name] for name in controls} == controls
+        assert request["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False},
+            **(extra_body or {}),
+        }
     messages = cast(list[dict[str, str]], requests[1]["messages"])
     assert messages[0]["content"] == eval_arms_module._BLIND_SYSTEM_PROMPT
     assert messages[1]["content"] == "who signed it?"
@@ -1492,6 +1523,30 @@ def test_baseline_generator_uses_the_configured_generation_model(
     assert stuffed_messages[0]["content"] == eval_arms_module._FULL_CONTEXT_SYSTEM_PROMPT
     assert "Ada signed the contract" in stuffed_messages[1]["content"]
     assert requests[3] == requests[2]
+
+
+@pytest.mark.parametrize("extra_body", ({"top_p": 0.5}, {"seed": 11}))
+def test_baseline_generator_rejects_explicit_unsupported_controls(
+    monkeypatch: pytest.MonkeyPatch, extra_body: dict[str, object]
+) -> None:
+    import openai
+
+    class Client:
+        def __init__(self, **_options: object) -> None: ...
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", Client)
+    with pytest.raises(ValidationError, match="does not support"):
+        eval_arms_module._BaselineGenerator(
+            ModelConfig(generation_model="gpt-5-mini"),
+            seed=11,
+            gen_kwargs="",
+            generation=MindBridgeConfig.model_validate(
+                {
+                    "embedding": {"provider": "openai"},
+                    "generation": {"provider": "openai", "extra_body": extra_body},
+                }
+            ),
+        )
 
 
 def test_a_failed_answer_keeps_retrieval_and_scores_the_joint_metrics_zero() -> None:

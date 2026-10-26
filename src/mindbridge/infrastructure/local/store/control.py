@@ -31,7 +31,6 @@ from mindbridge.infrastructure.local.store._lineage import (
     require_unretired_memories,
     require_visible_memories,
     restore_memory_versions,
-    retire_evidence_clauses,
     retire_memory_evidence,
     retire_memory_versions,
     reverse_evidence_clause_changes,
@@ -348,7 +347,6 @@ class OperationLog:
         *,
         rolled_back_at: datetime,
         retire_evidence: Sequence[tuple[str, str]] = (),
-        retire_clauses: Sequence[tuple[str, str]] = (),
         reverse_clause_changes: Sequence[StoredEvidenceClauseChange] = (),
         restore_versions: Sequence[str | tuple[str, int]] = (),
         retire_versions: Sequence[str] = (),
@@ -416,7 +414,6 @@ class OperationLog:
                 (
                     *delete_memory_ids,
                     *(memory_id for memory_id, _source in retire_evidence),
-                    *(memory_id for memory_id, _clause in retire_clauses),
                     *(change.memory_id for change in reverse_clause_changes),
                     *retire_versions,
                     *(entry if isinstance(entry, str) else entry[0] for entry in restore_versions),
@@ -442,11 +439,6 @@ class OperationLog:
                 _deleted, orphaned = delete_memory(connection, memory_id)
                 unreferenced.extend(orphaned)
             retire_memory_evidence(connection, retire_evidence, retired_at=reverted_at)
-            retire_evidence_clauses(
-                connection,
-                retire_clauses,
-                retired_at=reverted_at,
-            )
             reverse_evidence_clause_changes(
                 connection,
                 reverse_clause_changes,
@@ -462,7 +454,6 @@ class OperationLog:
                 connection,
                 (
                     *(memory_id for memory_id, _source in retire_evidence),
-                    *(memory_id for memory_id, _clause in retire_clauses),
                     *(change.memory_id for change in reverse_clause_changes),
                     *retire_versions,
                     *(entry if isinstance(entry, str) else entry[0] for entry in restore_versions),

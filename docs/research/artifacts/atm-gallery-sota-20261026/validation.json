@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-26",
+  "checks": [
+    {
+      "command": "uv lock --check --default-index https://pypi.org/simple",
+      "result": "passed"
+    },
+    {
+      "command": "uv run --frozen ruff format --check .",
+      "result": "passed; 338 files already formatted"
+    },
+    {
+      "command": "uv run --frozen ruff check .",
+      "result": "passed"
+    },
+    {
+      "command": "uv run --frozen mypy",
+      "result": "passed; 250 source files"
+    },
+    {
+      "command": "uv run --frozen pytest -W error",
+      "result": "passed; 2578 tests; 530.79 seconds"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CONTRIBUTING.md pinned markdownlint-cli2 v0.23.0 full command",
+      "result": "passed; 82 Markdown files; 0 errors"
+    },
+    {
+      "command": "CONTRIBUTING.md pinned lychee v0.23.0 full command",
+      "result": "passed; 821 targets; 813 OK; 8 redirects; 0 errors"
+    },
+    {
+      "command": "bash -n render-source-crops.sh",
+      "result": "passed"
+    },
+    {
+      "command": "new-report local-reference existence check",
+      "result": "passed"
+    },
+    {
+      "command": "source-crop visual inspection",
+      "result": "passed; both tables legible"
+    }
+  ],
+  "model_evaluation": "Not run; no new benchmark or SOTA result",
+  "external_implementations": "Read only; not executed",
+  "authored_scope": "Research Markdown, index links, source table crops, reproducer, evidence metadata",
+  "concurrent_work": "Other work changed retrieval.py during validation. These successful checks are observations of a concurrently edited checkout, not certification of an immutable final product patch."
+}

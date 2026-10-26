@@ -612,6 +612,55 @@ def test_declarative_openai_embedding_defaults_stay_text_and_input_shaped() -> N
         )
 
 
+def test_embeddinggemma2_vllm_config_embeds_documents_and_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url == "http://127.0.0.1:8000/v1/embeddings"
+        payload = json.loads(request.content)
+        requests.append(payload)
+        assert payload["model"] == "google/embeddinggemma-2"
+        assert payload["add_special_tokens"] is True
+        assert "dimensions" not in payload
+        return httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": [1.0, *([0.0] * 767)]}]}
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        monkeypatch.setattr(
+            recipes_module,
+            "_openai_client",
+            lambda **values: openai.OpenAI(http_client=http_client, **cast(Any, values)),
+        )
+        with Memory.from_config(
+            {
+                "data_dir": tmp_path,
+                "embedding": {
+                    "provider": "openai",
+                    "model": "google/embeddinggemma-2",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "api_key": "EMPTY",
+                    "dimension": 768,
+                    "modalities": ["text", "image", "audio", "video"],
+                    "request_format": "messages",
+                },
+            }
+        ) as memory:
+            record = memory.add("Ada prefers tea.")
+            hits = memory.search("Ada's preferred drink")
+
+    assert hits[0].id == record.id
+    assert len(requests) == 2
+    assert requests[0]["messages"][0]["content"] == [
+        {"type": "text", "text": "title: none | text: Ada prefers tea."}
+    ]
+    assert requests[1]["messages"][0]["content"] == [
+        {"type": "text", "text": "task: search result | query: Ada's preferred drink"}
+    ]
+
+
 def test_declarative_openai_embedding_rejects_a_model_that_declares_no_modality() -> None:
     # An empty set builds a Memory whose every write fails with "does not support: text". The
     # value is out of range, so it is refused here rather than at the first add.

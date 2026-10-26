@@ -4728,6 +4728,85 @@ def test_index_quantization_change_rebuilds_without_reembedding(tmp_path: Path) 
         assert recipe.endswith("quantization-int8")
 
 
+@pytest.mark.parametrize("previous_mode", ("none", "fp16", "int8", "rabitq"))
+@pytest.mark.parametrize("quantization", (IndexQuantization.NONE, IndexQuantization.INT8))
+def test_zvec_07_recipe_upgrade_preserves_sqlite_without_reembedding(
+    tmp_path: Path,
+    previous_mode: str,
+    quantization: IndexQuantization,
+) -> None:
+    with Memory(tmp_path, embedder=_FakeModels()) as memory:
+        record = memory.add(
+            "preserved episodic memory",
+            memory_type=MemoryType.EPISODIC,
+            metadata={"source": "before-upgrade"},
+        )
+    previous_recipe = (
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:"
+        f"context-keys-v12:quantization-{previous_mode}"
+    )
+    with LocalStore(tmp_path) as store:
+        store.set_metadata("index.recipe", previous_recipe)
+        stored_record = store.records.read_memory(record.id)
+        stored_documents = store.index.read_memory_index_documents((record.id,))
+    sentinel = tmp_path / "zvec" / "obsolete-index"
+    sentinel.write_text("replace this projection", encoding="utf-8")
+
+    reopened_models = _FakeModels()
+    reopened_models.fail_embedding = True
+    with Memory(tmp_path, embedder=reopened_models, index_quantization=quantization) as memory:
+        assert memory.get(record.id) == record
+        assert not sentinel.exists()
+        index = _FakeIndex.instances[-1]
+        assert index.quantization is quantization
+        assert tuple(index.documents.values()) == stored_documents
+
+    assert reopened_models.embed_inputs == []
+    with LocalStore(tmp_path) as store:
+        assert store.records.read_memory(record.id) == stored_record
+        assert store.index.read_memory_index_documents((record.id,)) == stored_documents
+        assert store.get_metadata("index.recipe") == (
+            "zvec-0.8:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:"
+            f"context-keys-v12:quantization-{quantization.value}"
+        )
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    (
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:"
+        "context-keys-v11:quantization-none",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:"
+        "context-keys-v11:quantization-none",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:"
+        "context-keys-v12:quantization-unknown",
+        "zvec-0.8:hnsw-cosine-m50-efc500:fts-unknown:grouped-range:"
+        "context-keys-v12:quantization-none",
+    ),
+)
+def test_unknown_index_recipe_preserves_sqlite_and_projection(
+    tmp_path: Path,
+    recipe: str,
+) -> None:
+    with Memory(tmp_path, embedder=_FakeModels()) as memory:
+        record = memory.add("preserved memory")
+    with LocalStore(tmp_path) as store:
+        store.set_metadata("index.recipe", recipe)
+        stored_record = store.records.read_memory(record.id)
+        stored_documents = store.index.read_memory_index_documents((record.id,))
+    sentinel = tmp_path / "zvec" / "preserved-index"
+    sentinel.write_text("still here", encoding="utf-8")
+
+    with pytest.raises(StorageError, match="metadata mismatch"):
+        Memory(tmp_path, embedder=_FakeModels())
+
+    assert sentinel.read_text(encoding="utf-8") == "still here"
+    with LocalStore(tmp_path) as store:
+        assert store.get_metadata("index.recipe") == recipe
+        assert store.records.read_memory(record.id) == stored_record
+        assert store.index.read_memory_index_documents((record.id,)) == stored_documents
+
+
 @pytest.mark.parametrize(
     "superseded",
     [

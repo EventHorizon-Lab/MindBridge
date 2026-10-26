@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -799,31 +800,48 @@ def test_video_segment_native_retry_keeps_valid_normal_segments_byte_identical(
     assert commands[1][commands[1].index("-vf") + 1].startswith("scale=")
 
 
-def test_fresh_cache_reuses_only_a_valid_legacy_video_entry(
+def test_obsolete_video_cache_is_recomputed_in_the_current_namespace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")
     cache = tmp_path / ".prepared" / "ffmpeg-v2" / "fixture"
-    legacy = tmp_path / ".prepared" / "ffmpeg-v1" / "fixture" / "legacy" / "segment-00000.mp4"
+    source_stat = source.stat()
+    legacy_key = hashlib.sha256(
+        json.dumps(
+            [
+                "video-segment-v2",
+                str(source.resolve()),
+                source_stat.st_size,
+                source_stat.st_mtime_ns,
+                [1.0],
+                "ffmpeg",
+            ],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:20]
+    legacy = tmp_path / ".prepared" / "ffmpeg-v1" / "fixture" / legacy_key / "segment-00000.mp4"
     legacy.parent.mkdir(parents=True)
     legacy.write_bytes(b"video")
     monkeypatch.setattr(
         "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
-        lambda path: path.is_file() and path.read_bytes() == b"video",
+        lambda path: path.is_file() and path.read_bytes() in {b"video", b"fresh"},
     )
-
-    prepared = _cached_segments(
-        source,
-        (1.0,),
-        cache,
-        "fresh",
-        lambda _working: pytest.fail("a valid legacy entry must not be re-encoded"),
-        None,
-        legacy_paths=(legacy,),
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_structural_video",
+        lambda path: path.is_file() and path.read_bytes() in {b"video", b"fresh"},
     )
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
 
-    assert prepared[0][2].read_bytes() == b"video"
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        Path(command[-1]).write_bytes(b"fresh")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+    prepared = _segment_video(source, (1.0,), cache, None)
+
+    assert prepared[0][2].read_bytes() == b"fresh"
+    assert prepared[0][2].is_relative_to(cache)
     assert legacy.read_bytes() == b"video"
 
 
@@ -864,20 +882,15 @@ def test_partial_cache_repair_does_not_replace_a_valid_sibling(
     assert [part[2].read_bytes() for part in prepared] == [b"valid-sibling", b"replacement"]
 
 
-def test_legacy_one_frame_entry_is_repaired_but_new_v2_one_frame_is_reused(
+def test_native_frame_fallback_is_cached_and_current_one_frame_cache_is_reused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")
     cache = tmp_path / ".prepared" / "ffmpeg-v2" / "fixture"
-    legacy = tmp_path / ".prepared" / "ffmpeg-v1" / "fixture" / "legacy" / "segment-00000.mp4"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_bytes(b"legacy-one-frame")
     monkeypatch.setattr(
         "mindbridge.benchmarks.prepare_media._has_structural_video",
-        lambda path: (
-            path.is_file() and path.read_bytes() in {b"legacy-one-frame", b"normal-one", b"native"}
-        ),
+        lambda path: path.is_file() and path.read_bytes() in {b"normal-one", b"native"},
     )
     monkeypatch.setattr(
         "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
@@ -904,11 +917,9 @@ def test_legacy_one_frame_entry_is_repaired_but_new_v2_one_frame_is_reused(
             "scale=640:360",
             str(working / "segment-%05d.mp4"),
         ],
-        legacy_paths=(legacy,),
     )
 
     assert prepared[0][2].read_bytes() == b"native"
-    assert legacy.read_bytes() == b"legacy-one-frame"
     assert filters == ["fps=1", "scale=640:360"]
 
     prepared[0][2].write_bytes(b"new-v2-one-frame")

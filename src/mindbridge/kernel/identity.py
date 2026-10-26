@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from opentelemetry.trace import Tracer
 
 from mindbridge._telemetry import IDENTITY_NAMES_BOUND, IDENTITY_NAMES_REFUSED
-from mindbridge.control import dump_operation, operation_key
+from mindbridge.control import IDENTITY_LINK_RECIPE, dump_operation, operation_key
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     MemoryNotFoundError,
@@ -24,7 +24,6 @@ from mindbridge.kernel.derived import has_indexed_speech
 from mindbridge.kernel.embedding import Embedding
 from mindbridge.kernel.formation import (
     CONSENT_RECIPE,
-    IDENTITY_LINK_RECIPE,
     NAMING_RECIPE,
     Formation,
     consent_proposal,

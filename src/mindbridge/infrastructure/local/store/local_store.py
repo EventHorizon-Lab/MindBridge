@@ -9,6 +9,7 @@ calls the other families' connection-level functions inside it.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,18 +74,28 @@ class LocalStore:
 
     def set_metadata(self, key: str, value: str) -> None:
         """Set one store-level compatibility value."""
-        require_identifier(key, "metadata key")
+        self.update_metadata({key: value})
+
+    def update_metadata(self, values: Mapping[str, str | None]) -> None:
+        """Commit marker changes together; a value of None removes a marker."""
+        for key in values:
+            require_identifier(key, "metadata key")
         with self._connections.transaction() as connection:
-            connection.execute(
-                """
+            now = datetime_text(datetime.now(timezone.utc))
+            for key, value in values.items():
+                if value is None:
+                    connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))
+                    continue
+                connection.execute(
+                    """
                 INSERT INTO store_metadata (key, value, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT (key) DO UPDATE SET
                     value = excluded.value,
                     updated_at = excluded.updated_at
                 """,
-                (key, value, datetime_text(datetime.now(timezone.utc))),
-            )
+                    (key, value, now),
+                )
 
     def get_metadata(self, key: str) -> str | None:
         """Read one store-level compatibility value."""

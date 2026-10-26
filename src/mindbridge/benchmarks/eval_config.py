@@ -36,6 +36,7 @@ from mindbridge.benchmarks.model_config import (
 )
 from mindbridge.benchmarks.task_catalog import expand
 from mindbridge.configuration import _absolute_http_url
+from mindbridge.models._openai_protocol import reasoning_model, sampling_supported
 
 DEFAULT_ARM = "mindbridge"
 
@@ -929,8 +930,10 @@ def _evaluation_memory_config(
             ),
             "model": model.generation_model,
             "timeout": model.timeout_seconds,
-            "temperature": 0.0,
-            "seed": arguments.seed,
+            "temperature": (
+                0.0 if sampling_supported(model.generation_model, extra_body) else None
+            ),
+            "seed": None if reasoning_model(model.generation_model) else arguments.seed,
             "modalities": model.generation_capabilities,
             "max_tokens": (
                 generation.max_tokens if "max_tokens" not in options else int(options["max_tokens"])

@@ -900,7 +900,7 @@ def test_response_cache_namespace_changes_with_the_answer_surface(
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_results_module.EVAL_SCHEMA_VERSION == 18
+    assert eval_results_module.EVAL_SCHEMA_VERSION == 19
     assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v18"
     arguments = _namespace_arguments()
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
@@ -922,12 +922,20 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     assert _cache_namespace(clocked_arguments, ModelConfig(), {"text": 1}) != before
 
 
+@pytest.mark.parametrize(
+    ("model", "temperature", "seed"),
+    (("compatible-model", 0.0, 7), ("gpt-5-mini", None, None), ("gpt-5.1", 0.0, None)),
+)
 def test_backend_pool_warms_query_embedding_before_evaluation(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    temperature: float | None,
+    seed: int | None,
 ) -> None:
     import openai
 
     calls: list[tuple[tuple[ModelInput, ...], EmbedTask]] = []
+    model_options: list[dict[str, object]] = []
 
     class Client:
         def __init__(self, **_kwargs: object) -> None: ...
@@ -935,7 +943,8 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
         def close(self) -> None: ...
 
     class Models(Client):
-        pass
+        def __init__(self, **kwargs: object) -> None:
+            model_options.append(kwargs)
 
     class Embedder:
         def __init__(self, **_kwargs: object) -> None: ...
@@ -953,11 +962,27 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
     monkeypatch.setattr(eval_module, "SentenceTransformersEmbedder", Embedder)
 
     pool = eval_module._BackendPool(
-        ModelConfig(), device="cuda", batch_size=8, needs_speech=False, seed=7
+        ModelConfig(generation_model=model),
+        device="cuda",
+        batch_size=8,
+        needs_speech=False,
+        seed=7,
     )
     pool.close()
 
     assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
+    assert model_options[0]["generation_temperature"] == temperature
+    assert model_options[0]["generation_seed"] == seed
+    recorded = eval_module._model_result(
+        cast(
+            eval_config_module._Arguments,
+            SimpleNamespace(model="mindbridge", device="cuda", seed=7, gen_kwargs=""),
+        ),
+        ModelConfig(generation_model=model),
+        None,
+    )
+    assert recorded["generation_temperature"] == temperature
+    assert recorded["generation_seed"] == seed
 
 
 def test_backend_pool_forwards_every_memory_setting_and_plugin(
@@ -1131,7 +1156,13 @@ def test_model_short_video_limit_is_explicit_and_validated() -> None:
         _model_config("mindbridge", "generation_min_video_seconds=0")
 
 
-def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("model_id", "temperature", "seed"),
+    (("override-model", 0.0, 7), ("gpt-5-mini", None, None)),
+)
+def test_eval_config_reuses_the_declarative_memory_schema(
+    tmp_path: Path, model_id: str, temperature: float | None, seed: int | None
+) -> None:
     path = tmp_path / "memory.json"
     path.write_text(
         json.dumps(
@@ -1162,7 +1193,7 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
     assert overrides == HarnessOverrides()
     model = _model_config(
         "mindbridge",
-        "generation_model=override-model",
+        f"generation_model={model_id}",
         memory_config=loaded,
     )
     model = replace(
@@ -1193,10 +1224,10 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
     assert getattr(effective.embedding, "device", None) == "cuda:1"
     assert effective.speech is not None
     assert getattr(effective.speech, "device", None) == "cuda:1"
-    assert effective.generation.model == "override-model"
+    assert effective.generation.model == model_id
     assert effective.generation.base_url == "https://configured.example/v1"
-    assert effective.generation.temperature == 0.0
-    assert effective.generation.seed == 7
+    assert effective.generation.temperature == temperature
+    assert effective.generation.seed == seed
     assert effective.generation.max_tokens == 512
     assert effective.generation.modalities == frozenset({Modality.TEXT, Modality.IMAGE})
     assert effective.settings.minimum_relevance == 0.2
@@ -1208,7 +1239,9 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
         memory_config=effective,
     )
     recorded = eval_module._model_result(arguments, model, effective)
-    assert recorded["generation_model"] == "override-model"
+    assert recorded["generation_model"] == model_id
+    assert recorded["generation_temperature"] == temperature
+    assert recorded["generation_seed"] == seed
     assert recorded["memory_config"] == eval_config_module._memory_config_payload(effective)
 
 

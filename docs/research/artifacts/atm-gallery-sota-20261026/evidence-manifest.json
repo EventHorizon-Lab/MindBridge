@@ -1,0 +1,110 @@
+{
+  "retrieved_on": "2026-10-26",
+  "scope": "Source review and hypotheses; no new model evaluation",
+  "local_base_commit": "42092a5fad5624955845d567380b555c3ef94642",
+  "local_worktree": "dirty; file hashes identify inspected content",
+  "local_files": {
+    "src/mindbridge/kernel/answering.py": "b82eb63080c923662b8c1718f2819433898535991746eb3da137dc8370c921b0",
+    "src/mindbridge/kernel/retrieval.py": "2e9a318912055f66921da58b1ac9ee6a04072917af51f33d9762a5b641dea230",
+    "src/mindbridge/kernel/embedding.py": "90a44e0655d8a0b4289f6c10e90d654d3b7e094b1a93da1c4c7ce7a661f7310c",
+    "src/mindbridge/kernel/compilation.py": "836fb29c4e28031c5901497e1ddfeb27e6607b2f2f711cab226c2b9c772283a0",
+    "src/mindbridge/kernel/vision.py": "ca61b0efdd39956741ed10238f93cabf4fe76b7fdfc134c65d6e8763888ac99b",
+    "src/mindbridge/benchmarks/eval_adapters.py": "3db3c4fcf7529deee56422183fba6097d6e0c327acd8bf53502e3dd10aed5aae",
+    "src/mindbridge/benchmarks/official_scorers.py": "8ca1dd6db514d1420962d9c2c5045a46b07f0aff746e56f668e37b383974670c",
+    "src/mindbridge/models/openai_sdk.py": "8f911e4fd6374f21643b74fad7395bb632b210f781834766bd16f1df76c6cc1d",
+    "src/mindbridge/plugins.py": "3503b4f15d2b6fe2a8ebfa4df507ec8773f34502ad531de76ba93693e9436b3f",
+    "benchmarks/corpora.py": "d3d66b5606dab63bc1fc30250071d51850a010450e37fdb6ed75fab0564757f3",
+    "docs/configuration.md": "82a3bd2d968c7c66585b47f8ff7423679b158b0be517fa7d4ea38ed1a6233c75",
+    "docs/research/hybrid-score-completion-2026-09-08.md": "4d3a1d36f5d791dd4b6fd9250cec40ef0045f4b4b7ff10fb731772efa2e478dc",
+    "docs/research/2026-09-12-baseline-loss-decomposition.md": "ce902202f7c8f361474d002f142abc89b2958595fef67f19f999642f65d73252"
+  },
+  "papers": [
+    {
+      "name": "atm",
+      "arxiv_version": "2603.01990v1",
+      "viewer": "https://www.alphaxiv.org/pdf/2603.01990v1",
+      "extracted_full_text_sha256": "0cb6801bd45f7b3429f455731650fc1b7626ccc1dfc5f9d287fa7965307e9ef0",
+      "pdf_sha256": "18241b729dc55e18c7836ef88656917d42b14930a4f843444bd9e84209e74675"
+    },
+    {
+      "name": "gallery",
+      "arxiv_version": "2601.03515v1",
+      "viewer": "https://www.alphaxiv.org/pdf/2601.03515v1",
+      "extracted_full_text_sha256": "c425a1a14625732ff59b8fcf96f471c8898e8de3db4ab92a47dd4e88badfdcf7",
+      "pdf_sha256": "afb731ea1d9385e158565ef76f015762fd79ef300cbdb7659359ca77ff1884db"
+    },
+    {
+      "name": "vmem",
+      "arxiv_version": "2608.01543v1",
+      "viewer": "https://www.alphaxiv.org/pdf/2608.01543v1",
+      "extracted_full_text_sha256": "9793ab07373c9484418dae5bebec8d3f0303a4b3f8b1e7215cfc38dff52be2c8",
+      "pdf_sha256": "7a1d30b387290e881df155da6a2696402f2a88c0266cfa9a0929d461af6dd4cb"
+    },
+    {
+      "name": "pace",
+      "arxiv_version": "2610.24378v1",
+      "viewer": "https://www.alphaxiv.org/pdf/2610.24378v1",
+      "extracted_full_text_sha256": "20ad2435965562f5981385bbad346b2a760bb2d68f0b7065af71c6444264f15b"
+    },
+    {
+      "name": "jam",
+      "arxiv_version": "2609.34385v1",
+      "viewer": "https://www.alphaxiv.org/pdf/2609.34385v1",
+      "extracted_full_text_sha256": "746c99bfe4c437510a86510a6dd8206b41b12e42095c7a12440fbaa3436bd850"
+    },
+    {
+      "name": "omni",
+      "arxiv_version": "2604.01007v2",
+      "viewer": "https://www.alphaxiv.org/pdf/2604.01007v2",
+      "extracted_full_text_sha256": "7e647e1491303c4460673ffbf15488eacd3f6c2b7d372de43618282d3fe6799a"
+    },
+    {
+      "name": "hypergraph",
+      "arxiv_version": "2610.29995v1",
+      "viewer": "https://www.alphaxiv.org/pdf/2610.29995v1",
+      "extracted_full_text_sha256": "685cd6c543500a15fc52a9e8b23e490eff2c3251608a5d6dd5f72641ac06d44a"
+    },
+    {
+      "name": "rawhistory",
+      "arxiv_version": "2610.24671v1",
+      "viewer": "https://www.alphaxiv.org/pdf/2610.24671v1",
+      "extracted_full_text_sha256": "da530d88041ac266533d0b4826ed3508a0067a1be0f39b706f8887e4f78092f0"
+    },
+    {
+      "name": "naiverag",
+      "arxiv_version": "2610.30755v1",
+      "viewer": "https://www.alphaxiv.org/pdf/2610.30755v1",
+      "extracted_full_text_sha256": "5fbd8c1622b05957f2a4b51474dcda336a39aafb6bbb384f11b093847ab7fb8d"
+    }
+  ],
+  "public_source_pins": {
+    "atm_main_leaderboard": "3c67edbe85586ec9df161215133a3244d549d248",
+    "gallery_scorer": "a93959e1e978a6a7d77798ae92c2ffe41c538c62",
+    "vmem_retrieval": "36916b14dc5241e04acbf5cd0f3c40799bc09550",
+    "pace_mem": "8a33ab65d8bf71f5a348d2da06ba66d807ae67fd",
+    "memexa_evidence_release": "atmbench-memexa-v2-20261002"
+  },
+  "historical_results": "Documentation inspected; referenced original model-run artifacts not present in this checkout",
+  "source_crops": [
+    {
+      "path": "vmem-table3.png",
+      "sha256": "25b395b0dd38ecf7403fdd505f7e2d65ddf4f478b3317cc7fe762a39ea8820d0",
+      "original_pdf": "https://arxiv.org/pdf/2608.01543v1",
+      "pdf_page": 6
+    },
+    {
+      "path": "gallery-table4.png",
+      "sha256": "1d00ddf8d2aec27fa2d8a25a9fb2a16fe9324ad57710d512a2113eb83844c7e5",
+      "original_pdf": "https://arxiv.org/pdf/2601.03515v1",
+      "pdf_page": 8
+    }
+  ],
+  "concurrent_source_changes": [
+    {
+      "path": "src/mindbridge/kernel/retrieval.py",
+      "initial_sha256": "2e9a318912055f66921da58b1ac9ee6a04072917af51f33d9762a5b641dea230",
+      "observed_later_sha256": "fb70676cb1d4058f0ef23d7baceaf82f0be3a204f06f46c73f9a8e2636a3925d"
+    }
+  ],
+  "concurrent_work_note": "Other work changed retrieval.py during research and validation; no product code was edited by this research task. Initial audit hashes are preserved."
+}

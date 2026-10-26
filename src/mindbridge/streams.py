@@ -380,7 +380,6 @@ class AsyncAudioStream:
     ) -> None:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
-        self._memory = memory
         self._max_streams = positive_int(max_streams, "max_streams")
         self._written_type = optional_memory_type(memory_type) or MemoryType.SEMANTIC
         self._context = _stream_context(context)

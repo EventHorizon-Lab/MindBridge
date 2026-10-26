@@ -27,7 +27,7 @@ from mindbridge import (
 )
 from mindbridge.infrastructure.local import IndexDocument, StoredEmbedding
 from mindbridge.infrastructure.local.zvec_index import ZvecIndex
-from mindbridge.kernel.contracts import index_recipe_for
+from mindbridge.kernel.metadata import index_recipe_for
 
 _NOW = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
 _SPACE = "pushdown-probe:2"

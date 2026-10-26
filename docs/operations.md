@@ -92,6 +92,12 @@ forward across a schema change, because a directory is never converted in place.
 upgrade as a separate backed-up step because a recognized embedding recipe migration may
 re-embed records.
 
+If a recognized embedding migration fails, reopen with the same target model and settings to
+retry it. The durable `embedding.migration_target` marker blocks a different target while the
+directory may contain partially migrated vectors. Leave that marker in place; successful
+recovery removes it atomically with the final space and index markers. Finish recovery before
+downgrading to a runtime that does not check the pending target, or restore the complete backup.
+
 ## Index maintenance and repair
 
 Normal startup, add, delete, and search operations drain the SQLite outbox. Drained rows are
@@ -140,68 +146,23 @@ If Zvec cannot open or appears corrupt:
 Never edit `search_index_queue`, replace `zvec/`, or move authoritative files while a `Memory` is
 live.
 
-A merge is not always a merge in place. Zvec 0.7 merges a collection that still holds a *dead
-row* — a document it stores but no longer serves, left by a delete or by a second write of an id
-it already held — by writing the surviving vectors densely while the ids keep their pre-merge
-positions, so every document from the first dead row onwards is then served its neighbour's
-vector. MindBridge therefore merges such a collection by copying its live documents into a fresh
-one, which costs about 4 s per 100 MB instead of a merge in place. A session that closes a
-collection it knows to be clean records that in `zvec/.mindbridge-clean` so the next owner can
-merge in place; a session that deleted anything, or that was killed, leaves none, and the next
-owner copies. The marker lives inside the collection, so a `zvec/` restored from a backup carries
-its own claim or none. Deleting it is always safe and never wrong — it only costs one copy.
+Zvec 0.8 fixes the deleted-row mapping defect that required copying a collection after an
+update or deletion. Ordinary `optimize()` now merges in place, including after reopening a
+collection. The old `zvec/.mindbridge-clean` marker is no longer used.
 
-**Which stores are affected.** Any store whose index was merged while it held a dead row. Every
-merge route can do it: a drain that crossed the 64-flush maintenance bound, the merge a writing
-session makes at `close()` — which a store written on or after 2026-09-13 does — an explicit
-`optimize()` or `reindex()`, and the file-descriptor pressure path. In practice a store is
-suspect when it deleted a record or re-embedded one — `delete()`, `forget()`, retention, a
-speaker rebinding, or a `settle()` that replaced a capture's embeddings — and then went on
-writing, closed, or was optimized. The defect is as old as the merge itself, not new in one
-release, so age alone does not clear a store. SQLite is untouched in every case: nothing is lost
-and no re-ingest is needed.
+On the first open after upgrading from the recognized Zvec 0.7 index recipes, MindBridge
+rebuilds the disposable projection from SQLite's stored FP32 embeddings. This also repairs
+old vector-to-ID mapping damage and changes INT8 projections to unrotated cosine quantization.
+It does not call the embedding model. Allow time and space for the rebuild before accepting
+traffic; keep the original SQLite and media backup if you need to restore the old application.
+Unknown recipes still fail rather than guessing how to interpret stored state.
 
-An index merged over a dead row cannot be told from a healthy one by `doc_count`,
-`index_completeness`, or the number of hits a search returns: only the ranking is wrong. Check a
-store by asking the index for the vectors it already holds — each one must find its own document
-first:
-
-```python
-import sqlite3
-
-import numpy as np
-
-from mindbridge.infrastructure.local.zvec_index import ZvecIndex
-
-connection = sqlite3.connect("file:state.sqlite3?immutable=1", uri=True)
-sample = connection.execute(
-    "SELECT embedding_id, dimension, vector FROM embeddings "
-    "WHERE object_part = 0 ORDER BY RANDOM() LIMIT 200"
-).fetchall()
-with ZvecIndex("zvec", sample[0][1]) as index:
-    hits = sum(
-        index.search(tuple(np.frombuffer(vector, dtype="<f4", count=dimension)), limit=1)[0].id
-        == embedding_id
-        for embedding_id, dimension, vector in sample
-    )
-print(f"self-hit {hits / len(sample):.3f}")
-```
-
-Only aggregate vectors are sampled because a dense search returns one embedding per parent memory,
-so on a multi-part record a part whose vector ties its sibling's is answered by the sibling and
-scores as a miss on a healthy store. Open the index the way the owner does: pass the store's
-`IndexQuantization` if it is not `NONE`, or the schema check refuses the collection, and run the
-check once per embedding dimension if the store holds more than one.
-
-A healthy store scores 1.000. A store whose index was merged over a dead row scores close to
-zero — the shipped store this was found on scored 0.060. Repair it by rebuilding from SQLite,
-with `reindex()` or with the `zvec/` procedure above: merging it again cannot repair it, because
-the wrong vector is what the collection now stores.
-
-Copying the collection needs room for a second copy of `zvec/` and takes the temporary directory
-beside it. A session killed in the middle leaves `.zvec.compact-*` behind, which the next open
-removes, and can leave the canonical `zvec/` absent for the width of a rename, which the next open
-rebuilds from SQLite.
+Compaction remains necessary when accumulated idmap files or process file-descriptor pressure
+cannot be reclaimed by an in-place merge. It copies live documents into a replacement collection,
+so it needs room for a second copy of `zvec/` beside the original. A session killed during this
+operation leaves `.zvec.compact-*` debris, which the next open removes, and can leave `zvec/`
+absent between renames, which the next open rebuilds from SQLite. Do not remove file-descriptor
+headroom or compaction capacity just because ordinary optimize no longer copies the collection.
 
 `capture_queue` is deferred enrichment rather than index work, and no operation drains it
 implicitly. A host that uses `capture()` owns the loop that calls `settle()`, and
@@ -236,11 +197,10 @@ MindBridge does not call `zvec.init()`. Account for several focused dense routes
 route, with at most four outer search workers per search. Keep `IndexQuantization.NONE` unless
 measured capacity and retrieval results justify a lossy mode. Changing only quantization rebuilds
 Zvec from stored vectors; `RABITQ` requires dimensions from 64 through 4095 and native support.
-Zvec 0.7 writes the quantized structure beside the FP32 vectors rather than in place of them, so a
-lossy mode lowers distance-computation cost and resident search footprint while *raising* bytes on
-disk: measured against a freshly rebuilt `NONE` index over ten stores holding 5,882 records,
-`zvec/` grew 54 % under `FP16`, 55 % under `INT8` and 86 % under `RABITQ`, with no measurable
-retrieval gain. Read it as a memory and latency setting, not as a way to store less.
+Quantized structures coexist with the FP32 vectors. Historical Zvec 0.7 measurements over ten
+stores holding 5,882 records grew `zvec/` by 54 % under `FP16`, 55 % under `INT8`, and 86 % under
+`RABITQ`, with no measurable retrieval gain; those percentages are not measurements of 0.8.
+Measure resident memory, latency, recall, and disk bytes separately before selecting a lossy mode.
 
 Quantized retrieval keeps a wider parent candidate pool and recalculates final cosine scores from
 SQLite's FP32 embeddings before ranking or applying `minimum_relevance`. This improves score
@@ -248,6 +208,14 @@ calibration and near-tie ordering without another model call, at the cost of rea
 the surviving candidate vectors. It does not repair ANN candidates that were never discovered.
 The [accuracy-first evaluation](research/2026-10-26-accuracy-first-retrieval.md) records the
 synthetic quality and latency tradeoffs; these are not real-model semantic accuracy measurements.
+
+Zvec 0.8 INT8 uses `enable_rotate=False`: the rotated cosine path returned unrelated neighbors
+in the upgrade evaluation. Grouped retrieval does not support native refinement, so enabling a
+refiner is not a repair for that path. Uniform UINT4/7/8 require L2, and unrotated INT4 reduced
+grouped recall without a demonstrated speed gain. These modes remain outside the public
+configuration. Embedded Jieba is available upstream, but MindBridge retains the stemmed/bigram
+fields for multilingual and mixed-script recall. See the
+[Zvec 0.8 evaluation](research/2026-10-26-zvec-08.md) for measurements and API limitations.
 
 ## Capacity
 
@@ -391,6 +359,13 @@ Streaming inspects the final usage chunk too. `mindbridge.model.response_models`
 several responses; the scalar field is `mixed` instead of silently assigning the whole span to the
 last response. These are response provenance, not a copy of the request or response body.
 
+Provider request IDs are recorded as `gen_ai.request.id` for a single request and collected in
+`mindbridge.model.request_ids` when one model span covers multiple requests. They are taken from
+the SDK response or provider error, including failure paths; an absent ID is left absent rather
+than invented. A local trace ID identifies the MindBridge operation, while the provider request
+ID identifies the upstream call for support. Keep both in protected operator telemetry. This
+follows OpenAI's [request debugging guidance](https://developers.openai.com/api/reference/overview#debugging-requests).
+
 The first-output clocks deliberately use different scopes and units:
 
 | Attribute | Unit | Boundary |
@@ -429,9 +404,59 @@ Watch these degradation and recognition attributes:
   identities, existing matches, creations, and cache status for each analyzed asset.
 
 Spans never record memory text, media bytes, paths, IDs, metadata, request or response bodies, or
-exception details. Apart from the non-content response model and fingerprint above, a failed span
+exception details. Apart from the non-content response model, fingerprint, and provider request IDs
+above, a failed span
 receives only generic error status. Use `search_with_trace()` for one retrieval investigation and
 the structured error envelope for failures.
+
+## Model quality gate
+
+Transport tests run without credentials and verify requests, validation, refusals, and error
+mapping. A separate small real-model gate exercises the public SDK with synthetic memories in a
+fresh directory for every case. It checks a grounded fact, insufficient evidence despite an
+unrelated retrieved memory, and instructions embedded in stored content. Every case must pass
+every repeat; an upstream error fails the gate rather than disappearing from its denominator.
+
+Grounded fixtures require a single answer word, allowing case, punctuation, and Markdown
+decoration. Negated, conflicting, or additional injected text fails. The report identifies this
+as an answering-only gate: the output-protocol option configures structural calls, but these
+answering fixtures do not establish that an endpoint accepts strict schemas. Verify formation,
+planning, vision, and consolidation separately when changing a provider or its protocol.
+
+Set `OPENAI_API_KEY` through a secret manager or the process environment. For a compatible server,
+set `OPENAI_BASE_URL` to the SDK base URL ending in `/v1`, without `/chat/completions`. Select an
+explicit model snapshot and the output protocol the endpoint supports:
+
+```bash
+uv run --frozen python -m mindbridge.benchmarks.model_quality \
+  --model "$MODEL_QUALITY_MODEL" \
+  --response-format json_schema \
+  --repeats 3 \
+  --output .benchmarks/model-quality/report.json
+```
+
+`MODEL_QUALITY_MODEL` names the model snapshot to evaluate. Use `--response-format json_object`
+only for a server that lacks strict schema support. The report retains the fixture version,
+configured and returned model identifiers, case pass/fail results, timing, and stable error codes;
+it does not retain prompts, answers, credentials, or raw provider exceptions. These synthetic
+fixtures do not authorize testing with private production content or establish full application
+quality. Use the [dataset harness](benchmarking.md) for broader comparisons, and calibrate quality
+criteria against reviewed failures before expanding this suite.
+
+The [model-quality workflow](../.github/workflows/model-quality.yml) runs manually with explicit
+model, response-format, and repeat inputs. Scheduled runs are opt-in: configure the repository
+secret `MODEL_QUALITY_API_KEY`, set `MODEL_QUALITY_ENABLED=true`, and provide the
+`MODEL_QUALITY_MODEL` snapshot variable. `MODEL_QUALITY_BASE_URL` and
+`MODEL_QUALITY_RESPONSE_FORMAT` optionally select a compatible endpoint and protocol. Review the
+aggregate artifact before approving prompt, model, or retrieval-policy changes. Keep the ordinary
+credential-free CI gate enabled even when real-service evaluation is unavailable.
+
+Recorded validation on 2026-10-26 used `gpt-5-mini-2025-08-07` as both the configured and returned
+model with fixture `mindbridge-reader-quality-v2`: all four cases passed each of three repeats
+(12/12). Separate strict-schema probes passed formation, consolidation, recall planning, vision,
+and media selection. The local aggregate reports remain under `.benchmarks/openai-practices/`.
+These synthetic checks do not establish benchmark gains or parity with other model deployments;
+live EmbeddingGemma 2 through vLLM was not verified.
 
 ## Upgrade
 

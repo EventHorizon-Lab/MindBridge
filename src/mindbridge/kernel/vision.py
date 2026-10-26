@@ -19,7 +19,7 @@ from mindbridge._telemetry import (
     VISION_BATCHES_RETRIED,
     mark_model_requests,
 )
-from mindbridge.control import dump_operation, operation_key
+from mindbridge.control import IDENTITY_LINK_RECIPE, dump_operation, operation_key
 from mindbridge.exceptions import MindBridgeError, ModelError, ValidationError
 from mindbridge.infrastructure.local.store import (
     IdentityLink,
@@ -39,7 +39,6 @@ from mindbridge.kernel.derived import (
     validated_descriptions,
 )
 from mindbridge.kernel.embedding import Embedding
-from mindbridge.kernel.formation import IDENTITY_LINK_RECIPE
 from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.lifecycle import Lifecycle, OperationAssets
 from mindbridge.kernel.materialization import Materializer

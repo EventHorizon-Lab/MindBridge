@@ -13,7 +13,7 @@ dependencies = [
     "numpy>=2,<3",
     "opentelemetry-api>=1.34,<2",
     "pydantic>=2.10,<3",
-    "zvec>=0.7,<0.8",
+    "zvec>=0.8,<0.9",
 ]
 
 [project.scripts]

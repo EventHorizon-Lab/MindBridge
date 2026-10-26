@@ -507,7 +507,7 @@ are never serialized.
 | `memory_not_found` | `memory_not_found` |
 | `speaker_not_found` | `speaker_not_found` |
 | `identity_not_found` | `identity_not_found` |
-| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed`, `model_failed` |
+| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `provider_unavailable`, `timeout`, `connection_failed`, `request_rejected`, `model_refused`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed`, `model_failed` |
 | `model_output_truncated` | `output_truncated` |
 | `storage_error` | unset, `data_dir_in_use`, `schema_unsupported`, `io_failed`, `flush_failed`, `instance_unusable` |
 | `index_unavailable` | unset, `index_missing` |
@@ -516,7 +516,15 @@ are never serialized.
 | `not_found`, `method_not_allowed`, `http_error` | unset |
 
 `retryable` is true only for `connection_failed`, `data_dir_in_use`, `flush_failed`,
-`index_missing`, `rate_limited`, and `timeout`. A retryable 503 response includes `Retry-After: 1`.
+`index_missing`, `provider_unavailable`, `rate_limited`, and `timeout`. A retryable 503 response
+includes `Retry-After: 1`.
+
+`model_refused` is an explicit provider refusal, not malformed output or insufficient retrieved
+evidence. It is permanent for that request and never includes the provider's refusal text.
+`quota_exhausted` includes exhausted credits and provider project or organization spend/usage
+limits. `provider_unavailable` covers temporary upstream server failures after the SDK's own retry
+budget; callers still need a bounded retry policy. See OpenAI's
+[error guidance](https://developers.openai.com/api/docs/guides/error-codes) for provider recovery steps.
 
 The status is a function of `reason` alone, read from one table in `mindbridge.api.errors`. Which
 exception class carried the failure, and which raise site produced it, do not change the answer:
@@ -532,8 +540,8 @@ in both directions, so a client can act on the status without also reading the r
 | 422 | `input_invalid`, `unsupported_modality` |
 | 500 | `unexpected`, `schema_unsupported`, `io_failed`, `instance_unusable`, or a generic `MindBridgeError` with no reason |
 | 501 | `backend_not_configured` |
-| 502 | `auth_failed`, `quota_exhausted`, `request_rejected`, `response_invalid`, `output_truncated`, `asset_unavailable`, `asset_changed`, `model_failed`, or a `model_error` with no reason |
-| 503 | `connection_failed`, `timeout`, `rate_limited`, `data_dir_in_use`, `flush_failed`, `index_missing`, or a `storage_error` with no reason |
+| 502 | `auth_failed`, `quota_exhausted`, `request_rejected`, `model_refused`, `response_invalid`, `output_truncated`, `asset_unavailable`, `asset_changed`, `model_failed`, or a `model_error` with no reason |
+| 503 | `connection_failed`, `timeout`, `rate_limited`, `provider_unavailable`, `data_dir_in_use`, `flush_failed`, `index_missing`, or a `storage_error` with no reason |
 
 Two rows are worth stating explicitly, because both used to answer twice. `payload_too_large` is
 one condition seen from two sides and both are fixed by sending less, so the provider path no

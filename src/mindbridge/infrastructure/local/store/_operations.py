@@ -92,7 +92,6 @@ def insert_operation(connection: sqlite3.Connection, operation: StoredOperation)
                     "activated_ids": list(operation.activated_ids),
                     "forgotten_ids": list(operation.forgotten_ids),
                     "linked": [list(pair) for pair in operation.linked],
-                    "linked_clauses": [list(pair) for pair in operation.linked_clauses],
                     "clause_changes": [
                         {
                             "memory_id": change.memory_id,
@@ -136,7 +135,6 @@ def operation_from_row(row: sqlite3.Row) -> StoredOperation:
         activated_ids=tuple(effects.get("activated_ids") or ()),
         forgotten_ids=tuple(effects.get("forgotten_ids") or ()),
         linked=tuple((pair[0], pair[1]) for pair in effects.get("linked") or ()),
-        linked_clauses=tuple((pair[0], pair[1]) for pair in effects.get("linked_clauses") or ()),
         clause_changes=tuple(
             StoredEvidenceClauseChange(
                 memory_id=change["memory_id"],

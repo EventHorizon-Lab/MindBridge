@@ -84,8 +84,7 @@ class _Embedder:
     embedding_model = "fake-real-index"
     embedding_space = "fake-real-index:2:test"
     embedding_dimension = 2
-    # Optional, duck-typed by `Memory` (`getattr(..., "_legacy_embedding_spaces", frozenset())`);
-    # declared here only so a test assigning it type-checks.
+    # Optional backend declaration read by kernel contracts; declared so upgrade tests type-check.
     _legacy_embedding_spaces: frozenset[str] = frozenset()
 
     def __init__(self) -> None:
@@ -597,7 +596,7 @@ def test_only_a_store_with_embeddings_announces_a_rebuild(
     store: only embeddings that have to be projected again are a rebuild.
     """
     with (
-        caplog.at_level(logging.INFO, logger="mindbridge.memory"),
+        caplog.at_level(logging.INFO, logger="mindbridge.kernel.recovery"),
         Memory(tmp_path, embedder=_Embedder()) as memory,
     ):
         record = memory.add("a kite over the harbour")
@@ -606,7 +605,7 @@ def test_only_a_store_with_embeddings_announces_a_rebuild(
     shutil.rmtree(tmp_path / "zvec")
     caplog.clear()
     with (
-        caplog.at_level(logging.INFO, logger="mindbridge.memory"),
+        caplog.at_level(logging.INFO, logger="mindbridge.kernel.recovery"),
         Memory(tmp_path, embedder=_Embedder()) as memory,
     ):
         assert [hit.id for hit in memory.search("kite over the harbour")] == [record.id]

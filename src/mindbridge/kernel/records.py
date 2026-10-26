@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 
 from opentelemetry.trace import Tracer
 
+from mindbridge.control import operation_touches
 from mindbridge.exceptions import IdentityNotFoundError, MemoryNotFoundError, ValidationError
-from mindbridge.kernel.control_plane import operation_touches
 from mindbridge.kernel.hydration import Hydrator, operation_record
 from mindbridge.kernel.identity import Identities
 from mindbridge.kernel.lifecycle import Lifecycle

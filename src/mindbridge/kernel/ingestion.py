@@ -631,7 +631,7 @@ class Ingestion(Traced):
                 missing = [self._embedding.prepare(memory, operation) for memory in missing]
                 selector_maps = {
                     memory.memory_id: text_selector_map(
-                        memory,
+                        memory.content,
                         raw_observation=not isinstance(memory.context, MemoryContext),
                     )
                     for memory in missing
@@ -865,7 +865,7 @@ class Ingestion(Traced):
                 )
             )
             selector_map = text_selector_map(
-                memory,
+                memory.content,
                 raw_observation=(row.context is None or row.context.kind is MemoryKind.OBSERVATION),
             )
             now = datetime.now(timezone.utc)

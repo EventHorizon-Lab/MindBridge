@@ -35,6 +35,8 @@ GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
 GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT = "gen_ai.openai.response.system_fingerprint"
 MODEL_RESPONSE_MODELS = "mindbridge.model.response_models"
 MODEL_RESPONSE_SYSTEM_FINGERPRINTS = "mindbridge.model.response_system_fingerprints"
+GEN_AI_REQUEST_ID = "gen_ai.request.id"
+MODEL_REQUEST_IDS = "mindbridge.model.request_ids"
 EMBEDDING_TASK = "mindbridge.embedding.task"
 ASYNC_QUEUE_TIME = "mindbridge.async.queue_time_ms"
 CAPTURE_SETTLED = "mindbridge.capture.records_settled"
@@ -122,6 +124,7 @@ class _ModelUsage:
     audio_seconds: float | None = None
     response_models: set[str] = field(default_factory=set)
     response_system_fingerprints: set[str] = field(default_factory=set)
+    request_ids: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -435,6 +438,24 @@ def record_model_provenance(*, response_model: str | None, system_fingerprint: s
         span.set_attribute(MODEL_RESPONSE_SYSTEM_FINGERPRINTS, (fingerprint,))
 
 
+def record_model_request_id(request_id: str) -> None:
+    """Keep opaque provider request identity, excluding malformed or oversized header values."""
+    if (
+        not request_id
+        or len(request_id) > 512
+        or not request_id.isascii()
+        or any(character.isspace() or not character.isprintable() for character in request_id)
+    ):
+        return
+    usage = _CURRENT_MODEL_USAGE.get()
+    if usage is not None:
+        usage.request_ids.add(request_id)
+        return
+    span = trace.get_current_span()
+    span.set_attribute(GEN_AI_REQUEST_ID, request_id)
+    span.set_attribute(MODEL_REQUEST_IDS, (request_id,))
+
+
 def record_model_usage(
     *,
     input_tokens: int | None,
@@ -558,6 +579,7 @@ def _sum_modalities(target: dict[str, int], values: Mapping[str, int]) -> None:
 
 def _write_model_provenance(span: Span, usage: _ModelUsage) -> None:
     for scalar, plural, values in (
+        (GEN_AI_REQUEST_ID, MODEL_REQUEST_IDS, usage.request_ids),
         (GEN_AI_RESPONSE_MODEL, MODEL_RESPONSE_MODELS, usage.response_models),
         (
             GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT,

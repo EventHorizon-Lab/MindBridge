@@ -38,11 +38,19 @@ from mindbridge._telemetry import (
     mark_model_requests,
     nested_model_span,
     record_model_provenance,
+    record_model_request_id,
     record_model_usage,
 )
 from mindbridge.evidence import answer_constraint_payloads, answer_evidence_payloads
 from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
 from mindbridge.models._media import container_duration_seconds
+from mindbridge.models._openai_protocol import (
+    output_limit_parameter,
+    reasoning_model,
+    sampling_supported,
+    validate_sampling,
+)
+from mindbridge.models._openai_schemas import SchemaName, response_schema
 from mindbridge.models.base import EmbedTask, FormationInput, ModelInput, _modalities
 from mindbridge.types import (
     AbstentionReason,
@@ -64,6 +72,10 @@ DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_GENERATION_MODEL = "gpt-5-mini"
 DEFAULT_TRANSCRIPTION_MODEL = "whisper-1"
 DEFAULT_EMBEDDING_DIMENSION = 1_536
+_STRICT_JSON_INSTRUCTION = (
+    " When the JSON schema requires an optional field, use null "
+    "for an absent value instead of omitting that field."
+)
 UNKNOWN_ANSWER = "I don't know based on the available memories."
 # The refusal the model is asked for is an opaque ASCII token, not an English sentence. Exact
 # equality against one sentence under-reported refusals ~7x, because a paraphrase, an answer in the
@@ -357,7 +369,6 @@ _TARGET_ONLY_INTENTS = frozenset({MemoryIntent.CORRECT.value, MemoryIntent.FORGE
 _MAX_CONSOLIDATION_OPERATIONS = 16
 # A rejected structured reply is quoted back in the error, because the response is failed whole
 # and the caller otherwise sees only "applied 0" with no way to learn which key the model wrote.
-_MAX_RESPONSE_EXCERPT = 400
 _TRUNCATED_ANSWER_ERROR = (
     "generation stopped at the output token limit; raise generation_max_tokens or lower the "
     "answer limit"
@@ -365,7 +376,15 @@ _TRUNCATED_ANSWER_ERROR = (
 _Operation = Literal["embedding", "generation", "transcription"]
 _JsonResult = TypeVar("_JsonResult")
 # The one 429 an identical retry can never clear: the account is out of quota, not too fast.
-_INSUFFICIENT_QUOTA = "insufficient_quota"
+_QUOTA_ERRORS = frozenset(
+    {
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+    }
+)
 # Bounds the base64 media the request carries, not the bytes on disk. Media reaches the provider
 # inside a data URL or an input_audio part, so the wire always carries 4/3 of the file size.
 _MAX_INLINE_MODEL_BYTES = 64 * 1024 * 1024
@@ -400,6 +419,7 @@ class OpenAIModels:
         "_embedding_model",
         "_embedding_request_format",
         "_embedding_space",
+        "_embeddinggemma2",
         "_formation_space",
         "_generation_capabilities",
         "_generation_extra_body",
@@ -408,6 +428,7 @@ class OpenAIModels:
         "_generation_media_policy",
         "_generation_min_video_seconds",
         "_generation_model",
+        "_generation_response_format",
         "_generation_seed",
         "_generation_stream",
         "_generation_temperature",
@@ -449,6 +470,7 @@ class OpenAIModels:
         generation_seed: int | None = None,
         generation_temperature: float | None = None,
         generation_max_tokens: int | None = None,
+        generation_response_format: Literal["json_object", "json_schema"] = "json_object",
         generation_min_video_seconds: float | None = None,
         generation_video_limit: int | None = 8,
         generation_extra_body: Mapping[str, object] | None = None,
@@ -466,6 +488,8 @@ class OpenAIModels:
         ):
             raise ValidationError("generation_media_max_items must be an integer between 1 and 8")
         generation_model = _text(generation_model, "generation_model")
+        if generation_response_format not in {"json_object", "json_schema"}:
+            raise ValidationError("generation_response_format must be json_object or json_schema")
         transcription_model = _text(transcription_model, "transcription_model")
         transcription_prompt, transcription_keywords, transcription_languages = (
             _transcription_context(
@@ -524,6 +548,12 @@ class OpenAIModels:
             raise ValidationError("generation_extra_body must be JSON-compatible") from None
         if not isinstance(generation_stream, bool):
             raise ValidationError("generation_stream must be a boolean")
+        validate_sampling(
+            generation_model,
+            temperature=generation_temperature,
+            seed=generation_seed,
+            extra_body=generation_extra_body,
+        )
         self._clients: dict[_Operation, OpenAI] = {}
         embedding_client = embedding_client if embedding_client is not None else client
         generation_client = generation_client if generation_client is not None else client
@@ -537,16 +567,19 @@ class OpenAIModels:
         self._embedding_model = embedding_model
         self._embedding_dimension = embedding_dimension
         self._embedding_request_format = embedding_request_format
+        self._embeddinggemma2 = (
+            embedding_model == "google/embeddinggemma-2" and embedding_request_format == "messages"
+        )
+        recipe = "messages-v1:" if embedding_request_format == "messages" else ""
+        if self._embeddinggemma2:
+            recipe = "embeddinggemma2-text-prompts-special-tokens-v1:"
         self._embedding_space = (
-            (
-                f"{embedding_model}:{embedding_dimension}:messages-v1:l2-v1"
-                if embedding_request_format == "messages"
-                else f"{embedding_model}:{embedding_dimension}:l2-v1"
-            )
+            f"{embedding_model}:{embedding_dimension}:{recipe}l2-v1"
             if embedding_space is None
             else _text(embedding_space, "embedding_space")
         )
         self._generation_model = generation_model
+        self._generation_response_format = generation_response_format
         self._transcription_model = transcription_model
         self._transcription_prompt = transcription_prompt
         self._transcription_keywords = transcription_keywords
@@ -588,8 +621,18 @@ class OpenAIModels:
         self._vision_space = _default_vision_space(
             generation_model,
             capabilities=self._generation_capabilities,
-            seed=generation_seed,
-            temperature=generation_temperature,
+            seed=(
+                generation_seed
+                if generation_seed is not None or reasoning_model(generation_model)
+                else _VISION_SEED
+            ),
+            temperature=(
+                generation_temperature
+                if generation_temperature is not None
+                else 0.0
+                if sampling_supported(generation_model, generation_extra_body)
+                else None
+            ),
             max_tokens=generation_max_tokens,
             extra_body=self._generation_extra_body,
         )
@@ -614,6 +657,10 @@ class OpenAIModels:
             # proposal.
             version="v4",
         )
+        if generation_response_format == "json_schema":
+            self._formation_space += _schema_recipe("formation")
+            self._vision_space += _schema_recipe("vision")
+            self._consolidation_recipe += _schema_recipe("consolidation")
 
     @property
     def embedding_capabilities(self) -> frozenset[Modality]:
@@ -693,14 +740,14 @@ class OpenAIModels:
     ) -> tuple[tuple[float, ...], ...]:
         """Encode one batch with the configured OpenAI-compatible API shape.
 
-        ``task`` is validated but intentionally not serialized: the generic OpenAI embeddings
-        contract has no task field. Task-aware providers should implement ``EmbeddingBackend``.
+        The generic OpenAI embeddings contract has no task field. EmbeddingGemma 2 in messages
+        mode selects the checkpoint's retrieval prefix for text using ``task``.
         """
         mark_model_requests(0, token_usage_expected=0)
         if isinstance(inputs, (str, bytes)):
             raise ValidationError("inputs must be a sequence of model inputs")
         try:
-            EmbedTask(task)
+            selected_task = EmbedTask(task)
         except ValueError:
             raise ValidationError("embedding task is invalid") from None
         batch = tuple(
@@ -713,6 +760,17 @@ class OpenAIModels:
             return ()
         for value in batch:
             _require_capabilities("embedding", value.modalities, self.embedding_capabilities)
+        if self._embeddinggemma2:
+            prefix = (
+                "task: search result | query: "
+                if selected_task is EmbedTask.QUERY
+                else "title: none | text: "
+            )
+            # Prefix text only, matching the local checkpoint recipe; media alone stays bare.
+            batch = tuple(
+                ModelInput(text=prefix + value.text if value.text else "", assets=value.assets)
+                for value in batch
+            )
         embedding_assets = tuple(asset for value in batch for asset in value.assets)
         _require_consistent_assets(embedding_assets)
         _require_inline_size(embedding_assets)
@@ -758,16 +816,20 @@ class OpenAIModels:
                 from openai.types.create_embedding_response import CreateEmbeddingResponse
 
                 samples = _embedding_samples(batch, sample_video=sample_video, sampled=sampled)
+                body: dict[str, object] = {
+                    "messages": samples[0] if len(samples) == 1 else samples,
+                    "model": self.embedding_model,
+                    # The declared dimension validates output; chat servers may reject it as
+                    # an unsupported Matryoshka truncation request.
+                    "encoding_format": "float",
+                }
+                if self._embeddinggemma2:
+                    # Its chat template emits content only; the tokenizer must add BOS/EOS.
+                    body["add_special_tokens"] = True
                 return client.post(
                     "/embeddings",
                     cast_to=CreateEmbeddingResponse,
-                    body={
-                        "messages": samples[0] if len(samples) == 1 else samples,
-                        "model": self.embedding_model,
-                        # The declared dimension validates output; chat servers may reject it as
-                        # an unsupported Matryoshka truncation request.
-                        "encoding_format": "float",
-                    },
+                    body=body,
                 )
             create_embedding = cast(Any, client.embeddings.create)
             return create_embedding(
@@ -807,7 +869,9 @@ class OpenAIModels:
         assets = tuple(asset for value in batch for asset in value.content.assets)
         _require_consistent_assets(assets)
         _require_inline_size(assets)
-        request = self._json_request(_FORMATION_SYSTEM_PROMPT, _formation_content(batch))
+        request = self._json_request(
+            _FORMATION_SYSTEM_PROMPT, _formation_content(batch), schema="formation"
+        )
         return self._json_completion(
             request,
             subject="formation",
@@ -885,9 +949,11 @@ class OpenAIModels:
         )
         content = _vision_content(batch)
         _require_inline_image_size(content)
-        request = self._json_request(_VISION_SYSTEM_PROMPT, content)
-        request.setdefault("temperature", 0.0)
-        request.setdefault("seed", _VISION_SEED)
+        request = self._json_request(_VISION_SYSTEM_PROMPT, content, schema="vision")
+        if sampling_supported(self._generation_model, self._generation_extra_body):
+            request.setdefault("temperature", 0.0)
+        if not reasoning_model(self._generation_model):
+            request.setdefault("seed", _VISION_SEED)
         return self._json_completion(
             request,
             subject="vision description",
@@ -921,6 +987,16 @@ class OpenAIModels:
         attempted = 0
         invalid_content: str | None = None
 
+        def remember_usage(response: object) -> None:
+            usages.append(
+                _model_usage(
+                    response,
+                    input_modalities=input_modalities,
+                    output_modalities=frozenset({Modality.TEXT}),
+                )
+            )
+            _record_openai_provenance(response)
+
         def attempt() -> _JsonResult:
             nonlocal attempted, invalid_content
             attempted += 1
@@ -935,7 +1011,9 @@ class OpenAIModels:
                     ),
                 )
                 if self._generation_stream:
-                    response = _collect_streamed_completion(response, subject=subject, stage=stage)
+                    response = _collect_streamed_completion(
+                        response, subject=subject, stage=stage, on_failure=remember_usage
+                    )
             except ModelError:
                 raise
             except Exception as error:
@@ -944,15 +1022,15 @@ class OpenAIModels:
                     reason=_provider_reason(error),
                     stage=stage,
                 ) from error
-            usages.append(
-                _model_usage(
-                    response,
-                    input_modalities=input_modalities,
-                    output_modalities=frozenset({Modality.TEXT}),
-                )
-            )
-            _record_openai_provenance(response)
+            remember_usage(response)
             content = _json_completion_text(response, subject=subject, stage=stage)
+            cleanup_error = getattr(response, "_cleanup_error", None)
+            if isinstance(cleanup_error, Exception):
+                raise ModelError(
+                    f"{subject} response cleanup failed",
+                    reason=_provider_reason(cleanup_error),
+                    stage=stage,
+                ) from cleanup_error
             try:
                 return parse(content)
             except _InvalidStructuredResponse:
@@ -973,6 +1051,8 @@ class OpenAIModels:
         self,
         system_prompt: str,
         content: str | list[dict[str, object]],
+        *,
+        schema: SchemaName,
     ) -> dict[str, object]:
         """Build one JSON-object chat completion under the configured generation controls."""
         request: dict[str, object] = {
@@ -983,12 +1063,19 @@ class OpenAIModels:
             ],
             "response_format": {"type": "json_object"},
         }
+        if self._generation_response_format == "json_schema":
+            messages = cast(list[dict[str, object]], request["messages"])
+            messages[0]["content"] = system_prompt + _STRICT_JSON_INSTRUCTION
+            request["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": schema, "strict": True, "schema": response_schema(schema)},
+            }
         if self._generation_seed is not None:
             request["seed"] = self._generation_seed
         if self._generation_temperature is not None:
             request["temperature"] = self._generation_temperature
         if self._generation_max_tokens is not None:
-            request["max_tokens"] = self._generation_max_tokens
+            request[output_limit_parameter(self._generation_model)] = self._generation_max_tokens
         if self._generation_extra_body is not None:
             request["extra_body"] = dict(self._generation_extra_body)
         return request
@@ -1029,7 +1116,7 @@ class OpenAIModels:
             trigger=trigger,
             capabilities=self._generation_capabilities,
         )
-        request = self._json_request(_CONSOLIDATION_SYSTEM_PROMPT, content)
+        request = self._json_request(_CONSOLIDATION_SYSTEM_PROMPT, content, schema="consolidation")
         return self._json_completion(
             request,
             subject="consolidation",
@@ -1069,8 +1156,9 @@ class OpenAIModels:
         )
         if attempted.strip():
             content = f"{content}\nPrevious attempt: {attempted.strip()}"
-        request = self._json_request(_RECALL_PLAN_SYSTEM_PROMPT, content)
-        request["temperature"] = 0.0
+        request = self._json_request(_RECALL_PLAN_SYSTEM_PROMPT, content, schema="recall_plan")
+        if sampling_supported(self._generation_model, self._generation_extra_body):
+            request["temperature"] = 0.0
         return self._json_completion(
             request,
             subject="recall plan",
@@ -1161,8 +1249,10 @@ class OpenAIModels:
             exhaustive=exhaustive,
         )
         stream_completed = False
+        _record_openai_provenance(responses)
         try:
             finish_reason: object = None
+            refused = False
             emitted = False
             answer_parts = []
             first_chunk = False
@@ -1191,7 +1281,11 @@ class OpenAIModels:
                 chunk_finish_reason = getattr(choices[0], "finish_reason", None)
                 if chunk_finish_reason is not None:
                     finish_reason = chunk_finish_reason
-                content = getattr(getattr(choices[0], "delta", None), "content", None)
+                delta = getattr(choices[0], "delta", None)
+                refused = refused or bool(getattr(delta, "refusal", None))
+                if refused:
+                    continue
+                content = getattr(delta, "content", None)
                 if content is None:
                     continue
                 if not isinstance(content, str):
@@ -1207,6 +1301,8 @@ class OpenAIModels:
                     answer_parts.append(content)
                     yield content
             _record_finish_reason(finish_reason)
+            if refused or finish_reason == "content_filter":
+                raise _model_refused("generation", "generate")
             if finish_reason == "length":
                 raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR, stage="generate")
             streamed = "".join(answer_parts)
@@ -1461,7 +1557,7 @@ class OpenAIModels:
             request["temperature"] = self._generation_temperature
         # Injected here, not at a call site, so streaming and non-streaming carry the same controls.
         if self._generation_max_tokens is not None:
-            request["max_tokens"] = self._generation_max_tokens
+            request[output_limit_parameter(self._generation_model)] = self._generation_max_tokens
         if self._generation_extra_body is not None:
             request["extra_body"] = dict(self._generation_extra_body)
         return request, grounded, modalities
@@ -1518,8 +1614,12 @@ class OpenAIModels:
                     "mindbridge.input.modalities": ("text",),
                 },
             ) as span:
-                request = self._json_request(_MEDIA_DIAGNOSTIC_PROMPT, text)
-                request["max_tokens"] = min(self._generation_max_tokens or 512, 512)
+                request = self._json_request(
+                    _MEDIA_DIAGNOSTIC_PROMPT, text, schema="media_selection"
+                )
+                request[output_limit_parameter(self._generation_model)] = min(
+                    self._generation_max_tokens or 512, 512
+                )
                 response = None
                 mark_model_requests(1)
                 try:
@@ -1710,6 +1810,26 @@ def _record_openai_provenance(response: object) -> None:
         response_model=model if isinstance(model, str) else None,
         system_fingerprint=fingerprint if isinstance(fingerprint, str) else None,
     )
+    _record_provider_request_id(response)
+
+
+def _record_provider_request_id(value: object) -> None:
+    request_id = getattr(value, "_request_id", None) or getattr(value, "request_id", None)
+    if not request_id:
+        headers = getattr(getattr(value, "response", None), "headers", None)
+        if headers is not None:
+            request_id = headers.get("x-request-id")
+    if isinstance(request_id, str):
+        record_model_request_id(request_id)
+
+
+def _schema_recipe(name: SchemaName) -> str:
+    payload = json.dumps(
+        {"schema": response_schema(name), "instruction": _STRICT_JSON_INSTRUCTION},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return ":json-schema-v1:" + hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def _record_usage_batch(
@@ -2138,6 +2258,7 @@ def _provider_reason(error: Exception) -> str | None:
 
     An unrecognized failure stays unclassified rather than being guessed into a retryable reason.
     """
+    _record_provider_request_id(error)
     try:
         import openai
     except ImportError:  # pragma: no cover - a client call implies the SDK imported already
@@ -2146,13 +2267,14 @@ def _provider_reason(error: Exception) -> str | None:
         # The SDK raises this for every 429, exhausted billing included, and an agent that retries
         # exhausted billing never stops. ``APIError.code`` is the SDK's own parsed error body, so
         # the permanent case is separated by the provider's code rather than by its message.
-        return "quota_exhausted" if error.code == _INSUFFICIENT_QUOTA else "rate_limited"
+        return "quota_exhausted" if error.code in _QUOTA_ERRORS else "rate_limited"
     # ``APITimeoutError`` subclasses ``APIConnectionError``, so the narrower class is checked first.
     for provider_error, reason in (
         (openai.AuthenticationError, "auth_failed"),
         (openai.APITimeoutError, "timeout"),
         (openai.APIConnectionError, "connection_failed"),
         (openai.BadRequestError, "request_rejected"),
+        (openai.InternalServerError, "provider_unavailable"),
         # The SDK translates transport failures only while the request itself is in flight. A
         # peer that drops the connection while the response body or a stream is being read
         # raises the transport's own exception, and one 463-second answer was recorded as an
@@ -2290,20 +2412,15 @@ def _json_completion_text(response: object, *, subject: str, stage: str) -> str:
         raise _invalid_json_response(subject, stage)
     finish_reason = getattr(choices[0], "finish_reason", None)
     _record_finish_reason(finish_reason)
+    message = getattr(choices[0], "message", None)
+    if getattr(message, "refusal", None) or finish_reason == "content_filter":
+        raise _model_refused(subject, stage)
     if finish_reason == "length":
         raise ModelOutputTruncatedError(
             f"{subject} stopped at the output token limit; raise generation_max_tokens",
             stage=stage,
         )
-    if finish_reason == "content_filter":
-        # A policy refusal cannot be cleared by repeating the identical request. Keep the public
-        # error classification while leaving it outside the malformed-structured-output retry.
-        raise ModelError(
-            f"{subject} response was invalid",
-            reason="response_invalid",
-            stage=stage,
-        )
-    content = getattr(getattr(choices[0], "message", None), "content", None)
+    content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
         raise _invalid_json_response(subject, stage)
     return content.strip()
@@ -2588,12 +2705,6 @@ def _invalid_consolidation_response(detail: str = "") -> ModelError:
     return _invalid_json_response("consolidation", "consolidate", detail)
 
 
-def _response_excerpt(content: str) -> str:
-    """Quote enough of a rejected reply to see the mistake, never a whole batch."""
-    text = " ".join(content.split())
-    return text if len(text) <= _MAX_RESPONSE_EXCERPT else f"{text[:_MAX_RESPONSE_EXCERPT]}..."
-
-
 def _consolidation_content(
     evidence: Sequence[MemoryRecord],
     *,
@@ -2703,20 +2814,8 @@ def _consolidation_results(
     content: str,
     evidence: Sequence[MemoryRecord],
 ) -> tuple[MemoryOperation, ...]:
-    """Parse the operations envelope, quoting the reply whenever it is rejected.
-
-    The rejection is total by design: a batch that miscounts its own evidence is not one to
-    apply in part. That makes the message the only account the caller ever gets of why a pass
-    proposed nothing, so it carries what was wrong and what the model actually wrote.
-    """
-    try:
-        return _consolidation_operations(content, evidence)
-    except _InvalidStructuredResponse as error:
-        raise _InvalidStructuredResponse(
-            f"{error} (model returned: {_response_excerpt(content)})",
-            reason="response_invalid",
-            stage="consolidate",
-        ) from error
+    """Validate operations without copying model text into public errors."""
+    return _consolidation_operations(content, evidence)
 
 
 def _consolidation_operations(
@@ -2744,12 +2843,8 @@ def _consolidation_operation(
     fields = set(value)
     unknown = fields - _CONSOLIDATION_FIELDS
     if unknown:
-        # Named rather than aliased: a key the field table does not carry is a proposal written
-        # against a different contract, and guessing what it meant is how a store acquires
-        # operations nobody specified.
-        raise _invalid_consolidation_response(
-            f": operation names unknown key(s) {', '.join(sorted(unknown))}"
-        )
+        # Never guess a misspelled field or echo arbitrary model-provided keys into logs.
+        raise _invalid_consolidation_response(f": operation names {len(unknown)} unknown field(s)")
     if "intent" not in fields:
         raise _invalid_consolidation_response(": operation names no intent")
     supplied = value.get("proposal")
@@ -2960,12 +3055,12 @@ def _answer_text(response: object) -> str:
         )
     finish_reason = getattr(choices[0], "finish_reason", None)
     _record_finish_reason(finish_reason)
+    if getattr(getattr(choices[0], "message", None), "refusal", None):
+        raise _model_refused("generation", "generate")
     if finish_reason == "length":
         raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR, stage="generate")
     if finish_reason == "content_filter":
-        raise ModelError(
-            "generation response was invalid", reason="response_invalid", stage="generate"
-        )
+        raise _model_refused("generation", "generate")
     answer = getattr(getattr(choices[0], "message", None), "content", None)
     if not isinstance(answer, str) or not answer.strip():
         raise ModelError(
@@ -3002,7 +3097,11 @@ def _record_video_sampling(count: int) -> None:
 
 
 def _collect_streamed_completion(  # noqa: C901 - validates one streamed response lifecycle.
-    responses: object, *, subject: str, stage: str
+    responses: object,
+    *,
+    subject: str,
+    stage: str,
+    on_failure: Callable[[object], None] | None = None,
 ) -> object:
     """Collect a completed OpenAI SSE response for a JSON-only caller."""
     content: list[str] = []
@@ -3010,6 +3109,10 @@ def _collect_streamed_completion(  # noqa: C901 - validates one streamed respons
     finish_reason: object = None
     model: object = None
     fingerprint: object = None
+    refused = False
+    completed = False
+    cleanup_error: Exception | None = None
+    _record_provider_request_id(responses)
     try:
         for response in cast(Any, responses):
             model = getattr(response, "model", None) or model
@@ -3026,30 +3129,51 @@ def _collect_streamed_completion(  # noqa: C901 - validates one streamed respons
             choice = choices[0]
             finish_reason = getattr(choice, "finish_reason", None) or finish_reason
             delta = getattr(choice, "delta", None)
+            refused = refused or bool(getattr(delta, "refusal", None))
             if (piece := getattr(delta, "content", None)) is not None:
                 if not isinstance(piece, str):
                     raise _invalid_json_response(subject, stage)
                 content.append(piece)
+        completed = True
+    except Exception:
+        if on_failure is not None:
+            on_failure(SimpleNamespace(usage=usage, model=model, system_fingerprint=fingerprint))
+        if refused or finish_reason == "content_filter":
+            raise _model_refused(subject, stage) from None
+        raise
     finally:
         close = getattr(responses, "close", None)
         if callable(close):
-            close()
-    if usage is None:
-        raise _invalid_json_response(subject, stage)
-    if finish_reason is None:
+            try:
+                close()
+            except Exception as error:
+                if completed:
+                    cleanup_error = error
+    if (usage is None and not refused and finish_reason != "content_filter") or (
+        finish_reason is None and not refused
+    ):
+        if on_failure is not None:
+            on_failure(SimpleNamespace(usage=usage, model=model, system_fingerprint=fingerprint))
         raise _invalid_json_response(subject, stage)
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
                 index=0,
-                message=SimpleNamespace(content="".join(content)),
+                message=SimpleNamespace(
+                    content="".join(content), refusal="refused" if refused else None
+                ),
                 finish_reason=finish_reason,
             )
         ],
         usage=usage,
         model=model,
         system_fingerprint=fingerprint,
+        _cleanup_error=cleanup_error,
     )
+
+
+def _model_refused(subject: str, stage: str) -> ModelError:
+    return ModelError(f"{subject} was refused by the model", reason="model_refused", stage=stage)
 
 
 def _answer_parts(

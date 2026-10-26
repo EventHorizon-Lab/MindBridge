@@ -10,6 +10,25 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- Explicit strict Structured Outputs for OpenAI completion slots: declarative `response_format`
+  and `OpenAIModels.generation_response_format` accept `json_schema`; `json_object` remains the
+  compatible default. Formation, vision, consolidation, recall planning, and media selection have
+  dedicated schemas and retain local semantic validation. Strict derived-content recipes include
+  the schema identity, so changing output protocols invalidates the corresponding derived cache.
+- Sanitized OpenAI request IDs on model traces, including failed requests, streams, and malformed
+  output retries. The optional model-quality workflow runs fixed synthetic answering cases
+  through the public SDK and fails on any incorrect, injected, or unsupported answer.
+- Model failure reasons `model_refused` (permanent, REST 502) and `provider_unavailable`
+  (retryable, REST 503). Explicit refusals and content filtering are no longer treated as
+  malformed output; JSON streaming preserves refusal classification and usage across cleanup
+  failures. Known billing, spend, and usage limits remain non-retryable.
+- OpenAI reasoning-family output budgets use `max_completion_tokens`. Known unsupported explicit
+  sampling settings now fail validation, and planning and vision omit incompatible automatic
+  temperature/seed controls. Generic compatible models retain their existing request format.
+  Caption recipes now hash effective sampling defaults, which may refresh an existing compatible
+  model's caption cache once.
+  `generation_extra_body` may no longer override model, messages, response format, or streaming
+  controls. Consolidation errors no longer quote model output or arbitrary unknown field names.
 - An opt-in independent evidence projection. `MemoryConfig.independent_evidence` (default
   `False`, also a `Memory(...)` keyword) replaces the capture-group noisy-OR summary with a
   bounded AND/OR proof search over the evidence graph: two disjoint joint assessments corroborate

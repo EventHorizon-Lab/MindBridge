@@ -54,7 +54,8 @@ def test_diagnosis_is_bounded_and_keeps_text_omissions_and_request_cost(
         sent.append(payload)
         if len(sent) == 1:
             assert isinstance(payload["messages"][1]["content"], str)
-            assert payload["max_tokens"] <= 512
+            assert payload["max_completion_tokens"] <= 512
+            assert "max_tokens" not in payload
             assert "data:image" not in request.content.decode()
         else:
             content = payload["messages"][1]["content"]

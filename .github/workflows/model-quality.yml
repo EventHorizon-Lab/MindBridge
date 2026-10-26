@@ -1,0 +1,82 @@
+name: Model quality
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Explicit model snapshot or compatible provider revision
+        required: true
+        type: string
+      response_format:
+        description: Structured-output protocol supported by the provider
+        type: choice
+        default: json_schema
+        options:
+          - json_schema
+          - json_object
+      base_url:
+        description: Optional SDK base URL ending in /v1, without /chat/completions
+        type: string
+      repeats:
+        description: Repeats per fixture; every repeat must pass
+        type: choice
+        default: "3"
+        options:
+          - "1"
+          - "3"
+          - "5"
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-quality-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  reader:
+    if: github.event_name != 'schedule' || vars.MODEL_QUALITY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENAI_API_KEY: ${{ secrets.MODEL_QUALITY_API_KEY }}
+      OPENAI_BASE_URL: ${{ inputs.base_url || vars.MODEL_QUALITY_BASE_URL || 'https://api.openai.com/v1' }}
+      QUALITY_MODEL: ${{ inputs.model || vars.MODEL_QUALITY_MODEL }}
+      QUALITY_FORMAT: ${{ inputs.response_format || vars.MODEL_QUALITY_RESPONSE_FORMAT || 'json_schema' }}
+      QUALITY_REPEATS: ${{ inputs.repeats || '3' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Require explicit model and credentials
+        run: |
+          test -n "$QUALITY_MODEL" || { echo "Set the model input or MODEL_QUALITY_MODEL variable"; exit 2; }
+          test -n "$OPENAI_API_KEY" || { echo "Set the MODEL_QUALITY_API_KEY secret"; exit 2; }
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked evaluation dependencies
+        run: uv sync --locked --default-index https://pypi.org/simple --extra openai --extra benchmarks
+
+      - name: Evaluate public SDK behavior
+        run: >-
+          uv run --no-sync --frozen python -m mindbridge.benchmarks.model_quality
+          --model "$QUALITY_MODEL"
+          --response-format "$QUALITY_FORMAT"
+          --repeats "$QUALITY_REPEATS"
+          --output model-quality.json
+
+      - name: Preserve scores and model identities
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: model-quality
+          path: model-quality.json
+          if-no-files-found: ignore
+          retention-days: 30

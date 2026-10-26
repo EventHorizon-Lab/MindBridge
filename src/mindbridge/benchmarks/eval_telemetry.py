@@ -82,7 +82,7 @@ BENCHMARK_INGEST_ITEMS = "mindbridge.benchmark.ingest.items"
 # model-dependent formation work one settle() call paid, i.e. formation lag; `compile()`'s span
 # duration is compile latency. None of these run unless the harness actually calls them --
 # `--ingest capture` for the first two, the `compile` answering arm for the third -- so a run that
-# never exercises a path reports nothing under it, the same convention `SEARCH_SPAN` follows.
+# never exercises a path reports nothing under it, as `ASK_RETRIEVAL_SPAN` does.
 CAPTURE_SPAN = "mindbridge.capture"
 SETTLE_SPAN = "mindbridge.settle"
 COMPILE_SPAN = "mindbridge.compile"
@@ -103,9 +103,6 @@ ANSWER_SPAN = "mindbridge.ask"
 SEARCH_E2E_SPAN = "mindbridge.search"
 ASK_RETRIEVAL_SPAN = "mindbridge.retrieve"
 RECALL_SPAN = "mindbridge.recall"
-# Compatibility export for callers that imported the former ambiguous name. Result documents
-# expose it only as a deprecated alias of ``ask_retrieval_core``.
-SEARCH_SPAN = ASK_RETRIEVAL_SPAN
 GENERATION_SPAN = "mindbridge.model.generation"
 TRANSCRIPTION_SPAN = "mindbridge.model.transcription"
 TRANSCRIPTION_MODULE = "transcription"
@@ -790,24 +787,6 @@ class _TaskTelemetry:
                 if not active_seconds or not self.ingest_successful_items
                 else self.ingest_successful_items / active_seconds
             ),
-            # Compatibility aliases. Their semantics are now explicit and failed attempts never
-            # enter them. ``item_latency_ms`` was not a latency and is intentionally retired.
-            "call_count": successful_count,
-            "item_count": self.ingest_successful_items,
-            "compute_seconds": (0.0 if successful is None else successful.total_ns / 1_000_000_000),
-            "wall_seconds": active_seconds,
-            "call_latency_ms": None if successful is None else successful.latency_ms(),
-            "item_latency_ms": None,
-            "items_per_second": (
-                None
-                if not active_seconds or not self.ingest_successful_items
-                else self.ingest_successful_items / active_seconds
-            ),
-            "deprecated_fields": {
-                "wall_seconds": "alias of active_seconds, not first-to-last observation window",
-                "item_latency_ms": "removed; use successful_batch_latency_ms",
-                "items_per_second": "alias of items_per_active_second",
-            },
         }
 
     def _span_latency_json(self, span_name: str) -> dict[str, object]:
@@ -833,11 +812,6 @@ class _TaskTelemetry:
             "observation_window_seconds": None if successful is None else successful.wall_seconds(),
             "latency_ms": None if successful is None else successful.latency_ms(),
             "throughput_per_active_second": (
-                None if not active_seconds or not count else count / active_seconds
-            ),
-            # Compatibility aliases with corrected, gap-free semantics.
-            "wall_seconds": active_seconds,
-            "throughput_per_second": (
                 None if not active_seconds or not count else count / active_seconds
             ),
         }
@@ -867,12 +841,6 @@ class _TaskTelemetry:
             end_to_end_time_to_first_token_ms=end_to_end,
             generation_time_to_first_token_ms=generation_ttft,
             generation_time_to_first_chunk_ms=generation_ttfc,
-            # Compatibility only: this used to be presented as answer TTFT even though it starts
-            # at generation. Consumers must migrate to one of the two explicit fields above.
-            time_to_first_token_ms=generation_ttft,
-            deprecated_fields={
-                "time_to_first_token_ms": "alias of generation_time_to_first_token_ms"
-            },
             sdk_operation=self._span_latency_json(ANSWER_SPAN),
         )
         return result
@@ -887,7 +855,7 @@ class _TaskTelemetry:
         successful_compute_seconds = (
             0.0 if successful is None else successful.total_ns / 1_000_000_000
         )
-        ratio_call_count = self.asr_ratio_spans.count
+        ratio_invocation_count = self.asr_ratio_spans.count
         compute_seconds = self.asr_ratio_spans.total_ns / 1_000_000_000
         audio_seconds = self.asr_audio_seconds
         subset_rtf = (
@@ -896,20 +864,18 @@ class _TaskTelemetry:
         subset_speedup = (
             None if not audio_seconds or not compute_seconds else audio_seconds / compute_seconds
         )
-        ratio_complete = ratio_call_count == success_count
+        ratio_complete = ratio_invocation_count == success_count
         return {
             "span": TRANSCRIPTION_SPAN,
             "invocation_count": node.count,
             "request_count": tokens.request_count,
-            "call_count": node.count,
             "success_count": success_count,
             "error_count": node.count - success_count,
             "audio_seconds": audio_seconds,
             "compute_seconds": compute_seconds,
             "successful_compute_seconds": successful_compute_seconds,
-            "ratio_call_count": ratio_call_count,
-            "ratio_invocation_count": ratio_call_count,
-            "audio_duration_missing_success_count": success_count - ratio_call_count,
+            "ratio_invocation_count": ratio_invocation_count,
+            "audio_duration_missing_success_count": success_count - ratio_invocation_count,
             "ratio_complete": ratio_complete,
             "real_time_factor": subset_rtf if ratio_complete else None,
             "realtime_speedup": subset_speedup if ratio_complete else None,
@@ -921,9 +887,8 @@ class _TaskTelemetry:
                 None if successful is None else successful.latency_ms()
             ),
             "ratio_inference_latency_ms": (
-                None if not ratio_call_count else self.asr_ratio_spans.latency_ms()
+                None if not ratio_invocation_count else self.asr_ratio_spans.latency_ms()
             ),
-            "deprecated_fields": {"call_count": "alias of invocation_count"},
         }
 
     def _time_to_searchable_json(self) -> dict[str, object]:
@@ -1056,11 +1021,6 @@ class _TaskTelemetry:
             "ingest": self._ingest_json(),
             "search_e2e": search_e2e,
             "ask_retrieval_core": ask_retrieval,
-            "search": {
-                **ask_retrieval,
-                "deprecated": True,
-                "replacement": "ask_retrieval_core",
-            },
             "answer": self._answer_json(),
             "asr": self._asr_json(),
             "capture": self._span_latency_json(CAPTURE_SPAN),

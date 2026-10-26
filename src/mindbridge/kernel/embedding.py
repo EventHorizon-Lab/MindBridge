@@ -25,6 +25,7 @@ from mindbridge.kernel.content import (
     embedding_row_id,
     prepared_modalities,
     text_content,
+    text_selector_map,
 )
 from mindbridge.kernel.contracts import Backends, fallback_unsupported, require_audio_transcription
 from mindbridge.kernel.derived import (
@@ -45,6 +46,7 @@ from mindbridge.kernel.speech import Speech
 from mindbridge.kernel.tracing import Traced
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import (
+    MemoryKind,
     Modality,
     SpeakerSegment,
 )
@@ -425,6 +427,15 @@ class Embedding(Traced):
             for memory, content in prepared
             for object_part, model_input in enumerate(self.inputs(content))
         )
+        selector_maps = {
+            memory.memory_id: text_selector_map(
+                content,
+                raw_observation=(
+                    memory.context is None or memory.context.kind is MemoryKind.OBSERVATION
+                ),
+            )
+            for memory, content in prepared
+        }
         vectors = self.embed(
             tuple(model_input for _memory, _content, _part, model_input in parts),
             task=EmbedTask.DOCUMENT,
@@ -444,8 +455,9 @@ class Embedding(Traced):
                 created_at=now,
                 object_part=object_part,
                 normalized=True,
+                text_selectors=selector_maps[memory.memory_id].get(model_input, ()),
             )
-            for (memory, _content, object_part, _model_input), vector in zip(
+            for (memory, _content, object_part, model_input), vector in zip(
                 parts,
                 vectors,
                 strict=True,
@@ -460,32 +472,44 @@ class Embedding(Traced):
                 memories = self._store.records.list_memories(limit=_REEMBED_PAGE_SIZE, after=after)
             if not memories:
                 return
+            prepared = tuple(
+                (
+                    memory,
+                    PreparedContent(
+                        text=memory.content,
+                        assets=memory.assets,
+                        modality=Modality(memory.modality),
+                        # Same reason as `_refresh_speech_memories`: an embedder swap has to
+                        # re-key each stored row the way `add()` keyed it, section by section.
+                        canonical_parts=stored_canonical_parts(
+                            memory.content,
+                            memory.assets,
+                        ),
+                        audio_transcript=has_stream_transcript(
+                            memory.content,
+                            memory.assets,
+                        ),
+                        visual_description=has_stream_description(
+                            memory.content,
+                            memory.assets,
+                        ),
+                    ),
+                )
+                for memory in memories
+            )
+            selector_maps = {
+                memory.memory_id: text_selector_map(
+                    content,
+                    raw_observation=(
+                        memory.context is None or memory.context.kind is MemoryKind.OBSERVATION
+                    ),
+                )
+                for memory, content in prepared
+            }
             parts = tuple(
                 (memory, object_part, model_input)
-                for memory in memories
-                for object_part, model_input in enumerate(
-                    self.inputs(
-                        PreparedContent(
-                            text=memory.content,
-                            assets=memory.assets,
-                            modality=Modality(memory.modality),
-                            # Same reason as `_refresh_speaker_memories`: an embedder swap has to
-                            # re-key each stored row the way `add()` keyed it, section by section.
-                            canonical_parts=stored_canonical_parts(
-                                memory.content,
-                                memory.assets,
-                            ),
-                            audio_transcript=has_stream_transcript(
-                                memory.content,
-                                memory.assets,
-                            ),
-                            visual_description=has_stream_description(
-                                memory.content,
-                                memory.assets,
-                            ),
-                        )
-                    )
-                )
+                for memory, content in prepared
+                for object_part, model_input in enumerate(self.inputs(content))
             )
             vectors = self.embed(
                 tuple(model_input for _memory, _part, model_input in parts),
@@ -503,8 +527,9 @@ class Embedding(Traced):
                     created_at=now,
                     object_part=object_part,
                     normalized=True,
+                    text_selectors=selector_maps[memory.memory_id].get(model_input, ()),
                 )
-                for (memory, object_part, _model_input), vector in zip(
+                for (memory, object_part, model_input), vector in zip(
                     parts,
                     vectors,
                     strict=True,

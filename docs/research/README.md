@@ -14,6 +14,9 @@ the repository. An archived command may require those artifacts or an older chec
 | Record | Scope |
 | --- | --- |
 | [Accuracy-first retrieval — 2026-10-26](2026-10-26-accuracy-first-retrieval.md) | Public SDK retrieval quality, quantization score calibration, candidate breadth and numerical scoring measurements |
+| [MindBridge 在 ATM-Bench 与 Mem-Gallery 上的竞争策略 — 2026-10-26](2026-10-26-atm-mem-gallery-sota-strategy.md) | Current-source review, code audit, protocol differences, and proposed discriminating experiments; no new model results |
+| [Context OS competitor brief — 2026-09-03](2026-09-03-context-os-competitor-brief.md) | Dated source review for fast capture, the memory control plane, and context compilation |
+| [Architecture cohesion audit — 2026-10-26](2026-10-26-architecture-cohesion.md) | Kernel dependency boundaries, safe recovery, and retained or removed compatibility paths |
 | [Zvec 0.8 adoption — 2026-10-26](2026-10-26-zvec-08.md) | Dependency and maintenance measurements, cosine rotation regression, multilingual coverage, and native API limits |
 | [Compact context presentation prototype](compact-context-prototype.md) | Frozen prototype and conv30 measurement; current contract lives in the SDK reference |
 | [Memory backend evaluation — 2026-09-08](2026-09-08-memory-backend-evaluation.md) | Dated analysis or results; retain the stated evidence limits |
@@ -49,21 +52,13 @@ the repository. An archived command may require those artifacts or an older chec
 | [Timeline neighbor-window risk review](timeline-neighbor-window-risk-review-2026-09-08.md) | Dated analysis or results; retain the stated evidence limits |
 | [Next experiment for raw-video memory](video-memory-next-experiment-2026-09-08.md) | Dated analysis or results; retain the stated evidence limits |
 
-## Design records
-
-Approval of a specification describes a past implementation decision. The current SDK and
-configuration references own the shipped signatures, defaults, and transport coverage.
-
-| Record | Kind |
-| --- | --- |
-| [Context OS competitor brief: fast capture, memory control plane, context compiler](../superpowers/research/2026-09-03-context-os-competitor-brief.md) | Dated source review |
-| [Context OS round 1: fast capture, memory control plane, context compiler](../superpowers/specs/2026-09-03-context-os-round-1-design.md) | Historical specification or acceptance scenario |
-| [Round 2 acceptance scenario: the household companion](../superpowers/specs/2026-09-03-household-companion-scenario.md) | Historical specification or acceptance scenario |
-| [Context OS round 2: identity as governed knowledge](../superpowers/specs/2026-09-03-identity-governance-design.md) | Historical specification or acceptance scenario |
-| [Recall programs, identity-anchored keys, and completeness-aware grounding](../superpowers/specs/2026-09-10-recall-programs-design.md) | Historical specification or acceptance scenario |
-
 ## Current implementation and experiment boundaries
 
+- [Architecture](../architecture.md) owns the current kernel and storage boundaries; the
+  [cohesion audit](2026-10-26-architecture-cohesion.md) records the recovery and compatibility
+  decisions.
+- [EmbeddingGemma 2 through vLLM](../configuration.md#embeddinggemma-2-through-vllm) and its
+  [deployment guide](../deployment.md#embeddinggemma-2-model-server) own the remote model recipe.
 - [Independent evidence](../memory-types-time-and-decay.md#experimental-independent-evidence)
   remains opt-in and store-pinned. Structural success is not proof of improved natural recall.
 - [Exact excerpts](../context-compilation.md#exact-raw-excerpts) are an explicit compilation option;

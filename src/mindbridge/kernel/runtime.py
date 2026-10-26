@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import errno
-import shutil
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Protocol, cast
+from typing import Protocol
 
 from mindbridge.exceptions import IndexUnavailableError, MindBridgeError, StorageError
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError
@@ -22,8 +21,6 @@ from mindbridge.infrastructure.local.store import (
     UnsupportedSchemaError,
 )
 from mindbridge.infrastructure.local.zvec_index import IndexHit
-from mindbridge.kernel.contracts import STORE_METADATA_KEYS, Backends, known_metadata_upgrade
-from mindbridge.kernel.settings import Settings
 
 
 class Index(Protocol):
@@ -144,78 +141,3 @@ class Storage:
     write_lock: RLock
     formation_lock: RLock
     settle_lock: RLock
-
-
-def _ensure_evidence_recipe(store: LocalStore, settings: Settings) -> None:
-    key = "evidence.projection_recipe"
-    recipe = "independent-v1" if settings.independent_evidence else "legacy-v1"
-    stored = store.get_metadata(key)
-    if stored is None and store.records.list_memories(limit=1):
-        stored = "legacy-v1"
-    if stored is not None and stored != recipe:
-        raise StorageError(
-            f"local store metadata mismatch for {key}: expected {recipe!r}, found {stored!r}"
-        )
-    store.set_metadata(key, recipe)
-
-
-def ensure_store_metadata(
-    store: LocalStore,
-    backends: Backends,
-    settings: Settings,
-    index_path: Path,
-) -> tuple[bool, bool]:
-    """Reconcile the store's markers with the wired backends and settings.
-
-    Returns `(rebuild_index, rebuild_embeddings)`: whether the Zvec collection must be rebuilt and
-    whether every memory must be re-embedded first. A marker the store has never recorded is
-    written; a known upgrade is accepted; anything else is a mismatch the caller must not paper
-    over.
-    """
-    expected = {
-        STORE_METADATA_KEYS["model"]: backends.embedding_model,
-        STORE_METADATA_KEYS["space"]: backends.space_id,
-        STORE_METADATA_KEYS["transcription"]: backends.transcription_space,
-        STORE_METADATA_KEYS["dimension"]: str(backends.embedding_dimension),
-        STORE_METADATA_KEYS["index"]: settings.index_recipe,
-    }
-    if backends.face_analyzer is not None:
-        expected[STORE_METADATA_KEYS["face"]] = backends.face_space
-        expected[STORE_METADATA_KEYS["face_analysis"]] = backends.face_analysis_space
-    rebuild_index = False
-    rebuild_embeddings = False
-    legacy_embedding_spaces = cast(
-        frozenset[str],
-        getattr(backends.embedder, "_legacy_embedding_spaces", frozenset()),
-    )
-    with translate_storage_errors("validate local store metadata"):
-        _ensure_evidence_recipe(store, settings)
-        for key, value in expected.items():
-            stored = store.get_metadata(key)
-            if stored is None:
-                if key == STORE_METADATA_KEYS["index"] and index_path.exists():
-                    rebuild_index = True
-                    rebuild_embeddings = True
-                else:
-                    store.set_metadata(key, value)
-            elif stored == value:
-                continue
-            elif (
-                requires_reembedding := known_metadata_upgrade(
-                    key,
-                    stored,
-                    legacy_embedding_spaces,
-                )
-            ) is not None:
-                rebuild_index = True
-                rebuild_embeddings = rebuild_embeddings or requires_reembedding
-            else:
-                raise StorageError(
-                    f"local store metadata mismatch for {key}: expected {value!r}, found {stored!r}"
-                )
-        if rebuild_index:
-            if index_path.exists():
-                shutil.rmtree(index_path)
-            if not rebuild_embeddings:
-                store.set_metadata(STORE_METADATA_KEYS["index"], settings.index_recipe)
-    return rebuild_index, rebuild_embeddings

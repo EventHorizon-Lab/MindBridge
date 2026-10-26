@@ -23,7 +23,9 @@ adapters around one constructed `Memory`, or have other processes call the exist
 
 Before starting the owner, verify:
 
-- Python 3.10 through 3.14 and compatible 64-bit wheels exist for Zvec and every selected backend.
+- Python 3.10 through 3.14 and compatible 64-bit wheels exist for Zvec 0.8 and every selected
+  backend. Zvec's additional Intel Mac and Windows ARM64 builds do not establish support for
+  every optional model dependency; verify the complete environment on the target platform.
 - The data directory is on one local, durable filesystem with working SQLite WAL, file locking,
   atomic rename, and durable writes.
 - The Python build links SQLite 3.35 or newer with the JSON1 extension, which is compiled in by
@@ -77,6 +79,41 @@ after any process fork, never before it.
 
 The Jina adapter executes pinned upstream model code and uses non-commercial weights. Review
 [embedding choices](configuration.md#embedding-choices) before deploying it.
+
+For OpenAI generation slots, configure only parameters supported by the selected model and choose
+`response_format="json_schema"` when the endpoint supports strict structured output. A compatible
+server may instead require the default JSON mode. Configure the SDK base URL, without appending
+`/chat/completions`, and keep credentials in environment lookup or a secret manager. Pin model
+snapshots for reproducible rollout comparisons, run the
+[model quality gate](operations.md#model-quality-gate), and retain provider request IDs with local
+trace IDs for production diagnosis. Local storage does not imply that inference remains local.
+
+## EmbeddingGemma 2 model server
+
+Run vLLM separately from the MindBridge owner, with a version containing
+[EmbeddingGemma 2 support](https://github.com/vllm-project/vllm/pull/60254). Obtain access to the
+model checkpoint and install the model runtime dependencies required by that vLLM version in its
+own environment. Start a pooling server with the checkpoint's bundled chat template:
+
+```bash
+vllm serve google/embeddinggemma-2 \
+  --runner pooling \
+  --max-model-len 8192 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Keep text, image, audio, and video enabled for full multimodal support. The 8,192-token limit is
+shared by text and media in each input; split larger inputs before ingestion. Do not substitute
+a generative Gemma chat template or rename the served model: MindBridge selects its retrieval
+recipe using the exact model name. Use vLLM's `--revision` option to pin an immutable checkpoint
+commit in deployments that need reproducibility.
+
+Install `mindbridge[openai]` in the application environment and use the
+[EmbeddingGemma 2 vLLM configuration](configuration.md#embeddinggemma-2-through-vllm), which sends
+requests to `http://127.0.0.1:8000/v1/embeddings`. The `EMPTY` key is a placeholder for this local
+server; configure the actual key when server authentication is enabled. Keep one MindBridge
+owner per physical data directory even when several owners share the model server.
 
 ## REST owner
 

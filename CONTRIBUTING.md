@@ -97,6 +97,24 @@ using their context managers or an explicit `close()`.
 There is no numeric coverage threshold. A new test should fail when the implementation is
 deliberately broken; assertions that only restate the implementation are not useful evidence.
 
+### Model quality changes
+
+For prompt, model, or retrieval-policy changes, attach task-specific evaluation results as well as
+the ordinary test results. Record the configured model snapshot, returned model identity when
+available, fixture version, pass criteria, and the commands run. Include grounded answers,
+insufficient evidence, and instructions embedded in stored content. Compare an equivalent
+baseline before accepting a quality claim; a mocked HTTP response verifies the adapter contract,
+not a model's behavior. Pin model snapshots for reproducible comparisons and re-evaluate before
+changing them. A current model alias alone is not a reproducibility guarantee.
+
+Keep real-service evaluation separate from the credential-free test suite. Use protected CI
+secrets or caller-owned clients, bound requests and output tokens, and report unavailable service
+checks explicitly. Retain aggregate case outcomes and safe model/request identifiers rather than
+private prompts or response bodies. See the [model quality gate](docs/operations.md#model-quality-gate)
+for the small recurring regression suite and [benchmarking](docs/benchmarking.md) for dataset
+evaluation. This follows OpenAI's [evaluation guidance](https://developers.openai.com/api/docs/guides/evaluation-best-practices)
+and [adversarial testing guidance](https://developers.openai.com/api/docs/guides/safety-best-practices).
+
 ## Architecture rules
 
 The supported local path is intentionally direct:
@@ -145,6 +163,13 @@ records. Preserve original measurements, source pins, rejected hypotheses, and v
 Historical examples may require their frozen checkout; current guides must use the public API in
 this checkout. A documentation review should compare signatures, defaults, exports, transport
 switches, and example configurations against their implementations, not only check Markdown.
+
+Remove superseded implementation specifications once the owning guides and regression tests cover
+their shipped behavior. Keep agent checklists, review transcripts, build output, and logs out of
+versioned documentation; retain reproducible research evidence and its limitations in the archive.
+Store temporary implementation plans and review notes under the ignored `.superpowers/` directory.
+The former `docs/superpowers/` location is ignored to prevent completed work plans from returning
+to the documentation tree.
 
 ## Pull requests
 

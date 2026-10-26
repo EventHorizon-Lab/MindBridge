@@ -14,6 +14,7 @@ contract.
 | Try MindBridge end to end | [Quick start](quickstart.md) | [Core concepts](concepts.md) |
 | Build a Python integration | [Configuration](configuration.md) | [Python SDK](api/python-sdk.md) |
 | Use a local WeMM embedding service | [Local WeMM deployment](use-local-wemm.md) | [Configuration](configuration.md) |
+| Use EmbeddingGemma 2 through vLLM | [Model server](deployment.md#embeddinggemma-2-model-server) | [Configuration](configuration.md#embeddinggemma-2-through-vllm) |
 | Give an agent a bounded context view | [Context compilation](context-compilation.md) | [Python SDK](api/python-sdk.md) |
 | Expose memory to another process | [REST](api/rest.md), [MCP](api/mcp.md), or [CLI](api/cli.md) | [Deployment](deployment.md) |
 | Run a durable instance | [Architecture](architecture.md) | [Operations](operations.md) and [troubleshooting](troubleshooting.md) |
@@ -73,11 +74,17 @@ contract.
 
 - [Accuracy-first retrieval](research/2026-10-26-accuracy-first-retrieval.md) — authoritative
   quantized scoring, candidate retention, quality fixtures, and measured latency tradeoffs.
+- [ATM-Bench and Mem-Gallery research strategy](research/2026-10-26-atm-mem-gallery-sota-strategy.md) —
+  current competitive results, MindBridge evidence gaps, and experiments for validating improvements.
+- [Architecture cohesion audit](research/2026-10-26-architecture-cohesion.md) — dependency
+  boundaries, recovery fixes, and compatibility removal decisions.
 - [Zvec 0.8 adoption](research/2026-10-26-zvec-08.md) — index migration, concurrency and
   quantization decisions, measured recall, and native API limits.
 - [Memory reliability changes](research/2026-10-08-reliability-optimization.md) — formation history,
   stale evidence guards, constraint candidates, request telemetry, and saved-prediction rejudging.
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
+- [Model quality gate](operations.md#model-quality-gate) — synthetic real-model regression cases,
+  explicit snapshots, safe artifacts, and optional scheduled evaluation.
 - [Annotated example configuration](examples/eval.example.yaml) — every evaluation slot and the
   order in which a run uses it.
 

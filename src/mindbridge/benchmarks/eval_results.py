@@ -23,7 +23,7 @@ from mindbridge.benchmarks.eval_cache import EvidenceInterval
 from mindbridge.benchmarks.eval_config import DEFAULT_ARM
 from mindbridge.models.base import _is_generation_abort_rejection
 
-EVAL_SCHEMA_VERSION = 18
+EVAL_SCHEMA_VERSION = 19
 
 
 @dataclass(frozen=True, slots=True)

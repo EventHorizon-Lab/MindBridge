@@ -54,8 +54,6 @@ _OPENEQA_FRAME_RATE = 1
 _PREPARATION_WORKERS = min(4, os.cpu_count() or 1)
 _PREPARED_MEDIA_CACHE_VERSION = "ffmpeg-v2"
 _VIDEO_SEGMENT_CACHE_KEY_VERSION = "video-segment-v3"
-_LEGACY_PREPARED_MEDIA_CACHE_VERSION = "ffmpeg-v1"
-_LEGACY_VIDEO_SEGMENT_CACHE_KEY_VERSION = "video-segment-v2"
 _T = TypeVar("_T")
 _R = TypeVar("_R")
 Limit: TypeAlias = int | float | None
@@ -1052,22 +1050,19 @@ def _segment_video(
         raise ValueError("video segment boundaries must be positive")
     stat_result = source.stat()
 
-    def cache_key(version: str) -> str:
-        return hashlib.sha256(
-            json.dumps(
-                [
-                    version,
-                    str(source.resolve()),
-                    stat_result.st_size,
-                    stat_result.st_mtime_ns,
-                    ordered,
-                    _ffmpeg_id(),
-                ],
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()[:20]
-
-    key = cache_key(_VIDEO_SEGMENT_CACHE_KEY_VERSION)
+    key = hashlib.sha256(
+        json.dumps(
+            [
+                _VIDEO_SEGMENT_CACHE_KEY_VERSION,
+                str(source.resolve()),
+                stat_result.st_size,
+                stat_result.st_mtime_ns,
+                ordered,
+                _ffmpeg_id(),
+            ],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:20]
 
     def command(_working: Path, video_filter: str = _VIDEO_FILTER) -> list[str]:
         return [
@@ -1113,9 +1108,6 @@ def _segment_video(
         command,
         announce,
         fallback_command=lambda working: command(working, _VIDEO_FILTER_NATIVE),
-        legacy_paths=_legacy_segment_paths(
-            cache, cache_key(_LEGACY_VIDEO_SEGMENT_CACHE_KEY_VERSION), ordered
-        ),
     )
 
 
@@ -1128,7 +1120,6 @@ def _cached_segments(
     announce: Callable[[str], None] | None,
     *,
     fallback_command: Callable[[Path], list[str]] | None = None,
-    legacy_paths: Sequence[Path] = (),
 ) -> tuple[tuple[float, float, Path], ...]:
     target = cache / key
     expected = tuple(target / f"segment-{index:05d}.mp4" for index in range(len(boundaries)))
@@ -1140,10 +1131,6 @@ def _cached_segments(
     complete = target / _COMPLETE_MARKER
     if complete.is_file() and all(path.is_file() and path.stat().st_size for path in expected):
         return _timed_paths(boundaries, expected)
-    if all(_has_structural_video(path) for path in expected):
-        complete.touch()
-        return _timed_paths(boundaries, expected)
-    _reuse_valid_legacy(legacy_paths, expected)
     if all(_has_structural_video(path) for path in expected):
         complete.touch()
         return _timed_paths(boundaries, expected)
@@ -1165,25 +1152,6 @@ def _cached_segments(
     finally:
         shutil.rmtree(working)
     return _timed_paths(boundaries, expected)
-
-
-def _reuse_valid_legacy(legacy_paths: Sequence[Path], expected: Sequence[Path]) -> None:
-    """Reuse only legacy segments that already meet the processor's two-frame threshold.
-
-    A legacy one-frame object may have lost real source frames to the old fps representation. It
-    must therefore take the native-cadence repair path instead of becoming a completed V2 entry.
-    """
-    if len(legacy_paths) != len(expected):
-        return
-    expected[0].parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for legacy_path, target_path in zip(legacy_paths, expected, strict=True):
-        if _has_structural_video(target_path) or not _has_preprocessable_video(legacy_path):
-            continue
-        target_path.unlink(missing_ok=True)
-        try:
-            os.link(legacy_path, target_path)
-        except OSError:
-            shutil.copy2(legacy_path, target_path)
 
 
 def _produce_segments(
@@ -1256,19 +1224,6 @@ def _segment_output_command(
         # named output regardless of the source's keyframe cadence.
         command.append(str(output.with_name("segment-00000.mp4")))
     return command
-
-
-def _legacy_segment_paths(cache: Path, key: str, boundaries: Sequence[float]) -> tuple[Path, ...]:
-    """Locate only the prior prepared-media namespace for a matching legacy cache key."""
-    parts = cache.parts
-    try:
-        index = parts.index(_PREPARED_MEDIA_CACHE_VERSION)
-    except ValueError:
-        return ()
-    legacy_root = Path(*parts[:index], _LEGACY_PREPARED_MEDIA_CACHE_VERSION, *parts[index + 1 :])
-    return tuple(
-        legacy_root / key / f"segment-{offset:05d}.mp4" for offset in range(len(boundaries))
-    )
 
 
 def _timed_paths(

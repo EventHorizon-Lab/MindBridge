@@ -33,6 +33,11 @@ from mindbridge.benchmarks.eval_config import (
     DEFAULT_ARM,
 )
 from mindbridge.benchmarks.model_config import ModelConfig
+from mindbridge.models._openai_protocol import (
+    output_limit_parameter,
+    reasoning_model,
+    sampling_supported,
+)
 from mindbridge.models.base import ModelInput
 from mindbridge.models.openai_sdk import (
     _json_text,
@@ -131,7 +136,7 @@ class _BaselineGenerator:
         self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
         options = dict(item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item)
         self._model = config.generation_model
-        self._seed = seed
+        self._seed = None if reasoning_model(self._model) else seed
         self._max_tokens = (
             None if "max_tokens" not in options else int(options["max_tokens"]) or None
         )
@@ -146,9 +151,8 @@ class _BaselineGenerator:
         # a thinking model answers at all: without the deployment's `reasoning_effort` the model
         # spends its budget on reasoning tokens and every reply ends `finish_reason=length`, which
         # would score as "the baseline knows nothing" rather than "the baseline was misconfigured".
-        # `temperature` stays pinned at 0 regardless: a sampling baseline is not reproducible, and
-        # `_generation_kwargs` already refuses a non-zero temperature on the other configuration
-        # path.
+        # Deterministic controls are sent only where the shared provider policy supports them.
+        # Explicit controls in extra_body still reach the adapter's validation.
         stanza = None if generation is None else generation.generation
         if stanza is not None:
             if stanza.extra_body is not None:
@@ -156,6 +160,7 @@ class _BaselineGenerator:
             if stanza.max_tokens is not None and self._max_tokens is None:
                 self._max_tokens = stanza.max_tokens
         self._extra_body = extra_body or None
+        self._temperature = 0.0 if sampling_supported(self._model, self._extra_body) else None
         self._generation_capabilities = config.generation_capabilities
         self._query_asset_cache: dict[Path, AssetRef] = {}
         self._native_media = OpenAIModels(
@@ -163,7 +168,7 @@ class _BaselineGenerator:
             generation_model=self._model,
             generation_capabilities=self._generation_capabilities,
             generation_seed=self._seed,
-            generation_temperature=0.0,
+            generation_temperature=self._temperature,
             generation_max_tokens=self._max_tokens,
             generation_min_video_seconds=config.generation_min_video_seconds,
             generation_video_limit=(8 if stanza is None else stanza.video_limit),
@@ -200,11 +205,13 @@ class _BaselineGenerator:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "temperature": 0.0,
-                "seed": self._seed,
             }
+            if self._temperature is not None:
+                request["temperature"] = self._temperature
+            if self._seed is not None:
+                request["seed"] = self._seed
             if self._max_tokens is not None:
-                request["max_tokens"] = self._max_tokens
+                request[output_limit_parameter(self._model)] = self._max_tokens
             if self._extra_body is not None:
                 request["extra_body"] = self._extra_body
             modalities = frozenset({Modality.TEXT})

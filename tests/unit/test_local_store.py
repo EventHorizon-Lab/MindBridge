@@ -3066,7 +3066,7 @@ def test_equal_valued_later_clause_update_does_not_bypass_rollback_order(
         )[0]
 
 
-def test_rollback_reads_incomplete_schema17_logs_that_only_recorded_clause_ids(
+def test_clause_snapshots_round_trip_and_rollback_preserves_the_version_history(
     tmp_path: Path,
 ) -> None:
     recorded_at = datetime(2026, 9, 8, 13, tzinfo=timezone.utc)
@@ -3082,30 +3082,18 @@ def test_rollback_reads_incomplete_schema17_logs_that_only_recorded_clause_ids(
             members,
             confidence=0.7,
             applied_at=recorded_at + timedelta(minutes=1),
-            key="old-schema17-log",
+            key="joint-clause-snapshot-log",
         )
         change = operation.clause_changes[0]
-        with closing(sqlite3.connect(store.database_path)) as connection:
-            connection.execute(
-                """
-                UPDATE memory_operations
-                SET effects_json = json_set(
-                    json_remove(effects_json, '$.clause_changes'),
-                    '$.linked_clauses', json_array(json_array(?, ?))
-                )
-                WHERE operation_id = ?
-                """,
-                (change.memory_id, change.clause_id, operation.operation_id),
-            )
-            connection.commit()
-
-        legacy = store.control.read_operations(operation_id=operation.operation_id)[0]
-        assert legacy.clause_changes == ()
-        assert legacy.linked_clauses == ((change.memory_id, change.clause_id),)
+        logged = store.control.read_operations(operation_id=operation.operation_id)[0]
+        assert logged.clause_changes == (change,)
+        assert change.previous_active is False
+        assert change.applied_confidence == 0.7
+        assert change.applied_version == 1
         assert store.control.rollback_operation(
-            legacy.operation_id,
+            logged.operation_id,
             rolled_back_at=recorded_at + timedelta(minutes=2),
-            retire_clauses=legacy.linked_clauses,
+            reverse_clause_changes=logged.clause_changes,
         )[0]
         with closing(sqlite3.connect(store.database_path)) as connection:
             assert (
@@ -3117,6 +3105,15 @@ def test_rollback_reads_incomplete_schema17_logs_that_only_recorded_clause_ids(
                 ).fetchone()[0]
                 == 0
             )
+            assert connection.execute(
+                """
+                SELECT version, confidence, retired_at IS NOT NULL
+                FROM memory_evidence_clause_versions
+                WHERE memory_id = 'derived' AND clause_id = ?
+                ORDER BY version
+                """,
+                (change.clause_id,),
+            ).fetchall() == [(1, 0.7, 1)]
 
 
 def test_clause_reactivation_preserves_the_historical_inactive_gap(

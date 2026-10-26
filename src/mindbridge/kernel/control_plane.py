@@ -70,33 +70,6 @@ _LOGGER = logging.getLogger(__name__)
 _REPEATED_FAILURES = 2
 
 
-def operation_touches(
-    record: MemoryOperationRecord,
-    memory_ids: frozenset[str],
-    identity_ids: frozenset[str],
-) -> bool:
-    """Report whether one logged operation moved any of these records or any of these people."""
-    operation = record.operation
-    named = {
-        *operation.evidence_ids,
-        *operation.target_ids,
-        *record.created_ids,
-        *record.changed_ids,
-        *record.forgotten_ids,
-        *(memory_id for memory_id, _version in record.superseded),
-    }
-    if named & memory_ids:
-        return True
-    people: set[str] = set()
-    if operation.identity is not None:
-        people.update((operation.identity.identity_id, *operation.identity.moved_ids))
-    if operation.claim is not None:
-        people.add(operation.claim.identity_id)
-    if operation.consent is not None:
-        people.add(operation.consent.identity_id)
-    return bool(people & identity_ids)
-
-
 class ControlPlane(Traced):
     """Propose, apply, audit, and reverse memory-control-plane operations."""
 
@@ -529,10 +502,7 @@ class ControlPlane(Traced):
                     ),
                     # `linked` is the evidence this operation actually inserted, so a link that
                     # predated it survives the reversal. Records deleted above take their own.
-                    retire_evidence=(
-                        () if row.clause_changes or row.linked_clauses else row.linked
-                    ),
-                    retire_clauses=row.linked_clauses,
+                    retire_evidence=(() if row.clause_changes else row.linked),
                     reverse_clause_changes=row.clause_changes,
                     # A CORRECT retired the versions it named. A CONSOLIDATE may also have
                     # superseded records in the derived record's lineage that no backend ever

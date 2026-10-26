@@ -411,12 +411,11 @@ def contextual_text_key_descriptors(text: str) -> tuple[_TextKeyDescriptor, ...]
 
 
 def text_selector_map(
-    memory: PreparedMemory,
+    content: PreparedContent,
     *,
     raw_observation: bool,
 ) -> dict[ModelInput, tuple[StoredTextSelector, ...]]:
     """Return selectors only when a new raw key is an exact projection of stored text."""
-    content = memory.content
     if (
         not raw_observation
         or content.modality is not Modality.TEXT
@@ -428,8 +427,7 @@ def text_selector_map(
     ):
         return {}
     parent_digest = hashlib.sha256(content.text.encode("utf-8")).hexdigest()
-    aggregate = memory.content
-    aggregate_input = ModelInput(text=aggregate.text, assets=())
+    aggregate_input = ModelInput(text=content.text, assets=())
     grouped: dict[ModelInput, list[StoredTextSelector]] = {}
     for descriptor in contextual_text_key_descriptors(content.text):
         model_input = ModelInput(text=descriptor.key)

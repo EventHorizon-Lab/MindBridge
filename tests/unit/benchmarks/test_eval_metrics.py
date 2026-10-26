@@ -47,6 +47,7 @@ from mindbridge.benchmarks.eval_metrics import NOISE_FLOOR
 from mindbridge.benchmarks.eval_results import SampleResult
 from mindbridge.benchmarks.eval_statistics import ScoredValue, percentile
 from mindbridge.benchmarks.eval_telemetry import (
+    ASK_RETRIEVAL_SPAN,
     BENCHMARK_ARM,
     BENCHMARK_ARM_SPAN,
     BENCHMARK_COMPILE_CHARS,
@@ -58,7 +59,6 @@ from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_JUDGE_SPAN,
     BENCHMARK_TASK,
     BENCHMARK_TASK_SPAN,
-    SEARCH_SPAN,
     EvaluationTelemetry,
     ResourceSampler,
     storage_bytes,
@@ -175,15 +175,24 @@ def test_ingest_reports_durable_searchable_latency_and_sustained_throughput() ->
 
     ingest = cast(Mapping[str, object], result["ingest"])
     assert ingest["span"] == BENCHMARK_INGEST_SPAN
-    assert ingest["call_count"] == 2
-    assert ingest["item_count"] == 8
+    assert {
+        "call_count",
+        "item_count",
+        "compute_seconds",
+        "wall_seconds",
+        "call_latency_ms",
+        "item_latency_ms",
+        "items_per_second",
+        "deprecated_fields",
+    }.isdisjoint(ingest)
+    assert ingest["success_count"] == 2
+    assert ingest["accepted_item_count"] == 8
     # Throughput uses the union of successful intervals and excludes the 100 ms idle gap.
-    assert cast(float, ingest["compute_seconds"]) == pytest.approx(0.3)
+    assert cast(float, ingest["successful_compute_seconds"]) == pytest.approx(0.3)
     assert cast(float, ingest["active_seconds"]) == pytest.approx(0.3)
-    assert ingest["item_latency_ms"] is None
     assert cast(float, ingest["amortized_compute_ms_per_accepted_item"]) == pytest.approx(37.5)
     assert cast(float, ingest["items_per_active_second"]) == pytest.approx(8 / 0.3)
-    latency = cast(Mapping[str, object], ingest["call_latency_ms"])
+    latency = cast(Mapping[str, object], ingest["successful_batch_latency_ms"])
     assert cast(float, latency["p50"]) == pytest.approx(150.0)
     assert "durable" in str(ingest["measures"])
     assert "outbox" in str(ingest["measures"])
@@ -238,9 +247,9 @@ async def test_ingest_traces_one_span_per_accepted_batch_with_its_item_count() -
     assert failures == 0
     assert memory.batches == [2, 2, 1]
     ingest = cast(Mapping[str, object], result["ingest"])
-    assert ingest["call_count"] == 3
-    assert ingest["item_count"] == 5
-    assert cast(float, ingest["items_per_second"]) > 0.0
+    assert ingest["success_count"] == 3
+    assert ingest["accepted_item_count"] == 5
+    assert cast(float, ingest["items_per_active_second"]) > 0.0
 
 
 # --- family 2: search latency at p50/p95/p99 with throughput --------------------------------
@@ -248,10 +257,14 @@ async def test_ingest_traces_one_span_per_accepted_batch_with_its_item_count() -
 
 def test_search_latency_reports_p50_p95_and_p99_for_the_named_span() -> None:
     result = _aggregate(
-        tuple(_span(SEARCH_SPAN, start_ms=0, end_ms=duration) for duration in (10, 20, 30, 40))
+        tuple(
+            _span(ASK_RETRIEVAL_SPAN, start_ms=0, end_ms=duration) for duration in (10, 20, 30, 40)
+        )
     )
 
-    search = cast(Mapping[str, object], result["search"])
+    search = cast(Mapping[str, object], result["ask_retrieval_core"])
+    assert "search" not in result
+    assert {"wall_seconds", "throughput_per_second"}.isdisjoint(search)
     # The whole retrieval leg of one ask, not the narrower index lookup inside it.
     assert search["span"] == "mindbridge.retrieve"
     assert search["count"] == 4
@@ -261,7 +274,7 @@ def test_search_latency_reports_p50_p95_and_p99_for_the_named_span() -> None:
     assert cast(float, latency["p95"]) == pytest.approx(38.5)
     assert cast(float, latency["p99"]) == pytest.approx(39.7)
     # Four searches inside a 40 ms observation window, not a queue depth.
-    assert cast(float, search["throughput_per_second"]) == pytest.approx(100.0)
+    assert cast(float, search["throughput_per_active_second"]) == pytest.approx(100.0)
 
 
 def test_answer_latency_names_the_quantity_it_measures() -> None:
@@ -485,9 +498,8 @@ def test_asr_hides_complete_ratio_when_a_successful_call_has_no_duration() -> No
     asr = cast(Mapping[str, object], result["asr"])
     assert asr["invocation_count"] == 3
     assert asr["request_count"] == 4
-    assert asr["call_count"] == 3
     assert asr["success_count"] == 3
-    assert asr["ratio_call_count"] == 1
+    assert asr["ratio_invocation_count"] == 1
     assert asr["audio_duration_missing_success_count"] == 2
     assert asr["ratio_complete"] is False
     assert cast(float, asr["audio_seconds"]) == pytest.approx(5.0)
@@ -500,7 +512,7 @@ def test_asr_hides_complete_ratio_when_a_successful_call_has_no_duration() -> No
 
 
 def test_asr_block_is_absent_when_no_transcription_ran() -> None:
-    result = _aggregate((_span(SEARCH_SPAN, end_ms=5),))
+    result = _aggregate((_span(ASK_RETRIEVAL_SPAN, end_ms=5),))
 
     assert result["asr"] is None
 
@@ -534,10 +546,10 @@ def test_time_to_first_token_is_reported_only_when_the_backend_streams() -> None
 
     quiet_answer = cast(Mapping[str, object], silent["answer"])
     assert quiet_answer["streaming"] is False
-    assert quiet_answer["time_to_first_token_ms"] is None
+    assert quiet_answer["generation_time_to_first_token_ms"] is None
     loud_answer = cast(Mapping[str, object], streaming["answer"])
     assert loud_answer["streaming"] is True
-    first_token = cast(Mapping[str, float], loud_answer["time_to_first_token_ms"])
+    first_token = cast(Mapping[str, float], loud_answer["generation_time_to_first_token_ms"])
     assert first_token["average"] == pytest.approx(25.0)
     assert cast(
         float, cast(Mapping[str, object], loud_answer["latency_ms"])["p50"]
@@ -756,7 +768,7 @@ def test_capture_settle_and_compile_spans_are_aggregated_separately() -> None:
 
 
 def test_capture_settle_and_compile_report_nothing_when_unexercised() -> None:
-    result = _aggregate((_span(SEARCH_SPAN, end_ms=5),))
+    result = _aggregate((_span(ASK_RETRIEVAL_SPAN, end_ms=5),))
 
     assert cast(Mapping[str, object], result["capture"])["count"] == 0
     assert cast(Mapping[str, object], result["time_to_searchable_ms"])["count"] == 0
@@ -1283,29 +1295,29 @@ def test_search_latency_never_mixes_the_narrower_lookup_or_the_search_operation(
     """`mindbridge.retrieve` is the reported boundary; two other spans must not join it."""
     result = _aggregate(
         (
-            _span(SEARCH_SPAN, start_ms=0, end_ms=100),
+            _span(ASK_RETRIEVAL_SPAN, start_ms=0, end_ms=100),
             # The lookup nested inside the retrieval leg, and the separate public operation.
             _span("mindbridge.index.search", start_ms=10, end_ms=20),
             _span("mindbridge.search", start_ms=200, end_ms=900, kind="operation"),
         )
     )
 
-    search = cast(Mapping[str, object], result["search"])
+    search = cast(Mapping[str, object], result["ask_retrieval_core"])
     assert search["count"] == 1
     assert cast(float, cast(Mapping[str, object], search["latency_ms"])["p50"]) == pytest.approx(
         100.0
     )
     nodes = cast(Mapping[str, Mapping[str, object]], result["nodes"])
-    assert set(nodes) == {SEARCH_SPAN, "mindbridge.index.search", "mindbridge.search"}
+    assert set(nodes) == {ASK_RETRIEVAL_SPAN, "mindbridge.index.search", "mindbridge.search"}
 
 
-def test_a_search_only_run_reports_nothing_under_search() -> None:
+def test_a_search_only_run_reports_no_in_answer_retrieval() -> None:
     result = _aggregate((_span("mindbridge.search", end_ms=50, kind="operation"),))
 
-    search = cast(Mapping[str, object], result["search"])
+    search = cast(Mapping[str, object], result["ask_retrieval_core"])
     assert search["count"] == 0
     assert search["latency_ms"] is None
-    assert search["throughput_per_second"] is None
+    assert search["throughput_per_active_second"] is None
 
 
 def _retrieval_sample(

@@ -26,8 +26,8 @@ data, not an account, authorization, request, or isolation boundary.
 
 `memory.py` holds the two public facades, `Memory` and `AsyncMemory`, and nothing else that
 decides behavior. `Memory.__init__` is the one place the runtime is assembled: it resolves
-`Settings` and `Backends`, opens the store, constructs the planes that need no index, upgrades
-and re-embeds the store if its markers say so, opens the index, constructs the remaining planes,
+`Settings` and `Backends`, opens the store, constructs the planes that need no index, delegates
+store recovery to `Recovery`, opens the index, constructs the remaining planes,
 and drains the outbox. Every plane's dependencies are keyword arguments to its constructor, so
 the wiring in that method is the dependency graph, and a plane cannot reach a resource it was
 not handed.
@@ -37,6 +37,7 @@ not handed.
 | `kernel/lifecycle.py` | `Lifecycle` | Operation leases, fork detection, close coordination, and the media leases an operation holds. |
 | `kernel/materialization.py` | `Materializer` | Validating caller content and leasing its media before any model runs. |
 | `kernel/hydration.py` | `Hydrator` | Stored rows to public `MemoryRecord`, `SearchHit`, and `AssetRef` values. |
+| `kernel/recovery.py` | `Recovery` | Validating store markers before writes, resuming recognized embedding upgrades, replacing derived indexes, and checkpointing recovery work before index creation. |
 | `kernel/speech.py`, `vision.py`, `embedding.py` | `Speech`, `Vision`, `Embedding` | The perception planes: transcripts and voice identities; descriptions, faces, and cross-modal links; routing content into the embedder and keying rows. |
 | `kernel/projection.py` | `Projection` | Applying committed SQLite truth to Zvec through the outbox, batched flushes, `reindex()`, `optimize()`. |
 | `kernel/retrieval.py` | `Retrieval` | Index candidates, authoritative hydration, and one ranking, shared by search, answer, compile, and the control plane. |
@@ -49,13 +50,16 @@ not handed.
 | `kernel/records.py` | `Records` | `get`, `list`, `delete`, `export`, retention, and reinforcement. |
 
 The pure modules beside them -- `content.py` for what the caller gave, `derived.py` for what a
-model derived, `temporal.py`, `ranking.py`, `contracts.py`, `validation.py`, `settings.py` --
+model derived, `temporal.py`, `ranking.py`, `contracts.py`, `metadata.py`, `validation.py`,
+`settings.py` --
 read no storage and call no model; they are the functions the planes agree on, and they are
 where a rule about identity, ranking, or derived text lives exactly once. Two small shared
 modules complete the kernel: `runtime.py` holds the `Storage` bundle, the `Index` protocol, the
-boundary error translation every plane uses, and the store-marker reconciliation that decides
-whether an opening store must rebuild its index or re-embed, and `tracing.py` holds the `Traced`
-base class that gives each plane its spans. The top-level `streams.py` holds the async observation streams
+boundary error translation every plane uses, and `tracing.py` holds the `Traced` base class that
+gives each plane its spans. `metadata.py` decides which stored recipes can be upgraded;
+`Recovery` executes that plan. Pure operation inspection and identity operation recipes live in
+top-level `control.py`, so reading records or describing visuals does not import an unrelated
+plane for one helper or constant. The top-level `streams.py` holds the async observation streams
 over `AsyncMemory`.
 
 `infrastructure/local/store/` mirrors the same discipline for SQLite. `LocalStore` owns one
@@ -88,6 +92,19 @@ The store also records the embedding model, space, dimension, transcription spac
 spaces, and the index recipe. An unrecognized mismatch fails at open instead of mixing
 incompatible state. A known index-only recipe change rebuilds Zvec from stored vectors; a
 recognized embedding recipe upgrade may re-embed records before publishing the new marker.
+
+Recovery validates all markers before writing any of them. Re-embedding persists an
+`embedding.migration_target` marker before its first batch; the value is canonical JSON of the
+target store markers. A failed or interrupted migration can resume only with that same target.
+The final embedding-space and index-recipe markers and removal of the pending target commit in
+one SQLite transaction. Matching opens do not rewrite marker timestamps. This adds metadata to
+schema 18 without changing tables; finish a pending migration before using an older runtime that
+does not enforce its target. Re-embedding reconstructs exact text selectors through the same
+pure helper as ingestion, preserving partial-source context compilation.
+
+The incomplete schema-17 development operation-log field `linked_clauses` and its separate
+rollback path are removed. Schema 17 was already refused at open. Current schema-18 operations
+continue to use `clause_changes` snapshots and retain historical clause versions on rollback.
 
 ## Write consistency
 
@@ -350,9 +367,12 @@ Model calls and separate SQLite transactions may overlap. SQLite serializes its 
 `BEGIN IMMEDIATE`. A process-local write lock protects outbox application, destructive operations,
 index replacement, final record and asset hydration, and add-time speaker identity updates, whose
 identity changes must roll back with a failed add. Ordinary Zvec queries may overlap with each
-other; every native write, flush, optimize, replacement, and close waits for active queries and
-excludes them, because Zvec 0.7 lets a query on one collection read a segment store that a
-concurrent flush is freeing (alibaba/zvec#714), which surfaced as a bus error in a long benchmark.
+other and with ordinary native upserts, deletes, and flushes. Zvec 0.8 synchronizes segment
+switching internally. Optimize, collection replacement, and close still wait for every active
+handle lease and exclude new operations. A maintenance check that needs no work takes a shared
+lease. Native mutations and maintenance acquire the process-wide FD lock before a collection
+lease; flush releases its shared lease before taking an exclusive maintenance lease, while
+retaining the process lock so another writer cannot exhaust recovery headroom.
 
 `reindex()` reads authoritative SQLite pages, replaces the Zvec collection, then replays the
 outbox so writes committed during the scan are retained. `close()` rejects new work, waits for

@@ -9,11 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from shutil import copytree, rmtree
 from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 from typing import Any, NoReturn, cast
 
+import numpy as np
 import pytest
 
 import mindbridge.infrastructure.local.zvec_index as zvec_index_module
@@ -43,7 +43,7 @@ def test_missing_zvec_has_an_actionable_error(
         missing_module,
     )
 
-    with pytest.raises(ZvecUnavailableError, match=r"Zvec 0.7.*64-bit zvec wheel"):
+    with pytest.raises(ZvecUnavailableError, match=r"Zvec 0.8.*64-bit zvec wheel"):
         ZvecIndex(tmp_path / "index", dimension=2)
 
 
@@ -493,6 +493,30 @@ def test_quantized_vector_indexes_query_and_reopen(
     with ZvecIndex(path, dimension=dimension, quantization=quantization) as reopened:
         hits = reopened.search(documents[0].embedding.values, limit=len(documents), exact=True)
         assert {hit.id for hit in hits} == expected_ids
+
+
+def test_int8_cosine_recall_survives_optimization_and_reopen(tmp_path: Path) -> None:
+    """A quantizer rotation mismatch must not turn nearest neighbors into random hits."""
+    _require_zvec()
+    rng = np.random.default_rng(20261026)
+    vectors = rng.standard_normal((1152, 64)).astype(np.float32)
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    queries = rng.standard_normal((12, 64)).astype(np.float32)
+    queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+    expected = np.argsort(-(queries @ vectors.T), axis=1)[:, :10]
+    path = tmp_path / "index"
+    with ZvecIndex(path, 64, quantization=IndexQuantization.INT8) as index:
+        index.upsert(
+            [_document(str(i), "note", tuple(float(x) for x in v)) for i, v in enumerate(vectors)]
+        )
+        index.optimize()
+        index.flush()
+    with ZvecIndex(path, 64, quantization=IndexQuantization.INT8) as reopened:
+        recovered = 0
+        for query, wanted in zip(queries, expected, strict=True):
+            hits = reopened.search(tuple(float(x) for x in query), limit=10)
+            recovered += len({int(hit.id) for hit in hits} & set(wanted))
+        assert recovered / 120 >= 0.9
 
 
 def test_full_text_search_stems_and_folds_accents(tmp_path: Path) -> None:
@@ -970,89 +994,36 @@ def test_a_merge_over_a_dead_row_keeps_every_vector_bound_to_its_own_id(
             assert ranked == exhaustive[:5]
 
 
-def test_only_a_collection_left_clean_is_merged_in_place_by_its_next_owner(
+@pytest.mark.parametrize("legacy_marker", (False, True))
+def test_updated_collections_merge_in_place_without_a_clean_marker(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    legacy_marker: bool,
 ) -> None:
-    """Copying the collection is the price of a dead row, not of having been written before.
-
-    Nothing on disk says whether an inherited collection holds one, so a session that closes a
-    collection it knows to be clean says so with a marker inside it, and a session that finds no
-    marker -- because the last one deleted something, or was killed -- copies. Without that, one
-    added record rewrote the whole collection at every close, forever: 2.13 s against 0.54 s on a
-    48 MB store, and about 21 s on the 481 MB store the close-time merge was written for.
-    """
+    """Zvec 0.8 can merge updates in place, including collections inherited from 0.7."""
     _require_zvec()
     path = tmp_path / "index"
     marker = path / ".mindbridge-clean"
-    compactions = 0
-    original = ZvecIndex._compact
-
-    def counted(self: ZvecIndex, **options: int) -> None:
-        nonlocal compactions
-        compactions += 1
-        original(self, **options)
-
-    monkeypatch.setattr(ZvecIndex, "_compact", counted)
-
     with ZvecIndex(path, dimension=2) as index:
         index.upsert(
             [_document(f"embedding_{n:02d}", f"note {n}", (1.0, float(n))) for n in range(8)]
         )
         index.flush()
-        index.delete(["embedding_00"])
-        index.flush()
-        index.optimize()
-    assert compactions == 1
-    assert marker.exists()
-
-    with ZvecIndex(path, dimension=2) as reopened:
-        # The claim is consumed at open: a crash from here on must not leave it standing.
-        assert not marker.exists()
-        assert reopened._dead_rows is False
-        reopened.upsert([_document("embedding_08", "note 8", (1.0, 8.0))])
-        reopened.flush()
-        reopened.optimize()
-        assert reopened._dead_rows is False
-    assert compactions == 1
-    assert marker.exists()
-
-    marker.unlink()
+    if legacy_marker:
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+    inode = path.stat().st_ino
     with ZvecIndex(path, dimension=2) as inherited:
-        assert inherited._dead_rows is True
+        inherited.delete(["embedding_00"])
+        inherited.upsert([_document("embedding_08", "note 8", (1.0, 8.0))])
+        inherited.flush()
         inherited.optimize()
-    assert compactions == 2
-    assert marker.exists()
-
+        assert path.stat().st_ino == inode
     with ZvecIndex(path, dimension=2) as verified:
         assert verified.doc_count == 8
         for number in (1, 4, 8):
             name = f"embedding_{number:02d}"
             assert verified.search((1.0, float(number)), limit=1, exact=True)[0].id == name
-
-
-def test_a_restored_collection_is_judged_by_its_own_marker(tmp_path: Path) -> None:
-    """The claim lives inside the collection, so restoring one cannot inherit another's."""
-    _require_zvec()
-    path = tmp_path / "index"
-    with ZvecIndex(path, dimension=2) as index:
-        index.upsert(
-            [_document(f"embedding_{n:02d}", f"note {n}", (1.0, float(n))) for n in range(4)]
-        )
-        index.flush()
-    assert (path / ".mindbridge-clean").exists()
-    backup = tmp_path / "dirty"
-    copytree(path, backup)
-    with ZvecIndex(backup, dimension=2) as dirty:
-        dirty.delete(["embedding_00"])
-        dirty.flush()
-    assert not (backup / ".mindbridge-clean").exists()
-
-    # The clean collection's marker must not speak for the dirty collection put in its place.
-    rmtree(path)
-    copytree(backup, path)
-    with ZvecIndex(path, dimension=2) as restored:
-        assert restored._dead_rows is True
 
 
 def test_open_sweeps_the_debris_a_killed_compaction_leaves(tmp_path: Path) -> None:
@@ -1138,7 +1109,7 @@ def _document(
 
 
 def _require_zvec() -> None:
-    pytest.importorskip("zvec", reason="Zvec 0.7 native wheel is not installed")
+    pytest.importorskip("zvec", reason="Zvec 0.8 native wheel is not installed")
 
 
 class _StatusCode(Enum):
@@ -1284,39 +1255,90 @@ def _asked_ef(options: object) -> int:
     return cast(int, cast(dict[str, Any], query["param"])["ef"])
 
 
-def test_native_writes_wait_for_in_flight_queries_and_reenter_their_own_gate() -> None:
-    # Zvec 0.7 frees a segment's in-memory store during flush while a query may still read it
-    # (alibaba/zvec#714); the gate must therefore hold a flush back until the query has left,
-    # and the flush thread must still be able to run maintenance that re-reads the collection.
+@pytest.mark.parametrize("operation", ("upsert", "delete", "flush", "maintenance_check"))
+def test_native_writes_overlap_queries(operation: str) -> None:
+    # Zvec 0.8 owns segment-switch synchronization. Only lifecycle operations need an
+    # exclusive lease; an ordinary mutation must finish while a query still holds its lease.
     reentered = Event()
 
     class FlushingCollection:
-        stats = SimpleNamespace(doc_count=0)
+        stats = SimpleNamespace(doc_count=0, index_completeness={"embedding": 1.0})
 
         def flush(self) -> None:
             with index._gate.read():
                 reentered.set()
 
+        def upsert(self, documents: Sequence[object]) -> list[_Status]:
+            self.flush()
+            return [_Status(_StatusCode.OK) for _ in documents]
+
+        def delete(self, ids: Sequence[str]) -> list[_Status]:
+            self.flush()
+            return [_Status(_StatusCode.OK) for _ in ids]
+
     index = object.__new__(ZvecIndex)
     index._gate = _CollectionGate()
     index._zvec = _FakeZvec
     index._collection = FlushingCollection()
+    index.dimension = 2
     index._flushes_since_optimization = 0
     index._flushes_since_compaction = 0
+    index._optimization_watermark = 0
 
     waiting = Event()
     entered = Event()
 
-    def flush() -> None:
+    def mutate() -> None:
         waiting.set()
-        index.flush()
+        if operation == "upsert":
+            index.upsert([_document("embedding", "content", (1.0, 0.0))])
+        elif operation == "delete":
+            index.delete(["embedding"])
+        elif operation == "flush":
+            index.flush()
+        else:
+            assert index.optimize_if_needed() is False
+            reentered.set()
         entered.set()
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         with index._gate.read():
-            future = executor.submit(flush)
+            future = executor.submit(mutate)
             assert waiting.wait(timeout=2)
-            assert not entered.wait(timeout=0.1)
+            assert entered.wait(timeout=2)
         future.result(timeout=2)
     assert entered.is_set()
     assert reentered.is_set()
+
+
+def test_close_waits_for_an_in_flight_native_write() -> None:
+    writing = Event()
+    release = Event()
+    closing = Event()
+
+    class Collection:
+        stats = SimpleNamespace(doc_count=0)
+
+        def flush(self) -> None:
+            writing.set()
+            assert release.wait(timeout=5)
+
+        def close(self) -> None:
+            closing.set()
+
+    index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
+    index._collection = Collection()
+    index._flushes_since_optimization = 0
+    index._flushes_since_compaction = 0
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        write = executor.submit(index.flush)
+        try:
+            assert writing.wait(timeout=2)
+            close = executor.submit(index.close)
+            assert not closing.wait(timeout=0.05)
+        finally:
+            release.set()
+        write.result(timeout=5)
+        close.result(timeout=5)
+    assert closing.is_set()

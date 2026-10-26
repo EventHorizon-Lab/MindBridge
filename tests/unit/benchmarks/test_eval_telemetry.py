@@ -549,7 +549,7 @@ def test_asr_ratios_use_matching_successful_call_sets() -> None:
 
     asr = cast(dict[str, object], result["asr"])
     successful = cast(dict[str, float], asr["successful_inference_latency_ms"])
-    assert asr["call_count"] == 2
+    assert asr["invocation_count"] == 2
     assert asr["success_count"] == 1
     assert asr["error_count"] == 1
     assert asr["audio_seconds"] == 2.0

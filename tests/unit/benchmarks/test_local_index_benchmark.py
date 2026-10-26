@@ -30,7 +30,7 @@ def test_fp32_vectors_are_deterministic_and_normalized() -> None:
 
 
 def test_small_benchmark_reports_valid_metrics(tmp_path: Path) -> None:
-    pytest.importorskip("zvec", reason="Zvec 0.7 native wheel is not installed")
+    pytest.importorskip("zvec", reason="Zvec 0.8 native wheel is not installed")
     result = run_benchmark(tmp_path, rows=32, dimension=8, queries=4, k=3, seed=7)
 
     assert set(result) == {
@@ -79,7 +79,7 @@ def test_small_benchmark_reports_valid_metrics(tmp_path: Path) -> None:
 
 
 def test_cli_prints_one_json_document(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    pytest.importorskip("zvec", reason="Zvec 0.7 native wheel is not installed")
+    pytest.importorskip("zvec", reason="Zvec 0.8 native wheel is not installed")
     data_dir = tmp_path / "cli"
 
     assert (

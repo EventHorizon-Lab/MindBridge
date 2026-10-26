@@ -12,10 +12,9 @@ import logging
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from mindbridge.exceptions import ModelError, ValidationError
-from mindbridge.infrastructure.local.zvec_index import validate_index_configuration
 from mindbridge.kernel.content import PreparedContent, prepared_modalities
 from mindbridge.kernel.validation import positive_int
 from mindbridge.models.base import (
@@ -30,70 +29,15 @@ from mindbridge.models.base import (
     VisionDescriptionBackend,
     _modalities,
 )
-from mindbridge.types import IndexQuantization, MemoryCapabilities, Modality
+from mindbridge.types import MemoryCapabilities, Modality
 
 _LOGGER = logging.getLogger(__name__)
-
-
-_INDEX_RECIPE_PREFIX = (
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:context-keys-v12"
-)
-
-
-# Recipes whose stored embeddings are still correct, so the index is rebuilt from SQLite without
-# paying to embed the content again. A full-text tokenizer change belongs here and not below: it
-# rewrites the derived documents and leaves every vector untouched. Version 9 named its CJK field
-# `fts-dual-language` because it ran a Chinese segmenter, which returned nothing for Japanese or
-# Korean; version 10 tokenized that field into script-agnostic character bigrams but admitted
-# only documents containing a listed script and answered a query from one field or the other by
-# detecting the query's script. Version 12 makes two changes at once, which is why it skips 11:
-# it decides what enters the bigram field by what the stemmed field already answers rather than
-# by script, and fuses both routes on any query with something for each (what makes a
-# mixed-script query able to reach a Latin-only memory); and it adds the `place_id` and
-# `identity_ids` filter fields, which are projections of rows SQLite already holds. Two unmerged
-# branches each shipped a different `v11`, so that number is burned rather than reused: a store
-# either of them built now fails loudly on open instead of matching a schema it does not have.
-_REINDEXABLE_INDEX_RECIPES = frozenset(
-    f"zvec-0.7:hnsw-cosine-m50-efc500:{full_text}:grouped-range:"
-    f"context-keys-v{version}:quantization-{mode.value}"
-    for full_text, version in (("fts-dual-language", 9), ("fts-stemmed-plus-bigram", 10))
-    for mode in IndexQuantization
-)
-
-
-# Recipes that also invalidate the stored embeddings, so reopening pays for a full re-embed.
-_LEGACY_INDEX_RECIPES = frozenset(
-    {
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
-        *(
-            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
-            f"context-keys-v8:quantization-{mode.value}"
-            for mode in IndexQuantization
-        ),
-    }
-)
 
 
 _NO_TRANSCRIPTION_SPACE = "none:asr-v1"
 
 
 _NO_FACE_SPACE = "none:face-v1"
-
-
-STORE_METADATA_KEYS = {
-    "model": "embedding.model_id",
-    "space": "embedding.space_id",
-    "transcription": "transcription.space_id",
-    "face": "face.space_id",
-    "face_analysis": "face.analysis_space_id",
-    "dimension": "embedding.dimension",
-    "index": "index.recipe",
-}
 
 
 class Closable(Protocol):
@@ -314,32 +258,6 @@ def declared_capabilities(
     )
 
 
-def validated_index_quantization(value: object) -> IndexQuantization:
-    if not isinstance(value, IndexQuantization):
-        raise ValidationError("index_quantization must be an IndexQuantization value")
-    return value
-
-
-def index_recipe_for(quantization: IndexQuantization) -> str:
-    return f"{_INDEX_RECIPE_PREFIX}:quantization-{quantization.value}"
-
-
-def known_metadata_upgrade(
-    key: str,
-    stored: str,
-    legacy_embedding_spaces: frozenset[str],
-) -> bool | None:
-    if key == STORE_METADATA_KEYS["space"] and stored in legacy_embedding_spaces:
-        return True
-    if key == STORE_METADATA_KEYS["index"] and stored in (
-        _LEGACY_INDEX_RECIPES
-        | _REINDEXABLE_INDEX_RECIPES
-        | {index_recipe_for(mode) for mode in IndexQuantization}
-    ):
-        return stored in _LEGACY_INDEX_RECIPES
-    return None
-
-
 @dataclass(frozen=True, slots=True)
 class Backends:
     """The injected model backends and the contracts they declared, validated once."""
@@ -354,6 +272,7 @@ class Backends:
     embedding_capabilities: frozenset[Modality]
     embedding_model: str
     space_id: str
+    legacy_embedding_spaces: frozenset[str]
     embedding_dimension: int
     generation_capabilities: frozenset[Modality]
     transcription_capabilities: frozenset[Modality]
@@ -388,7 +307,6 @@ class Backends:
 
 def resolve_backends(
     *,
-    index_quantization: IndexQuantization,
     embedder: EmbeddingBackend,
     answerer: GenerationBackend | None,
     transcriber: SpeechBackend | TranscriptionBackend | None,
@@ -401,10 +319,6 @@ def resolve_backends(
     embedding_capabilities, embedding_model, space_id, embedding_dimension = _embedding_contract(
         embedder
     )
-    try:
-        validate_index_configuration(embedding_dimension, index_quantization)
-    except ValueError as error:
-        raise ValidationError(str(error)) from None
     generation_capabilities = _generation_contract(answerer)
     transcription_capabilities, transcription_space = _transcription_contract(transcriber)
     vision_capabilities, vision_model, vision_space = _vision_contract(vision_describer)
@@ -422,6 +336,9 @@ def resolve_backends(
         embedding_capabilities=embedding_capabilities,
         embedding_model=embedding_model,
         space_id=space_id,
+        legacy_embedding_spaces=cast(
+            frozenset[str], getattr(embedder, "_legacy_embedding_spaces", frozenset())
+        ),
         embedding_dimension=embedding_dimension,
         generation_capabilities=generation_capabilities,
         transcription_capabilities=transcription_capabilities,

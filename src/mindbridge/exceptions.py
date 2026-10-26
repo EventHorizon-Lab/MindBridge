@@ -12,6 +12,7 @@ RETRYABLE_REASONS: frozenset[str] = frozenset(
         "flush_failed",
         "index_missing",
         "rate_limited",
+        "provider_unavailable",
         "timeout",
     }
 )

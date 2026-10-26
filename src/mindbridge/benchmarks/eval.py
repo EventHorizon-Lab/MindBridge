@@ -224,6 +224,7 @@ from mindbridge.models._jina import (
     DEFAULT_JINA_MODEL_ID,
     DEFAULT_JINA_REVISION,
 )
+from mindbridge.models._openai_protocol import reasoning_model, sampling_supported
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -619,27 +620,26 @@ class _BackendPool:
             item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item
         )
         enable_thinking = generation_options.get("enable_thinking")
+        extra_body = (
+            None
+            if enable_thinking is None
+            else {"chat_template_kwargs": {"enable_thinking": enable_thinking == "true"}}
+        )
         self.models = OpenAIModels(
             generation_client=self.client,
             generation_model=config.generation_model,
             generation_capabilities=config.generation_capabilities,
-            generation_seed=seed,
-            generation_temperature=0.0,
+            generation_seed=None if reasoning_model(config.generation_model) else seed,
+            generation_temperature=(
+                0.0 if sampling_supported(config.generation_model, extra_body) else None
+            ),
             generation_max_tokens=(
                 None
                 if "max_tokens" not in generation_options
                 else int(generation_options["max_tokens"])
             ),
             generation_min_video_seconds=config.generation_min_video_seconds,
-            generation_extra_body=(
-                None
-                if enable_thinking is None
-                else {
-                    "chat_template_kwargs": {
-                        "enable_thinking": enable_thinking == "true",
-                    }
-                }
-            ),
+            generation_extra_body=extra_body,
         )
         self.embedder = SentenceTransformersEmbedder(
             model_id=DEFAULT_JINA_MODEL_ID,
@@ -3674,6 +3674,12 @@ def _model_result(
     *,
     embedding_warmup_count: int | None = None,
 ) -> dict[str, object]:
+    generation_seed = None if reasoning_model(config.generation_model) else arguments.seed
+    generation_temperature = 0.0 if sampling_supported(config.generation_model, None) else None
+    if memory_config is not None:
+        generation = memory_config.generation
+        generation_seed = None if generation is None else generation.seed
+        generation_temperature = None if generation is None else generation.temperature
     result: dict[str, object] = {
         "adapter": arguments.model,
         "embedding_model": DEFAULT_JINA_MODEL_ID,
@@ -3690,8 +3696,8 @@ def _model_result(
         "generation_modalities": sorted(
             modality.value for modality in config.generation_capabilities
         ),
-        "generation_seed": arguments.seed,
-        "generation_temperature": 0.0,
+        "generation_seed": generation_seed,
+        "generation_temperature": generation_temperature,
         "generation_kwargs": arguments.gen_kwargs,
         "generation_min_video_seconds": config.generation_min_video_seconds,
         "transcription_model": DEFAULT_FUNASR_MODEL_ID,

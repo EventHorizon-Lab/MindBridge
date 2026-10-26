@@ -1,4 +1,4 @@
-"""Canonical serialization and idempotency identity for control-plane operations.
+"""Pure serialization, identity, and record selection for control-plane operations.
 
 Nothing here touches storage or models. `dump_operation` and `load_operation` round-trip one
 `MemoryOperation` through the append-only operation log so a logged operation can be replayed or
@@ -22,8 +22,42 @@ from mindbridge.types import (
     IdentityChange,
     IdentityClaim,
     MemoryOperation,
+    MemoryOperationRecord,
     SpatialContext,
 )
+
+# Binding one voice to one face is the kernel's own corroboration rule over co-occurrence
+# evidence it counted, not a model's proposal, so the recipe names that rule. It is what makes
+# the MERGE row's lineage honest: the recognizer models produced the templates, this rule
+# decided the bind, and `rollback()` reverses it.
+IDENTITY_LINK_RECIPE = "mindbridge-identity-link-v1"
+
+
+def operation_touches(
+    record: MemoryOperationRecord,
+    memory_ids: frozenset[str],
+    identity_ids: frozenset[str],
+) -> bool:
+    """Report whether one logged operation moved any of these records or any of these people."""
+    operation = record.operation
+    named = {
+        *operation.evidence_ids,
+        *operation.target_ids,
+        *record.created_ids,
+        *record.changed_ids,
+        *record.forgotten_ids,
+        *(memory_id for memory_id, _version in record.superseded),
+    }
+    if named & memory_ids:
+        return True
+    people: set[str] = set()
+    if operation.identity is not None:
+        people.update((operation.identity.identity_id, *operation.identity.moved_ids))
+    if operation.claim is not None:
+        people.add(operation.claim.identity_id)
+    if operation.consent is not None:
+        people.add(operation.consent.identity_id)
+    return bool(people & identity_ids)
 
 
 def dump_operation(operation: MemoryOperation) -> str:

@@ -111,9 +111,9 @@ _GROUP_OVERSAMPLE = 2
 _GROUP_FALLBACK_MINIMUM = 50
 _MAX_EMBEDDINGS_PER_MEMORY = 129
 # Two full-text views of the same content, fused by reciprocal rank when both can answer. The
-# stemmed field answers space-delimited scripts; the character-bigram field is script-agnostic
-# and is the only route that reaches Han, kana, Thai, Lao, Khmer and Myanmar, none of which the
-# tokenizers Zvec offers ("standard", "whitespace", "ngram", "jieba") can split into words.
+# stemmed field answers space-delimited scripts; the character-bigram field gives Han, kana,
+# Thai, Lao, Khmer and Myanmar an additional route without language-specific word segmentation.
+# Embedded Jieba is available in Zvec 0.8, but has not demonstrated a gain over these two fields.
 #
 # Choosing one field per query by detecting the query's script used to replace the fusion, and it
 # failed three ways. A single CJK character anywhere in a query sent the whole query to the
@@ -172,18 +172,12 @@ def validate_index_configuration(
 
 
 class _CollectionGate:
-    """Let queries overlap while every native write remains exclusive.
+    """Lease a live handle; lifecycle and maintenance operations take the exclusive side.
 
-    Zvec 0.7 lets a query snapshot the segment list without a lock while an insert or flush on
-    the same collection reassigns the writing segment and frees the old in-memory store
-    (alibaba/zvec#714). A query that lands in that window reads freed memory: sometimes a
-    ``fetch table failed`` error, sometimes SIGBUS with no Python traceback. Writers therefore
-    take the exclusive side of this gate, and a thread that already holds it may re-enter either
-    side, because flush runs maintenance and maintenance re-reads the collection it replaces.
+    Zvec 0.8 synchronizes ordinary queries, mutations and flushes internally. Replacement and
+    close still invalidate the handle, and maintenance needs a stable source while copying it.
+    An exclusive owner may re-enter either side to perform nested maintenance.
     """
-
-    # ponytail: writes exclude reads; drop back to replacement-only exclusion once the pinned
-    # zvec carries the fix for alibaba/zvec#714.
 
     def __init__(self) -> None:
         self._condition = Condition()
@@ -258,10 +252,6 @@ class IndexHit:
 class ZvecIndex:
     """Own one cosine/FTS collection derived from authoritative FP32 vectors."""
 
-    # Whether the collection can hold a document Zvec stores but no longer serves, which decides
-    # how `optimize` merges it. `__init__` sets it from what is already on disk.
-    _dead_rows = False
-
     def __init__(
         self,
         path: str | Path,
@@ -281,9 +271,6 @@ class ZvecIndex:
         self._gate = _CollectionGate()
         self._zvec: Any = _load_zvec()
         self._schema = self._build_schema()
-        # Until the collection has been opened and read, assume the worst of it, so a
-        # constructor that fails part way through cannot leave a clean marker behind.
-        self._dead_rows = True
         # A compaction that was killed leaves behind a complete second copy of the collection.
         # Removing it rests on the storage invariant that one physical `data_dir` has one live
         # owner -- held by the store's `.mindbridge.lock` -- so no live compaction can own a
@@ -311,15 +298,6 @@ class ZvecIndex:
             persisted_segments = _persisted_segment_count(self.path)
             self._flushes_since_optimization = persisted_segments
             self._flushes_since_compaction = persisted_segments
-            # A collection someone else wrote can hold dead rows, and Zvec does not report
-            # whether it does, so what stands in for that is a marker the previous owner leaves
-            # only when it closed a collection it knew to be clean. No marker means a session
-            # that deleted, replaced, or was killed, so an inherited collection is merged the
-            # safe way. The marker goes now rather than at the first write: this session is the
-            # one live owner, and a crash before its own close must not leave a stale claim.
-            self._dead_rows = inherited and not self._clean_marker.exists()
-            with suppress(OSError):
-                self._clean_marker.unlink()
         except BaseException:
             self.close()
             raise
@@ -382,23 +360,14 @@ class ZvecIndex:
         # write as far as the maintenance lock is concerned: another writer's segments must not
         # land between two chunks of one drain.
         written = []
-        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
+        with _INDEX_MAINTENANCE_LOCK, self._gate.read():
             _require_file_descriptor_headroom()
             collection = cast(Any, self._require_collection())
-            # An id already in the collection is replaced rather than added, so the document
-            # count grows by less than the batch exactly when this write left a superseded copy
-            # behind. That is a dead row, and `optimize` may not merge over one. Assumed until
-            # the counts say otherwise, so a write that fails part way through is assumed to
-            # have left one.
-            before = int(collection.stats.doc_count)
-            clean, self._dead_rows = self._dead_rows, True
             for start in range(0, len(docs), _MAX_WRITE_BATCH):
                 end = start + _MAX_WRITE_BATCH
                 written.append(
                     (ids[start:end], cast(Sequence[object], collection.upsert(docs[start:end])))
                 )
-            if int(collection.stats.doc_count) - before == len(docs):
-                self._dead_rows = clean
         for batch_ids, statuses in written:
             self._check_statuses("upsert", batch_ids, statuses)
 
@@ -410,9 +379,8 @@ class ZvecIndex:
             if not document_id or document_id != document_id.strip():
                 raise ValueError("index document IDs must be non-empty and trimmed")
         deleted = []
-        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
+        with _INDEX_MAINTENANCE_LOCK, self._gate.read():
             _require_file_descriptor_headroom()
-            self._dead_rows = True
             collection = cast(Any, self._require_collection())
             for start in range(0, len(ids), _MAX_WRITE_BATCH):
                 batch = list(ids[start : start + _MAX_WRITE_BATCH])
@@ -514,37 +482,23 @@ class ZvecIndex:
 
     def flush(self) -> None:
         """Make prior Zvec writes durable before SQLite acknowledges its outbox."""
-        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
-            _require_file_descriptor_headroom()
-            collection = cast(Any, self._require_collection())
-            collection.flush()
-            self._flushes_since_optimization += 1
-            self._flushes_since_compaction += 1
-            # Do not leave a window in which every concurrent collection can flush before the
-            # first caller gets to `optimize_if_needed`. Reclaim shared process capacity before
-            # another FD-producing native operation is admitted.
+        # Acquire the process lock before any handle lease throughout the mutation paths.
+        # Release the shared lease before requesting exclusive maintenance, retaining the
+        # process lock so another writer cannot consume the remaining FD recovery headroom.
+        with _INDEX_MAINTENANCE_LOCK:
+            with self._gate.read():
+                _require_file_descriptor_headroom()
+                collection = cast(Any, self._require_collection())
+                collection.flush()
+                self._flushes_since_optimization += 1
+                self._flushes_since_compaction += 1
             self._maintain_under_pressure()
 
     def optimize(self, *, concurrency: int = 0) -> None:
-        """Merge pending vectors into HNSW; queries wait, see `_CollectionGate`.
-
-        A dead row is a document Zvec still stores but no longer serves: one that was deleted,
-        or the superseded copy of one that was upserted again. Zvec 0.7 merges a collection that
-        holds any of them by writing the surviving vectors densely while the ids keep their
-        pre-merge positions, so every document from the first dead row onwards is served its
-        neighbour's vector. Scalar fields stay correct, `doc_count` stays correct, and the search
-        still answers, which is why nothing reports it: one delete before one merge moved a
-        1,000-document index from 1.00 to 0.10 agreement with an exhaustive cosine over the very
-        vectors it holds. `_compact` copies only live documents into a fresh collection, so the
-        merge it runs there has no dead row to skip; it is the merge for a collection that can be
-        carrying one, at the cost of rewriting the collection instead of merging it in place.
-        """
+        """Merge pending vectors in place; Zvec 0.8 preserves deleted-row mappings."""
         if isinstance(concurrency, bool) or concurrency < 0:
             raise ValueError("concurrency must be a non-negative integer")
-        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
-            if self._dead_rows:
-                self._compact(concurrency=concurrency)
-                return
+        with _INDEX_MAINTENANCE_LOCK, self._gate.write():
             collection = cast(Any, self._require_collection())
             collection.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
             self._optimization_watermark = self.doc_count
@@ -562,10 +516,11 @@ class ZvecIndex:
         # Every collection shares one process FD table. Serializing maintenance prevents several
         # otherwise-isolated stores from all opening replacement segments at the same pressure
         # boundary. Reads of other collections remain independent.
-        with self._gate.write(), _INDEX_MAINTENANCE_LOCK:
+        with _INDEX_MAINTENANCE_LOCK:
             # Zvec optimize compacts search segments but leaves one idmap SST per durable flush.
             if self._flushes_since_compaction >= _AUTO_COMPACT_FLUSHES:
-                self._compact()
+                with self._gate.write():
+                    self._compact()
                 return True
 
             # A fixed flush threshold cannot protect concurrent collections: four collections can
@@ -574,16 +529,16 @@ class ZvecIndex:
             # signal. Mature collections optimize first because merging a clean collection
             # reclaims most segment descriptors without copying it; young collections replace
             # directly because opening their full optimized index would increase pressure. A
-            # collection carrying a dead row has no cheap branch -- `optimize` copies it too --
-            # so the two differ only in how much they release for the copy they both pay.
+            # collection carrying updated or deleted rows can also merge in place on 0.8.
             if self._maintain_under_pressure():
                 return True
 
-            collection = cast(Any, self._require_collection())
-            stats = collection.stats
-            document_count = int(stats.doc_count)
-            self._optimization_watermark = min(self._optimization_watermark, document_count)
-            indexed = _indexed_document_count(stats)
+            with self._gate.read():
+                collection = cast(Any, self._require_collection())
+                stats = collection.stats
+                document_count = int(stats.doc_count)
+                self._optimization_watermark = min(self._optimization_watermark, document_count)
+                indexed = _indexed_document_count(stats)
             if (
                 self._flushes_since_optimization < minimum_flushes
                 and document_count - max(indexed, self._optimization_watermark) < minimum_unindexed
@@ -595,17 +550,20 @@ class ZvecIndex:
     def _maintain_under_pressure(self) -> bool:
         """Reclaim process FD capacity while the caller owns the maintenance lock."""
         under_pressure = _file_descriptor_pressure()
+        if not under_pressure:
+            return False
         maintained = False
         # Optimizing a new one-segment collection opens its complete HNSW and scalar-index set and
         # can consume more descriptors than it releases. Only use it once there are enough staged
         # segments to merge; replacement is the bounded recovery for a younger collection.
-        if under_pressure and self._flushes_since_optimization >= _PRESSURE_OPTIMIZE_FLUSHES:
-            self.optimize()
-            maintained = True
-            under_pressure = _file_descriptor_pressure()
-        if under_pressure and self._flushes_since_compaction >= _PRESSURE_COMPACT_FLUSHES:
-            self._compact()
-            return True
+        with self._gate.write():
+            if self._flushes_since_optimization >= _PRESSURE_OPTIMIZE_FLUSHES:
+                self.optimize()
+                maintained = True
+                under_pressure = _file_descriptor_pressure()
+            if under_pressure and self._flushes_since_compaction >= _PRESSURE_COMPACT_FLUSHES:
+                self._compact()
+                return True
         return maintained
 
     def _compact(self, *, concurrency: int = 0) -> None:
@@ -641,10 +599,7 @@ class ZvecIndex:
                         copied += len(batch)
                 written = int(target.stats.doc_count)
                 if written != copied:
-                    # The replacement is about to be merged and then declared clean, so a
-                    # duplicate among the copied documents would be a dead row nothing could
-                    # detect afterwards. `iter_docs` does not produce one on 0.7; refuse rather
-                    # than inherit the very defect this path exists to avoid.
+                    # Every visible source document must survive the replacement exactly once.
                     raise ZvecWriteError(
                         f"compaction copied {copied} documents into a collection holding "
                         f"{written}; refusing to merge it"
@@ -713,8 +668,6 @@ class ZvecIndex:
             self._optimization_watermark = replacement_watermark
             self._flushes_since_optimization = 0
             self._flushes_since_compaction = 0
-            # Only live documents were copied over.
-            self._dead_rows = False
 
     def _upsert_native(
         self, collection: object, documents: Sequence[object], *, action: str
@@ -743,7 +696,7 @@ class ZvecIndex:
         if isinstance(optimize_concurrency, bool) or optimize_concurrency < 0:
             raise ValueError("optimize_concurrency must be a non-negative integer")
 
-        with self._gate.write():
+        with _INDEX_MAINTENANCE_LOCK, self._gate.write():
             return self._rebuild(
                 documents,
                 batch_size=batch_size,
@@ -769,8 +722,6 @@ class ZvecIndex:
         self._optimization_watermark = 0
         self._flushes_since_optimization = 0
         self._flushes_since_compaction = 0
-        # The collection above is new, so it holds nothing at all, let alone a dead row.
-        self._dead_rows = False
 
         count = 0
         batch: list[IndexDocument] = []
@@ -788,31 +739,14 @@ class ZvecIndex:
         self.flush()
         return count
 
-    @property
-    def _clean_marker(self) -> Path:
-        """Where the last owner records that it left no dead row behind; see `optimize`.
-
-        Inside the collection rather than beside it, so the claim travels with what it describes:
-        a `zvec/` restored from a backup brings its own marker or none, where a marker one
-        directory up would have spoken for whatever was put under it. `_compact` and `rebuild`
-        replace the directory, which drops the claim exactly when it would have to be re-earned,
-        and the leading dot keeps the file out of both persisted-file counts.
-        """
-        return self.path / ".mindbridge-clean"
-
     def close(self) -> None:
         """Close and release Zvec's native file lock; repeated calls are safe."""
-        with self._gate.write():
+        with _INDEX_MAINTENANCE_LOCK, self._gate.write():
             if self._collection is None:
                 return
             collection = cast(Any, self._collection)
             self._collection = None
             collection.close()
-            # Written last, so only an orderly close of a collection with nothing dead in it
-            # hands the next owner the cheap in-place merge.
-            if not self._dead_rows:
-                with suppress(OSError):
-                    self._clean_marker.touch()
 
     def _dense_query(
         self,
@@ -1099,10 +1033,7 @@ class ZvecIndex:
             or index.m != _HNSW_M
             or index.ef_construction != _HNSW_EF_CONSTRUCTION
             or index.quantize_type != expected_quantization
-            or (
-                self.quantization is IndexQuantization.INT8
-                and not index.quantizer_param.enable_rotate
-            )
+            or (self.quantization is IndexQuantization.INT8 and index.quantizer_param.enable_rotate)
             or (
                 self.quantization is IndexQuantization.RABITQ
                 and (
@@ -1133,9 +1064,9 @@ class ZvecIndex:
             m=_HNSW_M,
             ef_construction=_HNSW_EF_CONSTRUCTION,
             quantize_type=quantize_type,
-            quantizer_param=self._zvec.QuantizerParam(
-                enable_rotate=self.quantization is IndexQuantization.INT8
-            ),
+            # Zvec 0.8's rotated INT8 cosine path returns unrelated neighbors even on a
+            # linear scan. The 0.8 recipe rebuilds old rotated projections from SQLite.
+            quantizer_param=self._zvec.QuantizerParam(enable_rotate=False),
         )
 
     def _query_param(self, *, ef: int, exact: bool) -> object:
@@ -1193,7 +1124,7 @@ def _load_zvec() -> ModuleType:
         return import_module("zvec")
     except ImportError as error:
         raise ZvecUnavailableError(
-            "Zvec 0.7 is required for local search; install a supported 64-bit zvec wheel"
+            "Zvec 0.8 is required for local search; install a supported 64-bit zvec wheel"
         ) from error
 
 
