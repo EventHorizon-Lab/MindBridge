@@ -9,6 +9,10 @@ invariants, and review expectations. Automated contributors must also follow
 MindBridge supports Python 3.10 through 3.14. The project uses
 [uv](https://docs.astral.sh/uv/) and the checked-in `uv.lock`.
 
+Local development accepts uv 0.12.5 or newer; there is no need to downgrade a newer installation.
+CI pins uv 0.12.5 explicitly for reproducibility. Keep the CI version pins and this minimum version
+aligned when raising the minimum supported uv version.
+
 ```bash
 git clone https://github.com/EventHorizon-Lab/MindBridge.git
 cd MindBridge
