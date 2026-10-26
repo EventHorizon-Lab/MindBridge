@@ -20,11 +20,13 @@ from mindbridge import (
     ContextSymbolRole,
     FormationInput,
     FormationProposal,
+    IndexQuantization,
     Memory,
     MemoryKind,
     MemoryType,
     Modality,
     ObservationContext,
+    RetrievalMode,
     RetrievalScope,
     TextSpanPiece,
     TextSpanSelector,
@@ -40,6 +42,7 @@ from mindbridge.infrastructure.local.store import (
     UnsupportedSchemaError,
 )
 from mindbridge.infrastructure.local.store.index import IndexOutbox
+from mindbridge.infrastructure.local.zvec_index import IndexHit
 from mindbridge.kernel.content import contextual_text_key_descriptors, contextual_text_keys
 from mindbridge.models.base import EmbedTask, ModelInput
 
@@ -163,6 +166,55 @@ def _memory(data_dir: Path, *, former: _DerivedFormer | None = None) -> Memory:
         former=former,
         minimum_relevance=0.0,
     )
+
+
+def test_quantized_excerpt_follows_the_exact_winning_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class QuantizedEmbedder(_PartEmbedder):
+        embedding_dimension = 64
+        embedding_space = "excerpt-test:64"
+
+        def embed(
+            self, inputs: Sequence[ModelInput], task: EmbedTask = EmbedTask.DOCUMENT
+        ) -> tuple[tuple[float, ...], ...]:
+            return tuple(vector + (0.0,) * 62 for vector in super().embed(inputs, task))
+
+    with Memory(
+        tmp_path,
+        embedder=QuantizedEmbedder(),
+        index_quantization=IndexQuantization.INT8,
+        retrieval_mode=RetrievalMode.DENSE,
+        minimum_relevance=0.85,
+    ) as memory:
+        record = memory.add(_long_source(), occurred_at=REFERENCE)
+        documents = memory._store.index.read_memory_index_documents((record.id,))
+        by_id = {document.embedding.embedding_id: document for document in documents}
+        unrelated = next(
+            document
+            for document in documents
+            if document.embedding.object_part > 0 and document.embedding.values[0] == 0.0
+        )
+        monkeypatch.setattr(
+            memory._index,
+            "search",
+            lambda *_args, **_kwargs: (
+                IndexHit(id=unrelated.embedding.embedding_id, relevance=0.2, confidence=0.6),
+            ),
+        )
+        bundle = memory.compile(
+            "TARGET CLAIM",
+            budget=ContextBudget(max_chars=3_000, max_items=1),
+            reference_at=REFERENCE,
+            allow_partial_sources=True,
+        )
+
+    assert len(bundle.excerpts) == 1
+    excerpt = bundle.excerpts[0]
+    assert excerpt.source_memory_id == record.id
+    assert "TARGET CLAIM" in excerpt.content
+    assert excerpt.matched_index_id != unrelated.embedding.embedding_id
+    assert by_id[excerpt.matched_index_id].embedding.values[0] == 1.0
 
 
 def test_descriptors_preserve_existing_keys_for_unicode_strip_crlf_and_repeats() -> None:

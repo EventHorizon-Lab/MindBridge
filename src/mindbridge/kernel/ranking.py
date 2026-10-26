@@ -13,9 +13,9 @@ import re
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import cast
 
 from mindbridge.infrastructure.local.store import IndexCandidate, StoredMemory
@@ -408,7 +408,7 @@ def extend_memory_type_traces(
 
 
 def record_ranked_trace(
-    target: dict[str, RetrievalCandidateTrace] | None,
+    target: dict[str, partial[RetrievalCandidateTrace]] | None,
     memory_id: str,
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
     dense_relevance: Mapping[str, float],
@@ -426,7 +426,10 @@ def record_ranked_trace(
 ) -> None:
     if target is None:
         return
-    target[memory_id] = RetrievalCandidateTrace(
+    # Rank and rejection are known only after qualification. Build and validate the public
+    # value once with its final disposition instead of validating it again through replace().
+    target[memory_id] = partial(
+        RetrievalCandidateTrace,
         memory_id=memory_id,
         index_ids=index_ids_by_memory[memory_id],
         dense_relevance=dense_relevance.get(memory_id, 0.0),
@@ -448,7 +451,7 @@ def qualified_candidates(
     *,
     minimum_relevance: float,
     trace_candidates: builtins.list[RetrievalCandidateTrace] | None,
-    ranked_traces: Mapping[str, RetrievalCandidateTrace] | None,
+    ranked_traces: Mapping[str, partial[RetrievalCandidateTrace]] | None,
 ) -> builtins.list[tuple[StoredMemory, float, float, bool]]:
     qualified = []
     for item in ranked:
@@ -456,17 +459,14 @@ def qualified_candidates(
             qualified.append(item)
         elif trace_candidates is not None and ranked_traces is not None:
             trace_candidates.append(
-                replace(
-                    ranked_traces[item[0].memory_id],
-                    rejected_by=RetrievalRejection.MINIMUM_RELEVANCE,
-                )
+                ranked_traces[item[0].memory_id](rejected_by=RetrievalRejection.MINIMUM_RELEVANCE)
             )
     return qualified
 
 
 def extend_ranked_traces(
     target: builtins.list[RetrievalCandidateTrace] | None,
-    ranked_traces: Mapping[str, RetrievalCandidateTrace] | None,
+    ranked_traces: Mapping[str, partial[RetrievalCandidateTrace]] | None,
     ranked: Sequence[tuple[StoredMemory, float, float, bool]],
     *,
     limit: int,
@@ -480,13 +480,7 @@ def extend_ranked_traces(
             rejected_by = RetrievalRejection.AMBIGUITY if rank <= 2 else RetrievalRejection.LIMIT
         elif rank > limit:
             rejected_by = RetrievalRejection.LIMIT
-        target.append(
-            replace(
-                ranked_traces[item[0].memory_id],
-                rank=rank,
-                rejected_by=rejected_by,
-            )
-        )
+        target.append(ranked_traces[item[0].memory_id](rank=rank, rejected_by=rejected_by))
 
 
 def parent_index_signals(

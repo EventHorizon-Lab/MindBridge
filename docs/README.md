@@ -71,6 +71,10 @@ contract.
 
 ## Evaluate
 
+- [Accuracy-first retrieval](research/2026-10-26-accuracy-first-retrieval.md) — authoritative
+  quantized scoring, candidate retention, quality fixtures, and measured latency tradeoffs.
+- [Zvec 0.8 adoption](research/2026-10-26-zvec-08.md) — index migration, concurrency and
+  quantization decisions, measured recall, and native API limits.
 - [Memory reliability changes](research/2026-10-08-reliability-optimization.md) — formation history,
   stale evidence guards, constraint candidates, request telemetry, and saved-prediction rejudging.
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.

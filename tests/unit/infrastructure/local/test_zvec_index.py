@@ -277,6 +277,26 @@ def test_group_by_falls_back_until_it_has_distinct_parent_memories() -> None:
     assert collection.output_fields == [["memory_id"]]
 
 
+def test_quantized_candidate_pool_does_not_repeat_native_group_oversampling() -> None:
+    first = _QueryDocument("first", 0.1, memory_id="first-parent")
+    second = _QueryDocument("second", 0.2, memory_id="second-parent")
+    collection = _GroupedCollection(
+        groups=(_Group("first-parent", (first,)), _Group("second-parent", (second,))),
+        documents=(first, second),
+    )
+    index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
+    index.dimension = 2
+    index.ef_search = 2048
+    index.quantization = IndexQuantization.INT8
+    index._zvec = _DenseZvec
+    index._collection = collection
+    hits = index.search((1.0, 0.0), limit=2)
+    assert [hit.id for hit in hits] == ["first", "second"]
+    assert collection.group_counts == [2]
+    assert collection.topks == []
+
+
 def test_dense_search_asks_for_the_largest_candidate_list_zvec_accepts() -> None:
     # A collection whose vectors sit in an HNSW graph silently drops true nearest neighbours when
     # the candidate list is small, and reports full health while doing it: measured on a shipped

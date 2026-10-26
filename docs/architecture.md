@@ -263,6 +263,18 @@ depend on the requested `limit`, so a narrow request returns the prefix of a wid
 reports the same score at both. A scope that leaves fewer survivors than the request asked for
 still widens the pool.
 
+Unquantized routes start with 100 parents. Quantized routes retain 200 parents for authoritative
+rescoring; the index does not multiply that expanded group budget again. After SQLite visibility
+and scope checks, every quantized candidate is scored against the stored FP32 embeddings, taking
+the best cosine across every parent part and query key before relevance gating and ranking.
+This corrects quantized distance and parent-part selection errors among discovered candidates;
+it cannot recover a parent absent from every candidate route. Unquantized dense scores retain
+their native semantics, while lexical-only hybrid candidates still receive exact score completion.
+Multi-key exact scoring streams bounded batches and uses NumPy without BLAS thread fan-out.
+Exact scoring also records its winning embedding for compiler excerpts. An equally good existing
+match wins ties; otherwise deterministic stored-part order selects the winner. Discovery trace
+IDs remain the candidates that admitted the parent, distinct from the part that won exact scoring.
+
 Ranking combines the strongest dense evidence with bounded lexical, temporal, ambiguity, and
 optional decay signals. `RetrievalScope` filters apply as authoritative SQLite checks rather than
 projection ranking: `valid_at` and `known_at` select the assertion valid in the world and known to

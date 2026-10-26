@@ -1911,10 +1911,10 @@ class MemoryCapabilities:
 class RetrievalCandidateTrace:
     """Effective score components and final disposition for one considered parent memory.
 
-    Dense values can come from an ANN hit or from exact scoring of persisted vectors when only
-    the lexical route admitted the parent. ``index_ids`` are the index candidates that admitted
-    the parent; they neither identify the admitting route nor list every persisted part used by
-    score completion.
+    Dense values can come from an unquantized ANN hit or from exact persisted-vector scoring
+    for quantized candidates and lexical-only parents. ``index_ids`` are the candidates that
+    admitted the parent; they neither identify the admitting route nor list every persisted
+    part used by exact scoring.
     """
 
     memory_id: str | None
