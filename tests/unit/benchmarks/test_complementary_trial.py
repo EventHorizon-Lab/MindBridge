@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import itertools
 import json
@@ -203,13 +204,9 @@ def test_trial_checks_pinned_question_digest(
 
 
 @pytest.mark.parametrize("changed", [None, "assets/video.mp4", "zvec/index"])
-def test_trial_freezes_assets_and_index_with_sqlite(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str | None
-) -> None:
-    monkeypatch.syspath_prepend(str(Path(__file__).parents[3] / "benchmarks"))
-    tree_manifest = importlib.import_module("paired_replay").tree_manifest
-
+def test_trial_freezes_assets_and_index_with_sqlite(tmp_path: Path, changed: str | None) -> None:
     driver = _driver()
+    tree_manifest = driver.tree_manifest
     source = tmp_path / "source"
     for name in ("state.sqlite3", ".mindbridge.lock", "assets/video.mp4", "zvec/index"):
         path = source / name
@@ -235,10 +232,8 @@ def test_trial_freezes_assets_and_index_with_sqlite(
 def test_trial_rejects_snapshot_changed_during_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.syspath_prepend(str(Path(__file__).parents[3] / "benchmarks"))
-    tree_manifest = importlib.import_module("paired_replay").tree_manifest
-
     driver = _driver()
+    tree_manifest = driver.tree_manifest
     source = tmp_path / "source"
     source.mkdir()
     (source / "state.sqlite3").write_bytes(b"original")
@@ -256,6 +251,19 @@ def test_trial_rejects_snapshot_changed_during_copy(
     monkeypatch.setattr(driver.shutil, "copytree", changed_copy)
     with pytest.raises(RuntimeError, match="changed while copying"):
         driver.copy_baseline(source, tmp_path / "copy", recipe)
+
+
+def test_trial_refuses_to_copy_a_store_with_a_live_owner(tmp_path: Path) -> None:
+    driver = _driver()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "state.sqlite3").write_bytes(b"sqlite")
+    with (source / ".mindbridge.lock").open("w+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        destination = tmp_path / "copy"
+        with pytest.raises(RuntimeError, match="still owned"):
+            driver.copy_baseline(source, destination, {})
+        assert not destination.exists()
 
 
 def test_media_audit_hashes_payload_without_logging_media_bytes() -> None:

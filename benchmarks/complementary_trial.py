@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import random
@@ -9,7 +10,8 @@ import shutil
 import statistics
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -319,9 +321,46 @@ def frozen_questions(path: Path) -> dict[str, ICMQuestion]:
     return {q.question_id: q for q in load_icm_bench(path)}
 
 
-def copy_baseline(source: Path, destination: Path, recipe: dict[str, Any]) -> dict[str, object]:
-    from paired_replay import _closed_store_lock, tree_manifest
+def tree_manifest(root: Path) -> dict[str, object]:
+    """Describe a store by content, independent of its clone path and file timestamps."""
+    root = root.resolve()
+    entries: list[dict[str, Any]] = [
+        {
+            "path": path.relative_to(root).as_posix(),
+            "bytes": path.stat().st_size,
+            "sha256": dataset_digest(path),
+        }
+        for path in sorted(item for item in root.rglob("*") if item.is_file())
+    ]
+    payload = json.dumps(
+        entries, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "files": len(entries),
+        "bytes": sum(int(entry["bytes"]) for entry in entries),
+    }
 
+
+@contextmanager
+def _closed_store_lock(path: Path) -> Iterator[None]:
+    if not path.is_dir() or not (path / "state.sqlite3").is_file():
+        raise FileNotFoundError(f"source store is missing state.sqlite3: {path}")
+    lock_path = path / ".mindbridge.lock"
+    if not lock_path.is_file():
+        raise FileNotFoundError(f"source store is missing its owner lock: {lock_path}")
+    with lock_path.open("rb") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"source store is still owned: {path}") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def copy_baseline(source: Path, destination: Path, recipe: dict[str, Any]) -> dict[str, object]:
     with _closed_store_lock(source):
         if dataset_digest(source / "state.sqlite3") != recipe["source_sqlite_sha256"]:
             raise RuntimeError("baseline snapshot changed since protocol freeze")
@@ -342,8 +381,6 @@ def run_cases(
     audit: Audit,
     vision: OpenAIModels,
 ) -> list[dict[str, Any]]:
-    from paired_replay import _closed_store_lock, tree_manifest
-
     questions = frozen_questions(BASELINE / "datasets/icm-bench/annotations/qa_test.jsonl")
     fixture_bytes = Path(__file__).with_name("complementary_scenarios.json").read_bytes()
     if hashlib.sha256(fixture_bytes).hexdigest() != recipe["fixture_sha256"]:
