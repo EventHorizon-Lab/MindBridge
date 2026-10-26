@@ -408,8 +408,14 @@ contains identifiers, score components, ranks, and rejection reasons, but no que
 metadata, media, vectors, paths, or model output. `ask` requires an answerer and returns only the
 retrieved hits the answerer actually used. A candidate's effective dense score can come from an
 ANN hit or from exact scoring of its persisted vectors when the lexical route alone admitted its
-parent. `index_ids` records the index candidates that admitted the parent; it does not identify
-their route or enumerate every persisted part considered during exact score completion.
+parent. With `FP16`, `INT8`, or `RABITQ`, all visible candidates are instead rescored from stored
+FP32 vectors before the relevance gate and final ranking; each parent uses its best part/query
+cosine. Quantized routes retain a wider candidate pool to reduce early truncation errors.
+`index_ids` records the candidates that admitted the parent; it does not identify their route or
+enumerate every persisted part considered during exact scoring. Exact rescoring does not make
+ANN discovery exhaustive.
+When a quantized candidate's exact winner differs from the ANN-selected part, compiler excerpts
+follow the exact winner; equal-score ties retain the existing match when possible.
 
 `answer_policy` is the caller's, because abstaining is right for one caller and wrong for
 another. The default `"strict"` refuses when the retrieved evidence is thin: `answer` is a fixed

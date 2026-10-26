@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Generator, Sequence
+from contextlib import closing
 from datetime import datetime, timezone
 
 from mindbridge.infrastructure.local.store._codec import (
@@ -320,6 +321,20 @@ class IndexOutbox:
         several retrieval-part embeddings. Callers that score parent memories must consider every
         row and reduce them under their own scoring rule.
         """
+        with closing(
+            self.iter_memory_embedding_parts(memory_ids, space_id=space_id, task=task)
+        ) as parts:
+            for memory_id, _embedding_id, values in parts:
+                yield memory_id, values
+
+    def iter_memory_embedding_parts(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        space_id: str,
+        task: str,
+    ) -> Generator[tuple[str, str, tuple[float, ...]], None, None]:
+        """Stream vector identities and FP32 values in deterministic part order."""
         if not memory_ids:
             return
         for memory_id in memory_ids:
@@ -332,10 +347,11 @@ class IndexOutbox:
                 placeholders = ", ".join("?" for _memory_id in batch)
                 rows = connection.execute(
                     f"""
-                    SELECT memory_id, object_part, dimension, vector
+                    SELECT memory_id, embedding_id, dimension, vector
                     FROM embeddings
                     WHERE memory_id IN ({placeholders})
                       AND space_id = ? AND task = ?
+                    ORDER BY object_part, embedding_id
                     """,
                     (*batch, space_id, task),
                 )
@@ -343,7 +359,11 @@ class IndexOutbox:
                     vector = row["vector"]
                     if not isinstance(vector, bytes):
                         raise RuntimeError("stored embedding vector is not a BLOB")
-                    yield row_text(row, "memory_id"), unpack_vector(vector, int(row["dimension"]))
+                    yield (
+                        row_text(row, "memory_id"),
+                        row_text(row, "embedding_id"),
+                        unpack_vector(vector, int(row["dimension"])),
+                    )
 
     def pending_index_operations(
         self, *, limit: int = 100, after: int = 0

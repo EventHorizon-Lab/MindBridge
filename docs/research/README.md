@@ -13,6 +13,8 @@ the repository. An archived command may require those artifacts or an older chec
 
 | Record | Scope |
 | --- | --- |
+| [Accuracy-first retrieval — 2026-10-26](2026-10-26-accuracy-first-retrieval.md) | Public SDK retrieval quality, quantization score calibration, candidate breadth and numerical scoring measurements |
+| [Zvec 0.8 adoption — 2026-10-26](2026-10-26-zvec-08.md) | Dependency and maintenance measurements, cosine rotation regression, multilingual coverage, and native API limits |
 | [Compact context presentation prototype](compact-context-prototype.md) | Frozen prototype and conv30 measurement; current contract lives in the SDK reference |
 | [Memory backend evaluation — 2026-09-08](2026-09-08-memory-backend-evaluation.md) | Dated analysis or results; retain the stated evidence limits |
 | [Memory backend research for MindBridge](2026-09-08-memory-backend-research.md) | Dated analysis or results; retain the stated evidence limits |

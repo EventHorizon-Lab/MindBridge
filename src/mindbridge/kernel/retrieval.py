@@ -15,7 +15,7 @@ from functools import partial
 
 from opentelemetry.trace import Tracer
 
-from mindbridge.infrastructure.local.scoring import max_cosine_scores
+from mindbridge.infrastructure.local.scoring import max_cosine_part_scores, max_cosine_scores
 from mindbridge.infrastructure.local.store import IndexCandidate
 from mindbridge.infrastructure.local.zvec_index import IndexHit
 from mindbridge.kernel.content import PreparedContent
@@ -75,6 +75,7 @@ from mindbridge.kernel.validation import (
 from mindbridge.models.base import EmbedTask
 from mindbridge.types import (
     ContentInput,
+    IndexQuantization,
     MemoryType,
     RetrievalCandidateTrace,
     RetrievalMode,
@@ -102,12 +103,13 @@ _QUERY_SPACE = re.compile(r"\s+")
 # candidate pool -- properties of the request: at limit 20 against limit 100, 27-39 % of the
 # candidates present in both runs reported a different dense relevance and 78-100 % a different
 # lexical bonus, over adjacent-rank cosine gaps whose median is 0.0026-0.0077. Every public
-# `limit` is capped at 100, so one pool of `RERANK_CANDIDATES` serves them all and the rerank
-# pool and the route depth are the same number. Widening it to the deepest previous pool
-# (`limit * 3` at limit 100) instead would have cost 2.3x the p50 of a `limit` 8 search, which
-# is the common one; a caller who needs more survivors than this pool holds still deepens it
-# through the widening loop below.
+# `limit` is capped at 100. Unquantized routes keep that fixed pool; quantized routes retain
+# twice as many parents before authoritative FP32 scoring, without repeating that expansion
+# in native grouping. The depth remains independent of the requested result count. Earlier
+# widening to `limit * 3` cost 2.3x p50 on a common limit-8 query; the loop below widens further
+# only when authoritative scope checks leave too few survivors.
 _ROUTE_CANDIDATES = RERANK_CANDIDATES
+_QUANTIZED_ROUTE_CANDIDATES = RERANK_CANDIDATES * 2
 
 
 _MAX_QUERY_RETRIEVAL_KEYS = 7
@@ -293,7 +295,13 @@ class Retrieval(Traced):
             lexical_query = ""
         if self._settings.retrieval_mode is RetrievalMode.DENSE:
             lexical_query = ""
-        candidate_limit = _ROUTE_CANDIDATES
+        # Quantized native order can hide a more relevant parent just below the ordinary
+        # route window. Keep a wider, request-limit-independent pool for SQLite FP32 scoring.
+        candidate_limit = (
+            _ROUTE_CANDIDATES
+            if self._settings.index_quantization is IndexQuantization.NONE
+            else _QUANTIZED_ROUTE_CANDIDATES
+        )
         candidate_ceiling = max(candidate_limit, limit * (MAX_RETRIEVAL_KEYS + 1))
         seen_index_ids: set[str] = set()
         # Both are static per document, so the index answers them itself instead of the loop
@@ -520,35 +528,60 @@ class Retrieval(Traced):
                         retrieval_mode=self._settings.retrieval_mode,
                     )
                     memories = tuple(memory for memory in memories if memory.memory_type in kept)
-                lexical_only_ids = tuple(
+                score_ids = tuple(
                     memory.memory_id
                     for memory in memories
-                    if memory.memory_id in lexical_matches
-                    and memory.memory_id not in dense_relevance
+                    if self._settings.index_quantization is not IndexQuantization.NONE
+                    or (
+                        memory.memory_id in lexical_matches
+                        and memory.memory_id not in dense_relevance
+                    )
                 )
-                if lexical_only_ids and vectors:
+                if score_ids and vectors:
                     with (
                         self._trace("mindbridge.retrieval.score_completion", kind="stage"),
-                        translate_storage_errors("complete hybrid candidate scores"),
-                        closing(
-                            self._store.index.iter_memory_embedding_vectors(
-                                lexical_only_ids,
-                                space_id=self._backends.space_id,
-                                task=DOCUMENT_TASK,
-                            )
-                        ) as document_vectors,
+                        translate_storage_errors("score search candidates"),
                     ):
-                        completed = max_cosine_scores(vectors, document_vectors)
-                    for memory_id, (relevance, confidence) in completed.items():
-                        dense_relevance[memory_id] = relevance
-                        dense_confidence[memory_id] = confidence
+                        if self._settings.index_quantization is not IndexQuantization.NONE:
+                            with closing(
+                                self._store.index.iter_memory_embedding_parts(
+                                    score_ids,
+                                    space_id=self._backends.space_id,
+                                    task=DOCUMENT_TASK,
+                                )
+                            ) as document_parts:
+                                part_scores = max_cosine_part_scores(
+                                    vectors,
+                                    document_parts,
+                                    preferred_embeddings=matched_dense_index_ids,
+                                )
+                            for memory_id, (
+                                embedding_id,
+                                relevance,
+                                confidence,
+                            ) in part_scores.items():
+                                dense_relevance[memory_id] = relevance
+                                dense_confidence[memory_id] = confidence
+                                matched_dense_index_ids[memory_id] = embedding_id
+                        else:
+                            with closing(
+                                self._store.index.iter_memory_embedding_vectors(
+                                    score_ids,
+                                    space_id=self._backends.space_id,
+                                    task=DOCUMENT_TASK,
+                                )
+                            ) as document_vectors:
+                                completed = max_cosine_scores(vectors, document_vectors)
+                            for memory_id, (relevance, confidence) in completed.items():
+                                dense_relevance[memory_id] = relevance
+                                dense_confidence[memory_id] = confidence
                 lexical_coverage = (
                     lexical_relevance(lexical_query, memories)
                     if self._settings.retrieval_mode is RetrievalMode.HYBRID
                     else {}
                 )
                 ranked = []
-                ranked_traces: dict[str, RetrievalCandidateTrace] | None = (
+                ranked_traces: dict[str, partial[RetrievalCandidateTrace]] | None = (
                     {} if trace_candidates is not None else None
                 )
                 for memory in memories:

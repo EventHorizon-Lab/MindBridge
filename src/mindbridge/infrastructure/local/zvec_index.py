@@ -851,7 +851,12 @@ class ZvecIndex:
         groups = collection.group_by_query(
             query=query,
             group_by_field_name=_MEMORY_ID_FIELD,
-            group_count=limit * _GROUP_OVERSAMPLE,
+            # The kernel already widens quantized routes for SQLite FP32 reranking. Keep
+            # those parents instead of searching twice that pool and truncating by lossy
+            # distances again. Unquantized routes retain their native-score oversampling.
+            group_count=(
+                limit * _GROUP_OVERSAMPLE if self.quantization is IndexQuantization.NONE else limit
+            ),
             topk_per_group=1,
             filter=filter_expression,
             include_vector=False,

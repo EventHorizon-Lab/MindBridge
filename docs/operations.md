@@ -242,6 +242,13 @@ disk: measured against a freshly rebuilt `NONE` index over ten stores holding 5,
 `zvec/` grew 54 % under `FP16`, 55 % under `INT8` and 86 % under `RABITQ`, with no measurable
 retrieval gain. Read it as a memory and latency setting, not as a way to store less.
 
+Quantized retrieval keeps a wider parent candidate pool and recalculates final cosine scores from
+SQLite's FP32 embeddings before ranking or applying `minimum_relevance`. This improves score
+calibration and near-tie ordering without another model call, at the cost of reading and scoring
+the surviving candidate vectors. It does not repair ANN candidates that were never discovered.
+The [accuracy-first evaluation](research/2026-10-26-accuracy-first-retrieval.md) records the
+synthetic quality and latency tradeoffs; these are not real-model semantic accuracy measurements.
+
 ## Capacity
 
 Growth and deletion are separate policies. `memory_budget_records` creates a control-plane
