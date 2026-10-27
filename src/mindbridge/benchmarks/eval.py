@@ -245,6 +245,9 @@ from mindbridge.models.openai_sdk import _answer_result
 
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v18"
 _BENCHMARK_SEARCH_REPLAY_SETUP_SPAN = "mindbridge.benchmark.search_replay_setup"
+# Mirror the fixed per-instance SDK admission contract documented in docs/operations.md.
+_SDK_STREAM_LIMIT = 8
+_SDK_OPERATION_LIMIT = 32
 
 
 class _MemoryContext(Protocol):
@@ -1807,6 +1810,7 @@ async def _measure_standalone_searches(  # noqa: C901 - setup failures need per-
         memory: AsyncMemory,
         question: EvalQuestion,
         sample: SampleResult,
+        instance_semaphore: asyncio.Semaphore,
     ) -> None:
         try:
             with traced_span(
@@ -1814,7 +1818,7 @@ async def _measure_standalone_searches(  # noqa: C901 - setup failures need per-
                 BENCHMARK_DIAGNOSTIC_SPAN,
                 attributes=span_attributes(sample),
             ):
-                async with request_semaphore:
+                async with instance_semaphore, request_semaphore:
                     await memory.search(
                         _content(question.content),
                         limit=recall_limit,
@@ -1858,9 +1862,10 @@ async def _measure_standalone_searches(  # noqa: C901 - setup failures need per-
                 ):
                     async with memory_factory(path) as memory:
                         opened = True
+                        instance_semaphore = asyncio.Semaphore(_SDK_OPERATION_LIMIT)
                         await asyncio.gather(
                             *(
-                                measure_one(memory, question, sample)
+                                measure_one(memory, question, sample, instance_semaphore)
                                 for question, sample in questions
                             )
                         )
@@ -2569,6 +2574,7 @@ async def _guarded_answer(
     question: EvalQuestion,
     *,
     semaphore: asyncio.Semaphore,
+    instance_semaphore: asyncio.Semaphore,
     systemic_stop: asyncio.Event,
     arm: _Arm,
     task_name: str,
@@ -2586,7 +2592,7 @@ async def _guarded_answer(
     try:
         _require_active_embedding_service(systemic_stop)
         if not arm.generates:
-            async with semaphore:
+            async with instance_semaphore, semaphore:
                 _require_active_embedding_service(systemic_stop)
                 outcome = await _arm_answer(
                     memory,
@@ -2606,7 +2612,7 @@ async def _guarded_answer(
             # This caller span starts before request admission. Its latency and TTFT therefore
             # include benchmark queueing; nested SDK/model spans expose service time.
             with _answer_span(tracer, task_name, sample_id, arm.name) as (answer_span, started):
-                async with semaphore:
+                async with instance_semaphore, semaphore:
                     _require_active_embedding_service(systemic_stop)
                     outcome = await _arm_answer(
                         memory,
@@ -2660,6 +2666,13 @@ async def _answer_many(
     tracer: Tracer | None = None,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
+    # The SDK's documented limits are per physical instance, while the request semaphore is
+    # shared across units. Queue excess callers here before they can occupy global slots or
+    # become immediate admission errors. Each unit owns its store and runs its arms in order.
+    instance_limit = _SDK_OPERATION_LIMIT if arm.reads_memory else request_concurrency
+    if _answers_through_ask(arm, task_name):
+        instance_limit = _SDK_STREAM_LIMIT
+    instance_semaphore = asyncio.Semaphore(min(request_concurrency, instance_limit))
     systemic_stop = asyncio.Event()
 
     with _arm_run_span(tracer, task_name, arm.name):
@@ -2670,6 +2683,7 @@ async def _answer_many(
                         memory,
                         question,
                         semaphore=semaphore,
+                        instance_semaphore=instance_semaphore,
                         systemic_stop=systemic_stop,
                         arm=arm,
                         task_name=task_name,

@@ -352,6 +352,11 @@ repository rather than the process directory; `--data-root` defaults to
 `<benchmarks-root>/data`. Run `mindbridge-bench eval --help` for the full concurrency, cache,
 generation, and comparison options.
 
+`request_concurrency` bounds in-flight requests across units. Within each physical store, the
+runner also queues SDK work at the runtime's fixed limits: eight streaming answers or 32
+non-streaming operations. Higher global concurrency can serve independent stores without
+overloading one instance. Waiting for either limit is included in caller latency and TTFT.
+
 Unless `--quiet` is set, `eval` reports ingest, sample, and judge progress to stderr. On a
 terminal those are live progress bars with an ETA. While a sample is still rebuilding, ingesting,
 deliberating, or answering, the sample bar keeps its honest completed-sample count but refreshes
