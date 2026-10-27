@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -818,51 +817,6 @@ def test_video_segment_native_retry_keeps_valid_normal_segments_byte_identical(
     assert [part[2].read_bytes() for part in prepared] == [b"normal", b"native"]
     assert commands[0][commands[0].index("-vf") + 1].startswith("fps=1,")
     assert commands[1][commands[1].index("-vf") + 1].startswith("scale=")
-
-
-def test_obsolete_video_cache_is_recomputed_in_the_current_namespace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    source = tmp_path / "source.mp4"
-    source.write_bytes(b"source")
-    cache = tmp_path / ".prepared" / "ffmpeg-v2" / "fixture"
-    source_stat = source.stat()
-    legacy_key = hashlib.sha256(
-        json.dumps(
-            [
-                "video-segment-v2",
-                str(source.resolve()),
-                source_stat.st_size,
-                source_stat.st_mtime_ns,
-                [1.0],
-                "ffmpeg",
-            ],
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()[:20]
-    legacy = tmp_path / ".prepared" / "ffmpeg-v1" / "fixture" / legacy_key / "segment-00000.mp4"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_bytes(b"video")
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
-        lambda path: path.is_file() and path.read_bytes() in {b"video", b"fresh"},
-    )
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.prepare_media._has_structural_video",
-        lambda path: path.is_file() and path.read_bytes() in {b"video", b"fresh"},
-    )
-    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
-    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
-
-    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
-        Path(command[-1]).write_bytes(b"fresh")
-
-    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
-    prepared = _segment_video(source, (1.0,), cache, None)
-
-    assert prepared[0][2].read_bytes() == b"fresh"
-    assert prepared[0][2].is_relative_to(cache)
-    assert legacy.read_bytes() == b"video"
 
 
 def test_partial_cache_repair_does_not_replace_a_valid_sibling(

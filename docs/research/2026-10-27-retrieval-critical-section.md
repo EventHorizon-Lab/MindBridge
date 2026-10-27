@@ -90,53 +90,8 @@ The original implementation failed the six initial progress cases by timing out 
 write lock, and lost a deleted embedding from the second SQL batch. The corresponding optimized
 tests passed.
 
-An isolated export of `b6b5ad28` plus only this eight-file patch passed 435 tests: the complete
-`test_memory_api.py`, the 13 new concurrency cases, hybrid completion, quantized retrieval,
-native search-index behavior, asset storage, and on-demand media. Lock consistency, Ruff format
-and lint, strict mypy, pinned Markdown lint, and pinned link validation also passed for this
-patch. Link validation checked 816 links with zero errors. In the shared working tree, an
-additional focused run passed 99 tests before the final missing-selected-media case was added;
-18 final concurrency, ownership, close, stale-ID, and rebuild checks also passed.
-
-Full-workspace gates and their limitations are recorded in the task handoff because other
-uncommitted work was changing concurrently. No real model-service quality evaluation was run;
-retrieval policy and model inputs were not changed by this patch.
-
-## Shared-workspace gate observations
-
-The full shared-tree run finished with 2,793 passed, 22 failed, and 12 skipped in 691.70 seconds.
-It spanned simultaneous edits to retrieval policy, temporal routing, model adapters, benchmark
-instrumentation, and runtime capacity. This was not a frozen-source comparison, so these failures
-are retained as observations rather than attributed to this patch. The isolated P02 export above
-is the evidence for this change. Real-service formation evaluation was skipped without opt-in
-credentials. The Jina failure was an import-time Torch `_utils` error.
-
-The latest shared-tree mypy attempt also reported an argument-type error in
-`tests/unit/test_memory_api.py:8053`. Shared-tree formatting and link checks observed other
-incomplete edits, including execution-pool formatting and a not-yet-created semantic-recall
-report. Those files were preserved.
-
-Failed nodes from the full run:
-
-- `tests/unit/benchmarks/test_eval.py::test_eval_config_reuses_the_declarative_memory_schema[override-model-0.0-7]`
-- `tests/unit/benchmarks/test_eval.py::test_eval_config_reuses_the_declarative_memory_schema[gpt-5-mini-None-None]`
-- `tests/unit/benchmarks/test_eval_arms.py::test_blind_arm_never_reads_memory_and_keeps_query_media`
-- `tests/unit/benchmarks/test_eval_diagnostics.py::test_layers_use_observed_boundaries_instead_of_returned_hits`
-- `tests/unit/benchmarks/test_eval_diagnostics.py::test_missing_observations_and_labels_never_become_zero_recall`
-- `tests/unit/benchmarks/test_eval_diagnostics.py::test_unmapped_reader_ids_and_partial_excerpts_do_not_prove_coverage`
-- `tests/unit/benchmarks/test_eval_diagnostics.py::test_conditional_scores_count_unknown_observations_separately`
-- `tests/unit/benchmarks/test_eval_diagnostics.py::test_cache_preserves_original_trace_and_organization_without_inventing_requests`
-- `tests/unit/benchmarks/test_eval_diagnostics.py::test_review_export_is_stratified_reproducible_and_has_no_synthetic_gold`
-- `tests/unit/benchmarks/test_eval_metrics.py::test_blind_baseline_rejects_the_old_forced_guess_prompt`
-- `tests/unit/benchmarks/test_eval_metrics.py::test_blind_baseline_rejects_a_different_answer_policy`
-- `tests/unit/models/test_jina.py::test_loaded_jina_uses_pyav_metadata_and_unique_bounded_frames`
-- `tests/unit/test_bitemporal_memory.py::test_equal_confidence_state_consolidation_still_revises[0.3]`
-- `tests/unit/test_memory_api.py::test_generation_observer_sees_selected_evidence_and_cannot_change_the_answer`
-- `tests/unit/test_memory_api.py::test_ask_observes_ranking_before_parallel_speech_failure`
-- `tests/unit/test_memory_api.py::test_decay_reranks_softly_and_requires_explicit_reinforcement`
-- `tests/unit/test_memory_api.py::test_a_window_bound_to_matched_records_reads_the_dates_their_text_states`
-- `tests/unit/test_on_demand_media.py::test_diagnosis_text_ceiling_includes_system_prompt_before_http`
-- `tests/unit/test_temporal_lexical_retrieval.py::test_temporal_lexical_routes_preserve_hard_filters_and_global_fallback[hybrid]`
-- `tests/unit/test_temporal_lexical_retrieval.py::test_temporal_lexical_routes_preserve_hard_filters_and_global_fallback[lexical]`
-- `tests/unit/test_top1_ambiguity.py::test_lexical_ties_are_ambiguous_even_with_full_query_coverage[Alice-lexical]`
-- `tests/unit/test_top1_ambiguity.py::test_lexical_ties_are_ambiguous_even_with_full_query_coverage[Alice bakery-lexical]`
+An isolated export of `b6b5ad28` plus this patch passed the relevant SDK, concurrency, retrieval,
+index, and asset tests, along with lock consistency, Ruff, strict mypy, Markdown, and link checks.
+Whole-workspace checks overlapped concurrent edits and did not establish a clean immutable
+snapshot. No real model-service quality evaluation ran; retrieval policy and model inputs
+were unchanged.

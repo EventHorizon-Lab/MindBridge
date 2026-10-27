@@ -17,9 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-# Two scripts, one documented CLI surface. `tests/test_package.py` fails a product module that
-# names the benchmark package in any string constant, so a single dispatcher could not reach the
-# benchmark family even through a lazy import. See docs/api/cli.md.
+# Separate entry points keep product modules independent of benchmark code.
 mindbridge = "mindbridge.cli:main"
 mindbridge-bench = "mindbridge.benchmarks.cli:main"
 
@@ -143,8 +141,7 @@ dev = [
     "pytest>=9.1,<10",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.11,<1",
-    # tests/test_package.py reads this file; tomllib is 3.11+. mypy also requires the
-    # backport on 3.10, which is why the tests passed before anything declared it.
+    # Packaging tests read pyproject.toml on Python 3.10, which has no tomllib.
     "tomli>=2,<3; python_version < '3.11'",
     # eval.py imports yaml and tqdm; neither ships inline types, so the strict gate needs stubs.
     "types-PyYAML>=6,<7",

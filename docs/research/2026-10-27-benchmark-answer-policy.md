@@ -19,17 +19,6 @@ bundle, and ask is retrieved evidence. Count full-context separators within its 
 record each cap's scope, and never call these character limits token-equivalent. An arm
 comparison remains an end-to-end comparison, not a causal estimate of memory alone.
 
-## Implementation plan
-
-- [x] Reproduce policy propagation, refusal accounting, separator overflow, and stale budget
-  cache reuse with failing tests.
-- [x] Pass task policies to all baseline readers, reuse grounded prompts and answer decoding,
-  and retain policy in sample and task provenance.
-- [x] Version baseline prompts, include the full-context cap in cache identity, reject external
-  blind controls with a different prompt or policy, and document comparison limits.
-- [x] Run focused regressions, repository quality gates, and a bounded reader-quality check
-  where an available real model permits it. Record unavailable checks explicitly.
-
 ## Evidence and validation
 
 ### Why this needs a protocol correction
@@ -110,47 +99,9 @@ quality, exact Mem-Gallery formatting compliance, or statistically reliable data
 The gallery-style case passed under both prompts: policy conflict does not imply every reader
 will follow the forced-guess instruction on every item.
 
-### Repository validation
+### Validation scope
 
-Focused tests reproduce each new failure before its fix, including product compile-budget
-provenance. Independent read-only review found no critical or important E01 defect and identified
-the compiler-budget provenance issue, which now has a regression test.
-
-Validation was performed in a shared, dirty working tree with other changes actively arriving;
-the complete run is not evidence of a frozen patch. No unrelated changes were reverted.
-
-| Check | Observed outcome |
-| --- | --- |
-| Complete eval, answer-arm, and metric test files | 330 passed in 26.17 seconds on the final focused run |
-| Policy, surface, and full-context cache namespace checks | 4 passed |
-| `uv lock --check --default-index https://pypi.org/simple` | Passed |
-| Ruff format and lint on the seven changed Python files | Passed |
-| Full Ruff format/lint | Not green in the shared tree; the final check reported concurrent `test_eval_diagnostics.py` formatting/import ordering |
-| `uv run --frozen mypy` | Passed, 274 source files at that snapshot |
-| Pinned Markdown lint | Changed documentation passed; full run passed at 177 files, then a later repeat found six errors in another task's `.superpowers/boundary-cleanup/` scratch Markdown |
-| Pinned Lychee link check | No broken links; one timeout on the unrelated W3C SKOS link in `2026-10-27-predicate-stability.md` |
-| `git diff --check` | Passed |
-| `uv run --frozen pytest -W error` | 2829 passed, 12 skipped, 7 failed; 713.44 seconds |
-
-The complete run's failures were inspected individually. None points to the E01 policy,
-separator, or cache-cap change:
-
-- `test_response_cache_namespace_changes_with_runner_recipe`: concurrent diagnostics schema
-  changed to 20 while the loaded test still expected 19.
-- `test_a_fully_cached_unit_completes_its_ingest_share_without_writing`: concurrent cached-answer
-  diagnostics added `generation_evidence`, absent on the loaded test double.
-- `test_runner_reports_cached_progress_before_pending_answer_finishes`: its background cached
-  path hit the same missing field, then its progress wait timed out.
-- `test_global_help_lists_only_supported_runners_without_importing_them`: concurrent
-  `review-samples` runner was absent from the loaded expected command set.
-- `test_state_revision_uses_grounded_confidence_before_retiring[True]`: bitemporal confidence
-  assertion, in a product module this change does not modify.
-- `test_semantic_recall_can_deepen_the_original_query_for_structured_anchors`: semantic recall
-  depth assertion, in a product module this change does not modify.
-- `test_async_closed_memory_keeps_public_error_contract`: concurrent execution-capacity code
-  surfaced a closed executor's `RuntimeError`.
-
-These observations are not a claim that the repository passes all quality gates. They also do
-not establish current failures after other contributors finish their changes. A subsequent
-focused rerun confirmed that all 330 eval/arm/metric tests pass, including the three cached-answer
-and schema failures above. The separate global-help assertion still failed on `review-samples`.
+Focused policy, answer-arm, metric, budget, and cache regressions passed for this patch.
+Whole-workspace checks overlapped concurrent edits and did not establish a clean immutable
+snapshot. The real-model fixture and its limits are recorded above; current repository gates
+are defined in [CONTRIBUTING.md](../../CONTRIBUTING.md#quality-gates).

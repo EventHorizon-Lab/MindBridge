@@ -128,30 +128,13 @@ Query execution/failure/limit counts are cumulative per ask; candidate and groun
 describe one round. They count records rather than gold evidence and cannot prove correctness
 without labelled fixtures. Provider-side packing happens later.
 
-## Validation status
+## Validation scope
 
-The final focused run passed 30 semantic-recall, planner-request and native-index tests with
-warnings as errors. Strict mypy passed for the eleven touched product/test modules; their Ruff
-lint and formatting checks passed. The seven touched documentation pages passed pinned
-Markdownlint. Lock consistency and `git diff --check` passed.
-
-The shared-workspace full run recorded 2,861 passes, 12 opt-in real-service skips and five
-failures while unrelated changes were being written concurrently. All five subsequently
-passed in a fresh targeted run:
-
-- `test_a_fully_cached_unit_completes_its_ingest_share_without_writing`
-- `test_runner_reports_cached_progress_before_pending_answer_finishes`
-- `test_returned_metadata_cannot_replace_observed_reader_source_provenance`
-- `test_global_help_lists_only_supported_runners_without_importing_them`
-- `test_cancellation_during_terminal_cleanup_remains_cancellation`
-
-The full suite was not repeated after those concurrent changes. Later whole-workspace Ruff
-lint and strict mypy passed. The last formatting check still reported an unrelated blank-line
-change in `benchmarks/eval_judge.py`; whole-workspace Markdownlint also observed errors in
-ignored agent plans. The final full Lychee run checked 891 links: 882 succeeded, eight redirected and one
-timed out at the W3C SKOS mapping link in the predicate-stability report. None of this page's
-links failed. These results establish the focused scope and record the incomplete global gate;
-they do not assert a clean immutable snapshot of the shared workspace.
+Focused semantic-recall, planner-request, and native-index tests passed with warnings as errors.
+The touched modules passed strict mypy and Ruff; the touched documentation passed pinned
+Markdownlint. Lock consistency and whitespace checks passed. Whole-workspace checks overlapped
+concurrent edits and did not establish a clean immutable snapshot. These checks establish local
+mechanism behavior; they do not establish natural-language retrieval or answer quality.
 
 ## Promotion gate and limits
 

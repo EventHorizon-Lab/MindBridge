@@ -113,28 +113,10 @@ content, other platforms, and a production precision/recall distribution were no
 Existing synthetic temporal boosts can admit weak semantic evidence; this change does not
 recalibrate that separate ranking policy.
 
-## Validation snapshot
+## Validation scope
 
-The final focused SDK/retrieval/read-path run passed 383 tests. A separate final native-index,
-storage, and temporal run passed 208 tests; these runs overlap and must not be added together.
-Strict mypy passed for the seven changed retrieval/adapter modules and new test files.
-Lock consistency and `git diff --check` passed. The three documentation files passed pinned
-Markdown lint. Full-checkout Ruff and mypy passed during intermediate snapshots, but subsequent
-unrelated concurrent edits introduced formatting, lint, and benchmark-test typing failures;
-the final shared checkout cannot be reported as passing those complete gates.
-
-The complete final `uv run --frozen pytest -W error --tb=short` run reported 2,861 passed,
-12 skipped, and five failures in other concurrently edited areas:
-
-- `tests/unit/benchmarks/test_eval.py::test_a_fully_cached_unit_completes_its_ingest_share_without_writing`
-- `tests/unit/benchmarks/test_eval.py::test_runner_reports_cached_progress_before_pending_answer_finishes`
-- `tests/unit/benchmarks/test_eval_diagnostics.py::test_returned_metadata_cannot_replace_observed_reader_source_provenance`
-- `tests/unit/benchmarks/test_suite_cli.py::test_global_help_lists_only_supported_runners_without_importing_them`
-- `tests/unit/test_runtime_capacity.py::test_cancellation_during_terminal_cleanup_remains_cancellation`
-
-No temporal retrieval test failed in that run. The twelve skipped cases require an explicit
-formation-time model-service evaluation opt-in and credentials. The pinned whole-checkout link
-check reported 880 successful links, eight redirects, one connection failure for the existing
-Uvicorn server-behavior URL, and one timeout for the separate predicate report's W3C SKOS URL.
-The final whole-checkout Markdown run also encountered six errors in another task's ignored
-`.superpowers/boundary-cleanup/` plan/progress files; no exclusions were added.
+Focused SDK, retrieval, read-path, native-index, storage, and temporal tests passed. The changed
+retrieval and adapter modules passed strict mypy; lock consistency, whitespace, and pinned
+Markdown checks passed for the patch. Whole-workspace checks overlapped concurrent edits and
+did not establish a clean immutable snapshot. The measured retrieval evidence and untested
+model-service quality boundaries are recorded above.

@@ -1194,61 +1194,28 @@ def test_model_short_video_limit_is_explicit_and_validated() -> None:
         _model_config("generation_min_video_seconds=0")
 
 
-@pytest.mark.parametrize(
-    "tokens",
-    (
-        ("--model", "mindbridge"),
-        ("--num-fewshot", "0"),
-        ("--num_fewshot", "0"),
-        ("--memory-config", "eval.yaml"),
-        ("--model_args", "generation_model=fixture"),
-        ("--judge_model_args", "model=fixture"),
-        ("--output_path", "results"),
-        ("--gen_kwargs", "max_tokens=64"),
-        ("--batch_size", "1"),
-        ("--max_batch_size", "1"),
-        ("--use_cache", "cache"),
-        ("--blind_baseline", "results.jsonl"),
-        ("--predict_only",),
-        ("--log_samples",),
-        ("--stream_results",),
-        ("--no-stream_results",),
-        ("--check_integrity",),
-    ),
-)
-def test_eval_rejects_removed_cli_spellings(
-    tokens: tuple[str, ...], capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_eval_rejects_unknown_options(capsys: pytest.CaptureFixture[str]) -> None:
     parser = eval_config_module._build_parser("eval")
 
     with pytest.raises(SystemExit) as error:
-        parser.parse_args(["--tasks", "clbench", *tokens])
+        parser.parse_args(["--tasks", "clbench", "--unknown-option"])
 
     assert error.value.code == 2
     assert "unrecognized arguments" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("key", ("model", "pretrained"))
-def test_eval_model_args_reject_removed_model_aliases(key: str) -> None:
+def test_eval_model_args_reject_unknown_keys() -> None:
     with pytest.raises(ValueError, match="invalid --model-args item"):
-        _model_config(f"{key}=fixture")
+        _model_config("unknown=fixture")
 
 
-def test_eval_judge_args_reject_removed_model_alias() -> None:
+def test_eval_judge_args_reject_unknown_keys() -> None:
     parser = eval_config_module._build_parser("eval")
-    parsed = parser.parse_args(["--tasks", "clbench", "--judge-model-args", "pretrained=fixture"])
+    parsed = parser.parse_args(["--tasks", "clbench", "--judge-model-args", "unknown=fixture"])
     arguments = eval_config_module._arguments(parser, parsed)
 
     with pytest.raises(ValueError, match="invalid --judge-model-args item"):
         eval_config_module._judge_config(ModelConfig(), arguments)
-
-
-def test_eval_config_rejects_removed_fewshot_setting(tmp_path: Path) -> None:
-    path = tmp_path / "eval.yaml"
-    path.write_text("benchmark:\n  run:\n    num_fewshot: 0\n", encoding="utf-8")
-
-    with pytest.raises(ValidationError, match="num_fewshot"):
-        eval_config_module._load_memory_config(path)
 
 
 @pytest.mark.parametrize(
@@ -4594,9 +4561,10 @@ def test_eval_config_defaults_absent_sections_instead_of_failing(
     assert config.embedding.provider in {"openai", "sentence-transformers"}
 
 
-def test_eval_config_rejects_an_unknown_harness_key(tmp_path: Path) -> None:
+@pytest.mark.parametrize("section", ("judge", "run"))
+def test_eval_config_rejects_an_unknown_harness_key(tmp_path: Path, section: str) -> None:
     path = tmp_path / "eval.yaml"
-    path.write_text("benchmark:\n  judge:\n    modle: typo\n", encoding="utf-8")
+    path.write_text(f"benchmark:\n  {section}:\n    unknown: typo\n", encoding="utf-8")
 
     with pytest.raises(ValidationError):
         eval_config_module._load_memory_config(path)

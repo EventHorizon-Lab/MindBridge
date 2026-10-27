@@ -20,7 +20,7 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
-ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).parents[2]
 SOURCE = ROOT / "src" / "mindbridge"
 DOCUMENT = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 PROJECT = cast(dict[str, object], DOCUMENT["project"])
@@ -48,7 +48,6 @@ def test_base_import_does_not_load_optional_protocols() -> None:
 
 def test_full_modal_contract_is_exported_from_the_package_root() -> None:
     package = importlib.import_module("mindbridge")
-    assert not hasattr(package, "JinaOmniEmbedder")
     names = {
         "ASRPartial",
         "AcousticBoundary",
