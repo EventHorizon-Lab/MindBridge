@@ -355,6 +355,7 @@ class OperationLog:
         require_in_force: Sequence[str] = (),
         split_identity: str | None = None,
         merge_identities: tuple[str, str] | None = None,
+        projection_identity_ids: Sequence[str] = (),
         require_no_later_dependencies: Sequence[str] = (),
         naming_projection_factory: NamingProjectionFactory | None = None,
     ) -> tuple[bool, tuple[StoredAsset, ...]]:
@@ -419,6 +420,8 @@ class OperationLog:
                     *(entry if isinstance(entry, str) else entry[0] for entry in restore_versions),
                     *clear_forgotten,
                 ),
+                identity_ids=projection_identity_ids,
+                force=bool(projection_identity_ids),
             )
             # Both identity reversals refuse before they write, so a refusal here leaves the
             # transaction with nothing to undo. The merge plan is checked rather than trusted:
@@ -464,7 +467,12 @@ class OperationLog:
                 "UPDATE memory_operations SET rolled_back_at = ? WHERE operation_id = ?",
                 (datetime_text(reverted_at), operation_id),
             )
-            refresh_naming_documents(connection, naming_before, naming_projection_factory)
+            refresh_naming_documents(
+                connection,
+                naming_before,
+                naming_projection_factory,
+                force_ids=projection_identity_ids,
+            )
         return True, tuple({asset.asset_id: asset for asset in unreferenced}.values())
 
     def read_operations(

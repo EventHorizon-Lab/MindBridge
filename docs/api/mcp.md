@@ -1,5 +1,11 @@
 # MCP API
 
+Tool calls share the directory's 32 request slots with REST, before framework worker dispatch.
+Overload returns the stable tool error envelope with `reason="capacity_exceeded"`,
+`stage="admission"`, and `retryable=true`. Process-wide budgets apply across independent
+directories; see [runtime limits](../operations.md#concurrency-and-overload). The serving host
+must also bound HTTP connections and MCP sessions.
+
 ## Surface
 
 The optional MCP adapter exposes fifteen typed tools over one injected synchronous `Memory`, or

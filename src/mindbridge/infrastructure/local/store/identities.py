@@ -588,61 +588,6 @@ class IdentityRegistry:
             return None, None
         return optional_row_text(current, "subject"), optional_row_text(current, "value")
 
-    def refresh_identity_projection(
-        self,
-        identity_id: str,
-        *,
-        memories: Iterable[StoredMemory] = (),
-        embeddings: Iterable[StoredEmbedding] = (),
-    ) -> IdentityProfile | None:
-        """Recompute `identities.name`/`relationship` from the current naming assertion.
-
-        The assertion is the record and this is the read path, the way `memory_versions`
-        carries the evidence and `refresh_evidence_projection` recomputes what reads see.
-        Supplied documents replace their indexed vectors in the same transaction, so stored
-        text can never disagree with the projection it was rebuilt for. Returns the projected
-        profile, or None when the identity does not exist.
-        """
-        require_identifier(identity_id, "identity_id")
-        supplied_memories, supplied_embeddings, supplied_by_memory = prepare_write_batch(
-            memories,
-            embeddings,
-        )
-        now = datetime_text(datetime.now(timezone.utc))
-        with self._connections.transaction() as connection:
-            resolved_id = resolve_identity_id(connection, identity_id)
-            if resolved_id is None:
-                return None
-            row = current_naming_assertion(connection, resolved_id)
-            name = None if row is None else optional_row_text(row, "subject")
-            relationship = None if row is None else optional_row_text(row, "value")
-            cursor = connection.execute(
-                """
-                UPDATE identities
-                SET name = ?, relationship = ?, updated_at = ?
-                WHERE identity_id = ?
-                """,
-                (name, relationship, now, resolved_id),
-            )
-            if cursor.rowcount == 0:
-                return None
-            evidence_ids = (
-                () if row is None else current_evidence_ids(connection, row_text(row, "memory_id"))
-            )
-            replace_memory_embeddings(
-                connection,
-                supplied_memories,
-                supplied_embeddings,
-                supplied_by_memory,
-            )
-        return IdentityProfile(
-            identity_id=resolved_id,
-            name=name,
-            relationship=relationship,
-            confirmed=row is not None,
-            evidence_ids=evidence_ids,
-        )
-
     def identity_for_subject(self, subject: str) -> str | None:
         """Return the identity whose visible naming assertion canonically names this subject.
 

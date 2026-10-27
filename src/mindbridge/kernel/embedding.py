@@ -351,6 +351,7 @@ class Embedding(Traced):
         self,
         names: Mapping[str, str | None],
         memories: Sequence[StoredMemory],
+        speech: Mapping[str, tuple[SpeakerSegment, ...]] | None = None,
         *,
         operation: OperationAssets,
     ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
@@ -360,6 +361,7 @@ class Embedding(Traced):
             speakers={identity_id: (identity_id, name) for identity_id, name in names.items()},
             operation=operation,
             update_operation=True,
+            candidate_speech=speech,
         )
 
     def _refresh_speech_memories(
@@ -369,6 +371,7 @@ class Embedding(Traced):
         speakers: Mapping[str | None, tuple[str, str | None]],
         operation: OperationAssets,
         update_operation: bool,
+        candidate_speech: Mapping[str, tuple[SpeakerSegment, ...]] | None = None,
     ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
         prepared: list[tuple[StoredMemory, PreparedContent]] = []
         for memory in memories:
@@ -378,9 +381,12 @@ class Embedding(Traced):
             )
             with translate_storage_errors("read cached speaker recognition"):
                 for asset in speech_assets:
-                    segments = self._store.media.read_speech(
-                        asset.asset_id,
-                        space_id=self._backends.transcription_space,
+                    segments = (
+                        candidate_speech.get(asset.asset_id)
+                        if candidate_speech is not None
+                        else self._store.media.read_speech(
+                            asset.asset_id, space_id=self._backends.transcription_space
+                        )
                     )
                     if segments is None:
                         continue

@@ -652,7 +652,9 @@ class AsyncVisionStream:
             and self._memory._memory._backends.vision_describer is not None
         ):
             state.description = (
-                await asyncio.to_thread(self._memory._memory._vision.describe, (state.image,))
+                await self._memory._memory._execution.run(
+                    self._memory._memory._vision.describe, (state.image,)
+                )
             )[0]
         # Sampled here, at the boundary, so the pose belongs to the scene being committed.
         context = self._context()

@@ -92,7 +92,15 @@ def open_store(data_dir: Path) -> LocalStore:
         ) from error
     except UnsupportedSchemaError as error:
         raise StorageError(str(error), reason="schema_unsupported", stage="open") from error
+    except LocalStoreCapacityError as error:
+        raise StorageError(
+            "local storage capacity exceeded", reason="capacity_exceeded", stage="open"
+        ) from error
     except Exception as error:
+        if isinstance(error, OSError) and error.errno in {errno.EMFILE, errno.ENFILE}:
+            raise StorageError(
+                "local file descriptor capacity exceeded", reason="capacity_exceeded", stage="open"
+            ) from error
         raise StorageError(
             "failed to open the local memory store", reason="io_failed", stage="open"
         ) from error
@@ -112,6 +120,14 @@ def translate_storage_errors(action: str) -> Iterator[None]:
             reason="capacity_exceeded",
             stage="admission",
         ) from error
+    except OSError as error:
+        if error.errno in {errno.EMFILE, errno.ENFILE}:
+            raise StorageError(
+                "local file descriptor capacity exceeded",
+                reason="capacity_exceeded",
+                stage="admission",
+            ) from error
+        raise StorageError(f"failed to {action}", reason="io_failed") from error
     except Exception as error:
         # `io_failed` is this wrapper's pre-existing contract and a test pins it. It is coarse by
         # design -- the wrapper catches whatever any storage action raised -- and deliberately not
@@ -126,10 +142,13 @@ def translate_index_errors(action: str) -> Iterator[None]:
     except MindBridgeError:
         raise
     except Exception as error:
-        detail = ""
-        if isinstance(error, OSError) and error.errno == errno.EMFILE:
-            detail = f": {error.strerror or 'too many open files'}"
-        raise IndexUnavailableError(f"failed to {action}{detail}") from error
+        if isinstance(error, OSError) and error.errno in {errno.EMFILE, errno.ENFILE}:
+            raise StorageError(
+                f"local file descriptor capacity exceeded: {error.strerror}",
+                reason="capacity_exceeded",
+                stage="index",
+            ) from error
+        raise IndexUnavailableError(f"failed to {action}") from error
 
 
 @dataclass(frozen=True, slots=True)

@@ -225,7 +225,7 @@ class Compilation(Traced):
     ) -> ContextBundle:
         with (
             self._trace("mindbridge.compile", kind="operation"),
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             # Taken before anything else, so `budget.max_latency_ms` bounds the compilation a
             # caller waits for rather than the selection pass alone.

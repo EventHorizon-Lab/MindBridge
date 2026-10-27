@@ -7,10 +7,27 @@ from datetime import datetime, timezone
 
 from mindbridge.infrastructure.local.store._codec import datetime_text, row_text
 from mindbridge.infrastructure.local.store._membership import IDENTITY_MEMORIES_SQL
+from mindbridge.infrastructure.local.store.errors import LocalStoreCapacityError
+
+MAX_PENDING_CAPTURES = 10_000
 
 
 def enqueue_capture(connection: sqlite3.Connection, memory_id: str, enqueued_at: datetime) -> None:
     """Queue a captured memory for settlement; one already waiting keeps its earlier slot."""
+    if (
+        connection.execute(
+            "SELECT 1 FROM capture_queue WHERE memory_id = ?", (memory_id,)
+        ).fetchone()
+        is not None
+    ):
+        return
+    if (
+        connection.execute("SELECT count(*) FROM capture_queue").fetchone()[0]
+        >= MAX_PENDING_CAPTURES
+    ):
+        raise LocalStoreCapacityError(
+            "pending capture capacity exceeded; settle existing captures before retrying"
+        )
     connection.execute(
         """
         INSERT INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)

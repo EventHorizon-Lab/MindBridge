@@ -26,6 +26,57 @@ from mindbridge import (
 from mindbridge.api.app import create_app
 
 
+@pytest.mark.asyncio
+async def test_terminal_streams_release_workers_before_slow_network_sends(tmp_path: Path) -> None:
+    blocked = 0
+    all_blocked, release = asyncio.Event(), asyncio.Event()
+    with Memory(tmp_path, embedder=TinyEmbedder(), answerer=_Answerer()) as memory:
+        memory.add("reference evidence")
+        app = create_app(memory=memory)
+
+        async def request(*, slow: bool) -> list[Message]:
+            scope: Scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "method": "POST",
+                "path": "/v1/answers/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+            }
+            received = False
+            messages: list[Message] = []
+
+            async def receive() -> Message:
+                nonlocal received
+                if not received:
+                    received = True
+                    return {"type": "http.request", "body": b'{"question":"reference evidence"}'}
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def send(message: Message) -> None:
+                nonlocal blocked
+                messages.append(message)
+                if slow and b"event: result" in message.get("body", b""):
+                    blocked += 1
+                    if blocked == 8:
+                        all_blocked.set()
+                    await release.wait()
+
+            await app(scope, receive, send)
+            return messages
+
+        calls = [asyncio.create_task(request(slow=True)) for _ in range(8)]
+        try:
+            await asyncio.wait_for(all_blocked.wait(), timeout=5)
+            ninth = await asyncio.wait_for(request(slow=False), timeout=2)
+            assert ninth[0]["status"] == 200
+            assert any(b"event: result" in message.get("body", b"") for message in ninth)
+        finally:
+            release.set()
+            await asyncio.gather(*calls)
+
+
 class _Answerer:
     generation_capabilities = frozenset({Modality.TEXT})
 

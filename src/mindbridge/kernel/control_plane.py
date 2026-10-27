@@ -117,7 +117,7 @@ class ControlPlane(Traced):
     ) -> tuple[ConsolidationCandidate, ...]:
         with (
             self._trace("mindbridge.consolidation_candidates", kind="operation"),
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             validate_limit(limit, maximum=100)
             if not isinstance(idle, bool):
@@ -252,7 +252,7 @@ class ControlPlane(Traced):
     ) -> ConsolidationReport:
         with (
             self._trace("mindbridge.consolidate", kind="operation"),
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             validate_limit(limit, maximum=100)
             if self._backends.consolidator is None:
@@ -362,7 +362,7 @@ class ControlPlane(Traced):
     def apply(self, operation: MemoryOperation) -> MemoryOperationRecord:
         with (
             self._trace("mindbridge.apply", kind="operation"),
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             if not isinstance(operation, MemoryOperation):
                 raise ValidationError("operation must be a MemoryOperation")
@@ -432,7 +432,7 @@ class ControlPlane(Traced):
     def forget(self, memory_ids: Sequence[str]) -> MemoryOperationRecord | None:
         with (
             self._trace("mindbridge.forget", kind="operation"),
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             if isinstance(memory_ids, (str, bytes)):
                 raise ValidationError("memory_ids must be a sequence of memory IDs")
@@ -465,7 +465,7 @@ class ControlPlane(Traced):
     def rollback(self, operation_id: int) -> bool:
         with (
             self._trace("mindbridge.rollback", kind="operation"),
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
             self._write_lock,
         ):
             if (
@@ -481,7 +481,7 @@ class ControlPlane(Traced):
             row = logged[0]
             operation = load_operation(row.operation_json)
             if operation.identity is not None:
-                return self._rollback_identity(row, operation, operation.identity)
+                return self._rollback_identity(row, operation, operation.identity, assets=assets)
             # A naming assertion is retracted, not deleted: the version it superseded has to
             # come back, and the record itself stays in the log so the audit trail shows both
             # names. That reversal rides the general `superseded` mechanism below. A consent
@@ -528,13 +528,15 @@ class ControlPlane(Traced):
                     # and must still un-forget rather than silently do nothing.
                     clear_forgotten=row.forgotten_ids
                     or (row.changed_ids if operation.intent is MemoryIntent.FORGET else ()),
-                    naming_projection_factory=self._formation.naming_projection_factory(assets),
+                    naming_projection_factory=self._formation.naming_projection_factory(
+                        assets, force=naming
+                    ),
+                    projection_identity_ids=(operation.claim.identity_id,)
+                    if naming and operation.claim is not None
+                    else (),
                 )
             self._lifecycle.queue_asset_cleanup(orphaned)
             self._projection.drain()
-            if reverted and naming and not self._settings.independent_evidence:
-                assert operation.claim is not None
-                self._reproject_identity(operation.claim.identity_id)
             return reverted
 
     def _rollback_identity(
@@ -542,6 +544,8 @@ class ControlPlane(Traced):
         row: StoredOperation,
         operation: MemoryOperation,
         change: IdentityChange,
+        *,
+        assets: OperationAssets,
     ) -> bool:
         """Reverse one identity-lifecycle operation: split a merge, or re-merge a split.
 
@@ -561,31 +565,13 @@ class ControlPlane(Traced):
                 rolled_back_at=datetime.now(timezone.utc),
                 split_identity=None if merging else absorbed,
                 merge_identities=(change.identity_id, absorbed) if merging else None,
+                naming_projection_factory=self._formation.naming_projection_factory(
+                    assets, force=True
+                ),
+                projection_identity_ids=(change.identity_id, absorbed),
             )
-        if reverted:
-            # Repaint from the assertions that stand now, exactly as reversing a naming does.
-            # A restored identity holds no assertion, so it projects as a nameless speaker.
-            self._reproject_identity(change.identity_id)
-            if not merging:
-                self._reproject_identity(absorbed)
+        self._projection.drain()
         return reverted
-
-    def _reproject_identity(self, identity_id: str) -> None:
-        """Repaint one identity's name and its indexed text from the assertion now current."""
-        with self._lifecycle.operation() as operation:
-            name, _relationship = self._identities.projected_identity(identity_id)
-            memories, embeddings = self._identities.reindex_speech(
-                identity_id,
-                speaker_name=name,
-                operation=operation,
-            )
-            with translate_storage_errors("refresh an identity projection"):
-                self._store.identities.refresh_identity_projection(
-                    identity_id,
-                    memories=memories,
-                    embeddings=embeddings,
-                )
-            self._projection.drain()
 
     def operations(self, *, limit: int = 100) -> tuple[MemoryOperationRecord, ...]:
         with self._trace("mindbridge.operations", kind="operation"), self._lifecycle.operation():

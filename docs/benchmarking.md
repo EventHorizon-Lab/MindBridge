@@ -353,9 +353,12 @@ repository rather than the process directory; `--data-root` defaults to
 generation, and comparison options.
 
 `request_concurrency` bounds in-flight requests across units. Within each physical store, the
-runner also queues SDK work at the runtime's fixed limits: eight streaming answers or 32
-non-streaming operations. Higher global concurrency can serve independent stores without
-overloading one instance. Waiting for either limit is included in caller latency and TTFT.
+runner queues SDK work at the runtime's fixed limits: eight streaming answers or 28
+model operations. It opens at most 16 stores and reserves one model-operation slot per unit
+worker for ingestion or settlement before choosing its shared answer window from the 28-slot
+process budget. Requested concurrency is a ceiling; values above these budgets wait in the
+harness. Waiting for admission is included in caller latency and TTFT. See
+[runtime limits](operations.md#concurrency-and-overload).
 
 Unless `--quiet` is set, `eval` reports ingest, sample, and judge progress to stderr. On a
 terminal those are live progress bars with an ETA. While a sample is still rebuilding, ingesting,

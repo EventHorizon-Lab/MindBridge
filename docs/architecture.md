@@ -400,6 +400,11 @@ reaches a [context bundle](context-compilation.md).
 Opening the store takes a non-blocking operating-system lock for the lifetime of its `Memory`.
 Another owner of the same directory fails immediately with `reason="data_dir_in_use"`; different
 directories can run concurrently. A `Memory` created before `fork()` is rejected in the child.
+Process-wide store, connection, submission, worker, and input-byte budgets also bound independent
+directories; see [operations](operations.md#concurrency-and-overload). Worker pools are shared
+within a process and recreated for new owners after fork. Model operations reserve capacity for
+lightweight reads. Formation claims overlapping source IDs while calling models outside its
+application lock, so distinct sources progress concurrently and duplicate sources pay once.
 
 Model calls and separate SQLite transactions may overlap. SQLite serializes its own writers with
 `BEGIN IMMEDIATE`. A process-local write lock protects outbox application, destructive operations,
@@ -428,8 +433,10 @@ active operations, releases asset leases, flushes and acknowledges the applied i
 closes each unique backend and storage resource once. A session that flushed also merges the
 durable segments there when two or more are persisted, so a writer hands over a compacted index; a
 session that only read one changes nothing on disk. A merge that fails still closes the store and
-releases its lock, and is reported. `AsyncMemory` delegates to this same synchronous core with
-`asyncio.to_thread`; it does not create a service or a second consistency model.
+releases its lock, and is reported. `AsyncMemory` delegates to this same synchronous core through
+the bounded execution plane; it does not create a service or a second consistency model.
+The complete `close(timeout_seconds=30.0)` wait is bounded. A timed-out caller leaves cleanup in
+progress, with ownership retained and new operations refused, until the original cleanup finishes.
 
 ## Model boundary
 

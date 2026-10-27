@@ -14,7 +14,7 @@ from collections.abc import (
 )
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from typing import TYPE_CHECKING, Protocol, cast
 
 from tqdm import tqdm
@@ -22,6 +22,10 @@ from tqdm import tqdm
 if TYPE_CHECKING:
     pass
 from mindbridge.benchmarks.eval_results import DEFAULT_ARM
+
+# The harness writes from threads in one process. tqdm's default multiprocessing RLock
+# allocates a named semaphore on Python 3.14, which survives abrupt or late shutdown.
+tqdm.set_lock(RLock())
 
 # The log namespace this harness is allowed to be verbose about: everything under the
 # installed package, derived so a rename cannot leave a stale literal behind.

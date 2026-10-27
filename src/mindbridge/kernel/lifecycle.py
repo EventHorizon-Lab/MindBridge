@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
+import math
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Condition
+from threading import Condition, Thread
 
-from mindbridge.exceptions import StorageError
+from mindbridge.exceptions import StorageError, ValidationError
+from mindbridge.infrastructure.local._capacity import Capacity
 from mindbridge.infrastructure.local.assets import AssetStoreError
 from mindbridge.infrastructure.local.store import SpeechRollback, StoredAsset
 from mindbridge.kernel.runtime import Storage, translate_storage_errors
 from mindbridge.models.base import SpeechAnalysis
 from mindbridge.types import FaceObservation, SpeakerSegment
+
+_PROCESS_OPERATIONS = Capacity(128)
+_PROCESS_MODELS = Capacity(28)
+_PROCESS_PAYLOAD = Capacity(512 * 1024 * 1024)
 
 
 @dataclass(slots=True)
@@ -33,6 +42,7 @@ class OperationAssets:
     # than applied on the spot: the naming assertion reindexes every memory that mentions the
     # person, and this write's own memory does not exist until it commits.
     speaker_names: dict[str, str]
+    payload_bytes: int = 0
     # A naming fact that named nobody: a label no recognizer in this clip produced, an identity
     # that no longer exists by binding time, or a name that failed validation. Counted rather
     # than only logged, alongside the refusals `_bind_speaker_names` already counts for a name
@@ -54,6 +64,9 @@ class Lifecycle:
         self._owner_pid = os.getpid()
         self._lifecycle = Condition()
         self._active_operations = 0
+        self._model_operations = 0
+        self._close_future: Future[None] | None = None
+        self._close_reported = False
         self._closing = False
         self._closed = True
         self._pending_asset_cleanup: dict[str, StoredAsset] = {}
@@ -69,32 +82,122 @@ class Lifecycle:
             self._closing = False
             self._lifecycle.notify_all()
 
-    def begin_close(self) -> bool:
-        """Reject new work and wait for active operations; False when already closed."""
+    def _close_job(self, finish: Callable[[], None], timeout_seconds: float) -> Future[None] | None:
         self.require_owner_process()
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValidationError("timeout_seconds must be a positive finite number")
         with self._lifecycle:
-            while self._closing:
-                self._lifecycle.wait()
-            if self._closed:
-                return False
-            self._closing = True
+            if self._closed and (self._close_future is None or self._close_reported):
+                return None
+            if self._close_future is None:
+                self._closing = True
+                self._close_future = Future()
+                try:
+                    Thread(
+                        target=self._finish_close,
+                        args=(finish, self._close_future),
+                        name="mindbridge-close",
+                        daemon=True,
+                    ).start()
+                except BaseException as error:
+                    self._close_future = None
+                    self._closing = False
+                    self._lifecycle.notify_all()
+                    if isinstance(error, (RuntimeError, OSError)):
+                        raise StorageError(
+                            "local close worker capacity exceeded",
+                            reason="capacity_exceeded",
+                            stage="close",
+                        ) from error
+                    raise
+            return self._close_future
+
+    @staticmethod
+    def _close_timeout() -> StorageError:
+        return StorageError(
+            "Memory is still closing; resources remain owned until active work and cleanup stop",
+            reason="timeout",
+            stage="close",
+        )
+
+    def close(self, finish: Callable[[], None], *, timeout_seconds: float) -> None:
+        """Bound the caller's wait while retaining ownership until cleanup actually finishes."""
+        future = self._close_job(finish, timeout_seconds)
+        if future is None:
+            return
+        try:
+            future.result(timeout=timeout_seconds)
+        except FutureTimeoutError as error:
+            raise self._close_timeout() from error
+        except BaseException:
+            with self._lifecycle:
+                self._close_reported = True
+            raise
+        else:
+            with self._lifecycle:
+                self._close_reported = True
+
+    async def close_async(self, finish: Callable[[], None], *, timeout_seconds: float) -> None:
+        future = self._close_job(finish, timeout_seconds)
+        if future is None:
+            return
+        wrapped = asyncio.wrap_future(future)
+        wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        try:
+            await asyncio.wait_for(asyncio.shield(wrapped), timeout_seconds)
+        except asyncio.TimeoutError as error:
+            raise self._close_timeout() from error
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            with self._lifecycle:
+                self._close_reported = True
+            raise
+        else:
+            with self._lifecycle:
+                self._close_reported = True
+
+    def _finish_close(self, finish: Callable[[], None], future: Future[None]) -> None:
+        with self._lifecycle:
             while self._active_operations:
                 self._lifecycle.wait()
-        return True
+        try:
+            finish()
+        except BaseException as error:
+            future.set_exception(error)
+        else:
+            future.set_result(None)
 
     @contextmanager
-    def operation(self) -> Iterator[OperationAssets]:
+    def operation(self, *, model_work: bool = False) -> Iterator[OperationAssets]:
         self.require_owner_process()
         with self._lifecycle:
             if self._closed or self._closing:
                 raise StorageError("Memory is closed", reason="instance_unusable")
-            if self._active_operations >= 32:
+            if (
+                self._active_operations >= 32
+                or (model_work and self._model_operations >= 28)
+                or not _PROCESS_OPERATIONS.acquire()
+            ):
                 raise StorageError(
                     "local operation capacity exceeded",
                     reason="capacity_exceeded",
                     stage="admission",
                 )
+            if model_work and not _PROCESS_MODELS.acquire():
+                _PROCESS_OPERATIONS.release()
+                raise StorageError(
+                    "process model operation capacity exceeded",
+                    reason="capacity_exceeded",
+                    stage="admission",
+                )
             self._active_operations += 1
+            self._model_operations += int(model_work)
         failed = False
         assets = OperationAssets(
             leased=[],
@@ -129,9 +232,27 @@ class Lifecycle:
             finally:
                 with self._lifecycle:
                     self._active_operations -= 1
+                    self._model_operations -= int(model_work)
+                    if model_work:
+                        _PROCESS_MODELS.release()
+                    _PROCESS_OPERATIONS.release()
+                    _PROCESS_PAYLOAD.release(assets.payload_bytes)
                     self._lifecycle.notify_all()
             if cleanup_error is not None and not failed:
                 raise cleanup_error
+
+    def reserve_payload(self, operation: OperationAssets, size: int) -> None:
+        if operation.payload_bytes + size > _PROCESS_PAYLOAD.limit:
+            raise ValidationError(
+                f"operation inputs must not exceed {_PROCESS_PAYLOAD.limit} bytes"
+            )
+        if not _PROCESS_PAYLOAD.acquire(size):
+            raise StorageError(
+                "in-flight content byte capacity exceeded",
+                reason="capacity_exceeded",
+                stage="admission",
+            )
+        operation.payload_bytes += size
 
     def require_owner_process(self) -> None:
         if os.getpid() != self._owner_pid:

@@ -3,19 +3,64 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from contextvars import copy_context
 from functools import partial
-from threading import BoundedSemaphore, Lock
+from threading import BoundedSemaphore, Condition, Lock
 from typing import ParamSpec, TypeVar
 
 from mindbridge.exceptions import StorageError
+from mindbridge.infrastructure.local._capacity import Capacity
 from mindbridge.kernel.lifecycle import Lifecycle
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
+_PROCESS_SUBMISSIONS = Capacity(128)
+_PROCESS_REQUESTS = Capacity(128)
+
+
+class _Workers:
+    def __init__(self) -> None:
+        self.parent = ThreadPoolExecutor(max_workers=64, thread_name_prefix="mindbridge-async")
+        self.index = ThreadPoolExecutor(max_workers=16, thread_name_prefix="mindbridge-index")
+        self.speech = ThreadPoolExecutor(max_workers=8, thread_name_prefix="mindbridge-speech")
+        self.lock = Lock()
+        self.streams: list[ThreadPoolExecutor] = []
+        self.idle: list[ThreadPoolExecutor] = []
+
+    def borrow_stream(self) -> ThreadPoolExecutor:
+        with self.lock:
+            if self.idle:
+                return self.idle.pop()
+            if len(self.streams) >= 32:
+                raise _overloaded()
+            worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mindbridge-stream")
+            self.streams.append(worker)
+            return worker
+
+    def release_stream(self, worker: ThreadPoolExecutor) -> None:
+        with self.lock:
+            self.idle.append(worker)
+
+
+_WORKER_PID = os.getpid()
+_WORKER_LOCK = Lock()
+_WORKERS: _Workers | None = None
+
+
+def _process_workers() -> _Workers:
+    global _WORKERS, _WORKER_PID, _WORKER_LOCK
+    if os.getpid() != _WORKER_PID:
+        _WORKERS = None
+        _WORKER_LOCK = Lock()
+        _WORKER_PID = os.getpid()
+    with _WORKER_LOCK:
+        if _WORKERS is None:
+            _WORKERS = _Workers()
+        return _WORKERS
 
 
 def _overloaded() -> StorageError:
@@ -57,8 +102,7 @@ class StreamWorkers:
     def __init__(self, *, require_open: Callable[[], None] | None = None) -> None:
         self._require_open = require_open
         self._lock = Lock()
-        self._workers: set[ThreadPoolExecutor] = set()
-        self._idle: list[ThreadPoolExecutor] = []
+        self._borrowed = 0
         self._closed = False
 
     def borrow(self) -> StreamWorker:
@@ -67,31 +111,20 @@ class StreamWorkers:
         with self._lock:
             if self._closed:
                 raise StorageError("Memory is closed", reason="instance_unusable")
-            if self._idle:
-                worker = self._idle.pop()
-            elif len(self._workers) < 8:
-                worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mindbridge-stream")
-                self._workers.add(worker)
-            else:
+            if self._borrowed >= 8:
                 raise _overloaded()
+            worker = _process_workers().borrow_stream()
+            self._borrowed += 1
             return StreamWorker(self, worker)
 
     def release(self, worker: ThreadPoolExecutor) -> None:
         with self._lock:
-            if not self._closed:
-                self._idle.append(worker)
-                return
-        worker.shutdown(wait=False)
+            self._borrowed -= 1
+        _process_workers().release_stream(worker)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            idle = tuple(self._idle)
-            self._idle.clear()
-        # Borrowed streams retain their worker until their queued close finishes. In particular,
-        # a caller may still own the terminal chunk after the Memory operation has ended.
-        for worker in idle:
-            worker.shutdown(wait=True)
 
 
 class Execution:
@@ -100,11 +133,13 @@ class Execution:
     def __init__(self, *, lifecycle: Lifecycle) -> None:
         self._lifecycle = lifecycle
         self.streams = StreamWorkers(require_open=lifecycle.require_open)
-        self._index = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mindbridge-index")
-        self._speech = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mindbridge-speech")
-        self._async = ThreadPoolExecutor(max_workers=32, thread_name_prefix="mindbridge-async")
-        self._async_slots = BoundedSemaphore(32)
-        self._lock = Lock()
+        workers = _process_workers()
+        self._index, self._speech, self._async = workers.index, workers.speech, workers.parent
+        self._index_slots, self._speech_slots = BoundedSemaphore(4), BoundedSemaphore(2)
+        self._async_slots = Capacity(32, parent=_PROCESS_SUBMISSIONS)
+        self.requests = Capacity(32, parent=_PROCESS_REQUESTS)
+        self._pending = 0
+        self._lock = Condition()
         self._closed = False
 
     async def run(self, fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
@@ -114,22 +149,35 @@ class Execution:
         with self._lock:
             if self._closed:
                 raise StorageError("Memory is closed", reason="instance_unusable")
-            if not self._async_slots.acquire(blocking=False):
+            if not self._async_slots.acquire():
                 raise _overloaded()
             try:
                 future = self._async.submit(copy_context().run, partial(fn, *args, **kwargs))
+                self._pending += 1
             except BaseException:
                 self._async_slots.release()
                 raise
-        future.add_done_callback(lambda _done: self._async_slots.release())
+        future.add_done_callback(self._completed)
         return await asyncio.wrap_future(future)
+
+    def _completed(self, future: Future[_T]) -> None:
+        with self._lock:
+            self._pending -= 1
+            self._lock.notify_all()
+        self._async_slots.release()
+
+    @staticmethod
+    def _limited(slots: BoundedSemaphore, call: Callable[[], _T]) -> _T:
+        with slots:
+            return call()
 
     def index_routes(self, calls: Sequence[Callable[[], _T]]) -> tuple[_T, ...]:
         results: list[_T] = []
         # At most four pending routes per admitted operation, including temporal supplements.
         for offset in range(0, len(calls), 4):
             futures = tuple(
-                self._index.submit(copy_context().run, call) for call in calls[offset : offset + 4]
+                self._index.submit(copy_context().run, self._limited, self._index_slots, call)
+                for call in calls[offset : offset + 4]
             )
             wait(futures)
             results.extend(future.result() for future in futures)
@@ -139,7 +187,9 @@ class Execution:
     def overlap_speech(
         self, fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs
     ) -> Iterator[Future[_T]]:
-        future = self._speech.submit(copy_context().run, partial(fn, *args, **kwargs))
+        future = self._speech.submit(
+            copy_context().run, self._limited, self._speech_slots, partial(fn, *args, **kwargs)
+        )
         try:
             yield future
         finally:
@@ -149,7 +199,6 @@ class Execution:
     def close(self) -> None:
         with self._lock:
             self._closed = True
-        self._async.shutdown(wait=True)
-        self._index.shutdown(wait=True)
-        self._speech.shutdown(wait=True)
+            while self._pending:
+                self._lock.wait()
         self.streams.close()

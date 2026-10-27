@@ -123,7 +123,7 @@ class Records(Traced):
     def delete(self, memory_id: str) -> bool:
         with (
             self._trace("mindbridge.delete", kind="operation"),
-            self._lifecycle.operation() as operation,
+            self._lifecycle.operation(model_work=True) as operation,
             self._write_lock,
         ):
             normalized_id = validated_identifier(memory_id, "memory_id")

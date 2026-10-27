@@ -1,5 +1,12 @@
 # REST API
 
+REST and MCP share a directory's 32 request slots before body parsing or framework worker
+dispatch. Request bodies have a 30-second total read deadline; each response send has a 30-second
+deadline. Body timeout returns the retryable 503 envelope with `reason="timeout"` and
+`stage="transport.read"`. A stalled response send ends the response and releases its request
+slot. Terminal answer streams return their worker before network delivery. See
+[runtime limits](../operations.md#concurrency-and-overload) for process-wide budgets.
+
 ## Surface
 
 The optional FastAPI adapter exposes thirteen `Memory` operations under `/v1`, or twenty-three when

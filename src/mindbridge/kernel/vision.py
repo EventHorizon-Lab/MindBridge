@@ -294,7 +294,7 @@ class Vision(Traced):
             )
         if not images:
             raise ValidationError("vision description requires at least one image")
-        with self._lifecycle.operation() as operation:
+        with self._lifecycle.operation(model_work=True) as operation:
             prepared = tuple(self._materializer.prepare(image, operation) for image in images)
             # One blob in, one asset out, so the cached captions line up with the inputs.
             asset_ids = tuple(content.assets[0].asset_id for content in prepared)

@@ -98,7 +98,7 @@ class Identities(Traced):
     def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
         with (
             self._trace("mindbridge.speech", kind="operation"),
-            self._lifecycle.operation() as operation,
+            self._lifecycle.operation(model_work=True) as operation,
         ):
             normalized_id = validated_identifier(memory_id, "memory_id")
             with self._write_lock, translate_storage_errors("read speech memory"):
@@ -131,7 +131,7 @@ class Identities(Traced):
     def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
         with (
             self._trace("mindbridge.faces", kind="operation"),
-            self._lifecycle.operation() as operation,
+            self._lifecycle.operation(model_work=True) as operation,
         ):
             normalized_id = validated_identifier(memory_id, "memory_id")
             with self._write_lock, translate_storage_errors("read face memory"):
@@ -210,7 +210,7 @@ class Identities(Traced):
         claim = ConsentClaim(identity_id=requested_id, state=state, note=note)
         with (
             self._trace("mindbridge.record_consent", kind="operation"),
-            self._lifecycle.operation() as operation,
+            self._lifecycle.operation(model_work=True) as operation,
             # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
             # phase and `add()`'s formation use: `_assert_consent` commits through the same
             # `_commit_formation` path as naming, so a consent statement must not land while a
@@ -316,7 +316,7 @@ class Identities(Traced):
     def unlink_identity(self, alias_id: str) -> str | None:
         with (
             self._trace("mindbridge.unlink_identity", kind="operation"),
-            self._lifecycle.operation() as operation,
+            self._lifecycle.operation(model_work=True) as operation,
             # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
             # phase and `add()`'s formation use: a split must not land while a consolidate apply
             # pass is in progress, and taking the two locks in a different order here would
@@ -420,7 +420,9 @@ class Identities(Traced):
                 affected = self._store.records.read_memories(memory_ids)
             # All previewed names travel together: two people may share one
             # document, which must be embedded once with both resulting names.
-            return factory(dict(projection), affected)
+            return self._embedding.refresh_naming_memories(
+                dict(projection), affected, operation=operation
+            )
         memories: tuple[StoredMemory, ...] = ()
         embeddings: tuple[StoredEmbedding, ...] = ()
         for identity_id, projected in projection:
@@ -492,7 +494,7 @@ class Identities(Traced):
         operation_name = "register_speaker" if speaker else "register_identity"
         with (
             self._trace(f"mindbridge.{operation_name}", kind="operation"),
-            self._lifecycle.operation() as operation,
+            self._lifecycle.operation(model_work=True) as operation,
             # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
             # phase and `add()`'s formation use: the IDENTIFY naming commit below must not land
             # while a consolidate apply pass is in progress, and taking the two locks in a
@@ -633,7 +635,7 @@ class Identities(Traced):
         requested_id = validated_identifier(identity_id, "identity_id")
         with (
             self._trace("mindbridge.forget_identity", kind="operation"),
-            self._lifecycle.operation() as operation,
+            self._lifecycle.operation(model_work=True) as operation,
             # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
             # phase and `add()`'s formation use: an irreversible erasure must not land while a
             # consolidate apply pass is in progress, and taking the two locks in a different

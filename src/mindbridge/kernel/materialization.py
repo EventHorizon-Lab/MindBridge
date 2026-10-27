@@ -57,6 +57,7 @@ class Materializer:
         for atom in atoms:
             if isinstance(atom, str):
                 text = validated_text(atom, "content")
+                self._lifecycle.reserve_payload(operation, len(text.encode("utf-8")))
                 text_parts.append(text)
                 canonical.append(("text", text))
                 continue
@@ -107,6 +108,7 @@ class Materializer:
     ) -> StoredAsset:
         try:
             if isinstance(atom, Path):
+                self._lifecycle.reserve_payload(operation, atom.stat().st_size)
                 modality, media_type = media_hint(atom.name, None)
                 candidate = self._assets.materialize_path(
                     atom,
@@ -115,6 +117,7 @@ class Materializer:
                     lease=True,
                 )
             elif isinstance(atom, Blob):
+                self._lifecycle.reserve_payload(operation, len(atom.data))
                 modality, media_type = media_hint(atom.name, atom.media_type)
                 candidate = self._assets.materialize_bytes(
                     atom.data,
@@ -160,6 +163,7 @@ class Materializer:
             raise
         if asset is None:
             raise ValidationError("asset reference does not exist in this data directory")
+        self._lifecycle.reserve_payload(operation, asset.size_bytes)
         if reference.modality is not None and reference.modality.value != asset.modality:
             raise ValidationError("asset reference modality does not match stored media")
         if reference.media_type is not None and reference.media_type != asset.mime_type:

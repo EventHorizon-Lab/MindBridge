@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import errno
 import math
-import os
 import re
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
@@ -14,10 +13,14 @@ from importlib import import_module
 from pathlib import Path
 from shutil import rmtree
 from tempfile import TemporaryDirectory
-from threading import Condition, RLock, get_ident
+from threading import Condition, get_ident
 from types import ModuleType
 from typing import Any, NoReturn, cast
 
+from mindbridge.infrastructure.local._capacity import FILE_DESCRIPTOR_LOCK
+from mindbridge.infrastructure.local._capacity import (
+    file_descriptor_usage as _file_descriptor_usage,
+)
 from mindbridge.infrastructure.local.store import IndexDocument
 from mindbridge.types import IndexQuantization
 
@@ -105,7 +108,7 @@ _FILE_DESCRIPTOR_COMPACTION_HEADROOM = 32
 _FILE_DESCRIPTOR_MAINTENANCE_RESERVE_MAX = _FILE_DESCRIPTOR_RESERVE * 2
 _PRESSURE_OPTIMIZE_FLUSHES = 8
 _PRESSURE_COMPACT_FLUSHES = 1
-_INDEX_MAINTENANCE_LOCK = RLock()
+_INDEX_MAINTENANCE_LOCK = FILE_DESCRIPTOR_LOCK
 _FILE_DESCRIPTOR_FAILURE = re.compile(r"(?:too many open files|\bemfile\b)", re.IGNORECASE)
 _GROUP_OVERSAMPLE = 2
 _GROUP_FALLBACK_MINIMUM = 50
@@ -1184,23 +1187,6 @@ def _file_descriptor_pressure() -> bool:
         ),
     )
     return opened + reserve > soft_limit
-
-
-def _file_descriptor_usage() -> tuple[int, int] | None:
-    descriptors = next(
-        (path for path in (Path("/proc/self/fd"), Path("/dev/fd")) if path.is_dir()),
-        None,
-    )
-    if os.name != "posix" or descriptors is None:
-        return None
-    try:
-        resource = import_module("resource")
-        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if int(soft_limit) < 0:
-            return None
-        return len(os.listdir(descriptors)), int(soft_limit)
-    except (AttributeError, ImportError, OSError):
-        return None
 
 
 def _persisted_index_file_count(path: Path) -> int:

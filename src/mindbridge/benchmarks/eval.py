@@ -247,7 +247,7 @@ EVAL_RUNNER_VERSION = "mindbridge_eval_official_v18"
 _BENCHMARK_SEARCH_REPLAY_SETUP_SPAN = "mindbridge.benchmark.search_replay_setup"
 # Mirror the fixed per-instance SDK admission contract documented in docs/operations.md.
 _SDK_STREAM_LIMIT = 8
-_SDK_OPERATION_LIMIT = 32
+_SDK_OPERATION_LIMIT = 28
 
 
 class _MemoryContext(Protocol):
@@ -1645,7 +1645,13 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     unit_paths: list[Path | None] = [None] * len(task.units)
     stores_ready = [False] * len(task.units)
     queue: asyncio.Queue[tuple[int, EvalUnit]] = asyncio.Queue()
-    request_semaphore = asyncio.Semaphore(request_concurrency)
+    worker_count = min(unit_concurrency, 16, len(task.units))
+    # Each unit can have one ingest or settlement outside answer admission. Reserve those
+    # process model slots before opening the answer window, rather than recording overload as
+    # a model-quality failure. Requested concurrency remains a ceiling.
+    request_semaphore = asyncio.Semaphore(
+        min(request_concurrency, max(1, _SDK_OPERATION_LIMIT - worker_count))
+    )
     completed = 0
     total = sum(len(unit.questions) for unit in task.units) * len(arms)
     notify_progress = on_progress or _ignore_progress
@@ -1746,7 +1752,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             notify_activity(_activity_summary(unit_activities, len(task.units)))
             queue.task_done()
 
-    workers = [asyncio.create_task(worker()) for _ in range(min(unit_concurrency, len(task.units)))]
+    workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
     await asyncio.gather(*workers)
     if any(group is None for group in slots):
         raise RuntimeError("evaluation worker exited before every unit completed")
@@ -1795,7 +1801,7 @@ async def _measure_standalone_searches(  # noqa: C901 - setup failures need per-
     if tracer is None or not any(arm.name == DEFAULT_ARM for arm in arms):
         return
     selected_tracer = tracer
-    store_semaphore = asyncio.Semaphore(unit_concurrency)
+    store_semaphore = asyncio.Semaphore(min(unit_concurrency, 16))
 
     def span_attributes(sample: SampleResult) -> dict[str, str]:
         return {

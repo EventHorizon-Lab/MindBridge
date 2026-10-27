@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import errno
 import logging
 from collections.abc import (
     AsyncGenerator,
@@ -297,6 +298,12 @@ class Memory:
             )
         except Exception as error:
             close_quietly(*injected, self._execution, self._store)
+            if isinstance(error, OSError) and error.errno in {errno.EMFILE, errno.ENFILE}:
+                raise StorageError(
+                    "local file descriptor capacity exceeded",
+                    stage="open",
+                    reason="capacity_exceeded",
+                ) from error
             raise IndexUnavailableError(
                 "failed to open the local search index", stage="open", reason="index_missing"
             ) from error
@@ -1077,13 +1084,16 @@ class Memory:
     def _capture_stream_input(self, item: StreamInput) -> MemoryRecord:
         return self._ingestion.capture_stream_input(item)
 
-    def close(self) -> None:
+    def close(self, *, timeout_seconds: float = 30.0) -> None:
         """Close model, index, and SQLite resources; repeated calls are harmless."""
         # A constructor that failed before wiring already closed what it had opened and left
         # nothing here to close, so this is the same no-op a closed instance gets.
         lifecycle: Lifecycle | None = getattr(self, "_lifecycle", None)
-        if lifecycle is None or not lifecycle.begin_close():
+        if lifecycle is None:
             return
+        lifecycle.close(self._finish_close, timeout_seconds=timeout_seconds)
+
+    def _finish_close(self) -> None:
         try:
             with self._write_lock:
                 failures = []
@@ -1647,5 +1657,7 @@ class AsyncMemory:
     async def optimize(self) -> None:
         await self._memory._execution.run(self._memory.optimize)
 
-    async def close(self) -> None:
-        await asyncio.to_thread(self._memory.close)
+    async def close(self, *, timeout_seconds: float = 30.0) -> None:
+        await self._memory._lifecycle.close_async(
+            self._memory._finish_close, timeout_seconds=timeout_seconds
+        )

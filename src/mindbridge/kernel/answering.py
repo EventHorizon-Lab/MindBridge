@@ -804,7 +804,7 @@ class Answering(Traced):
         operation_ttft_recorded = False
         with (
             self._trace("mindbridge.ask", kind="operation") as span,
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             queue_time_ms = ASYNC_QUEUE_TIME_MS.get()
             if queue_time_ms is not None:

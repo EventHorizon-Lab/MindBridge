@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Generator,
+    Mapping,
+    Sequence,
+)
 from concurrent.futures import Executor
 from contextlib import asynccontextmanager, suppress
 from contextvars import Context, copy_context
 from datetime import datetime
-from threading import BoundedSemaphore
-from time import perf_counter_ns
+from time import monotonic, perf_counter_ns
 from typing import Annotated, Any, Literal, Protocol, cast
 
 from fastapi import APIRouter, FastAPI, Query, Request, Response, status
@@ -47,7 +54,8 @@ from mindbridge.api.errors import (
 )
 from mindbridge.control import dump_operation
 from mindbridge.exceptions import StorageError
-from mindbridge.kernel.execution import StreamWorkers
+from mindbridge.infrastructure.local._capacity import Capacity
+from mindbridge.kernel.execution import StreamWorker, StreamWorkers
 from mindbridge.memory import Memory
 from mindbridge.types import (
     AbstentionReason,
@@ -85,6 +93,8 @@ from mindbridge.types import (
 )
 
 _MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+_REQUEST_BODY_TIMEOUT_SECONDS = 30.0
+_RESPONSE_SEND_TIMEOUT_SECONDS = 30.0
 _MemoryId = Annotated[str, PathParameter(min_length=1)]
 # The same identifier inside a request body, where `PathParameter` does not apply. Constrained
 # here rather than only in the SDK so a malformed ID fails validation on every route alike.
@@ -715,27 +725,52 @@ class _Memory(Protocol):
     def apply_retention(self, *, dry_run: bool = False) -> RetentionReport: ...
 
 
+class _ResponseSendTimeout(Exception):
+    pass
+
+
 class _RequestCapacity:
     """Refuse overload before buffering bodies or waiting for a framework worker."""
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, *, capacity: Capacity) -> None:
         self.app = app
-        self._slots = BoundedSemaphore(32)
+        self._slots = capacity
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or not _is_api_path(str(scope.get("path", ""))):
             await self.app(scope, receive, send)
             return
-        if not self._slots.acquire(blocking=False):
+        started = False
+
+        async def bounded_send(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            try:
+                await asyncio.wait_for(send(message), timeout=_RESPONSE_SEND_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                raise _ResponseSendTimeout from None
+
+        if not self._slots.acquire():
             response = exception_response(
                 StorageError(
                     "local request capacity exceeded", reason="capacity_exceeded", stage="admission"
                 )
             )
-            await response(scope, receive, send)
+            with suppress(_ResponseSendTimeout):
+                await response(scope, receive, bounded_send)
             return
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, bounded_send)
+        except _ResponseSendTimeout:
+            return
+        except asyncio.TimeoutError:
+            if not started:
+                response = exception_response(
+                    StorageError("request body timed out", reason="timeout", stage="transport.read")
+                )
+                with suppress(_ResponseSendTimeout):
+                    await response(scope, receive, bounded_send)
         finally:
             self._slots.release()
 
@@ -758,8 +793,9 @@ class _RequestBodyLimit:
             return
 
         body = bytearray()
+        deadline = monotonic() + _REQUEST_BODY_TIMEOUT_SECONDS
         while True:
-            message = await receive()
+            message = await asyncio.wait_for(receive(), timeout=max(0.0, deadline - monotonic()))
             if message["type"] == "http.disconnect":
                 return
             if message["type"] != "http.request":
@@ -908,7 +944,10 @@ def create_app(
     )
     register_error_handlers(app)
     app.add_middleware(_RequestBodyLimit)
-    app.add_middleware(_RequestCapacity)
+    app.add_middleware(
+        _RequestCapacity,
+        capacity=memory._execution.requests if isinstance(memory, Memory) else Capacity(32),
+    )
     app.add_middleware(
         _RequestTelemetry,
         tracer=tracer or trace.get_tracer("mindbridge.api"),
@@ -1419,6 +1458,7 @@ async def _answer_events(
     *,
     worker: Executor,
     context: Context,
+    close: Callable[[], Awaitable[None]],
 ) -> AsyncGenerator[bytes, None]:
     loop = asyncio.get_running_loop()
     chunk = first
@@ -1431,7 +1471,11 @@ async def _answer_events(
         while chunk is not _STREAM_EXHAUSTED:
             answer_chunk = cast(AnswerChunk, chunk)
             terminal = answer_chunk.result is not None
+            if terminal:
+                await close()
             yield _answer_event(answer_chunk)
+            if terminal:
+                return
             chunk = await loop.run_in_executor(worker, context.run, next_chunk)
         if not terminal:
             raise RuntimeError("answer stream ended without a terminal result")
@@ -1452,10 +1496,13 @@ class _AnswerStreamingResponse(StreamingResponse):
         worker: Executor,
         context: Context,
     ) -> None:
-        self._events = _answer_events(first, rest, worker=worker, context=context)
         self._rest = rest
         self._worker = worker
         self._context = context
+        self._closed = False
+        self._events = _answer_events(
+            first, rest, worker=worker, context=context, close=self._close_stream
+        )
         super().__init__(
             self._events,
             media_type="text/event-stream",
@@ -1472,7 +1519,13 @@ class _AnswerStreamingResponse(StreamingResponse):
             try:
                 await self._events.aclose()
             finally:
-                await _close_answer_stream(self._rest, worker=self._worker, context=self._context)
+                await self._close_stream()
+
+    async def _close_stream(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await _close_answer_stream(self._rest, worker=self._worker, context=self._context)
 
 
 async def _close_answer_stream(
@@ -1488,7 +1541,11 @@ async def _close_answer_stream(
         with suppress(asyncio.CancelledError):
             await asyncio.shield(closing)
     finally:
-        worker.shutdown(wait=False)
+        if isinstance(worker, StreamWorker):
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(asyncio.wrap_future(worker.release()))
+        else:
+            worker.shutdown(wait=False)
 
 
 def _answer_event(chunk: AnswerChunk) -> bytes:

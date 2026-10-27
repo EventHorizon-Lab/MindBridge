@@ -13,28 +13,55 @@ Stop gracefully by calling `Memory.close()`. It rejects new operations, waits fo
 releases media leases, closes model and storage resources, and releases the directory lock. The
 `.mindbridge.lock` file remains; only its operating-system lock indicates ownership.
 
+`close(timeout_seconds=30.0)` bounds the caller's complete wait, including backend cleanup and
+index flush. A timeout raises `StorageError(reason="timeout", stage="close")`. Cleanup continues
+on one closing thread; the instance rejects new work and retains directory ownership until its
+workers and resources actually stop. Call `close()` again to wait for that same cleanup. Never
+delete its lock file to work around a timeout. Synchronous provider calls cannot be forcibly
+cancelled safely; configure finite provider timeouts as well.
+
 Before first deployment or after composition changes, use the CLI doctor described in the
 [command-line reference](api/cli.md#doctor-and-explain). It checks configuration and loaders
 without writing memory. A remote doctor checks the REST liveness endpoint.
 
 ## Concurrency and overload
 
-Each physical `data_dir` owns its admission limits and workers. The fixed runtime bounds are:
+Each physical `data_dir` owns its admission limits and worker leases. Process budgets are shared
+across directories. The fixed runtime bounds are:
 
 | Resource | Limit |
 | --- | --- |
-| Active memory operations across SDK, REST, and MCP | 32 |
-| Submitted asynchronous SDK calls, including running calls | 32 |
-| Pinned answer-stream workers shared by AsyncMemory and REST | 8 |
-| Shared index-route workers | 4 |
-| Shared speech-overlap workers | 2 |
-| SQLite connections, including borrowed and idle handles | 32 |
-| Active `/v1` HTTP requests per application, including body reads and streams | 32 |
+| Active memory operations across SDK, REST, and MCP | 32 per directory; 128 per process |
+| Operations that can invoke a model | 28 per directory and per process |
+| Submitted asynchronous SDK calls, including live vision descriptions | 32 per directory; 128 per process |
+| Pinned answer-stream workers shared by AsyncMemory and REST | 8 per directory; 32 per process |
+| Index-route workers | 4 per directory; 16 per process |
+| Speech-overlap workers | 2 per directory; 8 per process |
+| SQLite connections, including borrowed and idle handles | 32 per directory; 128 per process |
+| REST `/v1` requests and MCP tool calls sharing one directory | 32 per directory; 128 per process |
+| Open local stores | 16 per process |
+| Materialized input text and media retained by active operations | 512 MiB per operation and per process |
+| Inputs in one SDK `add_many()` | 1,024 |
+| Captures awaiting enrichment or formation | 10,000 per directory |
 
 Admission is immediate: overload raises `StorageError(reason="capacity_exceeded",
 stage="admission")`, which is retryable. REST returns the shared 503 envelope with
 `Retry-After: 1`; MCP reports the same reason and retryability. Apply bounded backoff when
 retrying. `/healthz` remains outside request admission.
+
+Model work leaves four of a directory's operation slots available to lightweight reads. The
+process model budget also leaves room in shared SDK and framework worker pools; it does not
+guarantee progress through backend locks or unrelated host work. Local model adapters retain
+their inference safety locks. Formation calls over distinct sources may overlap; concurrent
+writes of the same source share one formation call, and application remains serialized and
+transactionally checked. Naming and identity rollback commit registry names, speech text,
+vectors, and repair outbox together, including when embedding fails.
+
+REST reads a request body within 30 seconds total and allows at most 30 seconds for each response
+send. Body timeout returns the usual retryable 503 `timeout` envelope. A send timeout ends the
+response and returns request capacity. A terminal answer releases its pinned worker before
+network delivery. MCP tool admission runs before framework worker dispatch; HTTP connection and
+MCP session limits still belong to the serving host.
 
 Index routes use batches of at most four per admitted operation; temporal supplements reuse
 the same pool. At most 128 route jobs and 32 speech-overlap jobs can be pending or running.
@@ -43,9 +70,23 @@ routes need. Cancelling an asynchronous waiter retains capacity until its synchr
 actually stops. Stream workers remain pinned through queued cleanup and are reusable before
 the terminal result is delivered. Close an abandoned stream with `close()` or `aclose()`.
 
-These bounds prevent request count from multiplying MindBridge-owned workers and connections.
-They are not a host-wide thread or memory limit: separate directories, caller-owned threads,
-native model/Zvec workers, backend request sizes, and provider quotas still need host sizing.
+The process shares 64 asynchronous parent threads, 16 index threads, eight speech threads, and
+at most 32 pinned stream threads, created as needed and reused across directories. Closing one
+directory waits for its own jobs without shutting down another directory's workers. Each closing
+directory can also use one cleanup thread. File-descriptor exhaustion is reported as
+`capacity_exceeded`, including during open, rather than as a missing search index.
+SQLite connection opens and native index allocations share one descriptor admission lock and
+preserve filesystem descriptor headroom before allocating; the numeric connection ceiling is
+also subject to the process's actual file-descriptor limit.
+
+These bounds cover MindBridge-owned submissions, workers, stores, and SQLite handles. The byte
+budget charges UTF-8 text and media sizes before materialization and releases them on operation
+exit. Inputs whose own cumulative size exceeds 512 MiB raise `ValidationError`; contention for
+otherwise valid input raises retryable `capacity_exceeded`. This is not an RSS or GPU-memory
+ceiling. Caller-owned buffers and threads, framework bodies,
+decoded media, native model/Zvec allocations, backend request sizes, and provider quotas still
+need host sizing. A full capture backlog refuses new queued records atomically; settle existing
+captures before retrying. Duplicate captures remain idempotent at the limit.
 The limits are conservative safety bounds, not measured optimal throughput settings.
 Use backend timeouts and bound the host's own producers. At the HTTP server boundary,
 Uvicorn's [concurrency limit](https://uvicorn.dev/server-behavior/#resource-limits) can

@@ -7,6 +7,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from time import perf_counter
 from typing import TypeVar
@@ -165,7 +166,10 @@ class Ingestion(Traced):
         transcript: str | None = None,
         description: str | None = None,
     ) -> MemoryRecord:
-        with self._trace("mindbridge.add", kind="operation"), self._lifecycle.operation() as assets:
+        with (
+            self._trace("mindbridge.add", kind="operation"),
+            self._lifecycle.operation(model_work=True) as assets,
+        ):
             if self._backends.former is not None and context is None:
                 context = ObservationContext()
             with self._trace("mindbridge.content.prepare", kind="stage"):
@@ -238,15 +242,19 @@ class Ingestion(Traced):
     ) -> tuple[MemoryRecord, ...]:
         with (
             self._trace("mindbridge.add_many", kind="operation"),
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             normalized_memory_type = validated_memory_type(memory_type)
             if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
                 raise ValidationError("contents must be a sequence of memory inputs")
             try:
-                batch = tuple(contents)
+                batch = tuple(islice(contents, 1_025))
             except TypeError:
                 raise ValidationError("contents must be a sequence of memory inputs") from None
+            if len(batch) > 1_024:
+                raise ValidationError(
+                    "contents must not exceed 1024 memory inputs; use add_stream for larger inputs"
+                )
             occurrences = _batch_values(occurred_at, len(batch), "occurred_at")
             occurrence_ends = _batch_values(occurred_end, len(batch), "occurred_end")
             metadata_values = _batch_values(metadata, len(batch), "metadata")
@@ -407,7 +415,7 @@ class Ingestion(Traced):
     ) -> int:
         with (
             self._trace("mindbridge.settle", kind="operation") as span,
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             validate_limit(limit, maximum=100)
             if (

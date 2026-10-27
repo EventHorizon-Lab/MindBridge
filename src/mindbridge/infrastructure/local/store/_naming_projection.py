@@ -14,14 +14,16 @@ from mindbridge.infrastructure.local.store._codec import (
 )
 from mindbridge.infrastructure.local.store._corroboration import independent_evidence_enabled
 from mindbridge.infrastructure.local.store._identity import dependent_naming_identities
+from mindbridge.infrastructure.local.store.media import _read_speech
 from mindbridge.infrastructure.local.store.records import (
     _read_memory_assets,
     replace_memory_embeddings,
 )
 from mindbridge.infrastructure.local.store.rows import StoredEmbedding, StoredMemory
+from mindbridge.types import SpeakerSegment
 
 NamingProjectionFactory = Callable[
-    [Mapping[str, str | None], Sequence[StoredMemory]],
+    [Mapping[str, str | None], Sequence[StoredMemory], Mapping[str, tuple[SpeakerSegment, ...]]],
     tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]],
 ]
 
@@ -31,12 +33,18 @@ def naming_snapshot(
     memory_ids: Sequence[str],
     *,
     identity_ids: Sequence[str] = (),
+    force: bool = False,
 ) -> dict[str, str | None]:
     """Remember candidate names before links or versions can remove dependencies."""
-    if not independent_evidence_enabled(connection):
+    if not force and not independent_evidence_enabled(connection):
         return {}
     affected = {*dependent_naming_identities(connection, memory_ids), *identity_ids}
-    return _names(connection, sorted(affected))
+    before = _names(connection, sorted(affected))
+    if force:
+        for identity_id in identity_ids:
+            # An absorbed identity has no registry row until the candidate split restores it.
+            before.setdefault(identity_id, None)
+    return before
 
 
 def _names(connection: sqlite3.Connection, identity_ids: Sequence[str]) -> dict[str, str | None]:
@@ -54,6 +62,8 @@ def refresh_naming_documents(
     connection: sqlite3.Connection,
     before: Mapping[str, str | None],
     factory: NamingProjectionFactory | None,
+    *,
+    force_ids: Sequence[str] = (),
 ) -> None:
     """Rebuild changed names inside their authoritative mutation transaction.
 
@@ -66,7 +76,7 @@ def refresh_naming_documents(
     changed = {
         identity_id: name
         for identity_id, name in _names(connection, tuple(before)).items()
-        if name != before[identity_id]
+        if name != before[identity_id] or identity_id in force_ids
     }
     if not changed:
         return
@@ -96,7 +106,17 @@ def refresh_naming_documents(
         )
         for memory_id in memory_ids
     }
-    memories, embeddings = factory(changed, tuple(current.values()))
+    speech = {
+        asset.asset_id: _read_speech(connection, asset.asset_id)
+        for memory in current.values()
+        for asset in memory.assets
+        if asset.modality in {"audio", "video"}
+        and connection.execute(
+            "SELECT 1 FROM speech_analyses WHERE asset_id = ?", (asset.asset_id,)
+        ).fetchone()
+        is not None
+    }
+    memories, embeddings = factory(changed, tuple(current.values()), speech)
     # Only text and vectors belong to this callback. The transaction may already
     # have retired, forgotten, or narrowed a row: never reapply old semantics.
     updated = tuple(

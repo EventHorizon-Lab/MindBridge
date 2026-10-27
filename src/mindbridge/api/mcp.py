@@ -38,7 +38,8 @@ from mindbridge.api.content import (
 )
 from mindbridge.api.deliberation import deliberation_lifespan
 from mindbridge.api.messages import error_message
-from mindbridge.exceptions import MindBridgeError
+from mindbridge.exceptions import MindBridgeError, StorageError
+from mindbridge.infrastructure.local._capacity import Capacity
 from mindbridge.types import (
     AbstentionReason,
     AnswerPolicy,
@@ -496,6 +497,7 @@ def build_mcp_server(
         ),
         middleware=[
             transport_telemetry,
+            _request_admission(memory),
             cast(ServerMiddleware[Any], _strict_tool_arguments),
         ],
     )
@@ -1055,6 +1057,30 @@ def _register_identity_tools(
         which is not evidence that the first call failed.
         """
         return ForgetResult(erasure=memory.forget_identity(identity_id))
+
+
+def _request_admission(memory: Memory) -> ServerMiddleware[Any]:
+    slots = memory._execution.requests if isinstance(memory, Memory) else Capacity(32)
+
+    async def admit(context: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
+        if context.method != "tools/call":
+            return await call_next(context)
+        if not slots.acquire():
+            return _envelope_result(
+                _tool_error(
+                    StorageError(
+                        "local request capacity exceeded",
+                        reason="capacity_exceeded",
+                        stage="admission",
+                    )
+                )
+            )
+        try:
+            return await call_next(context)
+        finally:
+            slots.release()
+
+    return cast(ServerMiddleware[Any], admit)
 
 
 def _stable_errors(

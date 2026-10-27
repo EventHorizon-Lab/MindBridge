@@ -118,6 +118,39 @@ class RecordingVisionDescriber:
 
 
 @pytest.mark.asyncio
+async def test_live_vision_rejects_before_captioning_when_sdk_submissions_are_full(
+    tmp_path: Path,
+) -> None:
+    describer = RecordingVisionDescriber()
+    with Memory(
+        tmp_path, embedder=RecordingEmbedder(frozenset({Modality.TEXT})), vision_describer=describer
+    ) as memory:
+        acquired = 0
+        try:
+            for _ in range(32):
+                assert memory._execution._async_slots.acquire()
+                acquired += 1
+            with pytest.raises(StorageError) as failure:
+                _ = [
+                    commit
+                    async for commit in AsyncVisionStream(
+                        AsyncMemory(memory), capture=True
+                    ).consume(
+                        _vision_packets(
+                            VisionFrame(Blob(b"frame", "image/png")),
+                            SceneBoundary(VisionBoundary.END),
+                        )
+                    )
+                ]
+            assert failure.value.reason == "capacity_exceeded"
+            assert describer.inputs == []
+        finally:
+            for _ in range(acquired):
+                memory._execution._async_slots.release()
+        assert memory.list().items == ()
+
+
+@pytest.mark.asyncio
 async def test_partial_snapshots_are_speculative_and_only_final_is_durable(
     tmp_path: Path,
 ) -> None:

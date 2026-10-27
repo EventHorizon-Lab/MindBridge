@@ -207,7 +207,7 @@ class Retrieval(Traced):
     ) -> SearchOutcome:
         with (
             self._trace("mindbridge.search", kind="operation"),
-            self._lifecycle.operation() as assets,
+            self._lifecycle.operation(model_work=True) as assets,
         ):
             validate_limit(limit, maximum=100)
             occurred_from, occurred_until = search_occurrence_range(

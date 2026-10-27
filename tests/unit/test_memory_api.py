@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 from collections.abc import AsyncIterator, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import MISSING, asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2904,7 +2904,10 @@ def test_naming_a_person_records_a_typed_assertion_bound_to_the_identity(tmp_pat
     assert "Alice is a recognized person, sister." not in contents
 
 
-def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: Path) -> None:
+@pytest.mark.parametrize("saturated", (False, True))
+def test_naming_is_auditable_and_rollback_restores_the_previous_name(
+    tmp_path: Path, saturated: bool
+) -> None:
     """Mishearing a name must be reversible in both directions, index included."""
     with Memory(
         tmp_path,
@@ -2933,7 +2936,10 @@ def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: P
         )
         assert '"speaker_name":"Li Hua"' in memory.get(record.id).content
 
-        assert memory.rollback(logged[0].operation_id) is True
+        with ExitStack() as leases:
+            for _ in range(31 if saturated else 0):
+                leases.enter_context(memory._lifecycle.operation())
+            assert memory.rollback(logged[0].operation_id) is True
 
         # The retracted name is gone from the projection, the registry, and the indexed text.
         assert memory.identity(identity_id) == IdentityProfile(
@@ -2949,6 +2955,41 @@ def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: P
         memory.forget_identity(identity_id)
         assert all("recognized person" not in hit.content for hit in memory.search("Li"))
         assert '"speaker_name":null' in memory.get(record.id).content
+
+
+def test_failed_rollback_embedding_preserves_names_and_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    embedder = _FakeEmbedder()
+    with Memory(
+        tmp_path,
+        embedder=embedder,
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        memory.register_identity(identity_id, "Li")
+        memory.register_identity(identity_id, "Li Hua")
+        operation_id = memory.operations()[0].operation_id
+
+        def fail(
+            _inputs: Sequence[ModelInput], task: EmbedTask = EmbedTask.DOCUMENT
+        ) -> tuple[tuple[float, ...], ...]:
+            raise ModelError("injected embedding failure", reason="model_failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(embedder, "embed", fail)
+            with pytest.raises(ModelError):
+                memory.rollback(operation_id)
+        assert memory.operations()[0].rolled_back_at is None
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name == "Li Hua"
+        assert '"speaker_name":"Li Hua"' in memory.get(record.id).content
+        assert memory.rollback(operation_id)
+        assert '"speaker_name":"Li"' in memory.get(record.id).content
 
 
 def test_deleting_the_standing_assertion_does_not_resurrect_a_retracted_name(
@@ -3051,7 +3092,10 @@ def test_naming_rollbacks_happen_newest_standing_first(tmp_path: Path) -> None:
         )
 
 
-def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reversal", ("unlink", "rollback_merge", "rollback_split"))
+def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(
+    tmp_path: Path, reversal: str
+) -> None:
     """Reversing a merge must repaint the indexed text, not only the identity rows.
 
     A merge writes the surviving person's name into every stored transcript projection of the
@@ -3079,7 +3123,10 @@ def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path
         assert memory.speech(first.id)[0].speaker_id == face_id
         assert '"speaker_name":"Bob"' in memory.get(first.id).content
 
-        assert memory.unlink_identity(voice_id) == voice_id
+        if reversal == "rollback_merge":
+            assert memory.rollback(_merge_row(memory).operation_id)
+        else:
+            assert memory.unlink_identity(voice_id) == voice_id
 
         assert memory.identity(voice_id) == IdentityProfile(identity_id=voice_id)
         for record in (first, second):
@@ -3099,6 +3146,19 @@ def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path
             for document in index.documents.values()
             if document.content == "Bob is a recognized person."
         }
+        if reversal == "rollback_split":
+            split = next(
+                row
+                for row in memory.operations()
+                if row.operation.intent is MemoryIntent.CORRECT
+                and row.operation.identity is not None
+            )
+            assert memory.rollback(split.operation_id)
+            for record in (first, second):
+                assert memory.speech(record.id)[0].speaker_id == face_id
+                content = memory.get(record.id).content
+                assert f'"speaker_id":"{face_id}"' in content
+                assert '"speaker_name":"Bob"' in content
 
 
 @pytest.mark.parametrize("value", ["x" * 256, "bad\nline", ""])
@@ -4385,13 +4445,14 @@ def test_add_many_hydrates_the_index_outbox_in_batches(
     assert connection_count - before <= 8
 
 
-def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
+def test_outbox_bounds_index_batches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A drain larger than the bound splits into batches of it, whatever the bound is.
 
     One flush follows each batch and costs the same whatever it carries, which is what makes this
     bound the knob deciding how many of them a bulk write pays for. What the search index accepts
     in one write is a separate limit that `ZvecIndex` enforces for itself.
     """
+    monkeypatch.setattr(projection_module, "OUTBOX_BATCH_SIZE", 64)
     bound = projection_module.OUTBOX_BATCH_SIZE
     count = bound + bound // 2
     with _memory(tmp_path, _FakeModels()) as memory:
@@ -4748,13 +4809,15 @@ def test_interrupted_reindex_is_completed_from_durable_sqlite(tmp_path: Path) ->
 
 def test_index_fd_exhaustion_keeps_the_actionable_cause() -> None:
     with (
-        pytest.raises(IndexUnavailableError, match=r"901 descriptors.*soft limit is 1024"),
+        pytest.raises(StorageError, match=r"901 descriptors.*soft limit is 1024") as failure,
         translate_index_errors("update the search index"),
     ):
         raise OSError(
             errno.EMFILE,
             "901 descriptors are open and the soft limit is 1024",
         )
+    assert failure.value.reason == "capacity_exceeded"
+    assert failure.value.stage == "index"
 
 
 def test_formation_marker_commits_with_derived_sqlite_before_index_flush(

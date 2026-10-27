@@ -56,6 +56,12 @@ provider client open when that adapter documents separate ownership. Use `Memory
 manager, or call `close()`; repeated closes are harmless. See [operations](../operations.md) for
 backup, recovery, and telemetry.
 
+Both facades accept `close(*, timeout_seconds: float = 30.0)`. The timeout must be positive and
+finite. It bounds the complete wait for quiescence and cleanup; expiration raises retryable
+`StorageError(reason="timeout", stage="close")`. Cleanup continues with ownership retained, and
+another `close()` waits for the same cleanup. The instance rejects new operations once closing
+starts. Configure provider timeouts because a running synchronous call cannot be forcibly stopped.
+
 ## Contract
 
 ### Construction
@@ -1675,8 +1681,10 @@ Stable input bounds are:
 The 512 MiB value is the local ingestion ceiling, not a promise that every model backend accepts an
 asset that large. Backend request limits apply before model work.
 
-Each instance admits at most 32 active memory operations and 32 submitted asynchronous calls;
-SQLite also caps actual borrowed plus idle connections at 32. Excess work raises retryable
+Each instance admits at most 32 active memory operations and 32 submitted asynchronous calls.
+Model operations have a shared process ceiling of 28, reserving capacity for lightweight reads;
+SQLite caps actual borrowed plus idle connections at 32 per instance and 128 per process.
+Excess work raises retryable
 `StorageError(reason="capacity_exceeded", stage="admission")` before additional resources are
 allocated. Cancellation does not return a running call's capacity until the call finishes.
 See [concurrency and overload](../operations.md#concurrency-and-overload) for all worker and
@@ -1691,7 +1699,11 @@ as four ordered stills, counted by `mindbridge.embedding.video_sampled_inputs`; 
 that declares the length constraint triggers it, and the video itself is still stored and still
 reaches the answering model on its own route.
 
-`add_many` has no separate SDK item-count cap, but each item is subject to the same content and
-metadata bounds. REST and MCP deliberately impose narrower transport limits. A `Memory` is bound
+`add_many` accepts at most 1,024 inputs; larger sequences raise `ValidationError` before model
+work or durable writes. Use `add_stream` for larger input sets. Active materialization shares a
+512 MiB process byte budget; inputs exceeding 512 MiB within one operation raise `ValidationError`.
+A directory holds at most 10,000 captures awaiting settlement. Contention for the byte budget or
+a full capture backlog raises retryable `capacity_exceeded`. Capturing an existing record remains
+idempotent at the backlog limit. REST and MCP impose narrower transport limits. A `Memory` is bound
 to the process that opened it and cannot be used after `fork`; open a new instance with a different
 `data_dir` in the child.

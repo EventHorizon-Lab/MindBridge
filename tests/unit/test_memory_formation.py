@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
@@ -171,6 +172,24 @@ def test_new_observation_forms_typed_memories_once_without_changing_source_ident
         plain = memory.add("I prefer tea", occurred_at=occurred, context=context)
 
     assert plain.id == source.id
+
+
+def test_distinct_sources_can_form_concurrently(tmp_path: Path) -> None:
+    both = Barrier(2, timeout=3)
+
+    class ParallelFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            both.wait()
+            return super().form(inputs)
+
+    former = ParallelFormer()
+    with Memory(tmp_path, embedder=TinyEmbedder(), former=former) as memory:
+        with ThreadPoolExecutor(max_workers=2) as callers:
+            records = tuple(callers.map(memory.add, ("first source", "second source")))
+        assert len({record.id for record in records}) == 2
+        assert former.calls == 2
 
 
 def test_concurrent_duplicate_source_runs_formation_once(tmp_path: Path) -> None:

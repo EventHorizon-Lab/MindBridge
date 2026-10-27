@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from functools import partial
+from threading import Condition
 from typing import cast
 
 from opentelemetry.trace import Tracer
@@ -587,6 +588,8 @@ class Formation(Traced):
         self._embedding = embedding
         self._projection = projection
         self._hydrator = hydrator
+        self._forming: set[str] = set()
+        self._formation_claims = Condition()
 
     def _history_for(
         self, source: MemoryRecord, excluded: Sequence[str]
@@ -638,10 +641,19 @@ class Formation(Traced):
     ) -> None:
         if self._backends.former is None or not sources:
             return
-        with self._formation_lock:
-            self._form_sources_locked(sources, operation=operation)
+        claimed = {source.id for source in sources}
+        with self._formation_claims:
+            while claimed & self._forming:
+                self._formation_claims.wait()
+            self._forming.update(claimed)
+        try:
+            self._form_sources_claimed(sources, operation=operation)
+        finally:
+            with self._formation_claims:
+                self._forming.difference_update(claimed)
+                self._formation_claims.notify_all()
 
-    def _form_sources_locked(
+    def _form_sources_claimed(
         self,
         sources: Sequence[MemoryRecord],
         *,
@@ -698,6 +710,17 @@ class Formation(Traced):
                 reason="response_invalid",
                 stage="form",
             )
+        with self._formation_lock:
+            self._apply_proposals(inputs, proposals_by_source, pending, operation=operation)
+
+    def _apply_proposals(
+        self,
+        inputs: Sequence[FormationInput],
+        proposals_by_source: tuple[tuple[FormationProposal, ...], ...],
+        pending: Sequence[MemoryRecord],
+        *,
+        operation: OperationAssets,
+    ) -> None:
         proposals_by_id: dict[str, tuple[FormationProposal, ...]] = {
             value.memory_id: proposals
             for value, proposals in zip(inputs, proposals_by_source, strict=True)
@@ -989,9 +1012,11 @@ class Formation(Traced):
             logged = self._store.control.read_operations(operation_key=operation.operation_key)
         return logged[0] if logged else None
 
-    def naming_projection_factory(self, assets: OperationAssets) -> NamingProjectionFactory | None:
+    def naming_projection_factory(
+        self, assets: OperationAssets, *, force: bool = False
+    ) -> NamingProjectionFactory | None:
         """Prepare exact candidate speech projections before their transaction commits."""
-        if not self._settings.independent_evidence:
+        if not force and not self._settings.independent_evidence:
             return None
         return partial(self._embedding.refresh_naming_memories, operation=assets)
 

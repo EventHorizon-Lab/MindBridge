@@ -30,14 +30,16 @@ from mindbridge.benchmarks.task_catalog import TaskSpec
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("request_concurrency", "unit_count"), ((12, 1), (40, 1), (12, 2)))
+@pytest.mark.parametrize(
+    ("request_concurrency", "unit_count"), ((12, 1), (40, 1), (12, 2), (128, 4))
+)
 async def test_streaming_evaluation_queues_excess_requests_per_store(
     tmp_path: Path, request_concurrency: int, unit_count: int
 ) -> None:
     release = Event()
     lock = Lock()
     active = peak = 0
-    target = min(request_concurrency, 8 * unit_count)
+    target = min(request_concurrency, 8 * unit_count, 28 - min(unit_count, 16))
     answerers: list[Answerer] = []
 
     class Answerer:
@@ -122,7 +124,7 @@ async def test_streaming_evaluation_queues_excess_requests_per_store(
 
 
 class _ConcurrentQueries(TinyEmbedder):
-    """Hold the first wave until all 32 SDK callers arrive, making overload deterministic."""
+    """Hold the first wave until all 28 model slots fill, making overload deterministic."""
 
     def __init__(self) -> None:
         self.release = Event()
@@ -137,7 +139,7 @@ class _ConcurrentQueries(TinyEmbedder):
         with self._lock:
             self._active += 1
             self.peak = max(self.peak, self._active)
-            if self._active == 32:
+            if self._active == 28:
                 self.release.set()
         try:
             assert self.release.wait(5), "benchmark did not fill available SDK capacity"
@@ -157,20 +159,20 @@ async def test_non_streaming_evaluation_queues_excess_requests_per_store(tmp_pat
                 AsyncMemory(memory),
                 tuple(
                     EvalQuestion(f"q{index}", ("What is the answer?",), references=("A",))
-                    for index in range(48)
+                    for index in range(128)
                 ),
-                request_concurrency=48,
+                request_concurrency=128,
                 recall_limit=1,
                 arm=_Arm("random"),
             )
         finally:
             embedder.release.set()
 
-    assert len(outcomes) == 48
+    assert len(outcomes) == 128
     assert all(
         isinstance(outcome, _AnswerOutcome) and outcome.error is None for outcome in outcomes
     )
-    assert embedder.peak == 32
+    assert embedder.peak == 28
 
 
 @pytest.mark.asyncio
@@ -178,7 +180,7 @@ async def test_search_replay_queues_excess_requests_per_store(tmp_path: Path) ->
     embedder = _ConcurrentQueries()
     questions = tuple(
         EvalQuestion(f"q{index}", ("What is the answer?",), references=("A",))
-        for index in range(48)
+        for index in range(128)
     )
     samples = tuple(
         SampleResult(
@@ -218,17 +220,17 @@ async def test_search_replay_queues_excess_requests_per_store(tmp_path: Path) ->
                 stores_ready=(True,),
                 memory_factory=lambda _path: AsyncMemory(memory),
                 unit_concurrency=1,
-                request_semaphore=asyncio.Semaphore(48),
+                request_semaphore=asyncio.Semaphore(128),
                 recall_limit=1,
                 arms=(PRODUCT_ARM,),
                 tracer=telemetry.tracer,
             )
-            performance = telemetry.result("fixture", question_count=48)
+            performance = telemetry.result("fixture", question_count=128)
         finally:
             embedder.release.set()
             telemetry.close()
 
     search_e2e = performance["search_e2e"]
     assert isinstance(search_e2e, dict)
-    assert search_e2e["count"] == 48
-    assert embedder.peak == 32
+    assert search_e2e["count"] == 128
+    assert embedder.peak == 28

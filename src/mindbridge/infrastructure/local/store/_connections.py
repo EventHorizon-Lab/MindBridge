@@ -9,6 +9,11 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from threading import Condition
 
+from mindbridge.infrastructure.local._capacity import (
+    FILE_DESCRIPTOR_LOCK,
+    Capacity,
+    file_descriptor_usage,
+)
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.infrastructure.local.store._predicates import validate_predicate_schema
 from mindbridge.infrastructure.local.store._recall import RECALL_FOLD_FUNCTION, recall_fold
@@ -29,6 +34,8 @@ from mindbridge.infrastructure.local.store.errors import (
 
 # Total connections, including checked-out, opening, and idle connections.
 _CONNECTION_POOL_SIZE = 32
+_PROCESS_INSTANCES = Capacity(16)
+_PROCESS_CONNECTIONS = Capacity(128)
 
 
 class Connections:
@@ -52,12 +59,17 @@ class Connections:
         # a commit this process did not make cannot exist.
         self._write_generation = 0
         self._directory_lock = DataDirectoryLock(self.data_dir)
+        if not _PROCESS_INSTANCES.acquire():
+            self._directory_lock.close()
+            raise LocalStoreCapacityError("local instance capacity exceeded")
         try:
             self._initialize_schema()
             self._schema_ready = True
             if os.name != "nt":
                 os.chmod(self.database_path, 0o600)
         except BaseException:
+            self._close_pool()
+            _PROCESS_INSTANCES.release()
             self._directory_lock.close()
             self._closed = True
             raise
@@ -77,6 +89,7 @@ class Connections:
                 self._pool_lock.wait()
         self._close_pool()
         self._directory_lock.close()
+        _PROCESS_INSTANCES.release()
 
     def _initialize_schema(self) -> None:
         """Create or validate the current schema; refuse every other version."""
@@ -110,6 +123,21 @@ class Connections:
         # approximates. A pooled connection is checked out to exactly one caller at a time, so
         # no two threads ever execute on it concurrently; without this, a connection could only
         # ever be reused by the thread that happened to open it.
+        if not _PROCESS_CONNECTIONS.acquire():
+            raise LocalStoreCapacityError("process SQLite connection capacity exceeded")
+        try:
+            with FILE_DESCRIPTOR_LOCK:
+                usage = file_descriptor_usage()
+                if usage is not None and usage[0] + 3 + 128 > usage[1]:
+                    raise LocalStoreCapacityError(
+                        "SQLite open refused before file descriptor exhaustion"
+                    )
+                return self._connect(secure_delete=secure_delete)
+        except BaseException:
+            _PROCESS_CONNECTIONS.release()
+            raise
+
+    def _connect(self, *, secure_delete: bool) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.database_path,
             timeout=30,
@@ -166,6 +194,7 @@ class Connections:
         try:
             if idle is not None and secure_delete:
                 idle.close()
+                _PROCESS_CONNECTIONS.release()
                 idle = None
             connection = (
                 self._open_connection(secure_delete=secure_delete) if idle is None else idle
@@ -181,6 +210,7 @@ class Connections:
                     else:
                         with suppress(sqlite3.Error):
                             connection.close()
+                        _PROCESS_CONNECTIONS.release()
                 self._active_connections -= 1
                 self._pool_lock.notify_all()
 
@@ -191,6 +221,7 @@ class Connections:
         for connection in connections:
             with suppress(sqlite3.Error):
                 connection.close()
+            _PROCESS_CONNECTIONS.release()
 
     @contextmanager
     def transaction(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:
