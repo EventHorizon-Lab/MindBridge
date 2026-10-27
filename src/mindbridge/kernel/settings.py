@@ -39,6 +39,7 @@ class Settings:
     ambiguity_margin: float
     evidence_budget: int | None
     recall_planning: bool
+    recall_query_expansion: bool
     recall_set_budget: int
     recall_set_max_rows: int
     recall_rounds: int
@@ -77,6 +78,7 @@ def resolve_settings(
     ambiguity_margin: float,
     evidence_budget_chars: int | None,
     recall_planning: bool,
+    recall_query_expansion: bool,
     recall_set_budget_chars: int,
     recall_set_max_rows: int,
     recall_rounds: int,
@@ -117,6 +119,7 @@ def resolve_settings(
         if evidence_budget_chars is None
         else positive_int(evidence_budget_chars, "evidence_budget_chars"),
         recall_planning=strict_bool(recall_planning, "recall_planning"),
+        recall_query_expansion=strict_bool(recall_query_expansion, "recall_query_expansion"),
         recall_set_budget=positive_int(recall_set_budget_chars, "recall_set_budget_chars"),
         recall_set_max_rows=positive_int(recall_set_max_rows, "recall_set_max_rows"),
         recall_rounds=positive_int(recall_rounds, "recall_rounds"),

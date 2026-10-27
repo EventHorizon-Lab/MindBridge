@@ -14,7 +14,7 @@ This page defines implementation invariants. See [core concepts](concepts.md) fo
 | `Memory` | Validate policy and backend contracts once, open storage in order, wire the kernel planes, and forward every public operation to the plane that owns it. |
 | Kernel planes (`mindbridge.kernel`) | One object per concern -- write, retrieval, answering, compilation, identity, control, records, perception, projection -- each constructed with exactly the store, index, backends, settings, and sibling planes it uses. |
 | Model backends | Embed, generate, transcribe or analyze speech, analyze faces, describe images, propose typed formations, or propose memory-control-plane operations. |
-| `LocalStore` | Persist authoritative records, FP32 embeddings, analysis and identity state, compatibility metadata, and the index outbox in SQLite, one table family per attribute over one connection pool. |
+| `LocalStore` | Persist authoritative records, FP32 embeddings, analysis and identity state, store identities and settings, and the index outbox in SQLite, one table family per attribute over one connection pool. |
 | `AssetStore` | Persist immutable image, video, and audio bytes by SHA-256. |
 | `ZvecIndex` | Maintain rebuildable dense, lexical, type, and event-time search projections. |
 | REST, MCP, and CLI adapters | Translate their protocol and call the same `Memory` kernel. |
@@ -37,7 +37,7 @@ not handed.
 | `kernel/lifecycle.py` | `Lifecycle` | Operation leases, fork detection, close coordination, and the media leases an operation holds. |
 | `kernel/materialization.py` | `Materializer` | Validating caller content and leasing its media before any model runs. |
 | `kernel/hydration.py` | `Hydrator` | Stored rows to public `MemoryRecord`, `SearchHit`, and `AssetRef` values. |
-| `kernel/recovery.py` | `Recovery` | Validating store markers before writes, resuming recognized embedding upgrades, replacing derived indexes, and checkpointing recovery work before index creation. |
+| `kernel/recovery.py` | `Recovery` | Validating current store identities before writes, initializing unused face spaces, replacing derived indexes, and checkpointing recovery work before index creation. |
 | `kernel/speech.py`, `vision.py`, `embedding.py` | `Speech`, `Vision`, `Embedding` | The perception planes: transcripts and voice identities; descriptions, faces, and cross-modal links; routing content into the embedder and keying rows. |
 | `kernel/projection.py` | `Projection` | Applying committed SQLite truth to Zvec through the outbox, batched flushes, `reindex()`, `optimize()`. |
 | `kernel/retrieval.py` | `Retrieval` | Index candidates, authoritative hydration, and one ranking, shared by search, answer, compile, and the control plane. |
@@ -56,7 +56,7 @@ read no storage and call no model; they are the functions the planes agree on, a
 where a rule about identity, ranking, or derived text lives exactly once. Two small shared
 modules complete the kernel: `runtime.py` holds the `Storage` bundle, the `Index` protocol, the
 boundary error translation every plane uses, and `tracing.py` holds the `Traced` base class that
-gives each plane its spans. `metadata.py` decides which stored recipes can be upgraded;
+gives each plane its spans. `metadata.py` validates current identities and plans quantization changes;
 `Recovery` executes that plan. Pure operation inspection and identity operation recipes live in
 top-level `control.py`, so reading records or describing visuals does not import an unrelated
 plane for one helper or constant. The top-level `streams.py` holds the async observation streams
@@ -77,7 +77,7 @@ white-box tests may reach the private modules directly.
 
 | Path | Authority | Recovery role |
 | --- | --- | --- |
-| `state.sqlite3` | Authoritative | Records, FP32 embeddings, model and index compatibility markers, cached analyses, identities, typed semantics with evidence, bitemporal versions, durable formation completion, forgetting state, deferred capture work, the memory-operation log, and pending index operations. |
+| `state.sqlite3` | Authoritative | Records, FP32 embeddings, model and index identity markers, cached analyses, identities, typed semantics with evidence, bitemporal versions, durable formation completion, forgetting state, deferred capture work, the memory-operation log, and pending index operations. |
 | `assets/` | Authoritative | Original media bytes, stored by digest. SQLite cannot recreate a missing asset. |
 | `zvec/` | Derived | Disposable search projection. It may be deleted while stopped; startup rebuilds it from SQLite without re-embedding stored content. |
 | `.mindbridge.lock` | Coordination only | Operating-system lock target; the file normally remains after shutdown, so its presence says nothing about a live owner. |
@@ -88,23 +88,25 @@ store writes and fsyncs a temporary object before publishing it under its digest
 bytes reuse one object. A backup needs SQLite and `assets/`; see the
 [backup runbook](operations.md#backup).
 
+The pure `kernel/predicates.py` registry resolves reviewed exact aliases before formation hashes
+a claim key. Registered scalar claims retain kind, subject or bound identity, spatial frame and
+anchor, value type, and cardinality policy in that key. STATE is functional, RELATION accumulates,
+and TRAIT retains its existing basis-dependent override rule. Naming and consent are outside the
+registry. Unknown predicates and compound objects retain literal keys. SQLite schema 20 preserves
+the original predicate alongside its key, registry revision, and match method. Only the current
+schema is accepted; opening a directory never upgrades an older schema. See
+[predicate stability](research/2026-10-27-predicate-stability.md) for scope and evaluation limits.
+
 The store also records the embedding model, space, dimension, transcription space, configured face
-spaces, and the index recipe. An unrecognized mismatch fails at open instead of mixing
-incompatible state. A known index-only recipe change rebuilds Zvec from stored vectors; a
-recognized embedding recipe upgrade may re-embed records before publishing the new marker.
+spaces, and the index recipe. A mismatch fails at open instead of mixing representations.
+Changing quantization within the current index recipe rebuilds Zvec from stored vectors.
+Changing a model space or using an older index recipe requires a fresh directory and re-ingestion.
 
-Recovery validates all markers before writing any of them. Re-embedding persists an
-`embedding.migration_target` marker before its first batch; the value is canonical JSON of the
-target store markers. A failed or interrupted migration can resume only with that same target.
-The final embedding-space and index-recipe markers and removal of the pending target commit in
-one SQLite transaction. Matching opens do not rewrite marker timestamps. This adds metadata to
-schema 18 without changing tables; finish a pending migration before using an older runtime that
-does not enforce its target. Re-embedding reconstructs exact text selectors through the same
-pure helper as ingestion, preserving partial-source context compilation.
-
-The incomplete schema-17 development operation-log field `linked_clauses` and its separate
-rollback path are removed. Schema 17 was already refused at open. Current schema-18 operations
-continue to use `clause_changes` snapshots and retain historical clause versions on rollback.
+Recovery validates every marker before writing any of them. A nonempty store must contain all
+required markers; face markers can be initialized together when no face analysis has been stored.
+Startup does not infer existing representation identities or re-embed stored content. Matching
+opens leave marker timestamps unchanged. Current operations use `clause_changes` snapshots and
+retain historical clause versions on rollback.
 
 ## Write consistency
 
@@ -275,10 +277,29 @@ bitemporal, symbolic-place, metric-spatial, and memory-type filters pass. Compos
 aggregate embedding plus bounded, de-duplicated text and media keys, and long text contributes
 bounded overlapping contextual keys. A query uses its complete aggregate plus bounded keys focused
 on the first text atom and query media. Dense routes and the lexical route may run concurrently,
-with at most four outer search workers. Every route runs at a fixed candidate depth that does not
-depend on the requested `limit`, so a narrow request returns the prefix of a wider one and each hit
-reports the same score at both. A scope that leaves fewer survivors than the request asked for
-still widens the pool.
+with at most four shared outer search workers per `Memory`, including concurrent requests and
+temporal supplements. Each route starts at a fixed candidate depth independent
+of the requested `limit`. When authoritative filters do not require widening, a narrow request
+returns the prefix of a wider one with the same scores. A scope that leaves too few survivors
+can double the route depth up to `max(initial_depth, 129 * limit)`.
+
+The depth is per route, not a query-wide candidate or latency budget. Different query keys and
+memory types contribute separate routes; temporal queries merge preferred-window and global
+routes. A query has at most eight dense keys. With `K` distinct query vectors, `T` pushed types
+(one when unspecified), and current depth `B`, a hybrid iteration requests at most
+`T * (K + 1) * B` candidates, or twice that with a temporal preference, before deduplication.
+Native index work and record size still affect latency and memory.
+
+Temporal lexical retrieval applies the preferred time window inside Zvec before taking its
+bounded top-k, using the same type, place, identity, and explicit hard-time intersection as the
+dense route. The global fallback retains the soft time preference. It does not double global
+lexical top-k until the corpus is exhausted or materialize all SQLite IDs in the time window.
+SQLite still drops stale candidates and enforces hard filters. Known global lexical scores
+remain unchanged. New preferred-window BM25 hits use the matching global type route's score
+normalizer; rank-fused hits with unknown global ranks are conservatively capped below that
+route's tail. This bounded approximation does not promise identical global ranks for unseen hits.
+See the [temporal lexical evaluation](research/2026-10-27-temporal-lexical-retrieval.md) for
+the Zvec version, quality fixtures, and measurement limits.
 
 Unquantized routes start with 100 parents. Quantized routes retain 200 parents for authoritative
 rescoring; the index does not multiply that expanded group budget again. After SQLite visibility
@@ -293,7 +314,13 @@ match wins ties; otherwise deterministic stored-part order selects the winner. D
 IDs remain the candidates that admitted the parent, distinct from the part that won exact scoring.
 
 Ranking combines the strongest dense evidence with bounded lexical, temporal, ambiguity, and
-optional decay signals. `RetrievalScope` filters apply as authoritative SQLite checks rather than
+optional decay signals. Hybrid lexical coverage measures IDF-weighted overlap of normalized
+words and adjacent-character bigrams. Negative words and bigrams remain evidence under the
+same frequency-based weighting rule as other terms; English contractions retain their `not`
+normalization. A word or bigram cannot establish grammatical polarity, its scope, or its
+object, so coverage has no negation-specific multiplier. Single-character tokens are not
+added. See the [negation evaluation](research/2026-10-27-chinese-negation.md) for paired
+fixtures and limitations. `RetrievalScope` filters apply as authoritative SQLite checks rather than
 projection ranking: `valid_at` and `known_at` select the assertion valid in the world and known to
 the system at those instants, while `near` and `radius_m` compare distance only within a matching
 spatial frame and anchor, with no implicit frame transform.
@@ -336,6 +363,17 @@ information about the question; and the rows a selective read did return stop at
 capability, planner failure, or plan the kernel will not run falls back to the single ranked
 search, which is the default.
 
+By default, `similar(query, k)` reuses the original ranking and ignores a rewritten query.
+`recall_query_expansion` is a separate, disabled experiment: a per-ask reader caches query
+rankings across replans and permits at most two additional searches, including a deeper read
+of the original question when `k` exceeds its initial ranked depth. Each search uses the shared
+retrieval plane with the original scope, memory type, reference clock and temporal intent.
+Alternate queries are text only. After normal grounding, each executed query may add at most
+`limit` novel rows within the existing character and media budgets. Query-local scores are
+never fused with the original ranking. This applies even when a plan contains only `similar`:
+new candidates must reach grounding to affect an answer. The supplemental note explicitly
+withholds completeness. See the [audit and evaluation](research/2026-10-27-semantic-recall.md).
+
 With `evidence_expansion` enabled, the grounded window gains a third source beside the ranking
 and the recall program, and it is the one that costs no model call. After the window is grounded,
 `Answering` reads the records it is structurally linked to -- the capture an observation was
@@ -373,6 +411,16 @@ handle lease and exclude new operations. A maintenance check that needs no work 
 lease. Native mutations and maintenance acquire the process-wide FD lock before a collection
 lease; flush releases its shared lease before taking an exclusive maintenance lease, while
 retaining the process lock so another writer cannot exhaust recovery headroom.
+
+After candidate discovery, retrieval holds the write lock only while reading records, protecting
+candidate media, and starting any FP32 scoring stream. The stream keeps one SQLite WAL snapshot
+across SQL batches; scoring, lexical coverage, and ranking then run outside the write lock.
+The reader closes after scoring, before lexical work. Candidate media leases transfer to
+operation-long leases for selected hits and otherwise end after ranking, including on failure.
+A deletion completed before authoritative hydration excludes the record. A deletion overlapping
+an already hydrated search may finish while that search returns its snapshot; leased media stays
+available until the operation ends, when pending orphan cleanup can remove it. A returned asset
+path does not extend that lease beyond the operation.
 
 `reindex()` reads authoritative SQLite pages, replaces the Zvec collection, then replays the
 outbox so writes committed during the scan are retained. `close()` rejects new work, waits for

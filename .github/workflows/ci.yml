@@ -95,6 +95,8 @@ jobs:
           wheel = next(pathlib.Path("dist").glob("*.whl"))
           sdist = next(pathlib.Path("dist").glob("*.tar.gz"))
           built = set(zipfile.ZipFile(wheel).namelist())
+          if any(pathlib.PurePosixPath(name).name == "AGENTS.md" for name in built):
+              raise SystemExit("built wheel contains contributor instructions")
           with tarfile.open(sdist) as archive:
               packed = set(archive.getnames())
           prefix = sdist.name[: -len(".tar.gz")] + "/src/"
@@ -131,6 +133,8 @@ jobs:
             !**/.venv/**
             !.pytest_cache/**
             !.benchmarks/**
+            !.superpowers/**
+            !docs/superpowers/**
             !.claude/worktrees/**
             !autoresearch/**
 

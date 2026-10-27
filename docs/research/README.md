@@ -13,10 +13,21 @@ the repository. An archived command may require those artifacts or an older chec
 
 | Record | Scope |
 | --- | --- |
+| [Local runtime performance — 2026-10-27](2026-10-27-local-runtime-performance.md) | FP32 buffer scoring, scoped SQLite hydration, exact-result checks, and frozen SDK latency comparisons |
+| [否定敏感检索的论文与开源方案评估 — 2026-10-27](2026-10-27-negation-retrieval-research.md) | Cross-encoder evidence, Chinese subject/scope extraction, exclusion-query methods, implementation status, and MindBridge evaluation priorities |
+| [质量损失分层审查 — 2026-10-27](2026-10-27-quality-diagnostics.md) | Five observed question boundaries, trace correlation, source coverage limits and stratified human annotation |
+| [Top1 ambiguity — 2026-10-27](2026-10-27-top1-ambiguity.md) | R03 reproduction, removal of the lexical route exemption, three-policy risk–coverage probes and correct-candidate losses |
+| [Retrieval critical-section review — 2026-10-27](2026-10-27-retrieval-critical-section.md) | P02 invariants, WAL snapshots, asset lease handoff, forced deletion interleavings, and paired lock-time measurements |
+| [Bounded temporal lexical retrieval — 2026-10-27](2026-10-27-temporal-lexical-retrieval.md) | Corpus-independent route depth, native time-filtered FTS compatibility, and paired synthetic discovery/cost evidence |
+| [STATE 修订的依据强度审查 — 2026-10-27](2026-10-27-state-revision-evidence.md) | Reproduced weak-state supersession, evidence-aware revision contract, deterministic fixtures, and real-model evaluation limits |
+| [Benchmark answer policy and budgets — 2026-10-27](2026-10-27-benchmark-answer-policy.md) | E01 policy confound, aligned readers, refusal accounting, budget/cache corrections, and validation limits |
+| [Controlled semantic recall — 2026-10-27](2026-10-27-semantic-recall.md) | R01 root cause, bounded opt-in query execution, native-index loss decomposition and limits on quality claims |
+| [Evidence selection and provider input boundaries — 2026-10-27](2026-10-27-answer-input-boundaries.md) | R04 review, retained soft evidence packing, complete message-text byte accounting, provider context failure contract, and validation limits |
+| [Formation semantic support audit — 2026-10-27](2026-10-27-semantic-support-audit.md) | Declared provenance versus semantic support, SDK counterexample, recent research, offline metrics and admission-policy promotion criteria |
+| [Negation and lexical evidence — 2026-10-27](2026-10-27-chinese-negation.md) | R02 root cause, pure IDF coverage, paired public-SDK fixtures, and disclosed ranking tradeoffs |
 | [Accuracy-first retrieval — 2026-10-26](2026-10-26-accuracy-first-retrieval.md) | Public SDK retrieval quality, quantization score calibration, candidate breadth and numerical scoring measurements |
 | [MindBridge 在 ATM-Bench 与 Mem-Gallery 上的竞争策略 — 2026-10-26](2026-10-26-atm-mem-gallery-sota-strategy.md) | Current-source review, code audit, protocol differences, and proposed discriminating experiments; no new model results |
 | [Context OS competitor brief — 2026-09-03](2026-09-03-context-os-competitor-brief.md) | Dated source review for fast capture, the memory control plane, and context compilation |
-| [Architecture cohesion audit — 2026-10-26](2026-10-26-architecture-cohesion.md) | Kernel dependency boundaries, safe recovery, and retained or removed compatibility paths |
 | [Zvec 0.8 adoption — 2026-10-26](2026-10-26-zvec-08.md) | Dependency and maintenance measurements, cosine rotation regression, multilingual coverage, and native API limits |
 | [Compact context presentation prototype](compact-context-prototype.md) | Frozen prototype and conv30 measurement; current contract lives in the SDK reference |
 | [Memory backend evaluation — 2026-09-08](2026-09-08-memory-backend-evaluation.md) | Dated analysis or results; retain the stated evidence limits |
@@ -54,9 +65,8 @@ the repository. An archived command may require those artifacts or an older chec
 
 ## Current implementation and experiment boundaries
 
-- [Architecture](../architecture.md) owns the current kernel and storage boundaries; the
-  [cohesion audit](2026-10-26-architecture-cohesion.md) records the recovery and compatibility
-  decisions.
+- [Architecture](../architecture.md) owns the current kernel and storage boundaries;
+  [operations](../operations.md) owns index recovery and store compatibility requirements.
 - [EmbeddingGemma 2 through vLLM](../configuration.md#embeddinggemma-2-through-vllm) and its
   [deployment guide](../deployment.md#embeddinggemma-2-model-server) own the remote model recipe.
 - [Independent evidence](../memory-types-time-and-decay.md#experimental-independent-evidence)

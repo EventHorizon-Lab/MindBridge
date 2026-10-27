@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from mindbridge.benchmarks.eval_config import _JudgeConfig
 from mindbridge.benchmarks.eval_judge import _judge_call
-from mindbridge.benchmarks.eval_results import SampleResult
+from mindbridge.benchmarks.eval_results import EVAL_SCHEMA_VERSION, SampleResult
 from mindbridge.benchmarks.icm_bench import load_icm_bench
 from mindbridge.benchmarks.official_scorers import (
     SCORER_VERSION,
@@ -50,7 +50,18 @@ def load_predictions(path: Path) -> tuple[dict[str, object], ...]:
         row = json.loads(line)
         if not isinstance(row, dict):
             raise ValueError("predictions must be JSONL objects")
-        for key in ("sample_id", "task", "unit_id", "question_id", "dataset_sha256"):
+        if row.get("schema_version") != EVAL_SCHEMA_VERSION:
+            raise ValueError("saved prediction schema version is unsupported")
+        for key in (
+            "sample_id",
+            "task",
+            "unit_id",
+            "question_id",
+            "dataset_sha256",
+            "evaluation_sha256",
+            "arm",
+            "source_question",
+        ):
             _text(row, key)
         if row["task"] != "icm-bench":
             raise ValueError("rejudge input must contain only icm-bench samples")
@@ -68,9 +79,9 @@ def load_predictions(path: Path) -> tuple[dict[str, object], ...]:
 def attach_questions(
     rows: Sequence[Mapping[str, object]], annotations: Path
 ) -> tuple[dict[str, object], ...]:
-    """Join original questions by ID and verify saved references and available question text.
+    """Join original questions by ID and verify saved references and question text.
 
-    Old generation prompts may include task templates; never reverse-engineer them into the
+    Generation prompts may include task templates; never reverse-engineer them into the
     original judge question. The annotation digest is recorded separately from the evaluation
     corpus digest, whose upstream definition may also include media.
     """
@@ -82,16 +93,13 @@ def attach_questions(
             raise ValueError("saved question_id is absent from ICM annotations")
         if _references(row) != (question.reference_answer,):
             raise ValueError("saved references disagree with ICM annotations or were not logged")
-        saved_question = row.get("source_question")
-        if saved_question is not None and saved_question != question.question:
+        if _text(row, "source_question") != question.question:
             raise ValueError("saved source_question disagrees with ICM annotations")
         matched.append(
             {
                 **row,
                 "source_question": question.question,
-                "question_binding": "id_reference_and_text"
-                if saved_question is not None
-                else "legacy_id_and_reference",
+                "question_binding": "id_reference_and_text",
             }
         )
     return tuple(matched)
@@ -148,7 +156,7 @@ async def _judge_row(
         task="icm-bench",
         benchmark="icm-bench",
         dataset_sha256=str(row["dataset_sha256"]),
-        evaluation_sha256=str(row.get("evaluation_sha256", "")),
+        evaluation_sha256=_text(row, "evaluation_sha256"),
         unit_id=str(row["unit_id"]),
         question_id=str(row["question_id"]),
         prediction=str(row["prediction"]),
@@ -161,7 +169,7 @@ async def _judge_row(
         ingest_failure_count=0,
         error_code=None,
         metadata={},
-        arm=str(row.get("arm", "mindbridge")),
+        arm=_text(row, "arm"),
     )
     try:
         scores, response, _cached = await _judge_call(

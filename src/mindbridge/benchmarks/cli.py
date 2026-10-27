@@ -24,6 +24,10 @@ RUNNERS: dict[str, tuple[str, str]] = {
         "mindbridge.benchmarks.local_index_benchmark",
         "Measure SQLite and Zvec ingestion and recall",
     ),
+    "review-samples": (
+        "mindbridge.benchmarks.eval_review",
+        "Export stratified questions for human evidence review",
+    ),
     "locomo-refined": (
         "mindbridge.benchmarks.locomo_refined_cli",
         "Run official LoCoMo-Refined",

@@ -28,7 +28,6 @@ def test_hardware_metadata_records_reproducible_gpu_facts(
 
     assert metadata["cpu_model"] == "Fixture CPU"
     assert metadata["ram_total_bytes"] == 64 * 1024**3
-    assert metadata["cuda_device_uuids"] == {"0": "GPU-one", "1": "GPU-two"}
     assert metadata["gpus"] == [
         {
             "index": 0,
@@ -58,7 +57,6 @@ def test_hardware_metadata_handles_missing_nvidia_smi(monkeypatch: pytest.Monkey
     metadata = eval_environment.hardware_metadata()
 
     assert metadata["gpus"] == []
-    assert metadata["cuda_device_uuids"] == {}
 
 
 def test_source_metadata_distinguishes_clean_dirty_and_unavailable(

@@ -140,9 +140,9 @@ class RunOverrides(_HarnessModel):
     """Run tunables the command line also exposes, so one file can describe a whole sweep.
 
     Every field is optional and mirrors the flag of the same name. A flag still wins, because a
-    flag is typed for one run while a file is reused across many. Only three kinds of input stay
-    command-line-only: the `--model` literal, the modes that do something other than evaluate
-    (`--list-tasks`, `--check-integrity`), and the `--model-args`/`--gen-kwargs`/
+    flag is typed for one run while a file is reused across many. Command-line-only inputs include
+    the modes that do something other than evaluate (`--list-tasks`, `--check-integrity`)
+    and the `--model-args`/`--gen-kwargs`/
     `--judge-model-args` strings, whose settings each already have a typed home elsewhere in this
     file.
     """
@@ -168,7 +168,6 @@ class RunOverrides(_HarnessModel):
     # `all`, -1, a 0-1 fraction, or a count -- normalised by the same rule as the flag.
     limit: int | float | str | None = None
     offset: Annotated[int, Field(strict=True, ge=0)] | None = None
-    num_fewshot: Annotated[int, Field(strict=True, ge=0)] | None = None
     batch_size: str | None = None
     max_batch_size: Annotated[int, Field(strict=True, gt=0)] | None = None
     unit_concurrency: Annotated[int, Field(strict=True, gt=0)] | None = None

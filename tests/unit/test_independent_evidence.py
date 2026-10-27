@@ -177,15 +177,16 @@ def test_projection_policy_is_pinned_across_reopen(tmp_path: Path, independent: 
         pass
 
 
-def test_unmarked_existing_legacy_store_cannot_switch_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("independent", [False, True])
+def test_nonempty_store_without_policy_marker_is_rejected(
+    tmp_path: Path, independent: bool
+) -> None:
     with _open(tmp_path, False) as memory:
-        _root(memory, "legacy record")
+        _root(memory, "preserved record")
     with LocalStore(tmp_path) as store:
         store.delete_metadata("evidence.projection_recipe")
     with pytest.raises(StorageError, match=r"evidence\.projection_recipe"):
-        _open(tmp_path, True)
-    with _open(tmp_path, False) as memory:
-        assert memory.list().items
+        _open(tmp_path, independent)
 
 
 def test_unmarked_empty_store_can_select_candidate(tmp_path: Path) -> None:

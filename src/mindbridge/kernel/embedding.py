@@ -54,9 +54,6 @@ from mindbridge.types import (
 DOCUMENT_TASK = EmbedTask.DOCUMENT.value
 
 
-_REEMBED_PAGE_SIZE = 32
-
-
 MAX_RETRIEVAL_KEYS = 128
 
 
@@ -464,78 +461,3 @@ class Embedding(Traced):
             )
         )
         return updated, embeddings
-
-    def reembed_memories(self) -> None:
-        after: tuple[datetime, str] | None = None
-        while True:
-            with translate_storage_errors("read memories for embedding migration"):
-                memories = self._store.records.list_memories(limit=_REEMBED_PAGE_SIZE, after=after)
-            if not memories:
-                return
-            prepared = tuple(
-                (
-                    memory,
-                    PreparedContent(
-                        text=memory.content,
-                        assets=memory.assets,
-                        modality=Modality(memory.modality),
-                        # Same reason as `_refresh_speech_memories`: an embedder swap has to
-                        # re-key each stored row the way `add()` keyed it, section by section.
-                        canonical_parts=stored_canonical_parts(
-                            memory.content,
-                            memory.assets,
-                        ),
-                        audio_transcript=has_stream_transcript(
-                            memory.content,
-                            memory.assets,
-                        ),
-                        visual_description=has_stream_description(
-                            memory.content,
-                            memory.assets,
-                        ),
-                    ),
-                )
-                for memory in memories
-            )
-            selector_maps = {
-                memory.memory_id: text_selector_map(
-                    content,
-                    raw_observation=(
-                        memory.context is None or memory.context.kind is MemoryKind.OBSERVATION
-                    ),
-                )
-                for memory, content in prepared
-            }
-            parts = tuple(
-                (memory, object_part, model_input)
-                for memory, content in prepared
-                for object_part, model_input in enumerate(self.inputs(content))
-            )
-            vectors = self.embed(
-                tuple(model_input for _memory, _part, model_input in parts),
-                task=EmbedTask.DOCUMENT,
-            )
-            now = datetime.now(timezone.utc)
-            embeddings = tuple(
-                StoredEmbedding(
-                    embedding_id=embedding_row_id(memory.memory_id, object_part),
-                    memory_id=memory.memory_id,
-                    values=vector,
-                    model_id=self._backends.embedding_model,
-                    space_id=self._backends.space_id,
-                    task=DOCUMENT_TASK,
-                    created_at=now,
-                    object_part=object_part,
-                    normalized=True,
-                    text_selectors=selector_maps[memory.memory_id].get(model_input, ()),
-                )
-                for (memory, object_part, model_input), vector in zip(
-                    parts,
-                    vectors,
-                    strict=True,
-                )
-            )
-            with translate_storage_errors("replace migrated embeddings"):
-                self._store.records.replace_memory_embeddings(memories, embeddings)
-            last = memories[-1]
-            after = (last.created_at, last.memory_id)

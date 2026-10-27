@@ -22,6 +22,7 @@ from pydantic import SecretStr
 if TYPE_CHECKING:
     pass
 from mindbridge import MindBridgeConfig
+from mindbridge.benchmarks.eval_adapters import MediaManifest
 from mindbridge.benchmarks.eval_config import (
     _CONFIG_FILE,
     _PARTIAL_SAMPLES_FILE,
@@ -166,7 +167,7 @@ def _secret_free_yaml_value(value: object) -> object:
         # Defensive fallback for a future credential field whose name is not yet `api_key`.
         return "<redacted>"
     if isinstance(value, str):
-        # A gateway URL can carry basic-auth userinfo; `base_url` and the raw `--model_args`
+        # A gateway URL can carry basic-auth userinfo; `base_url` and the raw `--model-args`
         # string both reach this manifest, so the credential is cut out of the URL itself.
         return _URL_USERINFO.sub("", value)
     return value
@@ -194,12 +195,15 @@ def _atomic_replace(files: Sequence[tuple[Path, bytes]]) -> None:
 
 
 def _merged_manifest(
-    manifest: Mapping[str, object] | None,
+    manifest: MediaManifest | None,
     manifest_directory: Path | None,
     generated: Mapping[str, object],
 ) -> dict[str, object]:
     payload = cast(
-        dict[str, object], _absolute_manifest_paths(dict(manifest or {}), manifest_directory)
+        dict[str, object],
+        _absolute_manifest_paths(
+            {} if manifest is None else json.loads(manifest.source_json), manifest_directory
+        ),
     )
     tasks = payload.get("tasks")
     merged = dict(tasks) if isinstance(tasks, dict) else {}

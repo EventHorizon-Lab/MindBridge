@@ -12,7 +12,7 @@ import logging
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Protocol
 
 from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.kernel.content import PreparedContent, prepared_modalities
@@ -272,7 +272,6 @@ class Backends:
     embedding_capabilities: frozenset[Modality]
     embedding_model: str
     space_id: str
-    legacy_embedding_spaces: frozenset[str]
     embedding_dimension: int
     generation_capabilities: frozenset[Modality]
     transcription_capabilities: frozenset[Modality]
@@ -336,9 +335,6 @@ def resolve_backends(
         embedding_capabilities=embedding_capabilities,
         embedding_model=embedding_model,
         space_id=space_id,
-        legacy_embedding_spaces=cast(
-            frozenset[str], getattr(embedder, "_legacy_embedding_spaces", frozenset())
-        ),
         embedding_dimension=embedding_dimension,
         generation_capabilities=generation_capabilities,
         transcription_capabilities=transcription_capabilities,

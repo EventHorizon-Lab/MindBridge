@@ -1,0 +1,130 @@
+{
+  "scope": "local runtime optimization; no model services or retrieval-policy changes",
+  "baseline_head": "b6b5ad280404216d04f2f4bd972a90966e0c377b",
+  "baseline": "frozen working-copy snapshot, including pre-existing uncommitted work",
+  "baseline_sha256": {
+    "src/mindbridge/infrastructure/local/scoring.py": "f1e3fd313a0061be884266cf686777872cb7e408959d50f33793b5aacdb92346",
+    "src/mindbridge/infrastructure/local/store/index.py": "d6689ac82241bb23ebdc7d8a00c6b119853a2599171bcca7b50970ec59e9a3d4",
+    "src/mindbridge/infrastructure/local/store/records.py": "ce8d8e6821b8499473ee2ab29f363a6667665afdfec6f940c91bffa0a5dc6484",
+    "src/mindbridge/kernel/retrieval.py": "3d848f20f8519f0c0349e99d914ac8300c2c6e4e267c8e93b12c9f8e16a626e5"
+  },
+  "candidate_sha256": {
+    "src/mindbridge/infrastructure/local/scoring.py": "6d11d440c093b03f0d88e8f7f5e1ded69c012650079a9143b9f71516d7a6da99",
+    "src/mindbridge/infrastructure/local/store/index.py": "8b52da515946991a6f9a9f040f39d5716ae6a54f87a85dd2cdce1c10cf09226f",
+    "src/mindbridge/infrastructure/local/store/records.py": "113e8bc90f3ef1c93afe5e5c5ae6c769614f741967746195d8516ec9a41d902c",
+    "src/mindbridge/kernel/retrieval.py": "f5c152c99af57a3b34541c9c1a1d5a2eb3ffdd180771661cb21daec7edc9fda2"
+  },
+  "python": "3.12.14",
+  "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+  "sdk_fixture": {
+    "revision": "local-perf-fixture-v1",
+    "rows": 2000,
+    "dimension": 1024,
+    "quantization": "int8",
+    "seed": "first 8 little-endian SHA256 bytes of each text",
+    "provider_services": false,
+    "warmups": 5,
+    "measured_searches": 31,
+    "pairs": 3
+  },
+  "kernel_fixture": {
+    "revision": "fp32-buffer-v1",
+    "seed": 20261027,
+    "alternating_pairs": 15,
+    "rows_dimensions": [
+      [
+        128,
+        1024
+      ],
+      [
+        512,
+        2048
+      ]
+    ],
+    "query_keys": [
+      1,
+      4,
+      8
+    ]
+  },
+  "sqlite_fixture": {
+    "revision": "scoped-hydration-v1",
+    "rows": 1000,
+    "assets_per_record": 1,
+    "alternating_pairs": 15,
+    "reads_per_sample": 3,
+    "physical_files_read": false
+  },
+  "cpu": "Intel Xeon Gold 6230R",
+  "numpy": "2.3.5",
+  "sqlite": "3.53.1",
+  "zvec": "0.8.0",
+  "sdk_candidate_files": [
+    "src/mindbridge/infrastructure/local/scoring.py",
+    "src/mindbridge/infrastructure/local/store/index.py",
+    "src/mindbridge/kernel/retrieval.py"
+  ],
+  "sqlite_candidate_files": [
+    "src/mindbridge/infrastructure/local/store/records.py"
+  ],
+  "rejected_attempts": [
+    {
+      "change": "in-place normalization only",
+      "verdict": "not retained; no clear gain",
+      "repetitions_per_measurement": 100,
+      "shape": [
+        128,
+        1024
+      ],
+      "baseline_seconds": [
+        0.5479447050020099,
+        0.6132051660024445,
+        0.5604332820003037
+      ],
+      "candidate_seconds": [
+        0.5440238369992585,
+        0.5792132189963013,
+        0.5492247869988205
+      ]
+    }
+  ],
+  "validation": {
+    "pytest_full": {
+      "passed": 3054,
+      "skipped": 12,
+      "seconds": 455.51,
+      "warnings_as_errors": true
+    },
+    "pytest_storage_retrieval": {
+      "passed": 702,
+      "seconds": 144.63
+    },
+    "pytest_new_tests": {
+      "passed": 22
+    },
+    "lock_check": "passed",
+    "ruff_format": "passed",
+    "ruff_lint": "passed",
+    "mypy": {
+      "checked_files": 283,
+      "errors": 0
+    },
+    "diff_check": "passed",
+    "markdownlint": {
+      "files": 369,
+      "errors": 0
+    },
+    "new_report_links": {
+      "links": 64,
+      "errors": 0
+    },
+    "whole_workspace_links": {
+      "links": 930,
+      "ok": 921,
+      "redirects": 8,
+      "timeouts": 1,
+      "invalid_errors": 0,
+      "timeout_url": "https://www.w3.org/TR/skos-reference/#mapping"
+    }
+  }
+}

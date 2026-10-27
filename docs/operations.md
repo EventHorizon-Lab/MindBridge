@@ -17,6 +17,43 @@ Before first deployment or after composition changes, use the CLI doctor describ
 [command-line reference](api/cli.md#doctor-and-explain). It checks configuration and loaders
 without writing memory. A remote doctor checks the REST liveness endpoint.
 
+## Concurrency and overload
+
+Each physical `data_dir` owns its admission limits and workers. The fixed runtime bounds are:
+
+| Resource | Limit |
+| --- | --- |
+| Active memory operations across SDK, REST, and MCP | 32 |
+| Submitted asynchronous SDK calls, including running calls | 32 |
+| Pinned answer-stream workers shared by AsyncMemory and REST | 8 |
+| Shared index-route workers | 4 |
+| Shared speech-overlap workers | 2 |
+| SQLite connections, including borrowed and idle handles | 32 |
+| Active `/v1` HTTP requests per application, including body reads and streams | 32 |
+
+Admission is immediate: overload raises `StorageError(reason="capacity_exceeded",
+stage="admission")`, which is retryable. REST returns the shared 503 envelope with
+`Retry-After: 1`; MCP reports the same reason and retryability. Apply bounded backoff when
+retrying. `/healthz` remains outside request admission.
+
+Index routes use batches of at most four per admitted operation; temporal supplements reuse
+the same pool. At most 128 route jobs and 32 speech-overlap jobs can be pending or running.
+Parent asynchronous calls use a separate pool so they cannot occupy the workers their child
+routes need. Cancelling an asynchronous waiter retains capacity until its synchronous work
+actually stops. Stream workers remain pinned through queued cleanup and are reusable before
+the terminal result is delivered. Close an abandoned stream with `close()` or `aclose()`.
+
+These bounds prevent request count from multiplying MindBridge-owned workers and connections.
+They are not a host-wide thread or memory limit: separate directories, caller-owned threads,
+native model/Zvec workers, backend request sizes, and provider quotas still need host sizing.
+The limits are conservative safety bounds, not measured optimal throughput settings.
+Use backend timeouts and bound the host's own producers. At the HTTP server boundary,
+Uvicorn's [concurrency limit](https://uvicorn.dev/server-behavior/#resource-limits) can
+also reject excess requests based on open connections and in-flight tasks. A worker count alone
+does not bound queued submissions;
+Python's [executor documentation](https://docs.python.org/3/library/concurrent.futures.html)
+also describes nested-pool deadlocks and cancellation limits.
+
 ## Health
 
 The REST adapter exposes an unauthenticated liveness endpoint outside `/v1`:
@@ -87,16 +124,9 @@ replays the queue without embedding historical content again. An unsupported sch
 unrecognized model, vector-space, dimension, analysis-space, or index-recipe mismatch fails at
 open instead of mixing state.
 
-Restore with the original MindBridge version and configuration first. A backup is the only way
-forward across a schema change, because a directory is never converted in place. Perform an
-upgrade as a separate backed-up step because a recognized embedding recipe migration may
-re-embed records.
-
-If a recognized embedding migration fails, reopen with the same target model and settings to
-retry it. The durable `embedding.migration_target` marker blocks a different target while the
-directory may contain partially migrated vectors. Leave that marker in place; successful
-recovery removes it atomically with the final space and index markers. Finish recovery before
-downgrading to a runtime that does not check the pending target, or restore the complete backup.
+Restore with the MindBridge version and configuration that wrote the backup. The current runtime
+accepts only its own schema and model spaces. To use another schema or embedding recipe, read the
+source data with its original runtime and re-ingest it into a fresh directory.
 
 ## Index maintenance and repair
 
@@ -194,7 +224,7 @@ zvec.init(query_threads=4, optimize_threads=2, memory_limit_mb=2048)
 ```
 
 MindBridge does not call `zvec.init()`. Account for several focused dense routes plus one lexical
-route, with at most four outer search workers per search. Keep `IndexQuantization.NONE` unless
+route, with at most four shared outer search workers per `Memory`. Keep `IndexQuantization.NONE` unless
 measured capacity and retrieval results justify a lossy mode. Changing only quantization rebuilds
 Zvec from stored vectors; `RABITQ` requires dimensions from 64 through 4095 and native support.
 Quantized structures coexist with the FP32 vectors. Historical Zvec 0.7 measurements over ten
@@ -397,6 +427,15 @@ Watch these degradation and recognition attributes:
   describe one `mindbridge.recall` stage, present only when `recall_planning` is on. Every
   planning failure resolves to the same fallback plan, so `fallback` is the only signal that the
   planner did not decide that question, and `complete` is what licenses a count over the set.
+- Experimental `recall_query_expansion` adds a `mindbridge.recall.ground` stage.
+  `mindbridge.recall.query_count`, `query_failures`, and `query_limited` are cumulative per ask;
+  use the final round rather than summing them. Other `mindbridge.recall.query_*` counts describe
+  that round: `candidates` is the distinct returned query hits, `new_candidates` excludes the
+  original ranked pool, `selected` counts novel hits offered after per-query row caps,
+  `grounded` counts actual additions, `budget_dropped` counts selected hits rejected by character
+  or media caps, and `omitted` counts all novel query hits left out. A zero `new_candidates`
+  means no expansion beyond the original pool, not proof of corpus completeness. These counts
+  precede provider-side media packing and cannot establish correct reader use.
 - `mindbridge.formation.refused_proposals` counts the proposals the kernel refused to ground,
   totalled over the whole operation span and present only when formation ran; the model adapter's
   `mindbridge.formation.dropped_proposals` counts the ones it could not read at all.
@@ -458,7 +497,27 @@ and media selection. The local aggregate reports remain under `.benchmarks/opena
 These synthetic checks do not establish benchmark gains or parity with other model deployments;
 live EmbeddingGemma 2 through vLLM was not verified.
 
-## Upgrade
+The formation-time fixture `mindbridge-formation-time-v1` independently tests the snapshot
+`gpt-5-mini-2025-08-07` with strict JSON Schema and a 4096-token output budget. Its synthetic
+source says “I moved to Paris yesterday” with observation time `2026-03-02T12:00:00Z`, no typed
+validity, and no history. The four cases cover observation time despite later creation, creation
+time as the fallback, no reference time, and an embedded instruction to use a fabricated date.
+Each runs three times. Dated cases must produce an event whose `valid_from` is March 1; the case
+without a reference must omit temporal bounds. Every repeat must pass. Run it explicitly with:
+
+```bash
+MINDBRIDGE_FORMATION_TIME_EVAL=1 uv run --frozen pytest -W error -rP \
+  tests/integration/test_formation_time_quality.py
+```
+
+Only fixture IDs, case IDs, repeat numbers, and configured/returned model identifiers are printed.
+On 2026-10-27 the credential-free regression reproduced the prior March 2 fallback and verified
+timestamp propagation and persistence of the resolved March 1 date after the fix. The real-model
+formation fixture and an equivalent real-model baseline comparison were not run because no
+service credentials were configured. Transport fixtures establish no model-quality improvement;
+run the credentialed checks before making that claim.
+
+## Changing the runtime or stored representations
 
 Before changing MindBridge, model revisions, vector dimensions, transcription or face recipes, or
 index settings:
@@ -466,20 +525,25 @@ index settings:
 1. Create and restore-test a backup.
 2. Stop the owner.
 3. Upgrade code and configuration together.
-4. Start one owner and let only recognized recipe migrations run.
+4. Start one owner with matching schema and model identities, or re-ingest into a fresh directory.
 5. Verify records, media, retrieval, and telemetry before restoring traffic.
 
-Never bypass compatibility checks by editing `PRAGMA user_version`, `store_metadata`, or the
+Never bypass identity and schema checks by editing `PRAGMA user_version`, `store_metadata`, or the
 outbox.
 
-**There is no schema upgrade path.** A data directory carrying any schema version other than the
-one this build writes is refused on open, with the version it found in the message; it is never
-converted in place. To move a store to a newer MindBridge, export it with the version that wrote
-it and re-ingest, or keep that version installed to read the directory. The refusal is permanent
-rather than transient, so a retry never starts working.
+**Only SQLite schema 20 is accepted.** Startup validates required tables, constraints, and
+predicate provenance before admitting the store. It never upgrades an older schema or re-embeds
+stored content. A nonempty store must contain all required identity and evidence-policy markers.
+The optional face backend can be enabled for the first time when no face analysis or face-space
+markers exist; startup records its two space identities together.
+
+`memory_semantics.predicate` retains the original model wording; `predicate_key`,
+`predicate_registry`, and `predicate_match` record the stable identifier, registry revision, and
+resolution method. Custom lineage IDs remain unchanged. Rebuilding Zvec cannot change semantic
+keys, evidence policy, or model spaces.
 
 Current clauses remain the authoritative `OR` of complete `AND` member sets; the flat
-`memory_evidence` rows are their compatibility union. Zvec remains derived: rebuilding a missing
+`memory_evidence` rows project their active members. Zvec remains derived: rebuilding a missing
 index reads the SQLite embeddings and current clause projection without calling the embedding
 model again.
 
@@ -493,10 +557,11 @@ A derived record whose basis is not a host assertion is visible only while it ha
 evidence clause. Such a record stays stored and readable by ID, but drops out of retrieval until
 evidence is added or it is deleted.
 
-Schema 18 declares `embedding_text_selectors` and `embedding_text_span_pieces`. A selector belongs
+The schema declares `embedding_text_selectors` and `embedding_text_span_pieces`. A selector belongs
 to one pure-text raw embedding part and stores a parent-content digest, reconstructed
 embedding-input digest, recipe, and ordered code-point ranges with piece digests. It does not
-duplicate parent text. Reopening a schema-18 store is idempotent. A partial or incompatible
+duplicate parent text. Reopening a current-schema store is idempotent.
+A partial or incompatible
 selector-table shape is refused after checking primary keys, foreign keys, check constraints, and
 the piece index, and nothing is written. Deleting an embedding cascades its selectors. Zvec rebuild
 reads existing SQLite vectors and does not create selectors or re-embed content.

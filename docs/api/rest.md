@@ -409,8 +409,7 @@ An excerpt is an exact partial rendering of a newly written raw text observation
 `MemoryResponse`. The response retains the parent and piece digests for machine verification;
 `rendered` shows the parent memory ID, code-point offsets, source timing, and a warning that omitted
 text may qualify the excerpt, while omitting the digests and `matched_index_id` from model-facing
-text. Older clients that ignore the additive `excerpts` array continue to receive complete hit
-arrays unchanged.
+text. The `hits` array contains complete records; partial source text appears only in `excerpts`.
 
 `ContextRequest.allow_partial_sources` must be explicitly true to select excerpts. Its default
 false preserves full-record-only compilation and avoids selector reads; `excerpts` remains an
@@ -507,20 +506,24 @@ are never serialized.
 | `memory_not_found` | `memory_not_found` |
 | `speaker_not_found` | `speaker_not_found` |
 | `identity_not_found` | `identity_not_found` |
-| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `provider_unavailable`, `timeout`, `connection_failed`, `request_rejected`, `model_refused`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed`, `model_failed` |
+| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `provider_unavailable`, `timeout`, `connection_failed`, `request_rejected`, `context_length_exceeded`, `model_refused`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed`, `model_failed` |
 | `model_output_truncated` | `output_truncated` |
-| `storage_error` | unset, `data_dir_in_use`, `schema_unsupported`, `io_failed`, `flush_failed`, `instance_unusable` |
+| `storage_error` | unset, `capacity_exceeded`, `data_dir_in_use`, `schema_unsupported`, `io_failed`, `flush_failed`, `instance_unusable` |
 | `index_unavailable` | unset, `index_missing` |
 | `mindbridge_error` | unset |
 | `internal_error` | `unexpected` |
 | `not_found`, `method_not_allowed`, `http_error` | unset |
 
-`retryable` is true only for `connection_failed`, `data_dir_in_use`, `flush_failed`,
+`retryable` is true only for `capacity_exceeded`, `connection_failed`, `data_dir_in_use`, `flush_failed`,
 `index_missing`, `provider_unavailable`, `rate_limited`, and `timeout`. A retryable 503 response
 includes `Retry-After: 1`.
 
 `model_refused` is an explicit provider refusal, not malformed output or insufficient retrieved
 evidence. It is permanent for that request and never includes the provider's refusal text.
+`context_length_exceeded` is a provider-declared context overflow, also permanent. Reduce the
+answer evidence or select a provider with sufficient capacity; an identical retry cannot fix it.
+Answer requests are not retried after silently trimming evidence. This reason is distinct from
+the adapter's byte-based `payload_too_large` and the output limit's `output_truncated`.
 `quota_exhausted` includes exhausted credits and provider project or organization spend/usage
 limits. `provider_unavailable` covers temporary upstream server failures after the SDK's own retry
 budget; callers still need a bounded retry policy. See OpenAI's
@@ -536,12 +539,12 @@ in both directions, so a client can act on the status without also reading the r
 | --- | --- |
 | 404 | unknown route; `memory_not_found`, `speaker_not_found`, `identity_not_found` |
 | 405 | method not allowed |
-| 413 | `payload_too_large`, whether the `/v1` request body exceeded 8 MiB or a configured backend rejected one asset as too large |
+| 413 | `context_length_exceeded` for provider context overflow; `payload_too_large` for byte-based request or backend payload limits |
 | 422 | `input_invalid`, `unsupported_modality` |
 | 500 | `unexpected`, `schema_unsupported`, `io_failed`, `instance_unusable`, or a generic `MindBridgeError` with no reason |
 | 501 | `backend_not_configured` |
 | 502 | `auth_failed`, `quota_exhausted`, `request_rejected`, `model_refused`, `response_invalid`, `output_truncated`, `asset_unavailable`, `asset_changed`, `model_failed`, or a `model_error` with no reason |
-| 503 | `connection_failed`, `timeout`, `rate_limited`, `provider_unavailable`, `data_dir_in_use`, `flush_failed`, `index_missing`, or a `storage_error` with no reason |
+| 503 | `capacity_exceeded`, `connection_failed`, `timeout`, `rate_limited`, `provider_unavailable`, `data_dir_in_use`, `flush_failed`, `index_missing`, or a `storage_error` with no reason |
 
 Two rows are worth stating explicitly, because both used to answer twice. `payload_too_large` is
 one condition seen from two sides and both are fixed by sending less, so the provider path no

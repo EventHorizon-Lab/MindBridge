@@ -28,6 +28,7 @@ from mindbridge.infrastructure.local.store._corroboration import (
     independent_evidence_enabled,
 )
 from mindbridge.infrastructure.local.store._outbox import queue_memory_embeddings
+from mindbridge.infrastructure.local.store._predicates import predicate_binding
 from mindbridge.infrastructure.local.store.errors import StaleOperationError
 from mindbridge.infrastructure.local.store.rows import (
     StoredEvidenceClauseChange,
@@ -35,6 +36,8 @@ from mindbridge.infrastructure.local.store.rows import (
     canonical_object_json,
     require_identifier,
 )
+from mindbridge.kernel.corroboration import Assessment
+from mindbridge.kernel.predicates import PREDICATE_REGISTRY_VERSION
 from mindbridge.types import EvidenceBasis, MemoryContext, MemoryKind
 
 
@@ -74,6 +77,18 @@ def write_memory_context(
         if existing is not None
         else context.lineage_id or memory_id
     )
+    spatial = context.spatial
+    predicate_key, predicate_match = predicate_binding(
+        lineage_id,
+        kind=context.kind.value,
+        basis=context.basis.value,
+        predicate=context.predicate,
+        value=context.value,
+        subject=context.subject,
+        identity_id=context.identity_id,
+        frame_id=None if spatial is None else spatial.frame_id,
+        anchor=None if spatial is None else spatial.anchor.value,
+    )
     recorded_at = _next_lineage_transaction_time(
         connection,
         context_recorded_at,
@@ -83,18 +98,18 @@ def write_memory_context(
     )
     valid_from = context.valid_from
     valid_until = context.valid_until
-    spatial = context.spatial
     orientation = None if spatial is None else spatial.orientation_xyzw
     connection.execute(
         """
         INSERT OR IGNORE INTO memory_semantics (
             memory_id, lineage_id, kind, basis, source_id,
             subject, predicate, value, model_id, recipe, identity_id,
+            predicate_key, predicate_registry, predicate_match,
             cue_modality, valence, arousal,
             spatial_frame_id, spatial_anchor, spatial_x, spatial_y, spatial_z,
             spatial_qx, spatial_qy, spatial_qz, spatial_qw, spatial_uncertainty_m
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         (
@@ -109,6 +124,9 @@ def write_memory_context(
             context.model_id,
             context.recipe,
             context.identity_id,
+            predicate_key,
+            PREDICATE_REGISTRY_VERSION,
+            predicate_match,
             None if context.cue_modality is None else context.cue_modality.value,
             context.valence,
             context.arousal,
@@ -139,11 +157,28 @@ def write_memory_context(
     # a STATE performs its lineage reconciliation in the same atomic formation transaction. The
     # later clause insertion recomputes the same projection from durable rows. A joint witness is
     # still one assessment, so it does not clear the two-group TRAIT/naming threshold.
-    evidence_count = (
-        1
+    evidence_count, confidence = (
+        (1, context.confidence)
         if not write_evidence and context.evidence_ids
-        else _evidence_summary(connection, memory_id)[0]
+        else _evidence_summary(connection, memory_id)
     )
+    if (
+        context.kind is MemoryKind.STATE
+        and not write_evidence
+        and context.evidence_ids
+        and independent_evidence_enabled(connection)
+    ):
+        support = evidence_support(
+            connection,
+            memory_id,
+            pending_assessment=Assessment(
+                sources=context.evidence_ids,
+                confidence=context.confidence,
+            ),
+        )
+        evidence_count, confidence = support.count, support.confidence
+    if not context.evidence_ids:
+        confidence = context.confidence
     # Decided against the lineage as it stands, before this write retires anything: an assertion
     # nobody can see must not be what displaces the standing one, and the explicit statement that
     # suppresses a guess only counts while it is still unretired.
@@ -175,6 +210,8 @@ def write_memory_context(
             memory_id,
             lineage_id=lineage_id,
             kind=context.kind.value,
+            basis=context.basis.value,
+            confidence=confidence,
             recorded_at=recorded_at,
             supersedes_id=supersedes_id,
             valid_from=valid_from,
@@ -215,6 +252,8 @@ def _retire_displaced_lineage(
     *,
     lineage_id: str,
     kind: str,
+    basis: str,
+    confidence: float,
     recorded_at: datetime,
     supersedes_id: str | None,
     valid_from: datetime | None,
@@ -231,7 +270,7 @@ def _retire_displaced_lineage(
     old_rows = connection.execute(
         """
         SELECT
-            s.memory_id, v.version, v.confidence, v.valid_from, v.valid_until,
+            s.memory_id, s.basis, v.version, v.confidence, v.valid_from, v.valid_until,
             v.recorded_at, v.visible, v.supersedes_id
         FROM memory_semantics AS s
         JOIN memory_versions AS v ON v.memory_id = s.memory_id
@@ -251,6 +290,13 @@ def _retire_displaced_lineage(
             transaction_memory_ids is not None
             and row_text(old, "memory_id") in transaction_memory_ids
         ) or not _intervals_overlap(valid_from, valid_until, old_from, old_until):
+            continue
+        if kind == MemoryKind.STATE.value and not _state_can_supersede(
+            basis,
+            confidence,
+            row_text(old, "basis"),
+            float(old["confidence"]),
+        ):
             continue
         tx_time = max(recorded_at, old_recorded + timedelta(microseconds=1))
         recorded_at = tx_time
@@ -282,6 +328,30 @@ def _retire_displaced_lineage(
             )
         supersedes_id = supersedes_id or row_text(old, "memory_id")
     return recorded_at, supersedes_id
+
+
+def _state_can_supersede(
+    basis: str,
+    confidence: float,
+    previous_basis: str,
+    previous_confidence: float,
+) -> bool:
+    """Compare proposal authority first, then support within the same authority tier.
+
+    An ambiguous alternative remains a conflict; merely arriving later cannot withdraw stronger
+    evidence. The derived claim's own basis matters, never the basis of its raw observation.
+    Confidence is an operational support score, not a calibrated probability of a state change.
+    """
+    assertions = {EvidenceBasis.USER_STATEMENT.value, EvidenceBasis.RESPONSE_FEEDBACK.value}
+    explicit = basis in assertions
+    previous_explicit = previous_basis in assertions
+    if explicit != previous_explicit:
+        return explicit
+    # A singleton noisy-OR projection can round 0.3 to 0.30000000000000004. That must not
+    # prevent an equally supported later assertion from revising it.
+    return confidence >= previous_confidence or math.isclose(
+        confidence, previous_confidence, rel_tol=1e-15, abs_tol=0.0
+    )
 
 
 def _intervals_overlap(
@@ -531,7 +601,7 @@ def _rebuild_flat_evidence_from_clauses(
     *,
     changed_at: datetime,
 ) -> None:
-    """Make legacy flat links the exact union of complete active support clauses."""
+    """Project flat source links from the exact union of complete active support clauses."""
     rows = connection.execute(
         """
         SELECT m.source_memory_id, MAX(c.confidence) AS confidence
@@ -885,7 +955,7 @@ def restamp_dependent_evidence(
         )
     if independent_evidence_enabled(connection):
         # Candidate projections read authoritative clauses directly, so no iterative group
-        # restamping is needed. Every dependent must refresh even if the legacy scalar stayed
+        # restamping is needed. Every dependent must refresh even if the scalar group stayed
         # unchanged: a multi-root summary can gain or lose an independent alternative.
         for dependent_id in closure:
             refresh_evidence_projection(
@@ -894,10 +964,10 @@ def restamp_dependent_evidence(
                 _next_semantic_transaction_time(connection, changed_at, (dependent_id,)),
             )
         return
-    _restamp_legacy_groups(connection, tuple(closure), changed_at)
+    _restamp_capture_groups(connection, tuple(closure), changed_at)
 
 
-def _restamp_legacy_groups(
+def _restamp_capture_groups(
     connection: sqlite3.Connection,
     closure: Sequence[str],
     changed_at: datetime,
@@ -1232,7 +1302,7 @@ def retire_memory_evidence(
     changed: list[str] = []
     for memory_id, source_memory_id in pairs:
         # Control-plane reinforcement has always been a singleton source link. Retire that
-        # exact legacy clause, never every alternative that happens to mention the same source.
+        # exact singleton clause, never every alternative that happens to mention the same source.
         tx_time = _retire_active_evidence_clause(
             connection,
             memory_id,
@@ -1659,6 +1729,8 @@ def rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contra
     *,
     changed_at: datetime,
 ) -> None:
+    # Source withdrawal is not permission to undo a CORRECT. An explicit later reassertion
+    # records its reactivation, so it can participate again without reviving withdrawn claims.
     assertions = connection.execute(
         """
         SELECT v.*, s.kind, s.basis, s.identity_id
@@ -1668,6 +1740,18 @@ def rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contra
           AND EXISTS (
               SELECT 1 FROM memory_evidence AS e
               WHERE e.memory_id = s.memory_id AND e.retired_at IS NULL
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM memory_operations AS o,
+                   json_each(o.operation_json, '$.target_ids') AS target
+              WHERE o.intent = 'correct' AND o.rolled_back_at IS NULL
+                AND target.value = s.memory_id
+                AND NOT EXISTS (
+                    SELECT 1 FROM memory_operations AS later,
+                         json_each(later.effects_json, '$.activated_ids') AS activated
+                    WHERE later.operation_id > o.operation_id AND later.rolled_back_at IS NULL
+                      AND activated.value = s.memory_id
+                )
           )
         ORDER BY v.recorded_at, s.memory_id
         """,
@@ -1704,6 +1788,10 @@ def rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contra
 
     # ponytail: replay is O(assertions²); add a compacted assertion ledger only if long-lived
     # lineages make deletion latency measurable.
+    summaries = {
+        row_text(row, "memory_id"): _evidence_summary(connection, row_text(row, "memory_id"))
+        for row in assertions
+    }
     segments: list[tuple[sqlite3.Row, datetime | None, datetime | None]] = []
     offset = 0
     while offset < len(assertions):
@@ -1729,7 +1817,15 @@ def rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contra
                 continue
             remaining: list[tuple[sqlite3.Row, datetime | None, datetime | None]] = []
             for owner, valid_from, valid_until in segments:
-                if not _intervals_overlap(valid_from, valid_until, cut_from, cut_until):
+                if not _intervals_overlap(valid_from, valid_until, cut_from, cut_until) or (
+                    kind == MemoryKind.STATE.value
+                    and not _state_can_supersede(
+                        row_text(cut_owner, "basis"),
+                        summaries[row_text(cut_owner, "memory_id")][1],
+                        row_text(owner, "basis"),
+                        summaries[row_text(owner, "memory_id")][1],
+                    )
+                ):
                     remaining.append((owner, valid_from, valid_until))
                     continue
                 if cut_from is not None and (valid_from is None or valid_from < cut_from):
@@ -1744,13 +1840,9 @@ def rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contra
         for row, valid_from, valid_until in segments
         if row_text(row, "basis") == EvidenceBasis.USER_STATEMENT.value
     )
-    summaries: dict[str, tuple[int, float]] = {}
     for row, valid_from, valid_until in segments:
         memory_id = row_text(row, "memory_id")
-        evidence_count, confidence = summaries.setdefault(
-            memory_id,
-            _evidence_summary(connection, memory_id),
-        )
+        evidence_count, confidence = summaries[memory_id]
         visible = semantic_visibility(
             connection,
             memory_id=memory_id,

@@ -31,12 +31,6 @@ def hardware_metadata() -> dict[str, object]:
         "logical_cores": _available_cpu_count(),
         "ram_total_bytes": _ram_total_bytes(),
         "gpus": gpus,
-        # Kept for readers of schema-v10 artifacts while the richer list is adopted.
-        "cuda_device_uuids": {
-            str(gpu["index"]): gpu["uuid"]
-            for gpu in gpus
-            if isinstance(gpu.get("index"), int) and isinstance(gpu.get("uuid"), str)
-        },
     }
 
 

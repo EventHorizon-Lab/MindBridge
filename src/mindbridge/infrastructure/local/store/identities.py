@@ -1080,9 +1080,8 @@ class IdentityRegistry:
         """Reverse one recorded merge, restoring alias_id as an independent identity.
 
         Returns the restored identity_id, or None when alias_id is not a reversible
-        alias: an unknown alias, an alias whose source held both modalities, and an
-        alias merged before this schema recorded the contributed modality all have no
-        recorded split point. Also returns None, changing nothing, when the target no
+        alias: an unknown alias or an alias whose source held both modalities has no
+        unambiguous split point. Also returns None, changing nothing, when the target no
         longer holds the other modality, because the split would leave it with no
         exemplars at all.
 

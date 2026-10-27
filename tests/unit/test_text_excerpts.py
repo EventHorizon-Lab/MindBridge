@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import shutil
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
@@ -82,7 +83,6 @@ class _PartEmbedder:
     embedding_space = "excerpt-test:2"
     embedding_dimension = 2
     embedding_capabilities = frozenset({Modality.TEXT})
-    _legacy_embedding_spaces: frozenset[str] = frozenset()
 
     def __init__(self, *, reject_long_documents: bool = False) -> None:
         self.reject_long_documents = reject_long_documents
@@ -218,8 +218,10 @@ def test_quantized_excerpt_follows_the_exact_winning_part(
     assert by_id[excerpt.matched_index_id].embedding.values[0] == 1.0
 
 
-@pytest.mark.parametrize("upgrade", ("space", "recipe"))
-def test_reembedding_preserves_exact_excerpts(tmp_path: Path, upgrade: str) -> None:
+@pytest.mark.parametrize("rebuild", ("missing_index", "quantization"))
+def test_index_rebuild_preserves_exact_excerpts_without_reembedding(
+    tmp_path: Path, rebuild: str
+) -> None:
     with _memory(tmp_path) as memory:
         record = memory.add(_long_source(), occurred_at=REFERENCE)
         before = memory.compile(
@@ -231,18 +233,17 @@ def test_reembedding_preserves_exact_excerpts(tmp_path: Path, upgrade: str) -> N
     assert len(before.excerpts) == 1
 
     embedder = _PartEmbedder()
-    if upgrade == "space":
-        embedder._legacy_embedding_spaces = frozenset({embedder.embedding_space})
-        embedder.embedding_space = "excerpt-test:2:v2"
-    else:
-        with LocalStore(tmp_path) as store:
-            store.set_metadata(
-                "index.recipe",
-                "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
-                "context-keys-v8:quantization-none",
-            )
+    if rebuild == "missing_index":
+        shutil.rmtree(tmp_path / "zvec")
 
-    with Memory(tmp_path, embedder=embedder, minimum_relevance=0.0) as memory:
+    with Memory(
+        tmp_path,
+        embedder=embedder,
+        minimum_relevance=0.0,
+        index_quantization=(
+            IndexQuantization.INT8 if rebuild == "quantization" else IndexQuantization.NONE
+        ),
+    ) as memory:
         after = memory.compile(
             "TARGET CLAIM",
             budget=ContextBudget(max_chars=3_000, max_items=1),
@@ -250,7 +251,7 @@ def test_reembedding_preserves_exact_excerpts(tmp_path: Path, upgrade: str) -> N
             allow_partial_sources=True,
         )
 
-    assert any(task is EmbedTask.DOCUMENT for task, _inputs in embedder.calls)
+    assert all(task is not EmbedTask.DOCUMENT for task, _inputs in embedder.calls)
     assert len(after.excerpts) == 1
     assert after.excerpts[0].source_memory_id == record.id
     assert after.excerpts[0].selector == before.excerpts[0].selector

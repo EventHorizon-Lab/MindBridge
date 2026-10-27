@@ -101,17 +101,13 @@ class MemoryConfig:
     # bearing: both factors are bounded below by `_RANK_FLOOR`, so with retention inside the gate
     # a perfectly relevant memory decayed to 0.30 and to 0.09 once a dated question's window also
     # missed it, under this default, and "prefer recent" silently became "hide old".
-    #
-    # `0.10` is not a round number and must not be tidied into one: the floor used to gate a
-    # rescaled `(1 + cosine) / 2` confidence, where the old 0.55 default admitted cosine 0.10, so
-    # 0.10 reproduces the previously shipped effective floor exactly and fixing the scale does not
-    # also silently tighten the policy. Raising it is a separate, separately measurable decision.
     minimum_relevance: _UnitInterval = 0.10
     ambiguity_margin: _UnitInterval = 0.01
     # `ask` grounds on `limit` memories and then keeps admitting lower-ranked ones while the
     # evidence stays inside this character budget. Retrieval scores separate the right memory
     # from the rest only weakly, so the answering model does the final selection and benefits
-    # from seeing more candidates. `None` grounds on exactly `limit`.
+    # from seeing more candidates. `None` disables this ranked-tail expansion; recall planning
+    # and linked evidence expansion may still add records when separately enabled.
     #
     # A record count is the wrong unit for that window, because record size is the caller's: a
     # dialogue turn is ~200 characters, a chat-assistant turn ~1 000, so `limit=12` is 2.5 k
@@ -133,16 +129,19 @@ class MemoryConfig:
     # larger budget is the default and a caller who wants the cheaper window lowers it. An earlier
     # null at `limit=20` (56 rows, +0.003) was measured on a different reader.
     #
-    # This raises a floor; it is not a ceiling. The `limit` hits are kept unconditionally, so
-    # setting it can only make the prompt larger, and `limit` stops being a token control once
-    # it is set: the budget refills the window to the same width whatever `limit` was. Bound a
-    # prompt by lowering this, or by lowering `limit` with this set to `None`.
+    # This is a supplemental packing budget, not a hard ceiling. The `limit` hits stay, so
+    # setting it can only widen the window; lowering `limit` may leave its size unchanged when
+    # the budget refills it. Lowering this reduces supplemental evidence;
+    # `None` with a lower `limit` reduces the guaranteed count. Neither bounds provider tokens.
     evidence_budget_chars: _PositiveInt | None = 24_000
     # Whether `ask` asks the answerer how to retrieve before retrieving. Off by default: it costs
     # one extra generation call per question, and it only pays where similarity has no way to
     # express the question -- a count, a list of "all", an adjacency, everything about a person.
     # With it off, `ask` runs exactly the one search it always has.
     recall_planning: _StrictBool = False
+    # Experimental query execution for similar steps, bounded across all rounds of one ask.
+    # Default recall programs reuse the original question's ranking.
+    recall_query_expansion: _StrictBool = False
     # How many characters of evidence a set, sequence or entity plan may add to the ranked
     # window. A point question keeps `limit` (and `evidence_budget_chars`); a question that asks
     # for every matching record needs more than a window of that width, and this is what bounds

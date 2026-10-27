@@ -44,6 +44,7 @@ from mindbridge.kernel.embedding import DOCUMENT_TASK, Embedding
 from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.lifecycle import OperationAssets
 from mindbridge.kernel.materialization import Materializer
+from mindbridge.kernel.predicates import claim_lineage_id, resolve_predicate
 from mindbridge.kernel.projection import Projection
 from mindbridge.kernel.runtime import Storage, translate_storage_errors
 from mindbridge.kernel.settings import Settings
@@ -60,6 +61,7 @@ from mindbridge.types import (
     MemoryOperation,
     MemoryRecord,
     MemoryType,
+    SpatialContext,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -300,6 +302,9 @@ def consolidation_primary(
                 memory_id=source.id,
                 content=ModelInput(text=source.content, assets=source.assets),
                 context=observation_from_record(source),
+                occurred_at=source.occurred_at,
+                occurred_end=source.occurred_end,
+                created_at=source.created_at,
             ),
             host_authored=host_authored,
         )
@@ -471,33 +476,23 @@ def formation_context(
 def _formation_lineage_id(
     proposal: FormationProposal,
     *,
-    spatial: object = None,
+    spatial: SpatialContext | None = None,
     identity_id: str | None = None,
 ) -> str:
-    frame_id = getattr(spatial, "frame_id", None)
-    anchor = getattr(getattr(spatial, "anchor", None), "value", None)
-    # A bound claim keys on the person, not on how the subject happened to be spelled, so every
-    # naming assertion about one identity lands in one lineage and a rename supersedes rather
-    # than forks. An unbound claim keeps the original payload byte for byte, so lineage IDs
-    # already on disk stay valid.
-    binding: dict[str, object] = (
-        {"subject": canonical_subject(proposal.subject)}
-        if identity_id is None
-        else {"subject": None, "identity_id": identity_id}
+    return claim_lineage_id(
+        kind=proposal.kind.value,
+        predicate=proposal.predicate,
+        subject=proposal.subject,
+        identity_id=identity_id,
+        frame_id=None if spatial is None else spatial.frame_id,
+        anchor=None if spatial is None else spatial.anchor.value,
+        resolution=resolve_predicate(
+            proposal.predicate,
+            kind=proposal.kind.value,
+            basis=proposal.basis.value,
+            value=proposal.value,
+        ),
     )
-    payload = json.dumps(
-        {
-            "kind": proposal.kind.value,
-            "predicate": canonical_subject(proposal.predicate),
-            "frame_id": frame_id,
-            "anchor": anchor,
-            **binding,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(f"mindbridge-lineage-v1:{payload}".encode()).hexdigest()
 
 
 def formation_memory_id(
@@ -628,6 +623,9 @@ class Formation(Traced):
                     context=observation_from_record(source),
                     history=history,
                     history_truncated=truncated,
+                    occurred_at=source.occurred_at,
+                    occurred_end=source.occurred_end,
+                    created_at=source.created_at,
                 )
             )
         return tuple(result)

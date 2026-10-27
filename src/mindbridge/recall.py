@@ -30,6 +30,9 @@ from mindbridge.types import MemoryType, Modality, SearchHit
 RecallShape = Literal["point", "set", "sequence", "entity", "composite"]
 RecallOp = Literal["similar", "match", "window", "neighbors", "entity"]
 
+# A trusted capability line emitted by the kernel, not stored evidence or a planner request.
+SEMANTIC_QUERY_CAPABILITY = "Semantic query expansion: enabled"
+
 _SHAPES: frozenset[str] = frozenset({"point", "set", "sequence", "entity", "composite"})
 _OPS: frozenset[str] = frozenset({"similar", "match", "window", "neighbors", "entity"})
 # Only `similar` is a ranking; the rest answer by predicate and can therefore be complete.
@@ -56,8 +59,8 @@ _FIELDS: frozenset[str] = frozenset(
     }
 )
 _HONOURED: Mapping[str, frozenset[str]] = {
-    # `similar` carries no filters: it ranks the caller's own question, which already carries the
-    # temporal window and scope the caller asked with, and `k` is only how deep to rank it.
+    # `similar` carries no filters. Readers reuse the original ranking by default; experimental
+    # query execution retains the caller's temporal intent and scope for every query.
     "similar": frozenset({"query", "k"}),
     "match": frozenset({"terms", "any_of", "time", "modality", "memory_type", "max_rows"}),
     "window": frozenset({"time", "modality", "memory_type", "max_rows"}),

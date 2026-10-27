@@ -175,13 +175,6 @@ class SentenceTransformersEmbedder:
         return self._space_id
 
     @property
-    def _legacy_embedding_spaces(self) -> frozenset[str]:
-        return frozenset(
-            _recipe_space(recipe, self._model_id, self._revision, self._dimension)
-            for recipe in (_jina._JINA_LEGACY_RECIPES if self._jina else ())
-        )
-
-    @property
     def embedding_dimension(self) -> int:
         return self._dimension
 

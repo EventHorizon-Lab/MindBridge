@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import struct
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from itertools import islice
 from operator import mul
@@ -49,7 +50,7 @@ def max_cosine_scores(
 
 def max_cosine_part_scores(
     query_vectors: Sequence[Sequence[float]],
-    document_parts: Iterable[tuple[str, str, Sequence[float]]],
+    document_parts: Iterable[tuple[str, str, Sequence[float] | bytes]],
     *,
     preferred_embeddings: Mapping[str, str] | None = None,
 ) -> dict[str, tuple[str, float, float]]:
@@ -69,7 +70,7 @@ def max_cosine_part_scores(
 
 def _max_cosines(
     query_vectors: Sequence[Sequence[float]],
-    document_parts: Iterable[tuple[str, str | None, Sequence[float]]],
+    document_parts: Iterable[tuple[str, str | None, Sequence[float] | bytes]],
     *,
     preferred_embeddings: Mapping[str, str] | None = None,
 ) -> dict[str, tuple[str | None, float]]:
@@ -126,8 +127,12 @@ def _unit_vector(values: Sequence[float], dimension: int) -> tuple[float, ...]:
 
 
 def _max_similarity(
-    queries: Sequence[Sequence[float]], values: Sequence[float], dimension: int
+    queries: Sequence[Sequence[float]], values: Sequence[float] | bytes, dimension: int
 ) -> float:
+    if isinstance(values, bytes):
+        if len(values) != dimension * 4:
+            raise ValueError("Cosine scoring requires nonempty vectors of equal dimension")
+        values = struct.unpack(f"<{dimension}f", values)
     norm = _vector_norm(values, dimension)
     if norm < float_info.min or not math.isfinite(norm):
         unit = _unit_vector(values, dimension)
@@ -135,10 +140,23 @@ def _max_similarity(
     return max(_dot_product(query, values) / norm for query in queries)
 
 
-def _normalized_matrix(vectors: Sequence[Sequence[float]], dimension: int) -> NDArray[np.float64]:
-    if not dimension or any(len(values) != dimension for values in vectors):
+def _normalized_matrix(
+    vectors: Sequence[Sequence[float] | bytes], dimension: int
+) -> NDArray[np.float64]:
+    if not dimension or any(
+        len(values) != dimension * 4 if isinstance(values, bytes) else len(values) != dimension
+        for values in vectors
+    ):
         raise ValueError("Cosine scoring requires nonempty vectors of equal dimension")
-    matrix = np.asarray(vectors, dtype=np.float64)
+    # SQLite's little-endian FP32 bytes can feed the batch directly. Float64 promotion and
+    # normalization stay identical to decoded tuples, without allocating a float per component.
+    matrix = np.asarray(
+        tuple(
+            np.frombuffer(values, dtype="<f4") if isinstance(values, bytes) else values
+            for values in vectors
+        ),
+        dtype=np.float64,
+    )
     scales = np.max(np.abs(matrix), axis=1)
     if not np.isfinite(matrix).all() or (scales == 0).any():
         raise ValueError("Cosine scoring requires finite, nonzero vectors")

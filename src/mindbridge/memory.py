@@ -23,8 +23,6 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from contextvars import copy_context
 from dataclasses import fields
 from datetime import datetime
@@ -57,6 +55,7 @@ from mindbridge.kernel.contracts import (
 )
 from mindbridge.kernel.control_plane import ControlPlane
 from mindbridge.kernel.embedding import Embedding
+from mindbridge.kernel.execution import Execution
 from mindbridge.kernel.formation import Formation
 from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.identity import Identities
@@ -153,6 +152,7 @@ class Memory:
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
         evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         recall_planning: bool = _DEFAULT_CONFIG.recall_planning,
+        recall_query_expansion: bool = _DEFAULT_CONFIG.recall_query_expansion,
         recall_set_budget_chars: int = _DEFAULT_CONFIG.recall_set_budget_chars,
         recall_set_max_rows: int = _DEFAULT_CONFIG.recall_set_max_rows,
         recall_rounds: int = _DEFAULT_CONFIG.recall_rounds,
@@ -184,6 +184,7 @@ class Memory:
             ambiguity_margin=ambiguity_margin,
             evidence_budget_chars=evidence_budget_chars,
             recall_planning=recall_planning,
+            recall_query_expansion=recall_query_expansion,
             recall_set_budget_chars=recall_set_budget_chars,
             recall_set_max_rows=recall_set_max_rows,
             recall_rounds=recall_rounds,
@@ -215,6 +216,7 @@ class Memory:
             )
 
         self._store = open_store(self.data_dir)
+        execution: Execution | None = None
         injected = (
             embedder,
             transcriber,
@@ -249,11 +251,11 @@ class Memory:
                 settle_lock=RLock(),
             )
             self._write_lock = self._storage.write_lock
-            # The planes that need no index open first, so the store can be upgraded and
-            # re-embedded before the index that projects it exists.
+            # Validate authoritative state and queue index recovery before opening Zvec.
             self._lifecycle = Lifecycle(
                 storage=self._storage,
             )
+            self._execution = execution = Execution(lifecycle=self._lifecycle)
             self._hydrator = Hydrator(
                 storage=self._storage,
             )
@@ -282,10 +284,9 @@ class Memory:
                 storage=self._storage,
                 backends=self._backends,
                 settings=self._settings,
-                embedding=embedding,
             ).prepare(index_path)
         except BaseException:
-            close_quietly(*injected, self._store)
+            close_quietly(*injected, execution, self._store)
             raise
 
         try:
@@ -295,7 +296,7 @@ class Memory:
                 quantization=self._settings.index_quantization,
             )
         except Exception as error:
-            close_quietly(*injected, self._store)
+            close_quietly(*injected, self._execution, self._store)
             raise IndexUnavailableError(
                 "failed to open the local search index", stage="open", reason="index_missing"
             ) from error
@@ -330,6 +331,7 @@ class Memory:
             speech=speech,
             embedding=embedding,
             projection=self._projection,
+            execution=self._execution,
         )
         self._formation = Formation(
             tracer=tracer,
@@ -379,6 +381,7 @@ class Memory:
             speech=speech,
             vision=self._vision,
             retrieval=self._retrieval,
+            execution=self._execution,
         )
         self._compilation = Compilation(
             tracer=tracer,
@@ -1107,7 +1110,9 @@ class Memory:
 
     def _close_resources(self) -> builtins.list[Exception]:
         failures: builtins.list[Exception] = []
-        for resource in unique_resources((*self._backends.resources(), self._index, self._store)):
+        for resource in unique_resources(
+            (self._execution, *self._backends.resources(), self._index, self._store)
+        ):
             try:
                 resource.close()
             except Exception as error:
@@ -1162,7 +1167,7 @@ class AsyncMemory:
         memory_type: MemoryType = MemoryType.SEMANTIC,
         context: ObservationContext | None = None,
     ) -> MemoryRecord:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             self._memory.add,
             content,
             occurred_at=occurred_at,
@@ -1173,10 +1178,10 @@ class AsyncMemory:
         )
 
     async def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
-        return await asyncio.to_thread(self._memory._add_stream_input, item)
+        return await self._memory._execution.run(self._memory._add_stream_input, item)
 
     async def _capture_stream_input(self, item: StreamInput) -> MemoryRecord:
-        return await asyncio.to_thread(self._memory._capture_stream_input, item)
+        return await self._memory._execution.run(self._memory._capture_stream_input, item)
 
     async def add_many(
         self,
@@ -1188,7 +1193,7 @@ class AsyncMemory:
         memory_type: MemoryType = MemoryType.SEMANTIC,
         context: Sequence[ObservationContext | None] | None = None,
     ) -> tuple[MemoryRecord, ...]:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             self._memory.add_many,
             contents,
             occurred_at=occurred_at,
@@ -1208,7 +1213,7 @@ class AsyncMemory:
         memory_type: MemoryType = MemoryType.SEMANTIC,
         context: ObservationContext | None = None,
     ) -> MemoryRecord:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             self._memory.capture,
             content,
             occurred_at=occurred_at,
@@ -1225,7 +1230,7 @@ class AsyncMemory:
         max_attempts: int = 3,
         memory_ids: Sequence[str] | None = None,
     ) -> int:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             self._memory.settle,
             limit=limit,
             max_attempts=max_attempts,
@@ -1238,7 +1243,7 @@ class AsyncMemory:
         limit: int = 100,
         memory_ids: Sequence[str] | None = None,
     ) -> tuple[PendingCapture, ...]:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             self._memory.pending_captures, limit=limit, memory_ids=memory_ids
         )
 
@@ -1295,7 +1300,7 @@ class AsyncMemory:
         occurred_until: datetime | None = None,
         scope: RetrievalScope | None = None,
     ) -> tuple[SearchHit, ...]:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             self._memory.search,
             query,
             limit=limit,
@@ -1317,7 +1322,7 @@ class AsyncMemory:
         occurred_until: datetime | None = None,
         scope: RetrievalScope | None = None,
     ) -> TracedSearchResult:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             self._memory.search_with_trace,
             query,
             limit=limit,
@@ -1356,7 +1361,7 @@ class AsyncMemory:
             finally:
                 ASYNC_QUEUE_TIME_MS.reset(token)
 
-        return await asyncio.to_thread(answer)
+        return await self._memory._execution.run(answer)
 
     def ask_stream(
         self,
@@ -1403,12 +1408,11 @@ class AsyncMemory:
         # would strand both. `next` is given a sentinel because a `StopIteration` crossing a
         # future becomes `RuntimeError` rather than ending the loop.
         #
-        # ponytail: thread affinity makes this one thread per in-flight stream, outside the cap
-        # the default executor puts on every other `AsyncMemory` call. Fine while concurrent
-        # streams are counted in tens; give the class a shared pool of pinned workers if a host
-        # ever runs enough of them for the thread count to bind before the provider does.
-        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mindbridge-ask")
+        # Admission happens before a worker is created, and every wrapper and transport borrows
+        # from this instance's same bounded pool.
+        worker = self._memory._execution.streams.borrow()
         first_advance = True
+        closed = False
 
         def advance(queued_at: float, record_queue: bool) -> object:
             token = None
@@ -1419,6 +1423,21 @@ class AsyncMemory:
             finally:
                 if token is not None:
                     ASYNC_QUEUE_TIME_MS.reset(token)
+
+        async def close_stream() -> None:
+            nonlocal closed
+            if closed:
+                return
+            closed = True
+            try:
+                closing = loop.run_in_executor(worker, context.run, stream.close)
+                closing.add_done_callback(
+                    lambda done: None if done.cancelled() else done.exception()
+                )
+                await asyncio.shield(closing)
+            finally:
+                released = asyncio.wrap_future(worker.release())
+                await asyncio.shield(released)
 
         try:
             while True:
@@ -1434,14 +1453,18 @@ class AsyncMemory:
                 )
                 if chunk is _STREAM_EXHAUSTED:
                     return
-                yield cast(AnswerChunk, chunk)
+                answer_chunk = cast(AnswerChunk, chunk)
+                if answer_chunk.result is not None:
+                    # Reading the terminal result is a complete consumption: callers need not
+                    # advance once more or explicitly close it to return worker capacity.
+                    await close_stream()
+                    yield answer_chunk
+                    return
+                yield answer_chunk
         finally:
             # A running executor call cannot be cancelled, so the close always completes even
             # when the awaiting task is gone; `wait=False` keeps that off the event loop.
-            closing_stream = loop.run_in_executor(worker, context.run, stream.close)
-            with suppress(asyncio.CancelledError):
-                await asyncio.shield(closing_stream)
-            worker.shutdown(wait=False)
+            await close_stream()
 
     async def compile(
         self,
@@ -1452,7 +1475,7 @@ class AsyncMemory:
         scope: RetrievalScope | None = None,
         allow_partial_sources: bool = False,
     ) -> ContextBundle:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             self._memory.compile,
             goal,
             budget=budget,
@@ -1467,13 +1490,13 @@ class AsyncMemory:
         return self._memory.capabilities
 
     async def get(self, memory_id: str) -> MemoryRecord:
-        return await asyncio.to_thread(self._memory.get, memory_id)
+        return await self._memory._execution.run(self._memory.get, memory_id)
 
     async def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
-        return await asyncio.to_thread(self._memory.speech, memory_id)
+        return await self._memory._execution.run(self._memory.speech, memory_id)
 
     async def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
-        return await asyncio.to_thread(self._memory.faces, memory_id)
+        return await self._memory._execution.run(self._memory.faces, memory_id)
 
     async def register_speaker(
         self,
@@ -1482,7 +1505,7 @@ class AsyncMemory:
         *,
         relationship: str | None = None,
     ) -> None:
-        await asyncio.to_thread(
+        await self._memory._execution.run(
             partial(
                 self._memory.register_speaker,
                 speaker_id,
@@ -1498,7 +1521,7 @@ class AsyncMemory:
         *,
         relationship: str | None = None,
     ) -> None:
-        await asyncio.to_thread(
+        await self._memory._execution.run(
             partial(
                 self._memory.register_identity,
                 identity_id,
@@ -1508,10 +1531,10 @@ class AsyncMemory:
         )
 
     async def identity(self, identity_id: str) -> IdentityProfile | None:
-        return await asyncio.to_thread(self._memory.identity, identity_id)
+        return await self._memory._execution.run(self._memory.identity, identity_id)
 
     async def unlink_identity(self, alias_id: str) -> str | None:
-        return await asyncio.to_thread(self._memory.unlink_identity, alias_id)
+        return await self._memory._execution.run(self._memory.unlink_identity, alias_id)
 
     async def record_consent(
         self,
@@ -1520,12 +1543,12 @@ class AsyncMemory:
         *,
         note: str | None = None,
     ) -> MemoryOperationRecord | None:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             partial(self._memory.record_consent, identity_id, state, note=note)
         )
 
     async def consent(self, identity_id: str) -> ConsentState | None:
-        return await asyncio.to_thread(self._memory.consent, identity_id)
+        return await self._memory._execution.run(self._memory.consent, identity_id)
 
     async def export(
         self,
@@ -1533,15 +1556,17 @@ class AsyncMemory:
         identity_id: str | None = None,
         memory_ids: Sequence[str] | None = None,
     ) -> ExportBundle:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             partial(self._memory.export, identity_id=identity_id, memory_ids=memory_ids)
         )
 
     async def apply_retention(self, *, dry_run: bool = False) -> RetentionReport:
-        return await asyncio.to_thread(partial(self._memory.apply_retention, dry_run=dry_run))
+        return await self._memory._execution.run(
+            partial(self._memory.apply_retention, dry_run=dry_run)
+        )
 
     async def reinforce(self, memory_ids: Sequence[str]) -> int:
-        return await asyncio.to_thread(self._memory.reinforce, memory_ids)
+        return await self._memory._execution.run(self._memory.reinforce, memory_ids)
 
     async def consolidation_candidates(
         self,
@@ -1549,7 +1574,7 @@ class AsyncMemory:
         limit: int = 32,
         idle: bool = False,
     ) -> tuple[ConsolidationCandidate, ...]:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             partial(self._memory.consolidation_candidates, limit=limit, idle=idle)
         )
 
@@ -1560,7 +1585,7 @@ class AsyncMemory:
         max_rounds: int = 4,
         idle: bool = False,
     ) -> DeliberationReport:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             partial(
                 self._memory.deliberate,
                 limit=limit,
@@ -1570,7 +1595,7 @@ class AsyncMemory:
         )
 
     async def apply(self, operation: MemoryOperation) -> MemoryOperationRecord:
-        return await asyncio.to_thread(self._memory.apply, operation)
+        return await self._memory._execution.run(self._memory.apply, operation)
 
     async def record_outcome(
         self,
@@ -1579,7 +1604,7 @@ class AsyncMemory:
         *,
         note: str | None = None,
     ) -> bool:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             partial(self._memory.record_outcome, operation_id, outcome, note=note)
         )
 
@@ -1591,7 +1616,7 @@ class AsyncMemory:
         limit: int = 32,
         trigger: MemoryTrigger = MemoryTrigger.MANUAL,
     ) -> ConsolidationReport:
-        return await asyncio.to_thread(
+        return await self._memory._execution.run(
             partial(
                 self._memory.consolidate,
                 evidence_ids=evidence_ids,
@@ -1602,25 +1627,25 @@ class AsyncMemory:
         )
 
     async def forget(self, memory_ids: Sequence[str]) -> MemoryOperationRecord | None:
-        return await asyncio.to_thread(self._memory.forget, memory_ids)
+        return await self._memory._execution.run(self._memory.forget, memory_ids)
 
     async def rollback(self, operation_id: int) -> bool:
-        return await asyncio.to_thread(self._memory.rollback, operation_id)
+        return await self._memory._execution.run(self._memory.rollback, operation_id)
 
     async def operations(self, *, limit: int = 100) -> tuple[MemoryOperationRecord, ...]:
-        return await asyncio.to_thread(partial(self._memory.operations, limit=limit))
+        return await self._memory._execution.run(partial(self._memory.operations, limit=limit))
 
     async def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
-        return await asyncio.to_thread(self._memory.list, limit=limit, cursor=cursor)
+        return await self._memory._execution.run(self._memory.list, limit=limit, cursor=cursor)
 
     async def delete(self, memory_id: str) -> bool:
-        return await asyncio.to_thread(self._memory.delete, memory_id)
+        return await self._memory._execution.run(self._memory.delete, memory_id)
 
     async def reindex(self) -> int:
-        return await asyncio.to_thread(self._memory.reindex)
+        return await self._memory._execution.run(self._memory.reindex)
 
     async def optimize(self) -> None:
-        await asyncio.to_thread(self._memory.optimize)
+        await self._memory._execution.run(self._memory.optimize)
 
     async def close(self) -> None:
         await asyncio.to_thread(self._memory.close)

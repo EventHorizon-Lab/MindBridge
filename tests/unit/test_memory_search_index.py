@@ -85,7 +85,6 @@ class _Embedder:
     embedding_space = "fake-real-index:2:test"
     embedding_dimension = 2
     # Optional backend declaration read by kernel contracts; declared so upgrade tests type-check.
-    _legacy_embedding_spaces: frozenset[str] = frozenset()
 
     def __init__(self) -> None:
         self.embedding_capabilities = _ALL_INPUT_MODALITIES
@@ -1473,30 +1472,6 @@ def test_a_described_clip_carries_its_durable_facts_as_their_own_section(tmp_pat
         # rebuilding it as one merged string keys 2048-character windows of the whole document
         # instead, and the per-section keys are lost on exactly the clips that name somebody.
         keys = [value.text for value in embedder.document_batches[-1]]
-        assert any(text.startswith(f"[facts:{asset_id}]") for text in keys)
-        assert any(text.startswith(f"[visual description:{asset_id}]") for text in keys)
-
-
-def test_a_re_embedding_migration_keeps_each_derived_section_as_its_own_key(
-    tmp_path: Path,
-) -> None:
-    """An embedder swap re-keys every stored row, and must key them the way `add()` did.
-
-    The migration reads `content` back as one string. Handing that string over as a single
-    canonical part throws away the section boundaries the write path embedded separately, so a
-    corpus that migrates loses the atomic facts key it had before the swap.
-    """
-    describer = _StructuredDescriber("Shown: a red bicycle", "Fact: the bicycle lives in the shed")
-    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
-        record = memory.add(Blob(b"bicycle-frame", "image/png"))
-        asset_id = record.assets[0].id
-
-    upgraded = _Embedder()
-    upgraded.embedding_space = "fake-real-index:2:test-v2"
-    upgraded._legacy_embedding_spaces = frozenset({_Embedder.embedding_space})
-    with Memory(tmp_path, embedder=upgraded, vision_describer=describer):
-        keys = [value.text for value in upgraded.document_batches[-1]]
-
         assert any(text.startswith(f"[facts:{asset_id}]") for text in keys)
         assert any(text.startswith(f"[visual description:{asset_id}]") for text in keys)
 

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import mindbridge.benchmarks.prepare_media as prepare_media
-from mindbridge.benchmarks.eval_adapters import load_task
+from mindbridge.benchmarks.eval_adapters import load_task, parse_media_manifest
 from mindbridge.benchmarks.task_catalog import TASKS
 
 
@@ -115,22 +115,25 @@ def test_m3_manifest_excludes_and_reports_unavailable_units(tmp_path: Path) -> N
         TASKS["m3-bench-web"],
         root=tmp_path,
         dataset_path=dataset,
-        media_manifest={
-            "tasks": {
-                "m3-bench-web": {
-                    "units": {
-                        "public": [
-                            {
-                                "text": "prepared segment",
-                                "start_seconds": 0,
-                                "end_seconds": 10,
-                            }
-                        ]
-                    },
-                    "unavailable_units": {"private": "ERROR: Private video"},
-                }
+        media_manifest=parse_media_manifest(
+            {
+                "version": 1,
+                "tasks": {
+                    "m3-bench-web": {
+                        "units": {
+                            "public": [
+                                {
+                                    "text": "prepared segment",
+                                    "start_seconds": 0,
+                                    "end_seconds": 10,
+                                }
+                            ]
+                        },
+                        "unavailable_units": {"private": "ERROR: Private video"},
+                    }
+                },
             }
-        },
+        ),
         verify_digest=False,
     )
 
@@ -145,22 +148,25 @@ def test_m3_manifest_ignores_unavailable_units_outside_selected_slice(tmp_path: 
         TASKS["m3-bench-web"],
         root=tmp_path,
         dataset_path=dataset,
-        media_manifest={
-            "tasks": {
-                "m3-bench-web": {
-                    "units": {
-                        "public": [
-                            {
-                                "text": "prepared segment",
-                                "start_seconds": 0,
-                                "end_seconds": 10,
-                            }
-                        ]
-                    },
-                    "unavailable_units": {"private": "ERROR: Private video"},
-                }
+        media_manifest=parse_media_manifest(
+            {
+                "version": 1,
+                "tasks": {
+                    "m3-bench-web": {
+                        "units": {
+                            "public": [
+                                {
+                                    "text": "prepared segment",
+                                    "start_seconds": 0,
+                                    "end_seconds": 10,
+                                }
+                            ]
+                        },
+                        "unavailable_units": {"private": "ERROR: Private video"},
+                    }
+                },
             }
-        },
+        ),
         offset=1,
         verify_digest=False,
     )

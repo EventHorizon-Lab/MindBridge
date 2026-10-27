@@ -71,7 +71,7 @@ Documentation changes must pass the same pinned tools and arguments as CI:
 ```bash
 docker run --rm -v "$PWD:/workdir:ro" davidanson/markdownlint-cli2:v0.23.0 \
   "**/*.md" "!.git/**" "!**/.venv/**" "!.pytest_cache/**" "!.benchmarks/**" \
-  "!.claude/worktrees/**" "!autoresearch/**"
+  "!.superpowers/**" "!docs/superpowers/**" "!.claude/worktrees/**" "!autoresearch/**"
 docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
   --no-progress --root-dir /input \
   './*.md' './docs/**/*.md' './.github/**/*.md'
@@ -146,14 +146,15 @@ adapters directly.
 
 ## Public contracts
 
-Stable Python imports are re-exported from `mindbridge`. Stable REST routes are under `/v1`, with
+Public Python imports are re-exported from `mindbridge`. REST routes are under `/v1`, with
 one error envelope documented in [the REST reference](docs/api/rest.md). The MCP adapter exposes
 fifteen tools documented in [the MCP reference](docs/api/mcp.md). Update tests and docs in the
 same change whenever any surface changes.
 
-The embedded release is a breaking line from the former service architecture. Do not restore
-removed scoping parameters, service configuration, or compatibility aliases. Applications that
-need separate memory domains allocate separate directories or separate processes.
+Backward compatibility is not required. Remove obsolete interfaces, format readers, and migration
+paths rather than preserving them with aliases or fallbacks. Document and test the current
+contract in the same patch. Applications that need separate memory domains allocate separate
+directories or separate processes.
 
 ## Documentation style
 
@@ -161,6 +162,9 @@ Use short sections, descriptive headings, fenced code blocks for multi-line exam
 for commands and paths. Use UTF-8, LF endings, and a trailing newline. Examples must be executable
 against the current public API. Keep `docs/README.md` current when adding, renaming, or removing a
 page.
+
+Keep `CHANGELOG.md` focused on the final changes a release delivers. Link to the owning guides
+for detailed contracts; omit intermediate implementations, review transcripts, and test counts.
 
 Keep the [research archive](docs/research/README.md) indexed when adding dated reports or design
 records. Preserve original measurements, source pins, rejected hypotheses, and verbatim protocols.

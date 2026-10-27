@@ -88,6 +88,12 @@ class Lifecycle:
         with self._lifecycle:
             if self._closed or self._closing:
                 raise StorageError("Memory is closed", reason="instance_unusable")
+            if self._active_operations >= 32:
+                raise StorageError(
+                    "local operation capacity exceeded",
+                    reason="capacity_exceeded",
+                    stage="admission",
+                )
             self._active_operations += 1
         failed = False
         assets = OperationAssets(
@@ -152,6 +158,16 @@ class Lifecycle:
         except AssetStoreError as error:
             raise StorageError("failed to lease local media", reason="io_failed") from error
         leased.extend(unique)
+
+    @contextmanager
+    def temporary_asset_lease(self, assets: Sequence[StoredAsset]) -> Iterator[None]:
+        """Protect candidate media until selected assets acquire operation-long leases."""
+        leased = tuple({asset.asset_id: asset for asset in assets}.values())
+        self._assets.acquire(leased, validate=False)
+        try:
+            yield
+        finally:
+            self._assets.release(leased)
 
     def queue_asset_cleanup(self, assets: Sequence[StoredAsset]) -> None:
         if not assets:

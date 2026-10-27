@@ -73,7 +73,7 @@ class LocalStore:
         self._connections.close()
 
     def set_metadata(self, key: str, value: str) -> None:
-        """Set one store-level compatibility value."""
+        """Set one store-level identity or setting."""
         self.update_metadata({key: value})
 
     def update_metadata(self, values: Mapping[str, str | None]) -> None:
@@ -98,7 +98,7 @@ class LocalStore:
                 )
 
     def get_metadata(self, key: str) -> str | None:
-        """Read one store-level compatibility value."""
+        """Read one store-level identity or setting."""
         require_identifier(key, "metadata key")
         with self._connections.connection() as connection:
             row = connection.execute(
@@ -108,7 +108,7 @@ class LocalStore:
         return None if row is None else row_text(row, "value")
 
     def delete_metadata(self, key: str) -> bool:
-        """Delete one store-level compatibility value."""
+        """Delete one store-level identity or setting."""
         require_identifier(key, "metadata key")
         with self._connections.transaction() as connection:
             cursor = connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))

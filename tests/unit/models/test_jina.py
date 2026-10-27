@@ -360,14 +360,6 @@ def test_public_adapter_has_fixed_identity_and_does_not_load_until_needed(
         DEFAULT_JINA_REVISION,
         32,
     )
-    assert backend._legacy_embedding_spaces == {
-        _recipe_space(recipe, DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION, 32)
-        for recipe in (
-            "jina-v5-omni-official-sentence-transformers-v3",
-            "jina-v5-omni-official-sentence-transformers-v4",
-            "jina-v5-omni-official-sentence-transformers-v5",
-        )
-    }
     assert backend.embed(()) == ()
     backend.close()
     assert loads == []
@@ -542,7 +534,7 @@ def test_lazy_jina_can_retry_after_encoder_validation_fails(
         backend.close()
 
 
-def test_unified_jina_reopens_the_existing_space_without_reembedding(tmp_path: Path) -> None:
+def test_jina_reopens_the_same_space_without_reembedding(tmp_path: Path) -> None:
     encoder = _Encoder(dimension=32)
     backend = SentenceTransformersEmbedder(
         encoder, model_id=DEFAULT_JINA_MODEL_ID, revision=DEFAULT_JINA_REVISION, dimension=32

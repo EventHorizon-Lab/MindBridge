@@ -99,10 +99,12 @@ def read_memories(
                 (*batch, *place_parameters, *identity_parameters),
             ).fetchall()
         )
-    assets_by_memory = _read_memory_assets(connection, tuple(memory_ids))
+    # Related rows cannot make a parent excluded by the authoritative SQL filter visible.
+    selected_ids = tuple(row_text(row, "memory_id") for row in rows)
+    assets_by_memory = _read_memory_assets(connection, selected_ids)
     contexts, semantic_ids = read_memory_contexts(
         connection,
-        tuple(memory_ids),
+        selected_ids,
         valid_at=valid_at,
         known_at=known_at,
         near=near,
@@ -110,12 +112,12 @@ def read_memories(
         active_only=active_only,
     )
     by_id = {
-        row_text(row, "memory_id"): memory_from_row(
+        memory_id: memory_from_row(
             row,
-            assets=assets_by_memory.get(row_text(row, "memory_id"), ()),
-            context=contexts.get(row_text(row, "memory_id")),
+            assets=assets_by_memory.get(memory_id, ()),
+            context=contexts.get(memory_id),
         )
-        for row in rows
+        for memory_id, row in zip(selected_ids, rows, strict=True)
         if memory_in_scope(
             row,
             active_only=active_only,
@@ -132,6 +134,29 @@ def write_embedding(
     connection: sqlite3.Connection,
     embedding: StoredEmbedding,
 ) -> None:
+    _write_embedding(connection, embedding, parent_content=None)
+
+
+def write_embeddings(
+    connection: sqlite3.Connection,
+    embeddings: Sequence[StoredEmbedding],
+) -> None:
+    """Reuse one parent's selector source across its consecutive keys in this transaction."""
+    parent_id: str | None = None
+    parent_content: tuple[str, str] | None = None
+    for embedding in embeddings:
+        if embedding.memory_id != parent_id:
+            parent_content = None
+        parent_content = _write_embedding(connection, embedding, parent_content=parent_content)
+        parent_id = embedding.memory_id
+
+
+def _write_embedding(
+    connection: sqlite3.Connection,
+    embedding: StoredEmbedding,
+    *,
+    parent_content: tuple[str, str] | None,
+) -> tuple[str, str] | None:
     # The only place a caller-supplied vector reaches the authoritative table, and so the only
     # place its content is checked. See StoredEmbedding for why hydration does not repeat this.
     require_storable_vector(embedding.values, normalized=embedding.normalized)
@@ -170,15 +195,17 @@ def write_embedding(
         (embedding.embedding_id,),
     )
     if not embedding.text_selectors:
-        return
-    row = connection.execute(
-        "SELECT content FROM memory_records WHERE memory_id = ?",
-        (embedding.memory_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError("text selectors require an existing parent memory")
-    content = row_text(row, "content")
-    parent_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return parent_content
+    if parent_content is None:
+        row = connection.execute(
+            "SELECT content FROM memory_records WHERE memory_id = ?",
+            (embedding.memory_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("text selectors require an existing parent memory")
+        content = row_text(row, "content")
+        parent_content = (content, hashlib.sha256(content.encode("utf-8")).hexdigest())
+    content, parent_digest = parent_content
     for selector_position, selector in enumerate(embedding.text_selectors):
         if selector.parent_content_sha256 != parent_digest:
             raise ValueError("text selector parent digest does not match stored content")
@@ -231,6 +258,7 @@ def write_embedding(
                     piece.piece_sha256,
                 ),
             )
+    return parent_content
 
 
 def replace_memory_embeddings(
@@ -257,8 +285,7 @@ def replace_memory_embeddings(
             memory,
             supplied_embedding_ids=embedding_ids[memory.memory_id],
         )
-    for embedding in embeddings:
-        write_embedding(connection, embedding)
+    write_embeddings(connection, embeddings)
 
 
 def write_memory(
@@ -455,7 +482,9 @@ def delete_memory(  # noqa: C901 - one atomic dependency and lineage teardown
         )
 
     reconciled: set[tuple[str, str]] = set()
-    for source_memory_id in removed_ids:
+    # Losing only part of a STATE's support can change which later revision is strong enough
+    # to replace it, even when the assertion itself survives the deletion.
+    for source_memory_id in (*removed_ids, *affected):
         semantic = connection.execute(
             """
             SELECT lineage_id, kind, basis
@@ -466,7 +495,8 @@ def delete_memory(  # noqa: C901 - one atomic dependency and lineage teardown
         if semantic is not None and (
             row_text(semantic, "kind") == MemoryKind.STATE.value
             or (
-                row_text(semantic, "kind") == MemoryKind.TRAIT.value
+                source_memory_id in removed_ids
+                and row_text(semantic, "kind") == MemoryKind.TRAIT.value
                 and row_text(semantic, "basis") == EvidenceBasis.USER_STATEMENT.value
             )
         ):
@@ -589,8 +619,7 @@ class MemoryRecords:
                 transaction_memory_ids.add(memory.memory_id)
                 if formation_pending_at is not None:
                     enqueue_capture(connection, memory.memory_id, formation_pending_at)
-            for embedding in supplied_embeddings:
-                write_embedding(connection, embedding)
+            write_embeddings(connection, supplied_embeddings)
             reproject_named_identities(
                 connection,
                 tuple(memory.memory_id for memory in supplied_memories),

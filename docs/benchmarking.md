@@ -112,6 +112,11 @@ Its per-arm `seconds` excludes shared selector work; `shared_selector_seconds` c
 to each reranking arm and is zero for the original ranking arm, regardless of execution order.
 Historical scores still require rejudging under the corrected ICM protocol.
 
+The support-coverage runner records provider-reported `prompt_tokens` for each outcome. Missing,
+malformed, or unobserved usage makes that outcome's count `null`; a measured zero remains `0`.
+Its `mean_prompt_tokens` is `null` whenever any outcome's usage is unknown, so a partial
+measurement cannot appear to be a complete cost average. Token counts are never estimated.
+
 ## Run an evaluation
 
 Set credentials for the OpenAI-compatible generation endpoint, then select a task or group:
@@ -123,6 +128,9 @@ uv run --frozen mindbridge-bench eval \
   --tasks locomo-refined \
   --output-path .benchmarks/results/locomo
 ```
+
+Task names and groups use the exact spelling shown by `--list-tasks`; glob patterns select
+multiple catalog entries.
 
 The resulting `results.jsonl` contains task/arm aggregates with `question_count`,
 `dataset_sha256`, and `evaluation_sha256`. `--check-integrity` additionally reports the selected
@@ -277,17 +285,23 @@ annotated [example configuration](examples/eval.example.yaml) for every field an
 `run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `stream_results`,
 `download`,
 `allow_unverified_data`, `verbosity`, `quiet`, `compare`, `fail_on_regression`,
-`regression_threshold`, `media_manifest`, `task_data`, `media_root`, and `num_fewshot`. Omitted
+`regression_threshold`, `media_manifest`, `task_data`, and `media_root`. Omitted
 keys retain the unset-flag defaults.
 
 `--blind` and `--blind-baseline` remain command-line-only because they label or attach a whole
 no-memory control run rather than an arm sweep. `--resume` is command-line-only for the same
 reason: it describes one invocation's recovery, not the sweep a file declares. `--blind` cannot be combined with an arm selection
-in the file. `--config`, the literal `--model mindbridge`, and the `--list-tasks` and
+in the file. `--config` and the `--list-tasks` and
 `--check-integrity` action modes also remain command-line-only. The three `*-args` strings are
 shorthand: `--model-args` writes generation endpoint settings, `--gen-kwargs` writes
 `generation.max_tokens` and `generation.extra_body`, and `--judge-model-args` writes
 `benchmark.judge`.
+
+Evaluation always uses MindBridge and the tasks' zero-shot protocols. CLI long options use
+hyphens and require their complete spelling. Generation overrides accept `generation_model`;
+judge overrides accept `model`. The `--model` selector, `--num-fewshot`/`num_fewshot`,
+`--memory-config`, underscore option aliases, and `pretrained` model aliases are not accepted.
+Results and samples use schema 22; the results document has no `num_fewshot` field.
 
 `--deliberate` and `--fallback-reference-at` also remain command-line-only;
 they are not accepted keys in `benchmark.run`. The product CLI `mindbridge ask` has no
@@ -439,20 +453,43 @@ The default is `mindbridge` alone. Each arm tags its samples and its task row wi
 -- under `arms`. Sample IDs of a non-default arm are prefixed with its name, so `samples.jsonl`
 stays one row per answered question per arm.
 
-Three properties of the baselines are load-bearing when quoting them:
+These properties of the baselines matter when quoting them:
 
-- **The two generating baselines are outside the product path by construction.** `Memory.ask`
-  abstains before it reaches the model when no hit survives grounding, so neither could exist
-  through it. They call the configured generation model with a harness-owned prompt, versioned as
-  `mindbridge_blind_v1` and `mindbridge_full_context_v1`, and are scored and judged by the same
-  scorers as the product arm. No baseline number is ever stamped `official_metric`.
-- **They are text-only.** Media in a question is dropped from the blind prompt, and media in a
-  corpus is not stuffed, so on a video or audio task both arms are lower bounds.
+- **The generating baselines are outside the product path by construction.** `Memory.ask`
+  abstains before it reaches the model when no hit survives grounding. These controls call the
+  configured generation model directly, with prompt protocols versioned as
+  `mindbridge_blind_v2` and `mindbridge_full_context_v2`, and are scored and judged by the same
+  scorers as the product arm. Full-context and compile reuse the product's base grounded reader
+  prompts. All three baselines receive `task_answer_policy`, including `--answer-policy`
+  overrides, and record it on samples, task rows, and arm definitions. Strict readers refuse
+  insufficient evidence; best-effort readers retain a tentative answer and flag uncertainty.
+  The product's host-assistant compile surface keeps its separate prompt and no ask policy.
+  No baseline number is ever stamped `official_metric`.
+- **Blind remains a prior-knowledge control.** It can answer public facts from model knowledge
+  but must not invent user facts; strict blind may correctly refuse personal questions. Its
+  abstention score alone does not demonstrate memory. V1 forced-guess results require a rerun;
+  `--blind-baseline` rejects a different prompt version or task policy.
+- **Corpus stuffing is text-only.** Query assets can reach blind and full-context when supported
+  by the generator; corpus media is not stuffed. Full-context is a lower bound on multimodal tasks.
+- **The evidence budgets measure different surfaces.** `--full-context-chars` caps rendered
+  evidence text, including separators, skipping whole items that do not fit. It excludes the
+  question, instructions, and native media. `--compile-max-chars` is the compiler's bundle cap;
+  product `evidence_budget_chars` controls evidence selection. Their scopes are recorded under
+  `arms.definitions`; none is a tokenizer-measured provider input limit. Changing the full-context
+  cap invalidates cached answers. Choose and report equal evidence caps for a budget-controlled
+  experiment, and measure actual provider usage separately. Defaults intentionally differ.
 - **`random` reuses the retriever, not necessarily the product arm's pool membership.** At the same
   causal store state it independently requests 100 candidates for a gold-labelled question
   (`recall_limit` otherwise), then applies a seeded shuffle. When the product answer ranks fewer
   candidates, treat this as a random-order control at its recorded depth, not a strict ranking-only
   A/B over identical membership.
+
+Arm results are end-to-end comparisons (`comparison_scope: end_to_end_system`,
+`memory_only_attribution: false`). Aligned refusal policies remove one confound, but differing
+knowledge sources, evidence representation, budgets, planning, and model calls still prevent
+attributing the entire score difference to memory alone. Report answerable and abstention
+subsets separately alongside the unchanged overall official metric. See the
+[E01 review](research/2026-10-27-benchmark-answer-policy.md) for evidence and validation limits.
 
 `compile` measures downstream task success from `Memory.compile()`'s bundle rather than
 `Memory.ask()`: it calls `compile(question, budget=ContextBudget(max_items=..., max_chars=...))`,
@@ -687,9 +724,7 @@ it has at least two frames. A shorter output is re-encoded from the same bounded
 with its native cadence, audio mapping, and geometry so no synthetic frame or event time is
 introduced. A consumer whose video processor needs two frames reports a genuine one-frame input as
 unsupported at its own boundary rather than changing the generic prepared-media representation.
-Only the current `ffmpeg-v2` cache namespace is reused. Older `ffmpeg-v1` derivatives are ignored
-and recomputed from their sources; they can be deleted to recover disk space. Current completed
-entries remain reusable, including genuine one-frame inputs.
+The `ffmpeg-v2` cache namespace retains completed entries, including genuine one-frame inputs.
 
 M3-Bench-web's official release publishes YouTube URLs rather than a durable web-video archive.
 When `yt-dlp` identifies a video as permanently unavailable (for example, private, removed, or
@@ -718,7 +753,9 @@ with the pinned release.
 
 For a prepared causal stream, pass `--media-manifest FILE`. Causal tasks require source intervals;
 the runner ingests only observations ending at or before the question cutoff. Relative paths are
-resolved from the manifest file. When the runner prepares media itself, it writes one manifest
+resolved from the manifest file. A version-1 manifest contains `tasks`, each task contains `units`,
+and each unit contains a list of objects with `path`, `text`, or both, plus optional `source_id`,
+`start_seconds`, and `end_seconds`. When the runner prepares media itself, it writes one manifest
 object to `OUTPUT/media-manifest.jsonl`; use that generated file as the format reference before
 supplying an operator-authored replacement.
 
@@ -813,8 +850,7 @@ Four of them need a note before a number is quoted:
   `ad80a3b1b322`: positive items have gain +2, fillers +1, and hard negatives -2, with the
   hidden-persona filler gain set to zero only for historical slates that have no hard negatives.
   The resulting `ndcg_at_5` is the ranking headline. `target_only_ndcg@5` remains a local
-  diagnostic. The deprecated `ndcg_graded@5` key is a compatibility alias for that target-only
-  diagnostic and is not classified as an upstream metric. The proactive decision judge, the two repetition-fatigue
+  diagnostic. The proactive decision judge, the two repetition-fatigue
   cluster tasks, `new_suggestions_chatbot`, `local_recommendation_geo_shift`,
   `active_mistake_prevention` and `short_vs_long_term_lifecycle` are answered and reported but
   carry no official headline -- therefore the aggregate `accuracy_pct_micro` is explicitly
@@ -837,10 +873,10 @@ number would measure the generator's prior knowledge of the scripts rather than 
 
 ## Reported performance and resource metrics
 
-Evaluation schema version `19` removes deprecated performance aliases listed below. Version `18`
-introduced `grounding_request` to each sample and, with `--log-samples`, the original
-`source_question`. The runner recipe is `mindbridge_eval_official_v18`, so previous
-answer caches are not reused under the new prompt and evidence projection.
+Evaluation artifacts use schema version `21` and runner recipe `mindbridge_eval_official_v18`.
+Results include five-layer quality diagnostics, observed answerer evidence, original trace/span
+identifiers, and `grounding_request` for each sample. `--log-samples` retains the original
+`source_question`. Baselines, rejudging inputs, and response caches require the current format.
 `grounding_request` describes the last **prepared** generation request: retained `record_ids`,
 original `asset_ids`, UTF-8 `text_bytes`, `media_fallback`, and span `successful` status. Text bytes
 cover the user evidence parts, excluding the system prompt, JSON request envelope, and encoded
@@ -851,19 +887,19 @@ reconstructing an assumed request from retrieved candidates.
 
 ### Rejudge saved ICM predictions
 
-Use the corrected, user-only ICM judge protocol on logged predictions without re-ingestion or
+Use the user-only ICM judge protocol on logged predictions without re-ingestion or
 answer generation:
 
 ```bash
 uv run --locked python -m mindbridge.benchmarks.rejudge_icm \
-  --predictions old-icm-samples.jsonl --annotations icm-questions.jsonl \
+  --predictions icm-samples.jsonl --annotations icm-questions.jsonl \
   --output icm-rejudged.json --model gpt-4o-mini
 ```
 
-The input must contain only `icm-bench` rows with logged reference answers. Original annotations
-are joined by question ID and checked against saved references and, when available, original
-question text. For older samples without that text, `question_binding=legacy_id_and_reference`
-marks the weaker check; the generation prompt is never treated as the original judge question.
+The input must contain only current-schema `icm-bench` rows with logged reference answers and
+original question text from `--log-samples`. Original annotations are joined by question ID and
+checked against both saved references and question text. The generation prompt is never treated
+as the original judge question. `question_binding=id_reference_and_text` records the checks.
 The output retains the prediction, prediction hash, old score and old protocol, and records the
 new protocol, model and input file hashes. A previous `JudgeError` can be rejudged; failed
 generation or ingestion is skipped. Judge failures are unscored, empty predictions score zero,
@@ -897,28 +933,10 @@ gaps do not inflate the denominator. TTFT and token-per-call distributions also 
 | `nodes` | Count, compute time, active time, throughput, average, p50/p95/p99, status, parent operation, purpose, model identity, response identity, fingerprint, embedding task, batch size, and modalities for every operation, stage, and model span. |
 | `token_usage` | Total and per-module request counts, exactness, input/output/cached/reasoning tokens, modality totals, per-call distribution, and observed output tokens per model-compute second. |
 
-Benchmark performance JSON now emits only the explicit metric names. Consumers of older result
-documents must update these removed fields:
-
-| Removed field | Current field |
-| --- | --- |
-| `performance.search` | `performance.ask_retrieval_core` |
-| `ingest.call_count` | `ingest.success_count` |
-| `ingest.item_count` | `ingest.accepted_item_count` |
-| `ingest.compute_seconds` | `ingest.successful_compute_seconds` |
-| `ingest.wall_seconds` | `ingest.active_seconds` |
-| `ingest.call_latency_ms`, `ingest.item_latency_ms` | `ingest.successful_batch_latency_ms`; per-item amortized work is `ingest.amortized_compute_ms_per_accepted_item` |
-| `ingest.items_per_second` | `ingest.items_per_active_second` |
-| Latency-block `wall_seconds`, `throughput_per_second` | `active_seconds`, `throughput_per_active_second` |
-| `answer.time_to_first_token_ms` | `answer.generation_time_to_first_token_ms` |
-| `asr.call_count`, `asr.ratio_call_count` | `asr.invocation_count`, `asr.ratio_invocation_count` |
-
-The accompanying `deprecated_fields` objects are removed. This changes the benchmark result
-schema; stored result files are not rewritten. Resource measurement `wall_seconds` retains its
-existing meaning as the measured resource window.
-
-Controls that require the current schema, including blind baselines and sample comparison, need
-new schema-19 output. Do not relabel older result files to bypass those checks.
+Performance fields name their measured boundaries explicitly. `ingest.successful_batch_latency_ms`
+reports successful batch latency; `ingest.amortized_compute_ms_per_accepted_item` reports per-item
+amortized work. `active_seconds` measures the union of operation intervals, while resource
+measurement `wall_seconds` measures the resource window.
 
 `ingest` ends only after the SQLite commit and the Zvec apply, so an accepted item is searchable
 when its measured call completes; the Zvec flush and outbox acknowledgement are batched behind the
@@ -1049,9 +1067,9 @@ captured against the same causal store state as the answer. Its configured depth
 `evidence_budget_chars` is set, which it is by default, and otherwise `min(100, recall_limit * 3)`;
 both the configured depth
 and the returned count are recorded. The random arm requests 100 for gold-labelled questions and
-`recall_limit` otherwise. New response-cache entries preserve the ranked IDs; a legacy cache entry
-without one is counted in
-`retrieval.unranked_labelled_question_count` instead of being scored as zero.
+`recall_limit` otherwise. Response-cache entries preserve the ranked IDs. An answer surface that
+does not expose ranked candidates is counted in `retrieval.unranked_labelled_question_count`
+instead of being scored as zero.
 
 ## Gold evidence per benchmark family
 
@@ -1116,6 +1134,70 @@ three-point floor and the two-run interval implied by that standard error. A dif
 than that is inside the run-to-run noise band and is not a result. `--compare` rows repeat
 `noise_floor` and add `below_noise_floor` for the observed delta.
 
+## Five-layer quality diagnosis
+
+Each sample carries `quality_diagnostics`, joined by `sample_id`, `trace_id` and
+`answer_span_id`. Trace IDs can span several questions; the answer span distinguishes them.
+The task/arm aggregate carries observation counts, coverage denominators, and conditional answer
+scores under the same key. These are MindBridge diagnostics, not upstream benchmark metrics.
+
+| Layer | Observation | What remains unknown |
+| --- | --- | --- |
+| `input` | Labelled source IDs present in the question's causally eligible input corpus, total eligible source count, ingest failures | Successful semantic representation or correct indexing; input presence proves neither |
+| `retrieval` | The ranked candidates already produced before recall planning and generation | Whether a miss came from representation, candidate generation, filtering or ranking |
+| `organization` | The last evidence list passed to the answerer, observed independently of returned hits; compile excerpts remain separate | Whether the selected sources jointly contain the required facts |
+| `reader_input` | The last prepared generation request's record/asset IDs, text bytes, media fallback and success status | Provider-side perception, fact extraction and reasoning |
+| `answer` | Task score, abstention, product error and scorer error | Causal responsibility for the score |
+
+`generation_evidence` stores the organization observation. `evidence` retains its existing meaning:
+the answer's returned hits. A prepared request is not proof that the provider perceived a critical
+frame, heard a phrase, or used a fact. `successful` describes the instrumented generation span;
+an unsuccessful prepared request must not be described as successful delivery.
+
+Source coverage counts the release's source groups, with any member satisfying a group. It is
+`null` when labels or observations are missing, a record cannot be mapped to a source, or evidence
+labels remain unresolved. An observed empty list with labels has zero coverage. Partial excerpts
+are listed separately and never credited as full parent-source coverage. Source coverage at every
+layer can be complete while the required fact span is missing: `fact_span_coverage` and
+`causal_attribution` remain `null`. Conditional QA scores and refusals are clues for investigation,
+not a reader-error rate. The aggregate retains separate scored and error denominators.
+
+Response-cache entries retain the original answer trace/span IDs and organization observation,
+including partial excerpt provenance. Cache hits are marked `observation_origin: response_cache`
+and receive no invented fresh trace. Prepared-request telemetry is not retained by the response
+cache, so that layer remains unavailable on cache-only replay. Custom backends and the harness
+generator may also lack prepared-request telemetry. These observations describe the last answerer
+call and last prepared request, not a complete causal history of recall rounds or retries.
+
+For datasets without fact spans, export a deterministic human-review sample:
+
+```bash
+mindbridge-bench review-samples \
+  --samples .benchmarks/results/memory/samples.jsonl \
+  --output .benchmarks/reviews/memory.jsonl --per-stratum 10 --seed 0
+```
+
+Sampling stratifies by task, arm, question type/category, error/abstention/unscored/zero/positive
+score, and source-label availability. Each row retains dataset/evaluation hashes, trace IDs, the
+observations already saved, and stratum population/selection counts. This is an audit sample;
+do not report its unweighted mean as a population metric. The command preserves existing human
+annotations by refusing to replace different output. It calls no model or retriever.
+
+All `annotation.layers`, `annotation.source_spans`, annotator and rationale fields start `null`,
+with status `pending`. Human reviewers must open the pinned original sources, mark supporting or
+contradicting character ranges, time intervals or frames with source IDs and units, assess each
+layer's sufficiency, and retain `unknown` where they cannot decide. Include a second independent
+review and adjudicate disagreements before treating annotations as reference evidence. An answer
+substring, source ID, model judgment or refusal alone is not a gold span. The export does not feed
+annotations into product requests or official scoring. It does not imply annotation has occurred.
+
+To distinguish causes after annotation, compare paired offline conditions with the same questions,
+reader/model revision and scorer: original evidence only, stored representation only, selected
+evidence and actual prepared context. Keep gold inputs outside normal retrieval and generation.
+Record the intervention and denominator; post-hoc coverage alone cannot establish causality.
+See the [quality diagnosis audit](research/2026-10-27-quality-diagnostics.md) for the rationale and
+research limits.
+
 ## Results and reproducibility
 
 Each completed `eval` output directory contains:
@@ -1126,7 +1208,8 @@ Each completed `eval` output directory contains:
   manifest describes the completed run; it is not intended to be passed back to `--config` as an
   input document.
 - `samples.jsonl`: one prediction and its native metrics, evidence intervals, retrieval diagnostics,
-  `ranked_source_ids_complete`, and structured failure fields per sample, per arm.
+  `ranked_source_ids_complete`, five-layer quality diagnostics and structured failure fields per
+  sample, per arm.
 - `results.jsonl`: one aggregate record with dataset and implementation pins, arm definitions,
   aggregate metrics, confidence intervals, performance, token usage, abstentions, mandatory
   controls, the noise floor, resource usage, and a digest of `samples.jsonl`.
@@ -1149,8 +1232,14 @@ embedding, generation, or judge endpoint is retried with exponential backoff (ca
 between attempts) for up to ten minutes. Such a failure describes the network at that second, not
 the answer, write, or verdict it interrupted, and one fourteen-hour run lost its `longmemeval-s`
 score to eight connection resets during judging. Only the attempt that succeeded is timed. An
-outage longer than the budget still produces the structured errors described above and still
-invalidates the score, so a dead endpoint is never hidden.
+outage longer than the budget follows the failure policy for that stage. Generation and judge
+request failures remain per-question errors: they score zero, stay in the mean, and increment
+`error_count`. Embedding failures retain the write and retrieval validity rules above.
+
+Only provider SDK and transport failures raised by a judge request enter that zero-score policy.
+Local response parsing, score combination, cache access, and usage accounting errors stop the
+evaluation instead of being reported as wrong model answers. Such an error means the evaluator
+could not establish a score; rerun after correcting the evaluator or its inputs.
 
 The standard CLI does not persist each question inside one unfinished task. The frozen long-run
 EgoLife protocol adds that narrower behavior with an attempt-owned benchmark source overlay; it
@@ -1253,10 +1342,11 @@ Several result fields carry a caveat that decides whether they can be quoted:
   it issues no scoring search. The artifact records that answer's configured candidate depth, and
   `retrieval_candidates` records the actual returned count for each sample. A miss there is a
   retrieval failure. What the answer actually grounded on is separate:
-  `evidence` is the answer's hits, and `dropped_hits` counts what the answerer's inline context
-  budget removed. A gold that is in the candidate list but not in `evidence` is budget loss, not
-  retrieval loss. Current response-cache entries retain the ranked candidate IDs; legacy entries
-  that predate that field report the retrieval metric as unranked. `ref_at_300` stays a property of
+  `evidence` is the answer's returned hits, and `dropped_hits` counts what the answerer's inline
+  context budget removed. A source present among candidates but absent from returned hits cannot
+  by itself establish budget loss: compare the independently observed `organization` and
+  `reader_input` layers, and inspect replanning, packing and media fallback. Response-cache
+  entries retain the ranked candidate IDs. `ref_at_300` stays a property of
   the answer's evidence.
 
 `performance` is aggregated separately for each task and arm, and each task row carries only the

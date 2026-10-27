@@ -12,13 +12,15 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from opentelemetry import trace
 from opentelemetry.trace import Tracer
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
+    from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
+    from openai.types.responses import Response
 from mindbridge import Modality
 from mindbridge._telemetry import (
     MODEL_MODULE,
@@ -69,6 +71,25 @@ from mindbridge.models.openai_sdk import (
     _record_openai_provenance,
     _record_usage_batch,
 )
+
+
+class _JudgeRequestRequired(TypedDict):
+    model: str
+    messages: list[ChatCompletionMessageParam]
+    temperature: float
+
+
+class _JudgeRequest(_JudgeRequestRequired, total=False):
+    max_tokens: int
+    extra_body: dict[str, object]
+
+
+class _JudgeRequestError(Exception):
+    """An exhausted SDK request failure, distinct from local scoring failures."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(str(error))
+        self.error = error
 
 
 async def _apply_judges(
@@ -209,7 +230,8 @@ async def _judge_sample(
             judge_response=(json.dumps(responses, ensure_ascii=False) if log_samples else None),
             judge_cached=all(item[2] for item in outcomes),
         )
-    except Exception as error:
+    except _JudgeRequestError as failure:
+        error = failure.error
         message = " ".join(str(error).split())[:500]
         # The judge's outage was waited out already; an answer that still has no verdict is
         # scored as wrong, the same as an answer that was never produced.
@@ -283,6 +305,10 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
     config: _JudgeConfig,
     read_cache: bool = True,
 ) -> tuple[Mapping[str, float], str, bool]:
+    from httpx2 import TransportError
+    from openai import APIError
+
+    request_errors = (APIError, TransportError)
     cache_task, key = _judge_cache_coordinates(
         messages,
         plan=plan,
@@ -300,9 +326,14 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
         )
         if cached is not None:
             return cached
-    request: dict[str, Any] = {
+    request: _JudgeRequest = {
         "model": config.model,
-        "messages": [{"role": message.role, "content": message.content} for message in messages],
+        "messages": [
+            {"role": "system", "content": message.content}
+            if message.role == "system"
+            else {"role": "user", "content": message.content}
+            for message in messages
+        ],
         "temperature": 0.0,
     }
     if plan.max_tokens is not None:
@@ -319,22 +350,39 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
     usages = []
     attempted = 0
 
-    async def call() -> tuple[Mapping[str, float], str, bool]:
+    async def call() -> ChatCompletion | Response:
         nonlocal attempted
         async with semaphore:
             attempted += 1
             mark_model_requests(attempted)
-            if use_responses_api:
-                response = await client.responses.create(
-                    model=config.model,
-                    input="\n".join(message.content for message in messages),
-                    max_output_tokens=plan.max_tokens,
-                    reasoning={"effort": "minimal"},
-                )
-                text = str(response.output_text or "").strip()
-            else:
-                response = await client.chat.completions.create(**request)
-                text = str(response.choices[0].message.content or "").strip()
+            try:
+                if use_responses_api:
+                    return await client.responses.create(
+                        model=config.model,
+                        input="\n".join(message.content for message in messages),
+                        max_output_tokens=plan.max_tokens,
+                        reasoning={"effort": "minimal"},
+                    )
+                completion: ChatCompletion = await client.chat.completions.create(**request)
+                return completion
+            except request_errors as error:
+                raise _JudgeRequestError(error) from error
+
+    try:
+        while True:
+            try:
+                response = await _retry_transient(call)
+                break
+            except _JudgeRequestError as failure:
+                if "extra_body" in request and _unsupported_extra_body(failure.error):
+                    request.pop("extra_body")
+                    continue
+                raise
+        text = (
+            str(cast("Response", response).output_text or "").strip()
+            if use_responses_api
+            else str(cast("ChatCompletion", response).choices[0].message.content or "").strip()
+        )
         _record_openai_provenance(response)
         usages.append(
             _model_usage(
@@ -347,16 +395,6 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
         if cache is not None:
             cache.put(cache_task, sample.unit_id, key, CachedAnswer(text, 0.0, ()))
         return scores, text, False
-
-    try:
-        while True:
-            try:
-                return await _retry_transient(call)
-            except Exception as error:
-                if "extra_body" in request and _unsupported_extra_body(error):
-                    request.pop("extra_body")
-                    continue
-                raise
     finally:
         _record_usage_batch(usages, request_count=attempted)
 
@@ -405,7 +443,7 @@ def _cached_judge_call(
     return parse_judge_response(plan, cached.prediction), cached.prediction, True
 
 
-def _unsupported_extra_body(error: Exception) -> bool:
+def _unsupported_extra_body(error: BaseException) -> bool:
     message = str(error).casefold()
     field = "enable_thinking" in message or "chat_template_kwargs" in message
     marker = any(

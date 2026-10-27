@@ -1,4 +1,4 @@
-"""The current SQLite schema, and the refusal of every other version."""
+"""The current SQLite schema and its structural validation."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sqlite3
 from mindbridge.infrastructure.local.store._codec import row_text
 from mindbridge.infrastructure.local.store.errors import UnsupportedSchemaError
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 20
 
 
 REQUIRED_TABLES = frozenset(
@@ -45,9 +45,8 @@ REQUIRED_TABLES = frozenset(
 )
 
 
-_TEXT_SELECTOR_SCHEMA = (
-    """
-    CREATE TABLE IF NOT EXISTS embedding_text_selectors (
+_TEXT_SELECTOR_SCHEMA = """
+    CREATE TABLE embedding_text_selectors (
         embedding_id TEXT NOT NULL REFERENCES embeddings (embedding_id) ON DELETE CASCADE,
         selector_position INTEGER NOT NULL CHECK (selector_position >= 0),
         parent_content_sha256 TEXT NOT NULL CHECK (
@@ -60,10 +59,9 @@ _TEXT_SELECTOR_SCHEMA = (
         ),
         recipe_version TEXT NOT NULL CHECK (length(trim(recipe_version)) > 0),
         PRIMARY KEY (embedding_id, selector_position)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS embedding_text_span_pieces (
+    );
+
+    CREATE TABLE embedding_text_span_pieces (
         embedding_id TEXT NOT NULL,
         selector_position INTEGER NOT NULL,
         piece_position INTEGER NOT NULL CHECK (piece_position >= 0),
@@ -77,16 +75,11 @@ _TEXT_SELECTOR_SCHEMA = (
         PRIMARY KEY (embedding_id, selector_position, piece_position),
         FOREIGN KEY (embedding_id, selector_position)
           REFERENCES embedding_text_selectors (embedding_id, selector_position) ON DELETE CASCADE
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS embedding_text_span_pieces_embedding_idx
-        ON embedding_text_span_pieces (embedding_id, selector_position, piece_position)
-    """,
-)
+    );
 
-
-_TEXT_SELECTOR_SCHEMA_SCRIPT = ";".join(_TEXT_SELECTOR_SCHEMA) + ";"
+    CREATE INDEX embedding_text_span_pieces_embedding_idx
+        ON embedding_text_span_pieces (embedding_id, selector_position, piece_position);
+"""
 
 
 _ASSET_SCHEMA = """
@@ -142,22 +135,19 @@ END;
 """
 
 
-_IDENTITY_LINK_EVIDENCE_DDL = (
-    """CREATE TABLE identity_link_evidence (
+_IDENTITY_LINK_EVIDENCE_SCHEMA = """
+CREATE TABLE identity_link_evidence (
     voice_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
     face_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
     asset_id TEXT NOT NULL REFERENCES media_assets (asset_id) ON DELETE CASCADE,
     created_at TEXT NOT NULL,
     PRIMARY KEY (voice_id, face_id, asset_id)
-)""",
-    "CREATE INDEX identity_link_evidence_face_idx ON identity_link_evidence (face_id)",
-    "CREATE INDEX identity_link_evidence_asset_idx ON identity_link_evidence (asset_id)",
-)
+);
 
+CREATE INDEX identity_link_evidence_face_idx ON identity_link_evidence (face_id);
 
-_IDENTITY_LINK_EVIDENCE_SCHEMA = "".join(
-    f"{statement};\n" for statement in _IDENTITY_LINK_EVIDENCE_DDL
-)
+CREATE INDEX identity_link_evidence_asset_idx ON identity_link_evidence (asset_id);
+"""
 
 
 _IDENTITY_SCHEMA = f"""
@@ -263,6 +253,9 @@ CREATE TABLE memory_semantics (
     source_id TEXT,
     subject TEXT,
     predicate TEXT,
+    predicate_key TEXT,
+    predicate_registry TEXT,
+    predicate_match TEXT,
     value TEXT,
     model_id TEXT,
     recipe TEXT,
@@ -339,7 +332,7 @@ CREATE UNIQUE INDEX memory_evidence_current_idx
     WHERE retired_at IS NULL;
 
 -- Clauses are authoritative provenance: one clause is an AND of its members, and several
--- clauses for a record are alternatives. `memory_evidence` remains the compatibility union.
+-- clauses for a record are alternatives. `memory_evidence` projects their active source union.
 CREATE TABLE memory_evidence_clauses (
     memory_id TEXT NOT NULL REFERENCES memory_semantics (memory_id) ON DELETE CASCADE,
     clause_id TEXT NOT NULL CHECK (length(clause_id) = 64 AND clause_id NOT GLOB '*[^0-9a-f]*'),
@@ -393,19 +386,15 @@ CREATE TABLE formation_runs (
 """
 
 
-# One statement per entry, joined below. Kept as a tuple so a caller that must stay inside its
-# own transaction can execute them one at a time: `executescript` issues an implicit COMMIT first.
-_CONTROL_SCHEMA = (
-    """
-    CREATE TABLE IF NOT EXISTS capture_queue (
+_CONTROL_SCHEMA = """
+    CREATE TABLE capture_queue (
         memory_id TEXT PRIMARY KEY REFERENCES memory_records (memory_id) ON DELETE CASCADE,
         enqueued_at TEXT NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
         last_error TEXT CHECK (last_error IS NULL OR length(trim(last_error)) > 0)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS memory_operations (
+    );
+
+    CREATE TABLE memory_operations (
         operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
         operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
         intent TEXT NOT NULL CHECK (
@@ -425,22 +414,14 @@ _CONTROL_SCHEMA = (
         outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
         outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
         CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
-    )
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_active_key_idx
+    );
+
+    CREATE UNIQUE INDEX memory_operations_active_key_idx
         ON memory_operations (operation_key)
-        WHERE rolled_back_at IS NULL
-    """,
-)
+        WHERE rolled_back_at IS NULL;
+"""
 
 
-_CONTROL_SCHEMA_SCRIPT = ";".join(_CONTROL_SCHEMA) + ";"
-
-
-# The scheduler's own durable state, added in v13. Two facts the store could not answer before:
-# "has anything already weighed this?" and "which recalls came back empty?".
-#
 # `memory_deliberations` is the already-weighed marker. Without it a candidate whose deliberation
 # yielded nothing -- the backend proposed nothing, or the kernel refused everything -- left no
 # trace and came back every round, paying the model each time. A row is written per pass, zero
@@ -451,7 +432,7 @@ _CONTROL_SCHEMA_SCRIPT = ";".join(_CONTROL_SCHEMA) + ";"
 # owner's own queries, which is their own memory domain, and is bounded on write rather than
 # growing without limit.
 _SCHEDULER_SCHEMA = """
-CREATE TABLE IF NOT EXISTS memory_deliberations (
+CREATE TABLE memory_deliberations (
     deliberation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
     weighed_at TEXT NOT NULL,
@@ -460,24 +441,24 @@ CREATE TABLE IF NOT EXISTS memory_deliberations (
     rejected INTEGER NOT NULL CHECK (rejected >= 0)
 );
 
-CREATE TABLE IF NOT EXISTS memory_deliberation_memories (
+CREATE TABLE memory_deliberation_memories (
     deliberation_id INTEGER NOT NULL
         REFERENCES memory_deliberations (deliberation_id) ON DELETE CASCADE,
     memory_id TEXT NOT NULL REFERENCES memory_records (memory_id) ON DELETE CASCADE,
     PRIMARY KEY (deliberation_id, memory_id)
 );
 
-CREATE INDEX IF NOT EXISTS memory_deliberation_memories_memory_idx
+CREATE INDEX memory_deliberation_memories_memory_idx
     ON memory_deliberation_memories (memory_id, deliberation_id);
 
-CREATE TABLE IF NOT EXISTS query_failures (
+CREATE TABLE query_failures (
     failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
     query TEXT NOT NULL CHECK (length(trim(query)) > 0),
     normalized TEXT NOT NULL CHECK (length(normalized) > 0),
     failed_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS query_failures_normalized_idx
+CREATE INDEX query_failures_normalized_idx
     ON query_failures (normalized, failed_at);
 """
 
@@ -569,12 +550,12 @@ CREATE TABLE embeddings (
 
 CREATE INDEX embeddings_memory_idx ON embeddings (memory_id);
 
-{_TEXT_SELECTOR_SCHEMA_SCRIPT}
+{_TEXT_SELECTOR_SCHEMA}
 
 {_ASSET_SCHEMA}
 {_IDENTITY_SCHEMA}
 {_SEMANTIC_SCHEMA}
-{_CONTROL_SCHEMA_SCRIPT}
+{_CONTROL_SCHEMA}
 
 CREATE TABLE store_metadata (
     key TEXT PRIMARY KEY CHECK (length(trim(key)) > 0),
@@ -633,7 +614,7 @@ def create_schema(
 
 
 def validate_text_selector_schema(connection: sqlite3.Connection) -> None:
-    """Reject a partial or incompatible selector projection before accepting schema 18."""
+    """Reject a partial or incompatible selector projection before opening the store."""
     expected_columns = {
         "embedding_text_selectors": (
             ("embedding_id", "TEXT", 1, 1),
@@ -744,7 +725,7 @@ def validate_text_selector_schema(connection: sqlite3.Connection) -> None:
 
 
 def validate_evidence_clause_schema(connection: sqlite3.Connection) -> None:
-    """Reject a partial development schema before migration writes any support rows."""
+    """Reject incomplete or incompatible support tables before opening the store."""
     expected_columns = {
         "memory_evidence_clauses": (
             "memory_id",

@@ -9,6 +9,7 @@ import pytest
 
 from mindbridge.benchmarks import rejudge_icm
 from mindbridge.benchmarks.eval_config import _JudgeConfig
+from mindbridge.benchmarks.eval_results import EVAL_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -16,11 +17,14 @@ if TYPE_CHECKING:
 
 def _saved(**updates: object) -> dict[str, object]:
     return {
+        "schema_version": EVAL_SCHEMA_VERSION,
         "sample_id": "icm-bench/timeline/q1",
         "task": "icm-bench",
         "unit_id": "timeline",
         "question_id": "q1",
         "dataset_sha256": "original-corpus",
+        "evaluation_sha256": "evaluation-inputs",
+        "arm": "mindbridge",
         "prediction": "Ada",
         "references": ["Ada"],
         "source_question": "Who left?",
@@ -87,6 +91,13 @@ def test_rejudge_refuses_annotation_mismatch_before_any_request(
 ) -> None:
     with pytest.raises(ValueError, match="disagree"):
         rejudge_icm.attach_questions((_saved(**updates),), _annotations(tmp_path / "qa.jsonl"))
+
+
+def test_rejudge_requires_logged_source_question(tmp_path: Path) -> None:
+    row = _saved()
+    del row["source_question"]
+    with pytest.raises(ValueError, match="requires source_question"):
+        rejudge_icm.attach_questions((row,), _annotations(tmp_path / "qa.jsonl"))
 
 
 def test_rejudge_failures_are_unscored_and_failed_generation_is_skipped(

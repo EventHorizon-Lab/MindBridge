@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from mindbridge.benchmarks.eval_results import EVAL_SCHEMA_VERSION
+
 PERFORMANCE_BUDGET_NAMES = (
     "answer_e2e_ttft_p95",
     "answer_e2e_latency_p95",
@@ -92,24 +94,18 @@ _MODEL_PATHS = tuple(
         "memory_config",
     )
 )
-_MISSING = object()
 
 
 def load_result(path: Path) -> dict[str, object]:
     """Load the result beside a directory, results file, or samples file."""
     resolved = path.expanduser().resolve()
-    candidates: tuple[Path, ...]
     if resolved.is_dir():
-        candidates = (resolved / "results.jsonl", resolved / "results.json")
+        result_path = resolved / "results.jsonl"
     elif resolved.name == "samples.jsonl":
-        candidates = (
-            resolved.with_name("results.jsonl"),
-            resolved.with_name("results.json"),
-        )
+        result_path = resolved.with_name("results.jsonl")
     else:
-        candidates = (resolved,)
-    result_path = next((candidate for candidate in candidates if candidate.is_file()), None)
-    if result_path is None:
+        result_path = resolved
+    if not result_path.is_file():
         raise FileNotFoundError(f"baseline results do not exist beside: {resolved}")
     try:
         document = json.loads(result_path.read_text(encoding="utf-8"))
@@ -117,8 +113,7 @@ def load_result(path: Path) -> dict[str, object]:
         raise ValueError(f"baseline result is invalid JSON: {result_path}") from error
     if not isinstance(document, dict):
         raise ValueError("baseline result must be one JSON object")
-    schema = document.get("schema_version")
-    if isinstance(schema, bool) or not isinstance(schema, int) or schema < 10:
+    if document.get("schema_version") != EVAL_SCHEMA_VERSION:
         raise ValueError("baseline result schema version is unsupported")
     return document
 
@@ -181,6 +176,8 @@ def performance_comparisons(
 
 def _require_comparable(candidate: Mapping[str, object], baseline: Mapping[str, object]) -> None:
     for side, document in (("candidate", candidate), ("baseline", baseline)):
+        if document.get("schema_version") != EVAL_SCHEMA_VERSION:
+            raise ValueError(f"{side} result schema version is unsupported")
         if document.get("status") != "completed":
             raise ValueError(f"{side} performance result is not completed without product errors")
     for path in (*_GLOBAL_PATHS, *_MODEL_PATHS):
@@ -188,15 +185,15 @@ def _require_comparable(candidate: Mapping[str, object], baseline: Mapping[str, 
         previous = _at(baseline, path)
         if current != previous:
             _not_comparable(".".join(path), current, previous)
-    if bool(candidate.get("response_cache")) or bool(baseline.get("response_cache")):
+    if bool(_at(candidate, ("response_cache",))) or bool(_at(baseline, ("response_cache",))):
         raise ValueError("performance results using a response cache are not comparable")
     # A resumed run skips the ingest a previous invocation already paid for and inherits its warm
     # description cache, so its write-path timings describe neither run.
-    if bool(candidate.get("resume")) or bool(baseline.get("resume")):
+    if bool(_at(candidate, ("resume",))) or bool(_at(baseline, ("resume",))):
         raise ValueError("performance results from a resumed run are not comparable")
 
-    current_protocol = _at(candidate, ("measurement_protocol", "state"), "legacy_unspecified")
-    previous_protocol = _at(baseline, ("measurement_protocol", "state"), "legacy_unspecified")
+    current_protocol = _at(candidate, ("measurement_protocol", "state"))
+    previous_protocol = _at(baseline, ("measurement_protocol", "state"))
     if current_protocol != previous_protocol:
         _not_comparable("measurement_protocol.state", current_protocol, previous_protocol)
 
@@ -204,7 +201,7 @@ def _require_comparable(candidate: Mapping[str, object], baseline: Mapping[str, 
     _require_acceleration_comparable(candidate, baseline)
     current_provenance = _response_provenance(candidate)
     previous_provenance = _response_provenance(baseline)
-    if current_provenance and previous_provenance and current_provenance != previous_provenance:
+    if current_provenance != previous_provenance:
         _not_comparable("model response provenance", current_provenance, previous_provenance)
 
 
@@ -214,45 +211,33 @@ def _require_hardware_comparable(
 
     current_hardware = _mapping(_at(candidate, ("environment", "hardware")), "candidate hardware")
     previous_hardware = _mapping(_at(baseline, ("environment", "hardware")), "baseline hardware")
-    for name in ("machine", "processor", "cpu_model", "logical_cores", "ram_total_bytes"):
-        if current_hardware.get(name) != previous_hardware.get(name):
+    for name in ("machine", "processor", "cpu_model", "logical_cores", "ram_total_bytes", "gpus"):
+        current = _at(current_hardware, (name,))
+        previous = _at(previous_hardware, (name,))
+        if current != previous:
             _not_comparable(
                 f"environment.hardware.{name}",
-                current_hardware.get(name),
-                previous_hardware.get(name),
+                current,
+                previous,
             )
-    current_gpus, previous_gpus = current_hardware.get("gpus"), previous_hardware.get("gpus")
-    if current_gpus is not None and previous_gpus is not None:
-        if current_gpus != previous_gpus:
-            _not_comparable("environment.hardware.gpus", current_gpus, previous_gpus)
-    elif current_hardware.get("cuda_device_uuids") != previous_hardware.get("cuda_device_uuids"):
-        _not_comparable(
-            "environment.hardware.cuda_device_uuids",
-            current_hardware.get("cuda_device_uuids"),
-            previous_hardware.get("cuda_device_uuids"),
-        )
 
 
 def _require_acceleration_comparable(
     candidate: Mapping[str, object], baseline: Mapping[str, object]
 ) -> None:
-    previous_acceleration = _at(baseline, ("environment", "acceleration_runtime"), _MISSING)
-    if previous_acceleration is not _MISSING:
-        current_acceleration = _at(candidate, ("environment", "acceleration_runtime"), _MISSING)
-        if current_acceleration != previous_acceleration:
-            _not_comparable(
-                "environment.acceleration_runtime", current_acceleration, previous_acceleration
-            )
+    previous_acceleration = _at(baseline, ("environment", "acceleration_runtime"))
+    current_acceleration = _at(candidate, ("environment", "acceleration_runtime"))
+    if current_acceleration != previous_acceleration:
+        _not_comparable(
+            "environment.acceleration_runtime", current_acceleration, previous_acceleration
+        )
 
 
 def _require_task_comparable(
     candidate: Mapping[str, object], baseline: Mapping[str, object]
 ) -> None:
     for side, task in (("candidate", candidate), ("baseline", baseline)):
-        if task.get("error_count") not in (None, 0) or task.get("ingest_failure_count") not in (
-            None,
-            0,
-        ):
+        if task.get("error_count") != 0 or task.get("ingest_failure_count") != 0:
             raise ValueError(f"{side} performance task contains product errors")
     for name in (
         "dataset_sha256",
@@ -260,13 +245,12 @@ def _require_task_comparable(
         "evaluation_sha256",
         "batch_size",
         "input_modalities",
-        "unit_count",
         "question_count",
     ):
-        if candidate.get(name) != baseline.get(name):
-            _not_comparable(
-                f"tasks[{candidate.get('task')}].{name}", candidate.get(name), baseline.get(name)
-            )
+        current = _at(candidate, (name,))
+        previous = _at(baseline, (name,))
+        if current != previous:
+            _not_comparable(f"tasks[{candidate.get('task')}].{name}", current, previous)
 
 
 def _product_tasks(document: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
@@ -275,7 +259,12 @@ def _product_tasks(document: Mapping[str, object]) -> dict[str, Mapping[str, obj
         raise ValueError("benchmark result tasks must be an array")
     rows: dict[str, Mapping[str, object]] = {}
     for item in raw:
-        if not isinstance(item, Mapping) or item.get("arm", "mindbridge") != "mindbridge":
+        if not isinstance(item, Mapping):
+            raise ValueError("benchmark result task rows must be objects")
+        arm = item.get("arm")
+        if not isinstance(arm, str) or not arm.strip():
+            raise ValueError("benchmark result task arms must be non-empty strings")
+        if arm != "mindbridge":
             continue
         name = item.get("task")
         if not isinstance(name, str) or not name:
@@ -370,12 +359,10 @@ def _mapping(value: object, label: str) -> Mapping[str, object]:
     return value
 
 
-def _at(document: Mapping[str, object], path: Sequence[str], default: object = _MISSING) -> object:
+def _at(document: Mapping[str, object], path: Sequence[str]) -> object:
     current: object = document
     for name in path:
         if not isinstance(current, Mapping) or name not in current:
-            if default is not _MISSING:
-                return default
             raise ValueError(f"benchmark result is missing {'.'.join(path)}")
         current = current[name]
     return current

@@ -14,10 +14,12 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Annotated, TypedDict
 
 import httpx2 as httpx
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from mindbridge import (
     AnswerPolicy,
@@ -31,6 +33,8 @@ from mindbridge import (
 )
 from mindbridge.benchmarks.complementary import (
     SELECTOR_PROMPT,
+    Arm,
+    EvidencePlan,
     parse_plan,
     select_evidence,
     selector_payload,
@@ -43,14 +47,131 @@ from mindbridge.benchmarks.task_catalog import TASKS
 ROOT = Path.home() / ".local/share/openresearch/benchmark-cache/mindbridge"
 BASELINE = ROOT / "icm-four-baseline-20260917"
 REFERENCE = datetime(2026, 9, 17, tzinfo=timezone.utc)
-ARMS = ("rank", "relevance", "coverage")
+ARMS: tuple[Arm, ...] = ("rank", "relevance", "coverage")
+
+PositiveInt = Annotated[int, Field(strict=True, gt=0)]
+NonemptyText = Annotated[str, Field(min_length=1, pattern=r"\S")]
+Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class Recipe(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    suite_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")]
+    candidate_rows: PositiveInt = Field(le=100)
+    reader_rows: PositiveInt
+    reader_chars: PositiveInt
+    diagnostic_rows: PositiveInt
+    question_ids: list[NonemptyText] = Field(min_length=1)
+    selection_rule: NonemptyText
+    selector_version: NonemptyText
+    video_limit: PositiveInt
+    reuse: NonemptyText
+    source_sqlite_sha256: Sha256
+    source_tree_sha256: Sha256
+    fixture_sha256: Sha256
+    protocol_sha256: Sha256
+
+    @model_validator(mode="after")
+    def valid_selection(self) -> Recipe:
+        if max(self.reader_rows, self.diagnostic_rows) > self.candidate_rows:
+            raise ValueError("reader rows must fit the candidate pool")
+        if len(set(self.question_ids)) != len(self.question_ids):
+            raise ValueError("question IDs must be unique")
+        return self
+
+
+class Observation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    id: NonemptyText
+    text: NonemptyText
+
+
+class TrialCase(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    id: NonemptyText
+    dataset: NonemptyText
+    question: NonemptyText
+    reference: NonemptyText
+    family: NonemptyText | None = None
+    pair: NonemptyText | None = None
+    variant: int | None = None
+    gold: list[NonemptyText] = Field(default_factory=list)
+
+
+class FixtureCase(TrialCase):
+    id: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")]
+    observations: list[Observation] = Field(min_length=1)
+    delete: list[NonemptyText] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_sources(self) -> FixtureCase:
+        if self.id == "icm-profile":
+            raise ValueError("fixture ID icm-profile is reserved for the baseline store")
+        sources = {observation.id for observation in self.observations}
+        if len(sources) != len(self.observations):
+            raise ValueError("observation IDs must be unique")
+        if len(set(self.delete)) != len(self.delete) or not set(self.delete) <= sources:
+            raise ValueError("deletions must reference unique observation IDs")
+        if not set(self.gold) <= sources - set(self.delete):
+            raise ValueError("gold sources must reference live observation IDs")
+        return self
+
+
+class Prediction(TypedDict):
+    case: str
+    dataset: str
+    family: str | None
+    arm: Arm
+    prediction: str
+    abstained: bool
+    seconds: float
+    shared_selector_seconds: float
+    plan_valid: bool
+    candidate_ids: list[str]
+    selected_ids: list[str]
+    returned_ids: list[str]
+    selected_chars: int
+    selected_media: list[str]
+    returned_media: list[str]
+
+
+class TrialResult(Prediction):
+    score: float
+    gold_source_recall: float | None
+    complete_gold_sources: bool | None
+
+
+class TreeManifest(TypedDict):
+    sha256: str
+    files: int
+    bytes: int
+
+
+class TreeEntry(TypedDict):
+    path: str
+    bytes: int
+    sha256: str
+
+
+def load_trial_inputs() -> tuple[Recipe, tuple[FixtureCase, ...]]:
+    recipe = Recipe.model_validate_json(Path(__file__).with_suffix(".json").read_bytes())
+    fixture_bytes = Path(__file__).with_name("complementary_scenarios.json").read_bytes()
+    if hashlib.sha256(fixture_bytes).hexdigest() != recipe.fixture_sha256:
+        raise RuntimeError("diagnostic fixture changed since protocol freeze")
+    fixtures = TypeAdapter(list[FixtureCase]).validate_json(fixture_bytes)
+    if not fixtures or len({case.id for case in fixtures}) != len(fixtures):
+        raise ValueError("fixture case IDs must be non-empty and unique")
+    return recipe, tuple(fixtures)
 
 
 def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def write_row(path: Path, row: dict[str, Any]) -> None:
+def write_row(path: Path, row: object) -> None:
     with path.open("a") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -69,12 +190,14 @@ class Audit:
     """Actual HTTP payloads, without credentials or raw encoded media."""
 
     def __init__(self, output: Path) -> None:
-        self.output, self.phase, self.case, self.rows = output, "initialization", "", []
+        self.output, self.phase, self.case = output, "initialization", ""
+        self.rows: list[dict[str, object]] = []
 
     def response(self, response: httpx.Response) -> None:
         response.read()
         request = json.loads(response.request.content)
-        media, text_chars = Counter(), 0
+        media: Counter[str] = Counter()
+        text_chars = 0
         for message in request.get("messages", []):
             content = message.get("content", "")
             if isinstance(content, str):
@@ -114,16 +237,19 @@ class SelectorBackend:
         client: OpenAI,
         model: str,
         audit: Audit,
-        recipe: dict[str, Any],
+        recipe: Recipe,
         output: Path,
     ) -> None:
         self.backend, self.client, self.model = backend, client, model
         self.audit, self.recipe, self.output = audit, recipe, output
         self.generation_capabilities = backend.generation_capabilities
-        self.arm, self.plan, self.payload = "rank", None, None
+        self.arm: Arm = "rank"
+        self.plan: EvidencePlan | None = None
+        self.payload: str | None = None
         self.selector_seconds = 0.0
-        self.selected, self.pool = (), ()
-        self.row_limit = recipe["reader_rows"]
+        self.selected: tuple[SearchHit, ...] = ()
+        self.pool: tuple[SearchHit, ...] = ()
+        self.row_limit = recipe.reader_rows
 
     def reset(self) -> None:
         self.plan = self.payload = None
@@ -137,7 +263,7 @@ class SelectorBackend:
         answer_policy: AnswerPolicy = "strict",
         exhaustive: bool = False,
     ) -> AnswerResult:
-        pool = tuple(hits[: self.recipe["candidate_rows"]])
+        pool = tuple(hits[: self.recipe.candidate_rows])
         payload = selector_payload(question.text, pool)
         if self.payload is None:
             self.payload = payload
@@ -181,7 +307,7 @@ class SelectorBackend:
             self.plan,
             arm=self.arm if self.plan is not None else "rank",
             rows=self.row_limit,
-            chars=self.recipe["reader_chars"],
+            chars=self.recipe.reader_chars,
         )
         self.audit.phase = "answer/" + self.arm
         return self.backend.answer(
@@ -233,12 +359,18 @@ def score(client: OpenAI, model: str, question: str, reference: str, prediction:
     )
     if plan is None:
         return 0.0
+    messages: list[ChatCompletionMessageParam] = []
+    for message in plan.calls[0]:
+        if message.role == "system":
+            messages.append({"role": "system", "content": message.content})
+        else:
+            messages.append({"role": "user", "content": message.content})
     response = client.chat.completions.create(
         model=model,
         temperature=0,
         max_tokens=8192,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        messages=[{"role": message.role, "content": message.content} for message in plan.calls[0]],
+        messages=messages,
     )
     return parse_judge_response(plan, response.choices[0].message.content or "")["accuracy"]
 
@@ -248,31 +380,31 @@ def source(hit: SearchHit) -> str:
 
 
 def evaluate(
-    memory: Memory, reader: SelectorBackend, audit: Audit, case: dict[str, Any], output: Path
-) -> list[dict[str, Any]]:
+    memory: Memory, reader: SelectorBackend, audit: Audit, case: TrialCase, output: Path
+) -> list[TrialResult]:
     reader.reset()
-    audit.case = case["id"]
+    audit.case = case.id
     order = list(ARMS)
-    random.Random(case["id"]).shuffle(order)
-    predictions = []
+    random.Random(case.id).shuffle(order)
+    predictions: list[Prediction] = []
     # Every prediction is complete before the reference enters any judge request.
     for arm in order:
         reader.arm, audit.phase = arm, "sdk/" + arm
         start = time.perf_counter()
         selector_before = reader.selector_seconds
         answer = memory.ask(
-            case["question"],
-            limit=reader.recipe["candidate_rows"],
+            case.question,
+            limit=reader.recipe.candidate_rows,
             reference_at=REFERENCE,
-            answer_policy="best_effort" if case["dataset"] == "icm-profile-dev" else "strict",
+            answer_policy="best_effort" if case.dataset == "icm-profile-dev" else "strict",
             link_identities=False,
         )
         selector_elapsed = reader.selector_seconds - selector_before
         predictions.append(
             {
-                "case": case["id"],
-                "dataset": case["dataset"],
-                "family": case.get("family"),
+                "case": case.id,
+                "dataset": case.dataset,
+                "family": case.family,
                 "arm": arm,
                 "prediction": answer.answer,
                 "abstained": answer.abstained,
@@ -288,31 +420,35 @@ def evaluate(
             }
         )
         write_row(output / "predictions.jsonl", predictions[-1])
-    for row in predictions:
-        audit.phase = "judge/" + row["arm"]
-        row["score"] = score(
-            reader.client, reader.model, case["question"], case["reference"], row["prediction"]
+    results: list[TrialResult] = []
+    for prediction in predictions:
+        audit.phase = "judge/" + prediction["arm"]
+        accuracy = score(
+            reader.client, reader.model, case.question, case.reference, prediction["prediction"]
         )
-        gold = set(case.get("gold", []))
-        row["gold_source_recall"] = (
-            len(gold & set(row["selected_ids"])) / len(gold) if gold else None
-        )
-        row["complete_gold_sources"] = gold <= set(row["selected_ids"]) if gold else None
+        gold, selected = set(case.gold), set(prediction["selected_ids"])
+        row: TrialResult = {
+            **prediction,
+            "score": accuracy,
+            "gold_source_recall": len(gold & selected) / len(gold) if gold else None,
+            "complete_gold_sources": gold <= selected if gold else None,
+        }
         write_row(output / "samples.jsonl", row)
+        results.append(row)
     print(
         "CASE_RESULT "
         + json.dumps(
             {
-                "id": case["id"],
-                "dataset": case["dataset"],
+                "id": case.id,
+                "dataset": case.dataset,
                 "plan_valid": reader.plan is not None,
-                "scores": {r["arm"]: r["score"] for r in predictions},
-                "selected_counts": {r["arm"]: len(r["selected_ids"]) for r in predictions},
+                "scores": {r["arm"]: r["score"] for r in results},
+                "selected_counts": {r["arm"]: len(r["selected_ids"]) for r in results},
             }
         ),
         flush=True,
     )
-    return predictions
+    return results
 
 
 def frozen_questions(path: Path) -> dict[str, ICMQuestion]:
@@ -321,10 +457,31 @@ def frozen_questions(path: Path) -> dict[str, ICMQuestion]:
     return {q.question_id: q for q in load_icm_bench(path)}
 
 
-def tree_manifest(root: Path) -> dict[str, object]:
+def load_profile_cases(recipe: Recipe) -> tuple[TrialCase, ...]:
+    questions = frozen_questions(BASELINE / "datasets/icm-bench/annotations/qa_test.jsonl")
+    profiles = []
+    for identifier in recipe.question_ids:
+        if identifier not in questions:
+            raise ValueError(f"selected question is missing from the frozen dataset: {identifier}")
+        question = questions[identifier]
+        if question.before_clip is not None:
+            raise RuntimeError("full-store trial only supports full-timeline Profile")
+        profiles.append(
+            TrialCase(
+                id=identifier,
+                dataset="icm-profile-dev",
+                question=question.question,
+                reference=question.reference_answer,
+                gold=list(question.evidence_video_ids),
+            )
+        )
+    return tuple(profiles)
+
+
+def tree_manifest(root: Path) -> TreeManifest:
     """Describe a store by content, independent of its clone path and file timestamps."""
     root = root.resolve()
-    entries: list[dict[str, Any]] = [
+    entries: list[TreeEntry] = [
         {
             "path": path.relative_to(root).as_posix(),
             "bytes": path.stat().st_size,
@@ -338,7 +495,7 @@ def tree_manifest(root: Path) -> dict[str, object]:
     return {
         "sha256": hashlib.sha256(payload).hexdigest(),
         "files": len(entries),
-        "bytes": sum(int(entry["bytes"]) for entry in entries),
+        "bytes": sum(entry["bytes"] for entry in entries),
     }
 
 
@@ -360,12 +517,12 @@ def _closed_store_lock(path: Path) -> Iterator[None]:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def copy_baseline(source: Path, destination: Path, recipe: dict[str, Any]) -> dict[str, object]:
+def copy_baseline(source: Path, destination: Path, recipe: Recipe) -> TreeManifest:
     with _closed_store_lock(source):
-        if dataset_digest(source / "state.sqlite3") != recipe["source_sqlite_sha256"]:
+        if dataset_digest(source / "state.sqlite3") != recipe.source_sqlite_sha256:
             raise RuntimeError("baseline snapshot changed since protocol freeze")
         manifest = tree_manifest(source)
-        if manifest["sha256"] != recipe["source_tree_sha256"]:
+        if manifest["sha256"] != recipe.source_tree_sha256:
             raise RuntimeError("baseline store tree changed since protocol freeze")
         shutil.copytree(source, destination)
         if tree_manifest(destination) != manifest:
@@ -374,28 +531,25 @@ def copy_baseline(source: Path, destination: Path, recipe: dict[str, Any]) -> di
 
 
 def run_cases(
-    recipe: dict[str, Any],
+    recipe: Recipe,
+    fixtures: Sequence[FixtureCase],
+    profiles: Sequence[TrialCase],
     output: Path,
     embedder: OpenAIModels,
     reader: SelectorBackend,
     audit: Audit,
     vision: OpenAIModels,
-) -> list[dict[str, Any]]:
-    questions = frozen_questions(BASELINE / "datasets/icm-bench/annotations/qa_test.jsonl")
-    fixture_bytes = Path(__file__).with_name("complementary_scenarios.json").read_bytes()
-    if hashlib.sha256(fixture_bytes).hexdigest() != recipe["fixture_sha256"]:
-        raise RuntimeError("diagnostic fixture changed since protocol freeze")
-    fixtures = json.loads(fixture_bytes)
-    results = []
+) -> list[TrialResult]:
+    results: list[TrialResult] = []
     for case in fixtures:
-        reader.row_limit = recipe["diagnostic_rows"]
-        with open_memory(output / "stores" / case["id"], embedder, reader) as memory:
-            audit.case, audit.phase = case["id"], "ingest"
+        reader.row_limit = recipe.diagnostic_rows
+        with open_memory(output / "stores" / case.id, embedder, reader) as memory:
+            audit.case, audit.phase = case.id, "ingest"
             ids = {}
-            for observation in case["observations"]:
-                record = memory.add(observation["text"], metadata={"source_id": observation["id"]})
-                ids[observation["id"]] = record.id
-            for deleted in case.get("delete", []):
+            for observation in case.observations:
+                record = memory.add(observation.text, metadata={"source_id": observation.id})
+                ids[observation.id] = record.id
+            for deleted in case.delete:
                 assert memory.delete(ids[deleted])
             results.extend(evaluate(memory, reader, audit, case, output))
     stores = list((BASELINE / "stores/icm-bench").rglob("state.sqlite3"))
@@ -408,34 +562,24 @@ def run_cases(
         + json.dumps(
             {
                 "parent_run": "a5f37edc-3a12-4f05-b294-a2da79de09fa",
-                "sqlite_sha256": recipe["source_sqlite_sha256"],
+                "sqlite_sha256": recipe.source_sqlite_sha256,
                 "store_tree": manifest,
             }
         ),
         flush=True,
     )
-    reader.row_limit = recipe["reader_rows"]
+    reader.row_limit = recipe.reader_rows
     with open_memory(copied, embedder, reader, vision=vision) as memory:
-        for identifier in recipe["question_ids"]:
-            q = questions[identifier]
-            if q.before_clip is not None:
-                raise RuntimeError("full-store trial only supports full-timeline Profile")
-            case = {
-                "id": identifier,
-                "dataset": "icm-profile-dev",
-                "question": q.question,
-                "reference": q.reference_answer,
-                "gold": list(q.evidence_video_ids),
-            }
-            results.extend(evaluate(memory, reader, audit, case, output))
+        for profile in profiles:
+            results.extend(evaluate(memory, reader, audit, profile, output))
     with _closed_store_lock(stores[0].parent):
         if tree_manifest(stores[0].parent) != manifest:
             raise RuntimeError("original baseline changed during the experiment")
     return results
 
 
-def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
-    summaries = {}
+def summarize(results: Sequence[TrialResult]) -> dict[str, dict[str, object]]:
+    summaries: dict[str, dict[str, object]] = {}
     for dataset in sorted({row["dataset"] for row in results}):
         summaries[dataset] = {}
         for arm in ARMS:
@@ -461,13 +605,14 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
 def main() -> int:
     from support_coverage import _env
 
-    recipe = json.loads(Path(__file__).with_suffix(".json").read_text())
-    settings = _env()
-    output = ROOT / recipe["suite_id"]
-    output.mkdir(parents=True, exist_ok=True)
-    if any(output.iterdir()):
+    recipe, fixtures = load_trial_inputs()
+    output = ROOT / recipe.suite_id
+    if output.exists() and any(output.iterdir()):
         raise RuntimeError("refusing to overwrite a trial; preserve partial evidence")
-    print("TRIAL_RECIPE " + json.dumps(recipe), flush=True)
+    profiles = load_profile_cases(recipe)
+    settings = _env()
+    output.mkdir(parents=True, exist_ok=True)
+    print("TRIAL_RECIPE " + recipe.model_dump_json(), flush=True)
     print(
         "TRIAL_MODELS "
         + json.dumps(
@@ -511,12 +656,12 @@ def main() -> int:
     )
     vision = vision_backend(client, settings["MINDBRIDGE_GENERATION_MODEL"])
     try:
-        results = run_cases(recipe, output, embedder, reader, audit, vision)
+        results = run_cases(recipe, fixtures, profiles, output, embedder, reader, audit, vision)
     finally:
         client.close()
         embedding_client.close()
     report = {
-        "recipe": recipe,
+        "recipe": recipe.model_dump(mode="json"),
         "results": summarize(results),
         "http_requests": audit.rows,
         "limitations": [

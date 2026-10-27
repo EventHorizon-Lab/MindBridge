@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Callable, Generator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Mapping, Sequence
+from concurrent.futures import Executor
+from contextlib import asynccontextmanager, suppress
 from contextvars import Context, copy_context
 from datetime import datetime
+from threading import BoundedSemaphore
 from time import perf_counter_ns
 from typing import Annotated, Any, Literal, Protocol, cast
 
@@ -45,6 +46,9 @@ from mindbridge.api.errors import (
     register_error_handlers,
 )
 from mindbridge.control import dump_operation
+from mindbridge.exceptions import StorageError
+from mindbridge.kernel.execution import StreamWorkers
+from mindbridge.memory import Memory
 from mindbridge.types import (
     AbstentionReason,
     AnswerChunk,
@@ -711,6 +715,31 @@ class _Memory(Protocol):
     def apply_retention(self, *, dry_run: bool = False) -> RetentionReport: ...
 
 
+class _RequestCapacity:
+    """Refuse overload before buffering bodies or waiting for a framework worker."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self._slots = BoundedSemaphore(32)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _is_api_path(str(scope.get("path", ""))):
+            await self.app(scope, receive, send)
+            return
+        if not self._slots.acquire(blocking=False):
+            response = exception_response(
+                StorageError(
+                    "local request capacity exceeded", reason="capacity_exceeded", stage="admission"
+                )
+            )
+            await response(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self._slots.release()
+
+
 class _RequestBodyLimit:
     """Bound `/v1` request bodies before framework parsing."""
 
@@ -855,15 +884,31 @@ def create_app(
     served = _ROUTED_OPERATIONS | (
         _EMBODIED_ROUTED_OPERATIONS if embodied_operations else frozenset()
     )
+    stream_workers = memory._execution.streams if isinstance(memory, Memory) else StreamWorkers()
+    background_lifespan = (
+        None if deliberate_every is None else deliberation_lifespan(memory, deliberate_every)
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        try:
+            if background_lifespan is None:
+                yield
+            else:
+                async with background_lifespan(app):
+                    yield
+        finally:
+            if not isinstance(memory, Memory):
+                await asyncio.to_thread(stream_workers.close)
+
     app = FastAPI(
         title="MindBridge",
         version="0.2.0",
-        lifespan=(
-            None if deliberate_every is None else deliberation_lifespan(memory, deliberate_every)
-        ),
+        lifespan=lifespan,
     )
     register_error_handlers(app)
     app.add_middleware(_RequestBodyLimit)
+    app.add_middleware(_RequestCapacity)
     app.add_middleware(
         _RequestTelemetry,
         tracer=tracer or trace.get_tracer("mindbridge.api"),
@@ -887,6 +932,7 @@ def create_app(
             memory,
             identity_operations=identity_operations,
             embodied_operations=embodied_operations,
+            stream_workers=stream_workers,
         )
     )
     return app
@@ -897,6 +943,7 @@ def _v1_router(  # noqa: C901 - one literal public route registry
     *,
     identity_operations: bool,
     embodied_operations: bool,
+    stream_workers: StreamWorkers,
 ) -> APIRouter:
     """Register every `/v1` route against one caller-owned memory instance."""
 
@@ -1053,7 +1100,7 @@ def _v1_router(  # noqa: C901 - one literal public route registry
                 link_identities=embodied_operations,
             )
         )
-        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mindbridge-rest-answer")
+        worker = stream_workers.borrow()
         context = copy_context()
 
         try:
@@ -1326,7 +1373,7 @@ async def _first_chunk_or_disconnect(
     stream: Generator[AnswerChunk, None, AnswerResult],
     *,
     connection: Request,
-    worker: ThreadPoolExecutor,
+    worker: Executor,
     context: Context,
 ) -> object:
     loop = asyncio.get_running_loop()
@@ -1370,7 +1417,7 @@ async def _answer_events(
     first: object,
     rest: Generator[AnswerChunk, None, AnswerResult],
     *,
-    worker: ThreadPoolExecutor,
+    worker: Executor,
     context: Context,
 ) -> AsyncGenerator[bytes, None]:
     loop = asyncio.get_running_loop()
@@ -1402,7 +1449,7 @@ class _AnswerStreamingResponse(StreamingResponse):
         first: object,
         rest: Generator[AnswerChunk, None, AnswerResult],
         *,
-        worker: ThreadPoolExecutor,
+        worker: Executor,
         context: Context,
     ) -> None:
         self._events = _answer_events(first, rest, worker=worker, context=context)
@@ -1431,7 +1478,7 @@ class _AnswerStreamingResponse(StreamingResponse):
 async def _close_answer_stream(
     stream: Generator[AnswerChunk, None, AnswerResult],
     *,
-    worker: ThreadPoolExecutor,
+    worker: Executor,
     context: Context,
 ) -> None:
     loop = asyncio.get_running_loop()

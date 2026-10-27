@@ -5,22 +5,21 @@ from __future__ import annotations
 import builtins
 import re
 import unicodedata
-from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
-from contextvars import copy_context
+from collections.abc import Iterator, Sequence
+from contextlib import ExitStack, closing
 from dataclasses import replace
 from datetime import datetime, timezone
 from functools import partial
+from itertools import chain
 
 from opentelemetry.trace import Tracer
 
 from mindbridge.infrastructure.local.scoring import max_cosine_part_scores, max_cosine_scores
-from mindbridge.infrastructure.local.store import IndexCandidate
 from mindbridge.infrastructure.local.zvec_index import IndexHit
 from mindbridge.kernel.content import PreparedContent
 from mindbridge.kernel.contracts import Backends
 from mindbridge.kernel.embedding import DOCUMENT_TASK, MAX_RETRIEVAL_KEYS, Embedding
+from mindbridge.kernel.execution import Execution
 from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.lifecycle import Lifecycle, OperationAssets
 from mindbridge.kernel.materialization import Materializer
@@ -40,6 +39,7 @@ from mindbridge.kernel.ranking import (
     lexical_relevance,
     merge_index_hits,
     merge_lexical_routes,
+    merge_temporal_lexical_hits,
     parent_index_ids,
     parent_index_signals,
     qualified_candidates,
@@ -59,7 +59,6 @@ from mindbridge.kernel.speech import Speech
 from mindbridge.kernel.temporal import (
     intersect_occurrence_range,
     occurrence_overlaps,
-    overlaps_temporal_range,
     query_temporal_range,
     resolved_reference_at,
     search_occurrence_range,
@@ -115,9 +114,6 @@ _QUANTIZED_ROUTE_CANDIDATES = RERANK_CANDIDATES * 2
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 
 
-_MAX_INDEX_SEARCH_WORKERS = 4
-
-
 class Retrieval(Traced):
     """One shared retrieval plane: index candidates, authoritative hydration, ranking."""
 
@@ -135,6 +131,7 @@ class Retrieval(Traced):
         speech: Speech,
         embedding: Embedding,
         projection: Projection,
+        execution: Execution,
     ) -> None:
         super().__init__(tracer)
         self._store = storage.store
@@ -148,6 +145,7 @@ class Retrieval(Traced):
         self._speech = speech
         self._embedding = embedding
         self._projection = projection
+        self._execution = execution
 
     def search(
         self,
@@ -331,8 +329,10 @@ class Retrieval(Traced):
                         retrieval_mode=self._settings.retrieval_mode,
                     )
                 else:
-                    # Zvec range-filtered FTS is unstable after dense queries; the global
-                    # fallback below still contributes the same lexical route.
+                    # Retrieve within the preferred window before truncating either route.
+                    # Expanding global FTS until a rare window appears costs corpus-sized
+                    # top-k results; native time filtering keeps the same bounded depth as
+                    # dense retrieval. The global route preserves the soft time preference.
                     preferred_range = intersect_occurrence_range(
                         temporal_range,
                         occurred_from,
@@ -343,7 +343,7 @@ class Retrieval(Traced):
                         if preferred_range is None
                         else self._index_candidates(
                             vectors,
-                            lexical_query="",
+                            lexical_query=lexical_query,
                             limit=candidate_limit,
                             memory_types=memory_types,
                             occurred_from=preferred_range[0],
@@ -366,7 +366,7 @@ class Retrieval(Traced):
                     )
                     candidates = IndexCandidates(
                         dense=merge_index_hits(preferred.dense, fallback.dense),
-                        lexical=merge_index_hits(preferred.lexical, fallback.lexical),
+                        lexical=merge_temporal_lexical_hits(preferred.lexical, fallback.lexical),
                         exhausted=preferred.exhausted and fallback.exhausted,
                     )
             index_ids = tuple(
@@ -384,22 +384,6 @@ class Retrieval(Traced):
                 translate_storage_errors("hydrate search candidates"),
             ):
                 hydrated_documents = self._store.index.read_index_candidates(index_ids)
-            with translate_index_errors("search memories"):
-                candidates, hydrated_documents = self._deepen_temporal_lexical_candidates(
-                    candidates,
-                    hydrated_documents,
-                    lexical_query=lexical_query,
-                    temporal_range=temporal_range,
-                    memory_types=memory_types,
-                    route_limit=candidate_limit,
-                    result_limit=limit,
-                    place_id=scope_place_id,
-                    identity_id=scope_identity_id,
-                    retrieval_mode=self._settings.retrieval_mode,
-                )
-            index_ids = tuple(
-                dict.fromkeys(hit.id for hit in (*candidates.dense, *candidates.lexical))
-            )
             documents = hydrated_documents
             if occurred_from is not None or occurred_until is not None:
                 documents = tuple(
@@ -487,21 +471,83 @@ class Retrieval(Traced):
                 candidate_limit=candidate_limit,
                 exhaustive=candidates.exhausted,
             )
-        with self._write_lock:
-            with (
-                self._trace("mindbridge.storage.hydrate", kind="stage"),
-                translate_storage_errors("hydrate search results"),
-            ):
-                memories = self._store.records.read_memories(
-                    parent_ids,
-                    valid_at=None if scope is None else scope.valid_at,
-                    known_at=None if scope is None else scope.known_at,
-                    near=None if scope is None else scope.near,
-                    radius_m=None if scope is None else scope.radius_m,
-                    place_id=None if scope is None else scope.place_id,
-                    identity_id=None if scope is None else scope.identity_id,
-                    active_only=True,
+        with ExitStack() as candidate_lease, ExitStack() as scoring_snapshot:
+            document_parts: Iterator[tuple[str, str, bytes]] | None = None
+            document_vectors: Iterator[tuple[str, tuple[float, ...]]] | None = None
+            with self._write_lock:
+                with (
+                    self._trace("mindbridge.storage.hydrate", kind="stage"),
+                    translate_storage_errors("hydrate search results"),
+                ):
+                    memories = self._store.records.read_memories(
+                        parent_ids,
+                        valid_at=None if scope is None else scope.valid_at,
+                        known_at=None if scope is None else scope.known_at,
+                        near=None if scope is None else scope.near,
+                        radius_m=None if scope is None else scope.radius_m,
+                        place_id=None if scope is None else scope.place_id,
+                        identity_id=None if scope is None else scope.identity_id,
+                        active_only=True,
+                    )
+                kept = (
+                    None
+                    if memory_types is None
+                    else frozenset(memory_type.value for memory_type in memory_types)
                 )
+                eligible_memories = tuple(
+                    memory for memory in memories if kept is None or memory.memory_type in kept
+                )
+                # Deletion must not separate authoritative hydration from media protection.
+                # Candidates keep short leases; only winners retain them through the operation.
+                candidate_lease.enter_context(
+                    self._lifecycle.temporary_asset_lease(
+                        tuple(asset for memory in eligible_memories for asset in memory.assets)
+                    )
+                )
+                score_ids = tuple(
+                    memory.memory_id
+                    for memory in eligible_memories
+                    if self._settings.index_quantization is not IndexQuantization.NONE
+                    or (
+                        memory.memory_id in lexical_matches
+                        and memory.memory_id not in dense_relevance
+                    )
+                )
+                if score_ids and vectors:
+                    with translate_storage_errors("score search candidates"):
+                        # BEGIN is deferred: consume the first row under the deletion lock to
+                        # establish the WAL snapshot. Keep the stream bounded across SQL batches
+                        # and release its reader immediately after scoring, before lexical work.
+                        if self._settings.index_quantization is not IndexQuantization.NONE:
+                            parts = scoring_snapshot.enter_context(
+                                closing(
+                                    self._store.index.iter_memory_embedding_parts(
+                                        score_ids,
+                                        space_id=self._backends.space_id,
+                                        task=DOCUMENT_TASK,
+                                    )
+                                )
+                            )
+                            first_part = next(parts, None)
+                            document_parts = (
+                                iter(()) if first_part is None else chain((first_part,), parts)
+                            )
+                        else:
+                            stored_vectors = scoring_snapshot.enter_context(
+                                closing(
+                                    self._store.index.iter_memory_embedding_vectors(
+                                        score_ids,
+                                        space_id=self._backends.space_id,
+                                        task=DOCUMENT_TASK,
+                                    )
+                                )
+                            )
+                            first_vector = next(stored_vectors, None)
+                            document_vectors = (
+                                iter(())
+                                if first_vector is None
+                                else chain((first_vector,), stored_vectors)
+                            )
             with self._trace("mindbridge.retrieval.rank", kind="stage"):
                 extend_missing_memory_traces(
                     trace_candidates,
@@ -514,8 +560,7 @@ class Retrieval(Traced):
                     lexical_matches,
                     retrieval_mode=self._settings.retrieval_mode,
                 )
-                if memory_types is not None:
-                    kept = frozenset(memory_type.value for memory_type in memory_types)
+                if kept is not None:
                     extend_memory_type_traces(
                         trace_candidates,
                         memories,
@@ -527,34 +572,18 @@ class Retrieval(Traced):
                         lexical_matches,
                         retrieval_mode=self._settings.retrieval_mode,
                     )
-                    memories = tuple(memory for memory in memories if memory.memory_type in kept)
-                score_ids = tuple(
-                    memory.memory_id
-                    for memory in memories
-                    if self._settings.index_quantization is not IndexQuantization.NONE
-                    or (
-                        memory.memory_id in lexical_matches
-                        and memory.memory_id not in dense_relevance
-                    )
-                )
+                memories = eligible_memories
                 if score_ids and vectors:
                     with (
                         self._trace("mindbridge.retrieval.score_completion", kind="stage"),
                         translate_storage_errors("score search candidates"),
                     ):
-                        if self._settings.index_quantization is not IndexQuantization.NONE:
-                            with closing(
-                                self._store.index.iter_memory_embedding_parts(
-                                    score_ids,
-                                    space_id=self._backends.space_id,
-                                    task=DOCUMENT_TASK,
-                                )
-                            ) as document_parts:
-                                part_scores = max_cosine_part_scores(
-                                    vectors,
-                                    document_parts,
-                                    preferred_embeddings=matched_dense_index_ids,
-                                )
+                        if document_parts is not None:
+                            part_scores = max_cosine_part_scores(
+                                vectors,
+                                document_parts,
+                                preferred_embeddings=matched_dense_index_ids,
+                            )
                             for memory_id, (
                                 embedding_id,
                                 relevance,
@@ -563,18 +592,13 @@ class Retrieval(Traced):
                                 dense_relevance[memory_id] = relevance
                                 dense_confidence[memory_id] = confidence
                                 matched_dense_index_ids[memory_id] = embedding_id
-                        else:
-                            with closing(
-                                self._store.index.iter_memory_embedding_vectors(
-                                    score_ids,
-                                    space_id=self._backends.space_id,
-                                    task=DOCUMENT_TASK,
-                                )
-                            ) as document_vectors:
-                                completed = max_cosine_scores(vectors, document_vectors)
+                        elif document_vectors is not None:
+                            completed = max_cosine_scores(vectors, document_vectors)
                             for memory_id, (relevance, confidence) in completed.items():
                                 dense_relevance[memory_id] = relevance
                                 dense_confidence[memory_id] = confidence
+                with translate_storage_errors("score search candidates"):
+                    scoring_snapshot.close()
                 lexical_coverage = (
                     lexical_relevance(lexical_query, memories)
                     if self._settings.retrieval_mode is RetrievalMode.HYBRID
@@ -740,104 +764,6 @@ class Retrieval(Traced):
                 self._store.identities.resolve_identity_id(scope.identity_id) or scope.identity_id
             )
 
-    def _deepen_temporal_lexical_candidates(
-        self,
-        candidates: IndexCandidates,
-        documents: tuple[IndexCandidate, ...],
-        *,
-        lexical_query: str,
-        temporal_range: tuple[datetime, datetime] | None,
-        memory_types: frozenset[MemoryType] | None,
-        route_limit: int,
-        result_limit: int,
-        place_id: str | None = None,
-        identity_id: str | None = None,
-        retrieval_mode: RetrievalMode,
-    ) -> tuple[IndexCandidates, tuple[IndexCandidate, ...]]:
-        if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
-            return candidates, documents
-        lexical_by_id = {hit.id: hit for hit in candidates.lexical}
-        # A heuristic proxy for "worth deepening for", NOT a bound on the gate. It cannot be one:
-        # Hybrid applies a full-coverage demotion before gating lexical evidence; lexical mode
-        # uses the native normalized FTS relevance directly. The threshold remains only a
-        # deepening heuristic, not a final admission criterion.
-        lexical_gate_scale = (
-            1.0 if retrieval_mode is RetrievalMode.LEXICAL else LEXICAL_FULL_COVERAGE_RELEVANCE
-        )
-        qualified_parents = {
-            document.memory_id
-            for document in documents
-            if (hit := lexical_by_id.get(document.embedding_id)) is not None
-            and lexical_gate_scale * hit.relevance >= self._settings.minimum_relevance
-            and overlaps_temporal_range(
-                document.occurred_at,
-                document.occurred_end,
-                temporal_range,
-            )
-        }
-        if len(qualified_parents) >= result_limit:
-            return candidates, documents
-        with (
-            self._trace("mindbridge.storage.temporal_candidates", kind="stage"),
-            translate_storage_errors("read temporal search candidates"),
-        ):
-            in_range, total = self._store.index.embedding_ids_in_range(
-                *temporal_range,
-                space_id=self._backends.space_id,
-                task=DOCUMENT_TASK,
-                # The whitelist only narrows what the deepening loop will consider, and the
-                # ranking stage applies the full set afterwards, so one pushed type is a
-                # sharpening and several are correctly left to it.
-                memory_type=(
-                    next(iter(memory_types)).value
-                    if memory_types is not None and len(memory_types) == 1
-                    else None
-                ),
-            )
-        if not in_range:
-            return candidates, documents
-        required = min(result_limit, len(in_range))
-        search_limit = route_limit
-        lexical = candidates.lexical
-        qualified = tuple(
-            hit
-            for hit in lexical
-            if hit.id in in_range
-            and lexical_gate_scale * hit.relevance >= self._settings.minimum_relevance
-        )
-        while len(qualified) < required and len(lexical) >= search_limit and search_limit < total:
-            search_limit = min(search_limit * 2, total)
-            lexical = self._index_candidates(
-                (),
-                lexical_query=lexical_query,
-                limit=search_limit,
-                memory_types=memory_types,
-                place_id=place_id,
-                identity_id=identity_id,
-                retrieval_mode=retrieval_mode,
-            ).lexical
-            qualified = tuple(
-                hit
-                for hit in lexical
-                if hit.id in in_range
-                and lexical_gate_scale * hit.relevance >= self._settings.minimum_relevance
-            )
-        updated = IndexCandidates(
-            dense=candidates.dense,
-            lexical=merge_index_hits(candidates.lexical, qualified[:route_limit]),
-            exhausted=candidates.exhausted,
-        )
-        added_ids = tuple(hit.id for hit in updated.lexical if hit.id not in lexical_by_id)
-        if not added_ids:
-            return updated, documents
-        with (
-            self._trace("mindbridge.storage.hydrate", kind="stage"),
-            translate_storage_errors("hydrate temporal lexical candidates"),
-        ):
-            added = self._store.index.read_index_candidates(added_ids)
-        by_id = {document.embedding_id: document for document in (*documents, *added)}
-        return updated, tuple(by_id.values())
-
     def _index_candidates(
         self,
         vectors: Sequence[Sequence[float]],
@@ -901,14 +827,7 @@ class Retrieval(Traced):
             span.set_attribute("mindbridge.index.route_count", len(calls))
             if not calls:
                 return IndexCandidates(dense=(), lexical=(), exhausted=True)
-            if len(calls) == 1:
-                routes = (calls[0](),)
-            else:
-                with ThreadPoolExecutor(
-                    max_workers=min(_MAX_INDEX_SEARCH_WORKERS, len(calls))
-                ) as executor:
-                    futures = tuple(executor.submit(copy_context().run, call) for call in calls)
-                    routes = tuple(future.result() for future in futures)
+            routes = self._execution.index_routes(calls)
         dense_routes = routes[: len(dense_calls)]
         lexical_routes = routes[len(dense_calls) :]
         return IndexCandidates(

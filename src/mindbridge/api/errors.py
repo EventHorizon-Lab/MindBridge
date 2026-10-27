@@ -36,6 +36,7 @@ REASON_STATUS: Mapping[str, int] = {
     # The request body and one inline media value are the same condition seen from two sides, and
     # both are fixed by sending less, so both say 413 rather than blaming the provider with 502.
     "payload_too_large": status.HTTP_413_CONTENT_TOO_LARGE,
+    "context_length_exceeded": status.HTTP_413_CONTENT_TOO_LARGE,
     "input_invalid": status.HTTP_422_UNPROCESSABLE_CONTENT,
     "unknown_field": status.HTTP_422_UNPROCESSABLE_CONTENT,
     "unsupported_modality": status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -60,6 +61,7 @@ REASON_STATUS: Mapping[str, int] = {
     # Every retryable reason lands here, and `test_every_retryable_reason_says_503` proves it:
     # an agent that reads 503 plus `Retry-After` must not have to also read the reason.
     "connection_failed": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "capacity_exceeded": status.HTTP_503_SERVICE_UNAVAILABLE,
     "timeout": status.HTTP_503_SERVICE_UNAVAILABLE,
     "rate_limited": status.HTTP_503_SERVICE_UNAVAILABLE,
     "provider_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,

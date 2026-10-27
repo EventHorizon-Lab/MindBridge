@@ -66,12 +66,9 @@ from mindbridge.benchmarks.eval_arms import (
     _Arm,
 )
 from mindbridge.benchmarks.eval_cache import CachedAnswer, ResponseCache
-from mindbridge.benchmarks.eval_config import (
-    DEFAULT_ARM,
-    RETRIEVAL_CANDIDATE_LIMIT,
-)
+from mindbridge.benchmarks.eval_config import RETRIEVAL_CANDIDATE_LIMIT
 from mindbridge.benchmarks.eval_metrics import _metrics
-from mindbridge.benchmarks.eval_results import SampleResult
+from mindbridge.benchmarks.eval_results import DEFAULT_ARM, SampleResult
 from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_ANSWER_SPAN,
     BENCHMARK_SAMPLE,
@@ -208,6 +205,12 @@ class _RankedMemory:
         _record_retrieval_results(self._ranked)
         return AnswerResult("Ada.", self._answer_hits)
 
+    async def ask_stream(self, question: object, **kwargs: object) -> AsyncIterator[AnswerChunk]:
+        result = await self.ask(question, **kwargs)
+        if result.answer:
+            yield AnswerChunk(text=result.answer)
+        yield AnswerChunk(result=result)
+
     async def search(
         self, _query: object, *, limit: int, **_kwargs: object
     ) -> tuple[SearchHit, ...]:
@@ -252,6 +255,7 @@ def _outcome(
     arm: _Arm,
     task_name: str = "atm-bench",
     context: str = "",
+    answer_policy: AnswerPolicy | None = None,
 ) -> eval_results_module._AnswerOutcome:
     answered = asyncio.run(
         _answer_many(
@@ -263,6 +267,7 @@ def _outcome(
             task_name=task_name,
             unit_id="unit",
             context=context,
+            answer_policy=answer_policy,
         )
     )[0]
     assert not isinstance(answered, BaseException)
@@ -351,7 +356,7 @@ def test_blind_arm_never_reads_memory_and_keeps_query_media(tmp_path: Path) -> N
     outcome = _outcome(_ForbiddenMemory(), question, arm=arm, context="a stuffed corpus")
 
     assert generator.calls == [("who signed it?", None)]
-    assert generator.media_calls == [{"question_assets": (query_image,)}]
+    assert generator.media_calls == [{"question_assets": (query_image,), "answer_policy": "strict"}]
     assert outcome.prediction == "Ada"
     assert outcome.memory_ids == ()
     assert outcome.ranked_source_ids == ()
@@ -378,6 +383,127 @@ def test_full_context_respects_its_stated_budget_and_skips_media() -> None:
 
     assert _full_context(items, 25) == f"{'a' * 10}\n\n{'b' * 10}"
     assert _full_context(items, 100) == f"{'a' * 10}\n\n{'b' * 10}\n\n{'c' * 10}"
+
+
+def test_full_context_counts_separators_and_still_considers_later_items() -> None:
+    items = (
+        MemoryItem("first", ("a" * 10,)),
+        MemoryItem("overflow", ("b" * 10,)),
+        MemoryItem("later", ("c" * 8,)),
+    )
+
+    assert _full_context(items, 20) == "aaaaaaaaaa\n\ncccccccc"
+    assert len(_full_context(items, 20)) == 20
+
+
+@pytest.mark.parametrize("arm_name", ("blind", "full-context", "compile"))
+@pytest.mark.parametrize(
+    ("task_name", "override", "expected"),
+    (
+        ("longmemeval-s", None, "strict"),
+        ("mem-gallery", None, "strict"),
+        ("m3-bench-robot", None, "best_effort"),
+        ("longmemeval-s", "best_effort", "best_effort"),
+        ("m3-bench-robot", "strict", "strict"),
+    ),
+)
+def test_baseline_arms_request_the_task_answer_policy(
+    arm_name: str, task_name: str, override: AnswerPolicy | None, expected: str, tmp_path: Path
+) -> None:
+    generator = _RecordingGenerator()
+    arm = _Arm(arm_name, generator=cast(eval_arms_module._BaselineGenerator, generator))
+
+    async def run() -> eval_results_module._AnswerOutcome:
+        async with AsyncMemory(Memory(tmp_path, embedder=_TinyEmbedder())) as memory:
+            await memory.add("Ada signed the contract")
+            outcomes = await _answer_many(
+                memory,
+                (_question(),),
+                request_concurrency=1,
+                recall_limit=20,
+                arm=arm,
+                task_name=task_name,
+                unit_id="unit",
+                context="Ada signed the contract",
+                answer_policy=override,
+            )
+            outcome = outcomes[0]
+            assert not isinstance(outcome, BaseException)
+            return outcome
+
+    outcome = asyncio.run(run())
+    assert outcome.error is None
+    assert generator.media_calls[0]["answer_policy"] == expected
+
+
+@pytest.mark.parametrize("arm_name", ("blind", "full-context", "compile"))
+@pytest.mark.parametrize(
+    ("reply", "refusal", "expected"),
+    (
+        ("[insufficient_evidence]", None, "I don't know based on the available memories."),
+        ("Not mentioned.", "Not mentioned.", "Not mentioned."),
+    ),
+)
+def test_baseline_refusals_are_decoded_and_counted(
+    arm_name: str, reply: str, refusal: str | None, expected: str, tmp_path: Path
+) -> None:
+    generator = _RecordingGenerator(reply)
+    arm = _Arm(arm_name, generator=cast(eval_arms_module._BaselineGenerator, generator))
+
+    async def run() -> eval_results_module._AnswerOutcome:
+        async with AsyncMemory(Memory(tmp_path, embedder=_TinyEmbedder())) as memory:
+            await memory.add("Ada signed the contract")
+            outcomes = await _answer_many(
+                memory,
+                (replace(_question(), refusal=refusal),),
+                request_concurrency=1,
+                recall_limit=20,
+                arm=arm,
+                task_name="mem-gallery",
+                unit_id="unit",
+            )
+            outcome = outcomes[0]
+            assert not isinstance(outcome, BaseException)
+            return outcome
+
+    outcome = asyncio.run(run())
+    assert outcome.error is None
+    assert outcome.prediction == expected
+    assert outcome.abstained
+    assert outcome.abstention_reason == "insufficient_evidence"
+
+
+@pytest.mark.parametrize("arm_name", ("blind", "full-context", "compile"))
+def test_baseline_samples_record_the_policy_that_generated_the_answer(arm_name: str) -> None:
+    task, unit, question = _task("longmemeval-s")
+    sample = _sample(
+        task,
+        unit,
+        question,
+        eval_results_module._AnswerOutcome("Ada", 1.0, 0.0, (), ()),
+        ingest_failures=0,
+        predict_only=True,
+        log_samples=False,
+        arm=_Arm(arm_name),
+        answer_policy="best_effort",
+    )
+
+    assert sample.answer_policy == "best_effort"
+
+
+@pytest.mark.parametrize("arm_name", ("blind", "full-context"))
+def test_baseline_best_effort_keeps_the_answer_and_reports_uncertainty(arm_name: str) -> None:
+    generator = _RecordingGenerator("[insufficient_evidence]\nAda")
+    outcome = _outcome(
+        _ForbiddenMemory(),
+        _question(),
+        arm=_Arm(arm_name, generator=cast(eval_arms_module._BaselineGenerator, generator)),
+        answer_policy="best_effort",
+    )
+
+    assert outcome.prediction == "Ada"
+    assert outcome.abstained
+    assert outcome.abstention_reason == "insufficient_evidence"
 
 
 def test_random_arm_shuffles_the_same_pool_and_scores_retrieval_only() -> None:
@@ -682,6 +808,14 @@ def test_every_arm_answers_the_same_questions_against_one_ingest(tmp_path: Path)
         async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
             _record_retrieval_results((_hit("s1", 0.9), _hit("gold-1", 0.5)))
             return AnswerResult("Ada.", (_hit("gold-1", 0.5),))
+
+        async def ask_stream(
+            self, question: object, **kwargs: object
+        ) -> AsyncIterator[AnswerChunk]:
+            result = await self.ask(question, **kwargs)
+            if result.answer:
+                yield AnswerChunk(text=result.answer)
+            yield AnswerChunk(result=result)
 
         async def search(self, _query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
             return (_hit("s1", 0.9), _hit("gold-1", 0.5))
@@ -1249,7 +1383,11 @@ def test_recall_planning_activation_is_aggregated_per_task_and_stamped_per_sampl
         assert rows["average"] == pytest.approx(6.0)
 
         # The last plan a sample ran is the one its answer was grounded on.
-        assert telemetry.sample_grounding("atm-bench/unit/q1") == SampleGrounding(0, 0, "set")
+        grounding = telemetry.sample_grounding("atm-bench/unit/q1")
+        assert grounding is not None
+        assert grounding == SampleGrounding(
+            0, 0, "set", trace_id=grounding.trace_id, answer_span_id=grounding.answer_span_id
+        )
         joined = _with_grounding_loss(
             (
                 _sample_with({"accuracy": 1.0}),
@@ -1293,6 +1431,10 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
             deliberate=False,
             compile_max_items=24,
             compile_max_chars=16_000,
+            compile_allow_partial_sources=False,
+            fallback_reference_at=None,
+            repeat_index=0,
+            stream_results=False,
             seed=7,
             seeds=(7, 7, 7, 7),
             bootstrap_samples=20,
@@ -1313,13 +1455,11 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
             request_concurrency=1,
             recall_limit=20,
             predict_only=False,
-            num_fewshot=0,
             log_samples=False,
             use_cache=None,
             resume=False,
             allow_unverified_data=False,
             run_id="run",
-            model=DEFAULT_ARM,
             model_args="",
             gen_kwargs="",
             device=None,
@@ -1361,11 +1501,16 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     arms = cast(dict[str, object], results["arms"])
     table = eval_console_module._table(results)
 
+    assert results["schema_version"] == 22
+    assert "num_fewshot" not in results
     assert [row["arm"] for row in rows] == [DEFAULT_ARM, "blind", "random"]
     assert [row["score"]["mean"] for row in rows] == [1.0, 0.0, None]  # type: ignore[index]
     assert rows[0]["official_metric"] is True
     assert rows[1]["official_metric"] is False
+    assert rows[1]["answer_policy"] == "strict"
     assert arms["selected"] == [DEFAULT_ARM, "blind", "random"]
+    assert arms["comparison_scope"] == "end_to_end_system"
+    assert arms["memory_only_attribution"] is False
     # No config file, so the product default budget applies and `ask` ranks the full pool.
     assert arms["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
     assert arms["retrieval_candidate_limit_arm"] == DEFAULT_ARM
@@ -1373,7 +1518,6 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     definitions = cast(dict[str, dict[str, object]], arms["definitions"])
     assert set(definitions) == {DEFAULT_ARM, "blind", "random"}
     assert definitions[DEFAULT_ARM]["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
-    assert definitions[DEFAULT_ARM]["answer_retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
     assert definitions[DEFAULT_ARM]["retrieval_candidate_limit_basis"] == (
         "full rerank pool because evidence_budget_chars is configured"
     )
@@ -1394,6 +1538,30 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     assert results["status"] == "completed_with_errors"
     assert eval_module._execution_has_errors(samples, results)
     assert "atm-bench-main [blind]" in table
+
+
+def test_product_budget_provenance_distinguishes_ask_and_compile_tasks() -> None:
+    arguments = cast(
+        eval_config_module._Arguments,
+        SimpleNamespace(
+            recall_limit=20,
+            arms=(DEFAULT_ARM,),
+            tasks=("longmemeval-s", "personamem-v3"),
+            answer_policy=None,
+            full_context_chars=1000,
+            compile_max_chars=128,
+            compile_max_items=3,
+            compile_allow_partial_sources=False,
+            seed=7,
+            ingest="add",
+        ),
+    )
+    provenance = eval_module._arm_provenance(arguments)
+    definitions = cast(dict[str, dict[str, object]], provenance["definitions"])
+    budgets = cast(dict[str, dict[str, object]], definitions[DEFAULT_ARM]["budget_by_task"])
+
+    assert budgets["personamem-v3"] == {"surface": "compile", "max_chars": 128, "max_items": 3}
+    assert budgets["longmemeval-s"]["surface"] == "ask"
 
 
 def test_answer_retrieval_candidate_limit_matches_budget_policy() -> None:
@@ -1500,6 +1668,7 @@ def test_baseline_generator_uses_the_configured_generation_model(
             ),
         )
     )
+    asyncio.run(generator.answer("who signed it?", "Ada", answer_policy="best_effort"))
     asyncio.run(generator.close())
 
     assert requests[0]["client"] == {
@@ -1523,6 +1692,10 @@ def test_baseline_generator_uses_the_configured_generation_model(
     assert stuffed_messages[0]["content"] == eval_arms_module._FULL_CONTEXT_SYSTEM_PROMPT
     assert "Ada signed the contract" in stuffed_messages[1]["content"]
     assert requests[3] == requests[2]
+    from mindbridge.models.openai_sdk import _BEST_EFFORT_SYSTEM_PROMPT
+
+    best_effort_messages = cast(list[dict[str, str]], requests[4]["messages"])
+    assert best_effort_messages[0]["content"] == _BEST_EFFORT_SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize("extra_body", ({"top_p": 0.5}, {"seed": 11}))
@@ -1696,11 +1869,11 @@ def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path
             *,
             answer_policy: str = "strict",
             exhaustive: bool = False,
-        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+        ) -> Generator[str, None, AnswerResult]:
             del question
             recorded.append(answer_policy)
             yield "Ada."
-            return tuple(hits)
+            return AnswerResult(answer="Ada.", hits=tuple(hits))
 
         def close(self) -> None:
             return None

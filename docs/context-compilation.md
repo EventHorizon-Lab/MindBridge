@@ -123,8 +123,8 @@ provenance; they are not repeated in the text sent to a model.
 
 Excerpts inherit the parent record's visibility, requested scope, temporal view, identity and
 consent checks. Only a dense-matched text part of a raw observation is eligible. Aggregate keys,
-lexical-only matches, media and derived records, and schema-17 rows migrated without selectors are
-not. The compiler tries the full parent first. A parent can appear either as one full hit or one
+lexical-only matches, media and derived records, and text parts without selectors are not.
+The compiler tries the full parent first. A parent can appear either as one full hit or one
 excerpt, never both. A later derived evidence closure can replace an excerpt only when its complete
 full-record closure fits atomically; otherwise the excerpt stays and the derived assertion is
 withheld. An excerpt is not an evidence-clause member, a citation reinforcement, or proof that its

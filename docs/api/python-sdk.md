@@ -79,6 +79,7 @@ Memory(
     ambiguity_margin: float = 0.01,
     evidence_budget_chars: int | None = 24_000,
     recall_planning: bool = False,
+    recall_query_expansion: bool = False,
     recall_set_budget_chars: int = 30_000,
     recall_set_max_rows: int = 60,
     recall_rounds: int = 2,
@@ -121,6 +122,10 @@ A plain `TranscriptionBackend` transcribes supported audio/video during `add` re
 `search()` or `compile()`. Recall planning adds generation calls and bounded SQLite reads;
 evidence expansion follows stored links without another model call. Their budgets and retry-round
 rules are defined in [local memory settings](../configuration.md#local-memory-settings).
+`recall_query_expansion=True` additionally executes planner `similar.query` strings as bounded
+text searches, including point plans. It requires planning, preserves the original grounding,
+and remains experimental and disabled by default. It adds query embedding calls in dense/hybrid
+mode; lexical mode uses full-text search only. No HTTP endpoint or MCP tool schema changes.
 `memory_budget_records` and the query-failure settings govern control-plane candidates.
 `retention` is inert until `apply_retention()` runs. `independent_evidence` selects an experimental
 store-pinned projection and requires a fresh directory when changing an existing store's policy.
@@ -153,9 +158,11 @@ modality cannot shut the others out.
 
 `evidence_budget_chars` (default `24_000`) keeps the `limit` hits and then admits more ranked
 evidence while its text-equivalent cost fits the budget: 2,000 characters per image, 4,000 per
-audio asset, and 12,000 per video asset. `None` grounds `ask()` on exactly `limit` hits. The
-budget raises a floor rather than imposing a ceiling, so bound a prompt by lowering `limit` and
-setting the budget to `None`; `AnswerResult.hits` reports every record the answer was grounded on,
+audio asset, and 12,000 per video asset. `None` disables this ranked-tail expansion; separately
+enabled recall planning or linked expansion may still add evidence. The budget expands the
+guaranteed window rather than imposing a ceiling. Lowering `limit` and setting the budget to
+`None` reduces the basic ranked window, without guaranteeing a provider token fit.
+`AnswerResult.hits` reports every record the answer was grounded on,
 which with the default budget is usually more than `limit` on a corpus of short records.
 The per-setting semantics and calibration notes live in
 [configuration](../configuration.md#local-memory-settings).
@@ -478,8 +485,10 @@ stream, so with `ask_stream` its duration includes the time a caller spends betw
 
 `AsyncMemory.ask_stream` is the same contract as an `AsyncGenerator[AnswerChunk, None]`,
 including validation at the call. Every step of the underlying stream runs in one worker thread,
-so the event loop stays free while the provider generates, at the cost of a thread per in-flight
-stream; `aclose()` closes the stream behind it.
+so the event loop stays free while the provider generates. A `Memory` owns at most eight reusable
+stream workers shared by all its async wrappers and REST adapters. Excess streams raise retryable
+`StorageError(reason="capacity_exceeded", stage="admission")` on their first pull. Reading the
+terminal chunk returns worker capacity; `aclose()` closes an abandoned stream behind it.
 
 ```text
 compile(
@@ -517,9 +526,8 @@ reads. `bundle.hits`
 continues to expose complete `SearchHit` records. Each excerpt identifies its parent and matched
 index row and carries a digest-bound `TextSpanSelector` whose ordered `TextSpanPiece` values expose
 half-open Unicode code-point offsets plus exact source text. `render()` labels the line as partial
-and warns that omitted text may qualify it. A consumer that ignores `excerpts` receives the old
-complete-hit behavior and simply loses this additional grounding. The additive `excerpts` tuple is
-present and empty when the opt-in is disabled or no eligible excerpt fits.
+and warns that omitted text may qualify it. The `excerpts` tuple is empty when the opt-in is
+disabled or no eligible excerpt fits.
 
 `bundle.compact()` is an opt-in Python presentation that aliases only structurally formatted
 memory IDs as `mN` and identity IDs as `iN`. The frozen `ContextPresentation` contains `text`, its
@@ -706,7 +714,7 @@ references them; deleting one of two memories holding the same file keeps the fi
 | Its `memory_assets` links, and then any `media_assets` descriptor and content-addressed blob no other memory still references | A blob a second memory still references, until that memory is deleted too |
 | Everything keyed on a removed asset: `speech_analyses`, `speech_segments`, `face_analyses`, `face_observations`, and the cached transcript on the descriptor | -- |
 | An `identities` row and its `identity_exemplars` biometric template, once the removed observations were its last and it carries no registered name, relationship, alias, or cross-modal evidence | A *named* or merged person, who is an assertion a caller made rather than a by-product of one recording. `forget_identity` erases a person |
-| Derived memories whose last complete support clause depended on this record | A derived memory with another complete support clause. Every clause containing this record is retired whole, and the compatibility evidence list is rebuilt from the surviving clauses. Its own text may still paraphrase what the record said; that is consolidation, and `delete` on the derived memory removes it |
+| Derived memories whose last complete support clause depended on this record | A derived memory with another complete support clause. Every clause containing this record is retired whole, and the flat evidence list is rebuilt from the surviving clauses. Its own text may still paraphrase what the record said; that is consolidation, and `delete` on the derived memory removes it |
 | -- | `memory_operations` rows naming the id. The operation log is append-only audit history: it records that an operation happened, over which ids, with which proposal and rationale. Rewriting it to hide a deleted id would make `rollback` unsound and the log unable to answer what a deletion followed. It holds ids, a proposal, and a rationale -- never the deleted record's content or its media |
 
 `capabilities` reports what the composition's backends declare rather than what a provider name
@@ -744,9 +752,11 @@ operations(*, limit: int = 100) -> tuple[MemoryOperationRecord, ...]
 `consolidation_candidates` is the durable trigger: it answers "what needs deliberation?" from
 state the store already committed, with no queue, timer, or scheduler behind it. Hand a row's
 `memory_ids` straight to `consolidate(evidence_ids=..., trigger=...)`, or let `deliberate` do it.
-Rows are interleaved across triggers so a busy trigger cannot starve the others out of the
-window. It needs no consolidation backend and holds no lock, but it is not free: a `QUERY_FAILURE`
-row costs one query embedding and one ranking pass to name the records nearest the failed query,
+Rows are interleaved across triggers to share the output window. If `limit` is smaller than the
+number of active trigger groups, earlier groups can still occupy every slot; this is not a
+scheduler with a bounded waiting-time guarantee. It needs no consolidation backend and holds no
+lock, but it is not free: a `QUERY_FAILURE` row costs one query embedding and one ranking pass to
+name the records nearest the failed query,
 so a host that polls this in a tight loop should say so with `memory_budget_records` and
 `query_failure_window_seconds` rather than with the poll interval.
 
@@ -774,6 +784,20 @@ that marker a candidate the model could not resolve would be re-listed and re-pa
 round, which is the same disease as a periodic timer. `PRESSURE` and `IDLE` have no signal time
 of their own -- a level and an operator's declaration are not events -- so for those the marker
 means weighed at all. A rolled-back operation weighed nothing, so its evidence becomes due again.
+
+For `EVIDENCE`, `CONTRADICTION`, `FEEDBACK`, `PRESSURE`, and `IDLE`, each trigger applies its
+candidate limit after eligibility filtering. Already-weighed entries are skipped while scanning
+in the trigger's existing order, so an unchanged prefix cannot hide later due work. Evidence
+selection also excludes forgotten sources before counting candidates. This allows a finite
+backlog to advance as returned candidates are weighed, without retrying unchanged conflicts.
+Continuous arrivals or new signals can still delay lower-priority work. `QUERY_FAILURE` has a
+separate bounded query window and requires retrieval before checking its evidence's marks.
+
+Candidate completeness and history cost are separate: deriving the marks still aggregates the
+deliberation history and standing operation log. A poll may scan many settled records before it
+finds due work or proves none remains. The candidate limit bounds returned work, not scan time
+or log size; deleting history would lose audit, rollback, or already-weighed information rather
+than repair candidate selection.
 
 `deliberate` is the memory-management loop itself: one round asks `consolidation_candidates` what
 is due and runs `consolidate` over each row with the row's own trigger, and the loop repeats
@@ -866,6 +890,14 @@ own deterministic rule rather than a backend choice: a new `STATE` or user-state
 the current version of every other record in the same lineage whose validity it overlaps,
 including records nobody showed the backend. The log row names those `(memory_id, version)` pairs
 in `MemoryOperationRecord.superseded` and `rollback()` restores exactly them.
+
+For registered scalar predicates, exact aliases such as `preferred_drink`, `favorite_beverage`,
+and `喜欢的饮料` share a claim key across languages. The original `MemoryContext.predicate` remains
+unchanged. Kind, subject identity, and spatial scope still separate claims; `home_city` and
+`current_location` remain different slots. RELATION values accumulate, and user-stated TRAIT
+assertions retain priority over model inferences. Unknown predicates, compound values, and
+unregistered paraphrases keep literal keys. See the
+[registry and upgrade notes](../research/2026-10-27-predicate-stability.md).
 
 Multi-target operations are all or nothing. A proposal whose targets are not all eligible is
 rejected whole -- `"unknown_target"`, `"not_derived"`, or `"already_forgotten"` -- so an applied
@@ -1045,7 +1077,6 @@ result for the exact final snapshot and closes the helper. `PrefetchResult` cont
 submission numbers are internal. Snapshots reject mutable `Path` atoms; use `Blob` or
 `AssetRef`.
 
-Migration: remove reads of `PrefetchResult.revision` and uses of the `submit()` return value.
 Use `finalize()` when results must match the final query; `latest` remains speculative.
 
 ### Async capture streams
@@ -1257,7 +1288,7 @@ StreamingGenerationBackend.stream_answer(
     *,
     answer_policy: AnswerPolicy = "strict",
     exhaustive: bool = False,
-) -> Iterator[str]
+) -> Generator[str, None, AnswerResult]
 
 TranscriptionBackend.transcribe(
     assets: Sequence[AssetRef],
@@ -1290,9 +1321,15 @@ ConsolidationBackend.consolidate(
 `FormationInput.memory_id` values from that exact call or active records in that primary input's
 `history`. It must include the proposal's primary input; another target's private history is not
 an allowed source. The kernel records one tuple as one conjunctive clause and treats separately emitted clauses
-as alternatives. Deleting any member retires its whole conjunction. `None` retains the legacy
-singleton link to the primary input alone. A model declaration is provenance metadata, not a
+as alternatives. Deleting any member retires its whole conjunction. `None` uses the primary input
+as the sole evidence member. A model declaration is provenance metadata, not a
 verified proof of complete or independent support.
+
+The kernel always forwards `answer_policy` and `exhaustive` to generation backends, including
+their default values. Recall planners receive `attempted`, including an empty string. A streaming
+backend yields text deltas and returns an `AnswerResult` as its generator completion value;
+that result carries the answer, used hits, and abstention status. Exhaustion without a result or
+returning a bare hit tuple is an invalid model response.
 
 Required properties are `embedding_capabilities`, `embedding_model`, `embedding_space`, and
 `embedding_dimension` for embedding; `transcription_capabilities`, `transcription_model`, and
@@ -1312,6 +1349,14 @@ bundled caption prompt.
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal
 against the source modality and spatial frame, assigns identity, links evidence, and commits.
+`FormationInput.occurred_at`, `occurred_end`, and `created_at` preserve the source observation's
+timestamps. Resolve relative dates against `occurred_at`, falling back to `created_at` when
+event time is absent. These are separate from `context.valid_from` / `valid_until`, which bound
+assertion validity. For example, “I moved to Paris yesterday” observed at
+`2026-03-02T12:00:00Z` supports a move on March 1 even when stored later. Custom callers may omit
+the new fields (all default to `None`); without a timestamp or dated evidence, a former must not
+substitute its wall clock. Supplied timestamps must be timezone-aware, and `occurred_end` requires
+an earlier `occurred_at`. The SDK always fills `created_at` from the committed source.
 `FormationInput.history` is a tuple of text-only `MemoryRecord` values; `history_truncated`
 reports an incomplete window. History IDs are unique and exclude the primary target. Custom
 formers can ignore the default empty history; enabling it requires a former that can reason over
@@ -1344,11 +1389,8 @@ The return is the model's JSON text, not an executed plan. The kernel validates 
 to ordinary retrieval for an unusable plan. `attempted` describes a previous round and is empty
 on the first call.
 
-`answer_policy` and `exhaustive` are keyword-only and defaulted on both generation protocols, and
-MindBridge sends each one only when it is not its default. A backend written against the earlier
-two-argument signature therefore keeps answering; accept `answer_policy` to support
-`"best_effort"`, which otherwise fails the call with `ModelError`. `exhaustive` is true when a
-recall program produced the hits as every record its predicate matched, in time order, rather
+`exhaustive` is true when a recall program produced the hits as every record its predicate
+matched, in time order, rather
 than as a ranking -- the bundled adapter uses it to describe the evidence order to the reader,
 which is the one thing about the hits a prompt cannot infer from the hits.
 
@@ -1382,7 +1424,7 @@ routed with no text at all looks like.
 | `SpeechAnalysis` | `turns`, `speakers` |
 | `FaceEmbedding` | `face_label`, `values`, `bounding_box`, `observed_at_ms` |
 | `FaceAnalysis` | `faces` |
-| `FormationInput` | `memory_id`, `content`, `context`, `history=()`, `history_truncated=False` |
+| `FormationInput` | `memory_id`, `content`, `context`, `history=()`, `history_truncated=False`, `occurred_at=None`, `occurred_end=None`, `created_at=None` |
 | `FormationProposal` | `kind`, `content`, `basis`, `subject`, `predicate`, `value`, `confidence`, `valid_from`, `valid_until`, `spatial`, `cue_modality`, `valence`, `arousal`, optional `evidence_ids` |
 
 ### Bundled adapters
@@ -1454,9 +1496,6 @@ encoder must expose an immutable `_commit_hash` in its model configuration or re
 that license covers the weights, not MindBridge. `DEFAULT_FUNASR_MODEL_ID` and
 `DEFAULT_FUNASR_RECIPE` publish the default speech recipe.
 `FunASRRecipe.auto_model_arguments() -> dict[str, object]` returns its standard FunASR composition.
-
-The separate `JinaOmniEmbedder` import has been removed; see the
-[Jina migration](../configuration.md#migrating-the-jina-provider) for its replacement.
 
 For `google/embeddinggemma-2`, the generic loader uses FP32 and supports `128`, `256`, `512`, or
 `768` dimensions without requiring optional Matryoshka metadata. Query and document prompts come
@@ -1548,7 +1587,7 @@ stream_answer(
     *,
     answer_policy: AnswerPolicy = "strict",
     exhaustive: bool = False,
-) -> Generator[str, None, tuple[SearchHit, ...]]
+) -> Generator[str, None, AnswerResult]
 transcribe(assets: Sequence[AssetRef]) -> tuple[str, ...]
 close() -> None
 ```
@@ -1602,7 +1641,8 @@ All stable exceptions derive from `MindBridgeError`:
 | `IndexUnavailableError` | `index_unavailable` | `None` |
 
 Every error may carry `reason`, `stage`, and `subject`. `retryable` is true only when `reason` is
-`connection_failed`, `data_dir_in_use`, `flush_failed`, `index_missing`, `provider_unavailable`, `rate_limited`, or
+`capacity_exceeded`, `connection_failed`, `data_dir_in_use`, `flush_failed`, `index_missing`,
+`provider_unavailable`, `rate_limited`, or
 `timeout`; it is never inferred from the message. `ModelOutputTruncatedError` is a deterministic
 `ModelError`, and `IndexUnavailableError` is a `StorageError`.
 
@@ -1611,6 +1651,15 @@ the refusal text. This is distinct from `response_invalid` and is not retried as
 `provider_unavailable` identifies temporary upstream server failures after the SDK's retry budget;
 `quota_exhausted` covers exhausted credits and provider spend or usage limits, which require an
 operator change rather than an identical retry. See the [shared error vocabulary](rest.md#codes-and-reasons).
+
+`context_length_exceeded` identifies a provider-declared input/context overflow. It is permanent
+for that request, distinct from byte-based `payload_too_large` and output-token truncation.
+The adapter preserves the selected answer evidence and does not retry by trimming it. Reduce
+evidence or choose sufficient provider capacity; `evidence_budget_chars` is a soft expansion
+budget, so lowering it alone may leave the mandatory `limit` hits over capacity. The adapter's
+4 MiB answer-text bound includes the system prompt, serialized user text, and attachment labels;
+it is independent of the model's token window. Answer and media-diagnostic text overflows report
+`payload_too_large` at stage `generate`. See [evidence and provider budgets](../configuration.md#local-memory-settings).
 
 Stable input bounds are:
 
@@ -1625,6 +1674,13 @@ Stable input bounds are:
 
 The 512 MiB value is the local ingestion ceiling, not a promise that every model backend accepts an
 asset that large. Backend request limits apply before model work.
+
+Each instance admits at most 32 active memory operations and 32 submitted asynchronous calls;
+SQLite also caps actual borrowed plus idle connections at 32. Excess work raises retryable
+`StorageError(reason="capacity_exceeded", stage="admission")` before additional resources are
+allocated. Cancellation does not return a running call's capacity until the call finishes.
+See [concurrency and overload](../operations.md#concurrency-and-overload) for all worker and
+transport limits and their sizing boundaries.
 
 Two degradations keep a write alive rather than failing it, and both are recorded on the operation
 span. Media the embedding model will not accept inline drops the retrieval key holding it: the

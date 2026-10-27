@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     pass
-from mindbridge import MemoryConfig, MindBridgeConfig
+from mindbridge import AnswerPolicy, MemoryConfig, MindBridgeConfig
 from mindbridge.benchmarks.eval_adapters import LoadedTask
 from mindbridge.benchmarks.eval_arms import (
     BLIND_PROMPT_VERSION,
@@ -25,11 +25,12 @@ from mindbridge.benchmarks.eval_arms import (
 from mindbridge.benchmarks.eval_config import (
     _RESULTS_FILE,
     _SAMPLES_FILE,
-    DEFAULT_ARM,
     RETRIEVAL_CANDIDATE_LIMIT,
     _Arguments,
 )
+from mindbridge.benchmarks.eval_diagnostics import summarize_diagnostics
 from mindbridge.benchmarks.eval_results import (
+    DEFAULT_ARM,
     EVAL_SCHEMA_VERSION,
     SampleResult,
 )
@@ -49,6 +50,7 @@ from mindbridge.benchmarks.official_scorers import (
     task_family,
     task_primary_metric,
 )
+from mindbridge.benchmarks.prompts import task_answer_policy
 
 # Measured on this harness: a per-benchmark difference under three points is inside the run to
 # run noise band, whose per-question standard deviation is about seventeen points.
@@ -227,6 +229,7 @@ def _metrics(
         "metrics": metric_rows,
         "exact_match": metric_rows.get("exact_match"),
         "question_count": len(samples),
+        "quality_diagnostics": summarize_diagnostics(samples),
         "scored_question_count": len(scored),
         "error_count": error_count,
         "retrieval_diagnostic_error_count": retrieval_diagnostic_error_count,
@@ -684,8 +687,24 @@ def _in_run_blind_rows(
     return rows
 
 
+def _validate_blind_protocol(document: Mapping[str, object]) -> None:
+    if document.get("blind") is not True:
+        raise ValueError("blind baseline must come from a run started with --blind")
+    if document.get("schema_version") != EVAL_SCHEMA_VERSION:
+        raise ValueError("blind baseline schema version is unsupported")
+    arms = document.get("arms")
+    definitions = arms.get("definitions") if isinstance(arms, Mapping) else None
+    blind = definitions.get("blind") if isinstance(definitions, Mapping) else None
+    prompt = blind.get("prompt") if isinstance(blind, Mapping) else None
+    if prompt != BLIND_PROMPT_VERSION:
+        raise ValueError("blind baseline prompt differs; rerun the control with this harness")
+
+
 def _blind_baseline_rows(
-    path: Path | None, tasks: Sequence[LoadedTask]
+    path: Path | None,
+    tasks: Sequence[LoadedTask],
+    *,
+    answer_policy: AnswerPolicy | None = None,
 ) -> dict[str, dict[str, object]]:
     """Load per-task scores from a prior --blind run of the same evaluation inputs."""
     if path is None:
@@ -697,10 +716,7 @@ def _blind_baseline_rows(
     document = json.loads(document_path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ValueError("blind baseline must be a results.jsonl document")
-    if document.get("blind") is not True:
-        raise ValueError("blind baseline must come from a run started with --blind")
-    if document.get("schema_version") != EVAL_SCHEMA_VERSION:
-        raise ValueError("blind baseline schema version is unsupported")
+    _validate_blind_protocol(document)
     digests = {task.spec.name: task.evaluation_sha256 for task in tasks}
     rows: dict[str, dict[str, object]] = {}
     for row in document.get("tasks", ()):
@@ -709,6 +725,8 @@ def _blind_baseline_rows(
             continue
         if row.get("evaluation_sha256") != digests[name]:
             raise ValueError(f"blind baseline evaluation inputs differ for {name}")
+        if row.get("answer_policy") != task_answer_policy(name, answer_policy):
+            raise ValueError(f"blind baseline answer policy differs for {name}")
         score = row.get("score")
         rows[name] = {
             "run_id": document.get("run_id"),

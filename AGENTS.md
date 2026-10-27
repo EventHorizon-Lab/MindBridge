@@ -64,8 +64,9 @@ narrowest relevant optional extra.
 ## Coding style
 
 Use UTF-8, LF endings, and a trailing newline. Prefer deletion and reuse over compatibility layers
-or speculative abstractions. Keep names conventional, public contracts explicit, and comments
-focused on constraints that are not obvious from the code.
+or speculative abstractions. Backward compatibility is not required; remove obsolete interfaces,
+formats, and migration paths instead of preserving them. Keep names conventional, public contracts
+explicit, and comments focused on constraints that are not obvious from the code.
 
 Use `apply_patch` for hand edits. Preserve unrelated work in a dirty tree. Do not run destructive
 Git commands to discard another contributor's changes.

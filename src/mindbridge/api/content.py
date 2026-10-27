@@ -13,13 +13,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import Annotated, Literal, TypeAlias, cast
+from functools import cached_property
+from typing import Annotated, Literal, TypeAlias
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StringConstraints,
     field_validator,
     model_validator,
@@ -84,33 +87,56 @@ class _InputText(StrictModel):
     text: Text
 
 
+@dataclass(frozen=True)
+class _DecodedMedia:
+    data: bytes
+    media_type: str
+    name: str | None
+
+    @cached_property
+    def blob(self) -> Blob:
+        return Blob(data=self.data, media_type=self.media_type, name=self.name)
+
+
 class _InputImage(StrictModel):
+    model_config = ConfigDict(frozen=True)
+
     type: Literal["input_image"]
     image_url: Source | None = None
     file_id: PartId | None = None
+    _value: _DecodedMedia | AssetRef | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def require_one_source(self) -> _InputImage:
+        if self._value is not None:
+            return self
         _one_source(image_url=self.image_url, file_id=self.file_id)
         if self.image_url is not None:
-            _validate_data_url(self.image_url)
-            if self.image_url.startswith("data:"):
-                media_type, _data = _decode_data_url(self.image_url)
-                if not media_type.startswith("image/"):
-                    raise ValueError("input_image data must have an image media type")
+            media_type, data = _validate_data_url(self.image_url)
+            if not media_type.startswith("image/"):
+                raise ValueError("input_image data must have an image media type")
+            self._value = _DecodedMedia(data, media_type, None)
+        else:
+            assert self.file_id is not None
+            self._value = AssetRef(id=self.file_id, modality=Modality.IMAGE)
         return self
 
 
 class _InputFile(StrictModel):
+    model_config = ConfigDict(frozen=True)
+
     type: Literal["input_file"]
     file_url: Source | None = None
     file_data: str | None = None
     file_id: PartId | None = None
     media_type: MediaType | None = None
     filename: Filename | None = None
+    _value: _DecodedMedia | AssetRef | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def require_one_source(self) -> _InputFile:
+        if self._value is not None:
+            return self
         _one_source(file_url=self.file_url, file_data=self.file_data, file_id=self.file_id)
         if self.media_type is not None and self.media_type.split("/", 1)[0] not in {
             "image",
@@ -119,17 +145,23 @@ class _InputFile(StrictModel):
         }:
             raise ValueError("media_type must be image, video, or audio")
         if self.file_url is not None:
-            _validate_data_url(self.file_url)
-            if self.file_url.startswith("data:") and self.media_type is not None:
-                embedded_type, _data = _decode_data_url(self.file_url)
-                if not _media_type_matches(self.media_type, embedded_type):
-                    raise ValueError("media_type contradicts the data URL")
-        if self.file_data is not None:
+            embedded_type, data = _validate_data_url(self.file_url)
+            if self.media_type is not None and not _media_type_matches(
+                self.media_type, embedded_type
+            ):
+                raise ValueError("media_type contradicts the data URL")
+            self._value = _DecodedMedia(data, embedded_type, self.filename)
+        elif self.file_data is not None:
             if self.media_type is None:
                 raise ValueError("media_type is required with file_data")
             if self.media_type.endswith("/*"):
                 raise ValueError("file_data requires a concrete media_type")
-            decode_base64(self.file_data)
+            self._value = _DecodedMedia(
+                decode_base64(self.file_data), self.media_type, self.filename
+            )
+        else:
+            assert self.file_id is not None
+            self._value = _file_reference(self.file_id, self.media_type)
         return self
 
 
@@ -149,28 +181,10 @@ def content_input(content: Content) -> ContentInput:
     for part in content:
         if isinstance(part, _InputText):
             atoms.append(part.text)
-        elif isinstance(part, _InputImage):
-            if part.file_id is not None:
-                atoms.append(AssetRef(id=part.file_id, modality=Modality.IMAGE))
-            else:
-                atoms.append(_data_blob(cast(str, part.image_url), media_type="image/*", name=None))
-        elif part.file_id is not None:
-            atoms.append(_file_reference(part.file_id, part.media_type))
-        elif part.file_data is not None:
-            atoms.append(
-                Blob(
-                    data=decode_base64(part.file_data),
-                    media_type=cast(str, part.media_type),
-                    name=part.filename,
-                )
-            )
         else:
+            assert part._value is not None
             atoms.append(
-                _data_blob(
-                    cast(str, part.file_url),
-                    media_type=part.media_type,
-                    name=part.filename,
-                )
+                part._value.blob if isinstance(part._value, _DecodedMedia) else part._value
             )
     return tuple(atoms)
 
@@ -246,18 +260,6 @@ def _file_reference(file_id: str, media_type: str | None) -> AssetRef:
     return AssetRef(id=file_id, media_type=media_type)
 
 
-def _data_blob(
-    value: str,
-    *,
-    media_type: str | None = None,
-    name: str | None,
-) -> Blob:
-    embedded_type, data = _decode_data_url(value)
-    if media_type is not None and not _media_type_matches(media_type, embedded_type):
-        raise ValueError("media_type contradicts the data URL")
-    return Blob(data=data, media_type=embedded_type, name=name)
-
-
 def _one_source(**sources: object) -> None:
     if sum(source is not None for source in sources.values()) != 1:
         raise ValueError(f"exactly one of {', '.join(sources)} is required")
@@ -269,10 +271,10 @@ def _media_type_matches(expected: str, actual: str) -> bool:
     )
 
 
-def _validate_data_url(value: str) -> None:
+def _validate_data_url(value: str) -> tuple[str, bytes]:
     if not value.startswith("data:"):
         raise ValueError("remote URLs are not accepted; fetch media before calling MindBridge")
-    _decode_data_url(value)
+    return _decode_data_url(value)
 
 
 def _decode_data_url(value: str) -> tuple[str, bytes]:

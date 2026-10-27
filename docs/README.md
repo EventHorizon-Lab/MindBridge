@@ -72,17 +72,27 @@ contract.
 
 ## Evaluate
 
+- [Negation retrieval research](research/2026-10-27-negation-retrieval-research.md) — original
+  papers, open implementations, Chinese scope extraction, and evaluation priorities.
+- [Controlled semantic recall](research/2026-10-27-semantic-recall.md) — R01 audit, bounded
+  opt-in query execution, candidate/grounding loss decomposition and quality limits.
+- [Quality diagnosis audit](research/2026-10-27-quality-diagnostics.md) — five observed boundaries,
+  source-coverage limits and human evidence review.
+- [Predicate stability](research/2026-10-27-predicate-stability.md) — exact aliases, conservative
+  claim keys and deterministic correction fixtures.
+- [Negation and lexical evidence](research/2026-10-27-chinese-negation.md) — R02 root cause,
+  language-neutral IDF, paired retrieval fixtures, and disclosed ranking tradeoffs.
+- [Top1 ambiguity](research/2026-10-27-top1-ambiguity.md) — R03 reproduction, policy risk–coverage
+  comparison and correct-candidate losses.
 - [Accuracy-first retrieval](research/2026-10-26-accuracy-first-retrieval.md) — authoritative
   quantized scoring, candidate retention, quality fixtures, and measured latency tradeoffs.
 - [ATM-Bench and Mem-Gallery research strategy](research/2026-10-26-atm-mem-gallery-sota-strategy.md) —
   current competitive results, MindBridge evidence gaps, and experiments for validating improvements.
-- [Architecture cohesion audit](research/2026-10-26-architecture-cohesion.md) — dependency
-  boundaries, recovery fixes, and compatibility removal decisions.
 - [Zvec 0.8 adoption](research/2026-10-26-zvec-08.md) — index migration, concurrency and
   quantization decisions, measured recall, and native API limits.
-- [Memory reliability changes](research/2026-10-08-reliability-optimization.md) — formation history,
-  stale evidence guards, constraint candidates, request telemetry, and saved-prediction rejudging.
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
+- [Offline semantic support audit](semantic-support-audit.md) — atomic-claim review, evidence
+  localization, withdrawal residue and verification costs before changing formation admission.
 - [Model quality gate](operations.md#model-quality-gate) — synthetic real-model regression cases,
   explicit snapshots, safe artifacts, and optional scheduled evaluation.
 - [Annotated example configuration](examples/eval.example.yaml) — every evaluation slot and the

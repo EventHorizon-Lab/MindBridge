@@ -66,13 +66,13 @@ required tables. Use a version that supports the store, or reopen a backup with 
 ### Store metadata mismatch
 
 The store records the embedding model, vector space and dimension, transcription space, configured
-face spaces, and the index recipe. Reopen with the original configuration, apply only a supported
-upgrade, or ingest the source content into a new directory.
+face spaces, and the index recipe. Reopen with the original configuration or ingest the source
+content into a new directory. A nonempty store with missing required markers is rejected.
 
 `reindex()` cannot convert incompatible embeddings, transcripts, or face analyses; it rebuilds the
-Zvec projection from the durable values already in SQLite. A known index-only recipe change,
-including quantization, rebuilds Zvec from stored vectors. A recognized embedding recipe upgrade
-may re-embed records before publishing its new compatibility marker.
+Zvec projection from the durable values already in SQLite. Changing quantization within the current
+index recipe rebuilds Zvec from stored vectors. Older recipes and different embedding spaces are
+rejected without rewriting the store or its index.
 
 ### Zvec is missing or damaged
 
@@ -171,6 +171,15 @@ provider status, and response shape. MindBridge preserves the provider exception
 `__cause__` and classifies known SDK failures in `reason`, but REST and MCP never serialize
 provider bodies. Configure credentials, base URL, timeout, proxy, and provider retry policy on the
 provider SDK or the declarative OpenAI slot.
+
+For `reason="context_length_exceeded"`, the provider rejected the request against its context
+window. Reduce the selected evidence or choose sufficient model capacity, reserving room for
+output and reasoning. `evidence_budget_chars` only controls expansion beyond mandatory `limit`
+hits: lowering it cannot remove those hits. Setting it to `None` and lowering `limit` reduces
+the basic ranked window; optional planning and linked expansion can still add records. None of
+these controls guarantees a token fit. Use the provider's own token counter on the
+complete request when available; character/media estimates and local byte ceilings are not
+token limits. Answer overflow is not retried with evidence silently removed.
 
 For `code="model_output_truncated"`, generation reached its output-token limit: raise the adapter's
 generation limit or reduce the `ask()` evidence limit. Retrying the identical request is not a fix.

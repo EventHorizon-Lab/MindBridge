@@ -36,7 +36,7 @@ git diff --check
 - [ ] Deployment ownership or single-process behavior changed
 - [ ] None of the above
 
-<!-- Describe upgrade steps, data compatibility, reindexing, and rollback for checked items. -->
+<!-- Describe the current contract, data re-ingestion, reindexing, and recovery for checked items. -->
 
 ## Follow-up
 

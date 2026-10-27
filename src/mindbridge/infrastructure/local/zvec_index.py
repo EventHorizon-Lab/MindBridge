@@ -234,6 +234,10 @@ class IndexHit:
     confidence: float | None = None
     """Calibratable dense evidence strength, independent of rank fusion."""
     lexical_match: bool = False
+    lexical_score: float | None = None
+    """Unnormalized single-field BM25 score; absent for rank-fused or zero-score results."""
+    lexical_route: str | None = None
+    """The pushed memory type, or None for the unfiltered lexical route."""
 
     def __post_init__(self) -> None:
         if not self.id or self.id != self.id.strip():
@@ -245,6 +249,16 @@ class IndexHit:
                 raise ValueError(f"index hit {name} must be between zero and one")
         if not isinstance(self.lexical_match, bool):
             raise ValueError("index hit lexical_match must be a boolean")
+        if self.lexical_score is not None and (
+            isinstance(self.lexical_score, bool)
+            or not math.isfinite(self.lexical_score)
+            or self.lexical_score < 0.0
+        ):
+            raise ValueError("index hit lexical_score must be finite and nonnegative")
+        if self.lexical_route is not None and (
+            not self.lexical_route or self.lexical_route != self.lexical_route.strip()
+        ):
+            raise ValueError("index hit lexical_route must be non-empty and trimmed")
         if self.confidence is None:
             object.__setattr__(self, "confidence", self.relevance)
 
@@ -312,8 +326,9 @@ class ZvecIndex:
     @property
     def doc_count(self) -> int:
         """Return the number of documents currently visible to Zvec."""
-        collection = cast(Any, self._require_collection())
-        return int(collection.stats.doc_count)
+        with self._gate.read():
+            collection = cast(Any, self._require_collection())
+            return int(collection.stats.doc_count)
 
     def upsert(self, documents: Sequence[IndexDocument]) -> None:
         """Idempotently apply a batch, checking every per-document status."""
@@ -466,6 +481,7 @@ class ZvecIndex:
             )
         scores = tuple(max(0.0, _required_score(doc)) for doc in docs)
         maximum = max(scores, default=0.0)
+        comparable_scores = not _ngram_text(text) and maximum > 0.0
         return tuple(
             IndexHit(
                 id=_required_id(doc),
@@ -476,6 +492,8 @@ class ZvecIndex:
                 ),
                 confidence=0.0,
                 lexical_match=True,
+                lexical_score=score if comparable_scores else None,
+                lexical_route=memory_type,
             )
             for rank, (doc, score) in enumerate(zip(docs, scores, strict=True), start=1)
         )
@@ -1064,8 +1082,7 @@ class ZvecIndex:
             m=_HNSW_M,
             ef_construction=_HNSW_EF_CONSTRUCTION,
             quantize_type=quantize_type,
-            # Zvec 0.8's rotated INT8 cosine path returns unrelated neighbors even on a
-            # linear scan. The 0.8 recipe rebuilds old rotated projections from SQLite.
+            # Zvec's rotated INT8 cosine path returns unrelated neighbors even on a linear scan.
             quantizer_param=self._zvec.QuantizerParam(enable_rotate=False),
         )
 
@@ -1080,7 +1097,7 @@ class ZvecIndex:
     def _validate_vector(self, values: Sequence[float]) -> None:
         if len(values) != self.dimension:
             raise ValueError(f"vector must contain exactly {self.dimension} values")
-        if not all(math.isfinite(value) for value in values):
+        if not all(map(math.isfinite, values)):
             raise ValueError("vector values must be finite")
 
     def _check_statuses(

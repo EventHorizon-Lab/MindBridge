@@ -7,14 +7,14 @@ runs, and what the run report then says about it.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from mindbridge import AnswerPolicy, AnswerResult, AsyncMemory, DeliberationReport
+from mindbridge import AnswerChunk, AnswerPolicy, AnswerResult, AsyncMemory, DeliberationReport
 from mindbridge.benchmarks import eval as eval_module
 from mindbridge.benchmarks.eval import (
     MemoryFactory,
@@ -70,6 +70,21 @@ class _Memory:
         del reference_at, limit, answer_policy
         self.events.append(f"ask:{question}")
         return AnswerResult("A")
+
+    async def ask_stream(
+        self,
+        question: object,
+        *,
+        limit: int,
+        reference_at: datetime | None = None,
+        answer_policy: AnswerPolicy = "strict",
+    ) -> AsyncIterator[AnswerChunk]:
+        result = await self.ask(
+            question, limit=limit, reference_at=reference_at, answer_policy=answer_policy
+        )
+        if result.answer:
+            yield AnswerChunk(text=result.answer)
+        yield AnswerChunk(result=result)
 
 
 def _task(tmp_path: Path) -> LoadedTask:

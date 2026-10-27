@@ -5,20 +5,19 @@ unscoped candidate window and dropped everything outside the scope in SQLite aft
 post-filter widens the window when too few candidates survive, but the widening is bounded, and
 for a predicate that matches two records in a library the bound is reached long before the matches
 are: the answer silently came back short. These tests pin the two halves of the fix -- the filter
-reaches Zvec, and the collection carrying it is detected as stale and rebuilt from SQLite without
-re-embedding a thing.
+reaches Zvec, and a missing collection rebuilds those fields from SQLite without re-embedding.
 """
 
 from __future__ import annotations
 
 import math
+import shutil
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
 from mindbridge import (
     EmbedTask,
-    IndexQuantization,
     Memory,
     Modality,
     ModelInput,
@@ -27,7 +26,6 @@ from mindbridge import (
 )
 from mindbridge.infrastructure.local import IndexDocument, StoredEmbedding
 from mindbridge.infrastructure.local.zvec_index import ZvecIndex
-from mindbridge.kernel.metadata import index_recipe_for
 
 _NOW = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
 _SPACE = "pushdown-probe:2"
@@ -170,28 +168,19 @@ class _CountingEmbedder:
         pass
 
 
-def test_a_collection_built_before_the_filter_fields_rebuilds_without_re_embedding(
+def test_missing_index_rebuild_preserves_scope_fields_without_reembedding(
     tmp_path: Path,
 ) -> None:
-    previous = (
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:"
-        f"context-keys-v10:quantization-{IndexQuantization.NONE.value}"
-    )
-    assert previous != index_recipe_for(IndexQuantization.NONE)
-
     with Memory(tmp_path, embedder=_CountingEmbedder(), minimum_relevance=0) as memory:
         record = memory.add(
             "a kettle on a worktop",
             context=ObservationContext(place_id="kitchen"),
         )
-        # Stamp the store as one whose collection was built by the previous schema.
-        memory._store.set_metadata("index.recipe", previous)
-    assert (tmp_path / "zvec").exists()
+    shutil.rmtree(tmp_path / "zvec")
 
     reopened = _CountingEmbedder()
     with Memory(tmp_path, embedder=reopened, minimum_relevance=0) as memory:
-        # The stale collection was removed and replayed from SQLite: no vector was recomputed,
-        # and the new filter field is populated from authoritative rows.
+        # The scope fields are reconstructed from authoritative rows alongside stored vectors.
         assert reopened.calls == 0
         scoped = memory.search("kettle", scope=RetrievalScope(place_id="kitchen"))
     assert [hit.id for hit in scoped] == [record.id]

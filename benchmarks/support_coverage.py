@@ -159,7 +159,7 @@ class Outcome:
     # comparison stated in characters alone overstated one arm's saving by 1.6x.
     evidence_cost: int
     # What the provider said it was billed for the answer call. The only unmodelled cost here.
-    prompt_tokens: int
+    prompt_tokens: int | None
     media_rows: int
     correct: float
     # Mem-Gallery's judged metric beside its deterministic primary; zero on the corpora that have
@@ -238,24 +238,34 @@ def _billing_hook(response: httpx.Response) -> None:
     Cost is the whole claim this measurement makes, and it has been got wrong twice by modelling
     it -- once by counting characters and ignoring media entirely, once by pricing a media part at
     the flat charge `evidence_cost` uses rather than what a model is billed for. The provider says
-    what it charged; read that instead. Best effort by construction: a body this cannot parse
-    leaves the modelled figure standing rather than failing an answer.
+    what it charged; read that instead. Missing or malformed usage leaves the total unknown
+    rather than failing an answer or estimating its cost.
     """
+    _BILLED.observed = True
     try:
         response.read()
-        usage = response.json().get("usage") or {}
-        tokens = int(usage.get("prompt_tokens", 0))
-    except Exception:
+        payload = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError, httpx.HTTPError, httpx.StreamError):
+        _BILLED.tokens = None
         return
-    _BILLED.tokens = getattr(_BILLED, "tokens", 0) + tokens
+    usage = payload.get("usage") if isinstance(payload, Mapping) else None
+    tokens = usage.get("prompt_tokens") if isinstance(usage, Mapping) else None
+    previous = getattr(_BILLED, "tokens", 0)
+    if type(tokens) is not int or tokens < 0 or previous is None:
+        _BILLED.tokens = None
+    else:
+        _BILLED.tokens = previous + tokens
 
 
-def _billed_tokens() -> int:
-    return cast(int, getattr(_BILLED, "tokens", 0))
+def _billed_tokens() -> int | None:
+    if not getattr(_BILLED, "observed", False):
+        return None
+    return cast(int | None, _BILLED.tokens)
 
 
 def _reset_billing() -> None:
     _BILLED.tokens = 0
+    _BILLED.observed = False
 
 
 def _env() -> Mapping[str, str]:
@@ -913,6 +923,7 @@ def _gallery_outcomes(
 def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
     counts = Counter(outcome.support for outcome in outcomes)
     total = len(outcomes) or 1
+    billed = [outcome.prompt_tokens for outcome in outcomes if outcome.prompt_tokens is not None]
     return {
         "questions": len(outcomes),
         "accuracy": round(statistics.fmean(outcome.correct for outcome in outcomes), 4),
@@ -939,8 +950,8 @@ def _summarize(outcomes: Sequence[Outcome]) -> dict[str, object]:
         "mean_evidence_cost": round(
             statistics.fmean(outcome.evidence_cost for outcome in outcomes), 1
         ),
-        "mean_prompt_tokens": round(
-            statistics.fmean(outcome.prompt_tokens for outcome in outcomes), 1
+        "mean_prompt_tokens": (
+            round(statistics.fmean(billed), 1) if len(billed) == len(outcomes) else None
         ),
     }
 

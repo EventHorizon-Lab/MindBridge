@@ -20,10 +20,10 @@ from mindbridge import (
     MindBridgeError,
 )
 from mindbridge.benchmarks.eval_cache import EvidenceInterval
-from mindbridge.benchmarks.eval_config import DEFAULT_ARM
 from mindbridge.models.base import _is_generation_abort_rejection
 
-EVAL_SCHEMA_VERSION = 19
+EVAL_SCHEMA_VERSION = 22
+DEFAULT_ARM = "mindbridge"
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +233,12 @@ class SampleResult:
     judge_model: str | None = None
     judge_response: str | None = None
     judge_cached: bool = False
+    # Observed independently of the answer's returned hits. None is unobserved; () is empty.
+    generation_evidence: tuple[EvidenceInterval, ...] | None = None
+    # Only labelled sources present in the eligible corpus, not an assertion about the index.
+    input_source_ids: tuple[str, ...] | None = None
+    trace_id: str | None = None
+    answer_span_id: str | None = None
 
     @property
     def sample_id(self) -> str:
@@ -240,9 +246,19 @@ class SampleResult:
         return identity if self.arm == DEFAULT_ARM else f"{self.arm}:{identity}"
 
     def json(self) -> dict[str, object]:
+        from mindbridge.benchmarks.eval_diagnostics import quality_diagnostics
+
         payload: dict[str, object] = {
             "schema_version": EVAL_SCHEMA_VERSION,
             "sample_id": self.sample_id,
+            "trace_id": self.trace_id,
+            "answer_span_id": self.answer_span_id,
+            "generation_evidence": (
+                None
+                if self.generation_evidence is None
+                else tuple(item.json() for item in self.generation_evidence)
+            ),
+            "quality_diagnostics": quality_diagnostics(self),
             "arm": self.arm,
             "retrieval_candidates": self.retrieval_candidates,
             "ranked_source_ids": self.ranked_source_ids,
@@ -326,6 +342,9 @@ class _AnswerOutcome:
     compiled_items: int | None = None
     excerpt_source_ids: tuple[str, ...] = ()
     excerpt_evidence: tuple[EvidenceInterval, ...] = ()
+    generation_evidence: tuple[EvidenceInterval, ...] | None = None
+    trace_id: str | None = None
+    answer_span_id: str | None = None
 
 
 def _restored_failure(payload: Mapping[str, object]) -> FailureDetail:
@@ -335,7 +354,7 @@ def _restored_failure(payload: Mapping[str, object]) -> FailureDetail:
         reason=_optional_text(payload["reason"]),
         stage=_optional_text(payload["stage"]),
         cause_type=_optional_text(payload["cause_type"]),
-        message=_optional_text(payload.get("message")),
+        message=_optional_text(payload["message"]),
     )
 
 

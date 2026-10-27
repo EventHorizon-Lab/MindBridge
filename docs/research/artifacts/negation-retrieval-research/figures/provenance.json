@@ -1,0 +1,30 @@
+[
+  {
+    "image": "nevir-generalization.png",
+    "source": "https://arxiv.org/pdf/2502.13506v4",
+    "source_sha256": "7f9398aab55444d47847374b0f124cbbb873b7ab6ef29e115456ab3789bcde97",
+    "pdf_page_one_based": 8,
+    "crop_points": [
+      310,
+      82,
+      565,
+      322
+    ],
+    "resolution_dpi": 220,
+    "transform": "PDF rendering and crop only; original labels and colors preserved"
+  },
+  {
+    "image": "chinese-negation-binding.png",
+    "source": "https://arxiv.org/pdf/2404.09830v1",
+    "source_sha256": "12c74dc9077cd0d7be75a1ae3acc5e26ec7086e26bc79fb8f5fff3651ac191d0",
+    "pdf_page_one_based": 2,
+    "crop_points": [
+      310,
+      218,
+      538,
+      315
+    ],
+    "resolution_dpi": 220,
+    "transform": "PDF rendering and crop only; original labels and colors preserved"
+  }
+]

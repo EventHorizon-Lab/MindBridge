@@ -7,6 +7,10 @@ class LocalStoreClosedError(RuntimeError):
     """Raised when a closed local store is used."""
 
 
+class LocalStoreCapacityError(RuntimeError):
+    """Raised before opening a connection beyond the instance's capacity."""
+
+
 class UnsupportedSchemaError(RuntimeError):
     """Raised when the data directory has an unknown or incomplete schema."""
 

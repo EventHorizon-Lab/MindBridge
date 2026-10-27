@@ -139,12 +139,13 @@ class AssetStore:
             raise AssetStoreError(f"asset {asset.asset_id} is not a valid local file")
         return path
 
-    def acquire(self, assets: Iterable[StoredAsset]) -> None:
-        """Lease existing CAS files so concurrent garbage collection cannot remove them."""
+    def acquire(self, assets: Iterable[StoredAsset], *, validate: bool = True) -> None:
+        """Protect CAS files; provisional candidates defer validation until selection."""
         supplied = tuple(assets)
         with self._write_lock:
-            for asset in supplied:
-                self.resolve(asset)
+            if validate:
+                for asset in supplied:
+                    self.resolve(asset)
             self._leases.update(asset.asset_id for asset in supplied)
 
     def release(self, assets: Iterable[StoredAsset]) -> None:

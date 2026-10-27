@@ -104,10 +104,9 @@ def recall_time_clause(
 ) -> tuple[str, tuple[object, ...]]:
     """Bound the effective event interval, start inclusive and end exclusive.
 
-    `embedding_ids_in_range` bounds the same interval but drops rows with no `occurred_at`,
-    because an index pass has an unfiltered fallback behind it. These primitives are the answer
-    themselves, so a record with no stated event time is placed at its `created_at` rather than
-    left out of every window.
+    Ranked index retrieval excludes rows without `occurred_at` from its preferred time route
+    and retains a global fallback. These primitives are the answer themselves, so a record
+    with no stated event time is placed at its `created_at` rather than left out of every window.
     """
     clauses: list[str] = []
     parameters: list[object] = []

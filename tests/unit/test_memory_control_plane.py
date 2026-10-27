@@ -2487,7 +2487,7 @@ def test_contradiction_work_keeps_the_earliest_later_same_value_interval(tmp_pat
         assert len(contexts) == 2
 
 
-def test_contradiction_lineage_limit_precedes_due_filtering(tmp_path: Path) -> None:
+def test_contradiction_candidates_share_the_window_with_evidence(tmp_path: Path) -> None:
     intervals = (
         ("Ana", "location", None, None, "kitchen"),
         ("Ana", "location", None, None, "garden"),
@@ -2507,6 +2507,107 @@ def test_contradiction_lineage_limit_precedes_due_filtering(tmp_path: Path) -> N
         )
         assert len(all_contradictions) == 2
         assert limited == (all_contradictions[0],)
+
+
+def test_weighed_conflict_prefix_does_not_hide_later_lineages_after_restart(tmp_path: Path) -> None:
+    intervals = tuple(
+        (subject, "location", None, None, value)
+        for subject in ("Ana", "Bea", "Cora", "Dana", "Eva")
+        for value in ("kitchen", "garden")
+    )
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path, consolidator, former=FunctionalIntervalsFormer(intervals)) as memory:
+        memory.add_many(
+            tuple(f"claim {index}" for index in range(len(intervals))),
+            occurred_at=(OCCURRED,) * len(intervals),
+        )
+        conflicts = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
+        assert len(conflicts) == 5
+        for candidate in conflicts[:2]:
+            memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
+
+    with _memory(tmp_path, consolidator) as memory:
+        # Both earlier lineages still disagree, but their unchanged signals are no longer due.
+        # Repeated polling must expose the next due lineage without mutating a cursor or log.
+        for _poll in range(2):
+            assert _trigger_rows(memory, MemoryTrigger.CONTRADICTION, limit=2) == (conflicts[2],)
+        for candidate in conflicts[2:]:
+            assert _trigger_rows(memory, MemoryTrigger.CONTRADICTION, limit=2) == (candidate,)
+            memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
+        assert memory.consolidation_candidates(limit=2) == ()
+        assert len(consolidator.calls) == 5
+        assert memory.operations() == ()
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    (MemoryTrigger.EVIDENCE, MemoryTrigger.FEEDBACK, MemoryTrigger.PRESSURE, MemoryTrigger.IDLE),
+)
+def test_weighed_prefix_does_not_exhaust_a_local_trigger_window(
+    tmp_path: Path, trigger: MemoryTrigger
+) -> None:
+    intervals = tuple((f"person {index}", "location", None, None, "kitchen") for index in range(9))
+    former = FunctionalIntervalsFormer(intervals) if trigger is MemoryTrigger.EVIDENCE else None
+    with _memory(
+        tmp_path,
+        ScriptedConsolidator(),
+        former=former,
+        memory_budget_records=1 if trigger is MemoryTrigger.PRESSURE else None,
+    ) as memory:
+        records = (
+            _observations(memory, *(f"claim {index}" for index in range(9)))
+            if trigger is MemoryTrigger.IDLE
+            else memory.add_many(
+                tuple(f"claim {index}" for index in range(9)), occurred_at=(OCCURRED,) * 9
+            )
+        )
+        if trigger is MemoryTrigger.FEEDBACK:
+            memory.reinforce(tuple(record.id for record in records))
+        idle = trigger is MemoryTrigger.IDLE
+        due = _trigger_rows(memory, trigger, idle=idle)
+        assert len(due) == 9
+        memory.consolidate(
+            evidence_ids=tuple(memory_id for row in due[:8] for memory_id in row.memory_ids),
+            trigger=trigger,
+        )
+
+        # Eight settled rows fill the old 4 * limit prefetch, hiding the ninth due row forever.
+        assert _trigger_rows(memory, trigger, limit=2, idle=idle) == (due[8],)
+
+
+def test_a_new_claim_reactivates_a_deliberated_conflict_after_restart(tmp_path: Path) -> None:
+    intervals = (
+        ("Ana", "location", None, None, "kitchen"),
+        ("Ana", "location", None, None, "garden"),
+    )
+    with _memory(
+        tmp_path, ScriptedConsolidator(), former=FunctionalIntervalsFormer(intervals)
+    ) as memory:
+        memory.add_many(("first claim", "second claim"), occurred_at=(OCCURRED,) * 2)
+        (conflict,) = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
+        memory.consolidate(evidence_ids=conflict.memory_ids, trigger=conflict.trigger)
+        assert _trigger_rows(memory, MemoryTrigger.CONTRADICTION) == ()
+
+    with _memory(
+        tmp_path,
+        ScriptedConsolidator(),
+        former=FunctionalIntervalsFormer(
+            (
+                ("Ana", "location", None, None, "office"),
+                ("Ana", "location", None, None, "studio"),
+            )
+        ),
+    ) as memory:
+        memory.add_many(("third claim", "fourth claim"), occurred_at=(OCCURRED,) * 2)
+        (renewed,) = _trigger_rows(memory, MemoryTrigger.CONTRADICTION, limit=2)
+        assert renewed != conflict
+        assert renewed.evidence_count == 2
+        old_context = memory.get(conflict.memory_ids[0]).context
+        new_context = memory.get(renewed.memory_ids[0]).context
+        assert old_context is not None and new_context is not None
+        assert old_context.lineage_id == new_context.lineage_id
+        memory.consolidate(evidence_ids=renewed.memory_ids, trigger=renewed.trigger)
+        assert _trigger_rows(memory, MemoryTrigger.CONTRADICTION, limit=2) == ()
 
 
 def test_a_concurrent_duplicate_is_refused_inside_the_transaction(tmp_path: Path) -> None:

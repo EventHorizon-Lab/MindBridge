@@ -1106,9 +1106,11 @@ def _blind_document(**overrides: object) -> dict[str, object]:
         "schema_version": eval_results_module.EVAL_SCHEMA_VERSION,
         "run_id": "blind-run",
         "blind": True,
+        "arms": {"definitions": {"blind": {"prompt": "mindbridge_blind_v2"}}},
         "tasks": [
             {
                 "task": "fixture",
+                "answer_policy": "strict",
                 "primary_metric": "accuracy",
                 "evaluation_sha256": "e" * 64,
                 "question_count": 2,
@@ -1154,6 +1156,29 @@ def test_blind_baseline_rejects_different_evaluation_inputs(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="evaluation inputs differ"):
         eval_metrics_module._blind_baseline_rows(path, (_loaded_task("f" * 64),))
+
+
+def test_blind_baseline_rejects_the_old_forced_guess_prompt(tmp_path: Path) -> None:
+    path = tmp_path / "results.jsonl"
+    path.write_text(
+        json.dumps(
+            _blind_document(arms={"definitions": {"blind": {"prompt": "mindbridge_blind_v1"}}})
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="prompt"):
+        eval_metrics_module._blind_baseline_rows(path, (_loaded_task(),))
+
+
+def test_blind_baseline_rejects_a_different_answer_policy(tmp_path: Path) -> None:
+    path = tmp_path / "results.jsonl"
+    path.write_text(json.dumps(_blind_document()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="answer policy"):
+        eval_metrics_module._blind_baseline_rows(
+            path, (_loaded_task(),), answer_policy="best_effort"
+        )
 
 
 # --- noise floor -----------------------------------------------------------------------------

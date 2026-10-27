@@ -460,50 +460,23 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "all": tuple(TASKS),
 }
 
-ALIASES = {
-    "world-mem-arena": "worldmemarena",
-    "worldmem": "worldmemarena",
-    "m3": "m3-bench",
-    "m3-robot": "m3-bench-robot",
-    "m3-web": "m3-bench-web",
-    "supermemory": "supermemory-vqa",
-    "supermemory-subject-1": "supermemory-vqa",
-    "atm": "atm-bench",
-    "atm-main": "atm-bench-main",
-    "atm-hard": "atm-bench-hard",
-    "atm-main-sgm": "atm-bench-main-sgm",
-    "atm-hard-sgm": "atm-bench-hard-sgm",
-    "longmemeval": "longmemeval-s",
-    "longmemeval-small": "longmemeval-s",
-    "evoemo": "es-memeval",
-    "evo-emo": "es-memeval",
-    "cl-bench": "clbench",
-    "personamem": "personamem-v3",
-    "open-eqa": "openeqa",
-    "em-eqa": "openeqa",
-    "openeqa-hm3d-v0": "openeqa-hm3d",
-    "openeqa-scannet-v0": "openeqa-scannet",
-    "personamem-v3-backend": "personamem-v3",
-}
-
 
 def expand(names: Sequence[str]) -> tuple[str, ...]:
     """Expand task groups deterministically in catalog order."""
-    normalized = tuple(ALIASES.get(_normalize(name), _normalize(name)) for name in names)
     available = (*TASKS, *GROUPS)
-    normalized = tuple(
+    expanded = tuple(
         match
-        for name in normalized
+        for name in names
         for match in (
             tuple(candidate for candidate in available if fnmatchcase(candidate, name))
             if any(marker in name for marker in "*?[")
             else (name,)
         )
     )
-    unknown = tuple(name for name in normalized if name not in TASKS and name not in GROUPS)
+    unknown = tuple(name for name in expanded if name not in TASKS and name not in GROUPS)
     if unknown:
         raise ValueError(f"unknown task: {', '.join(unknown)}; --list-tasks prints valid names")
-    wanted = {task for name in normalized for task in GROUPS.get(name, (name,))}
+    wanted = {task for name in expanded for task in GROUPS.get(name, (name,))}
     selected = tuple(name for name in TASKS if name in wanted)
     if not selected:
         raise ValueError("task selection is empty; --tasks list prints valid names")
@@ -534,7 +507,3 @@ def listing(root: Path, section: str = "all") -> str:
     if section == "tags":
         lines.extend(("tags:", "  (none)"))
     return "\n".join(lines)
-
-
-def _normalize(name: str) -> str:
-    return name.strip().casefold().replace("_", "-")

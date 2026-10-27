@@ -15,6 +15,7 @@ from mindbridge.infrastructure.local.store._recall import (
 )
 from mindbridge.infrastructure.local.store._schema import SCHEMA_VERSION
 from mindbridge.infrastructure.local.store.errors import (
+    LocalStoreCapacityError,
     LocalStoreClosedError,
     StaleOperationError,
     UnsupportedSchemaError,
@@ -52,6 +53,7 @@ __all__ = [
     "IndexDocument",
     "IndexOperation",
     "LocalStore",
+    "LocalStoreCapacityError",
     "LocalStoreClosedError",
     "NamingProjectionFactory",
     "RecallDigest",

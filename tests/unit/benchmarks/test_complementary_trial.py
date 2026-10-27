@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -52,8 +53,156 @@ def _driver() -> ModuleType:
     spec = importlib.util.spec_from_file_location("complementary_driver", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _recipe(driver: ModuleType, **changes: object) -> object:
+    assert driver.__file__ is not None
+    payload = json.loads(Path(driver.__file__).with_suffix(".json").read_text())
+    payload.update(changes)
+    return driver.Recipe.model_validate(payload)
+
+
+def _trial_files(
+    driver: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    case_id: str = "diagnostic",
+    **recipe_changes: object,
+) -> None:
+    assert driver.__file__ is not None
+    recipe = json.loads(Path(driver.__file__).with_suffix(".json").read_text())
+    fixtures = json.dumps(
+        [
+            {
+                "id": case_id,
+                "dataset": "constructed-text-diagnostics",
+                "question": "Who borrowed the tool?",
+                "reference": "Mara",
+                "observations": [{"id": "one", "text": "Mara borrowed the tool."}],
+                "gold": ["one"],
+            }
+        ]
+    ).encode()
+    recipe["fixture_sha256"] = hashlib.sha256(fixtures).hexdigest()
+    recipe.update(recipe_changes)
+    script = tmp_path / "inputs" / "complementary_trial.py"
+    script.parent.mkdir()
+    script.with_suffix(".json").write_text(json.dumps(recipe))
+    script.with_name("complementary_scenarios.json").write_bytes(fixtures)
+    monkeypatch.setattr(driver, "__file__", str(script))
+    monkeypatch.setattr(driver, "ROOT", tmp_path / "output")
+    support = ModuleType("support_coverage")
+    support._env = lambda: {}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "support_coverage", support)
+
+
+def test_trial_rejects_candidate_count_beyond_sdk_limit_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _driver()
+    _trial_files(driver, tmp_path, monkeypatch, candidate_rows=101)
+    with pytest.raises(ValueError, match="candidate_rows"):
+        driver.main()
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "../outside",
+        "./diagnostic",
+        "diagnostic/.",
+        "/absolute",
+        "..",
+        ".",
+        "icm-profile",
+        r"nested\case",
+    ],
+)
+def test_trial_rejects_fixture_store_aliases_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case_id: str
+) -> None:
+    driver = _driver()
+    _trial_files(driver, tmp_path, monkeypatch, case_id=case_id)
+    with pytest.raises(ValueError):
+        driver.main()
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("invalid", ["missing", "cutoff", "valid"])
+def test_trial_preflights_selected_questions_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    driver = _driver()
+    identifier = "missing" if invalid == "missing" else "selected"
+    _trial_files(driver, tmp_path, monkeypatch, question_ids=[identifier])
+    baseline = tmp_path / "baseline"
+    dataset = baseline / "datasets/icm-bench/annotations/qa_test.jsonl"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text(
+        json.dumps(
+            {
+                "question_id": "selected",
+                "question": "Who?",
+                "reference_answer": "Li",
+                "category": "Identity Recall"
+                if invalid == "cutoff"
+                else "Long-Term Identity Profile Inference",
+                "target_character_ids": ["Li"],
+                "evidence_video_ids": ["clip_001"],
+                "before_clip": "clip_002" if invalid == "cutoff" else None,
+            }
+        )
+    )
+    monkeypatch.setattr(driver, "BASELINE", baseline)
+    monkeypatch.setitem(
+        driver.TASKS,
+        "icm-bench",
+        replace(driver.TASKS["icm-bench"], digest=driver.dataset_digest(dataset)),
+    )
+    if invalid == "valid":
+        recipe, _fixtures = driver.load_trial_inputs()
+        profiles = driver.load_profile_cases(recipe)
+        assert [(case.id, case.question, case.reference, case.gold) for case in profiles] == [
+            ("selected", "Who?", "Li", ["clip_001"])
+        ]
+    elif invalid == "missing":
+        with pytest.raises(ValueError, match=r"selected.*missing"):
+            driver.main()
+    else:
+        with pytest.raises(RuntimeError, match="full-timeline Profile"):
+            driver.main()
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("invalid", ["recipe", "fixtures"])
+def test_trial_validates_inputs_before_creating_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    driver = _driver()
+    assert driver.__file__ is not None
+    recipe = json.loads(Path(driver.__file__).with_suffix(".json").read_text())
+    fixtures = b'[{"id":"broken","dataset":"diagnostics","observations":[]}]'
+    recipe["fixture_sha256"] = hashlib.sha256(fixtures).hexdigest()
+    if invalid == "recipe":
+        recipe["candidate_rows"] = True
+    script = tmp_path / "inputs" / "complementary_trial.py"
+    script.parent.mkdir()
+    script.with_suffix(".json").write_text(json.dumps(recipe))
+    script.with_name("complementary_scenarios.json").write_bytes(fixtures)
+    monkeypatch.setattr(driver, "__file__", str(script))
+    output = tmp_path / "output"
+    monkeypatch.setattr(driver, "ROOT", output)
+    support = ModuleType("support_coverage")
+    support._env = lambda: {}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "support_coverage", support)
+    with pytest.raises(ValueError):
+        driver.main()
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("order", list(itertools.permutations(("rank", "relevance", "coverage"))))
@@ -139,7 +288,7 @@ def test_paired_trial_uses_one_shared_plan_and_keeps_labels_out(
             client,
             "mock",
             audit,
-            {"reader_rows": 2, "reader_chars": 1000, "candidate_rows": 60},
+            _recipe(driver, reader_rows=2, reader_chars=1000, candidate_rows=60),
             tmp_path,
         )
         with driver.open_memory(tmp_path / "store", models, reader) as memory:
@@ -149,13 +298,15 @@ def test_paired_trial_uses_one_shared_plan_and_keeps_labels_out(
                 memory,
                 reader,
                 audit,
-                {
-                    "id": "independent",
-                    "dataset": "constructed-text-diagnostics",
-                    "question": "What tool and from whom?",
-                    "reference": "HIDDEN_REFERENCE",
-                    "gold": ["one", "two"],
-                },
+                driver.TrialCase.model_validate(
+                    {
+                        "id": "independent",
+                        "dataset": "constructed-text-diagnostics",
+                        "question": "What tool and from whom?",
+                        "reference": "HIDDEN_REFERENCE",
+                        "gold": ["one", "two"],
+                    }
+                ),
                 tmp_path,
             )
     assert len(rows) == 3 and all(row["plan_valid"] for row in rows)
@@ -213,14 +364,18 @@ def test_trial_freezes_assets_and_index_with_sqlite(tmp_path: Path, changed: str
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"original")
     manifest = tree_manifest(source)
-    recipe = {
-        "source_sqlite_sha256": driver.dataset_digest(source / "state.sqlite3"),
-        "source_tree_sha256": manifest["sha256"],
-    }
+    recipe = _recipe(
+        driver,
+        source_sqlite_sha256=driver.dataset_digest(source / "state.sqlite3"),
+        source_tree_sha256=manifest["sha256"],
+    )
     destination = tmp_path / "copy"
     if changed is not None:
         (source / changed).write_bytes(b"modified")
-        assert driver.dataset_digest(source / "state.sqlite3") == recipe["source_sqlite_sha256"]
+        assert (
+            driver.dataset_digest(source / "state.sqlite3")
+            == hashlib.sha256(b"original").hexdigest()
+        )
         with pytest.raises(RuntimeError, match="store tree changed"):
             driver.copy_baseline(source, destination, recipe)
         assert not destination.exists()
@@ -238,10 +393,11 @@ def test_trial_rejects_snapshot_changed_during_copy(
     source.mkdir()
     (source / "state.sqlite3").write_bytes(b"original")
     (source / ".mindbridge.lock").touch()
-    recipe = {
-        "source_sqlite_sha256": driver.dataset_digest(source / "state.sqlite3"),
-        "source_tree_sha256": tree_manifest(source)["sha256"],
-    }
+    recipe = _recipe(
+        driver,
+        source_sqlite_sha256=driver.dataset_digest(source / "state.sqlite3"),
+        source_tree_sha256=tree_manifest(source)["sha256"],
+    )
     original_copy = driver.shutil.copytree
 
     def changed_copy(source: Path, destination: Path) -> None:
@@ -262,7 +418,7 @@ def test_trial_refuses_to_copy_a_store_with_a_live_owner(tmp_path: Path) -> None
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         destination = tmp_path / "copy"
         with pytest.raises(RuntimeError, match="still owned"):
-            driver.copy_baseline(source, destination, {})
+            driver.copy_baseline(source, destination, _recipe(driver))
         assert not destination.exists()
 
 
@@ -283,7 +439,7 @@ def test_trial_visual_backend_satisfies_memory_contract(tmp_path: Path) -> None:
             client,
             "mock",
             driver.Audit(tmp_path / "http.jsonl"),
-            {"reader_rows": 12, "reader_chars": 24000, "candidate_rows": 60},
+            _recipe(driver, reader_rows=12, reader_chars=24000, candidate_rows=60),
             tmp_path,
         )
         with driver.open_memory(tmp_path / "store", models, reader, vision=vision):
@@ -305,6 +461,7 @@ def test_trial_rejects_partial_output(
     support._env = lambda: {}  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "support_coverage", support)
     monkeypatch.setattr(driver, "ROOT", tmp_path)
+    monkeypatch.setattr(driver, "BASELINE", tmp_path / "missing-baseline")
     with pytest.raises(RuntimeError, match="refusing to overwrite a trial"):
         driver.main()
     assert partial.read_text() == "preserve this evidence"

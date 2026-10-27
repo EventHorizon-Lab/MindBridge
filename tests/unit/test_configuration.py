@@ -153,6 +153,10 @@ def test_jina_is_selected_through_the_sentence_transformers_provider() -> None:
             "embedding": {"provider": "openai"},
             "settings": {"index_speech": "false"},
         },
+        {
+            "embedding": {"provider": "openai"},
+            "settings": {"recall_query_expansion": "false"},
+        },
     ),
 )
 def test_declarative_config_does_not_coerce_boolean_or_numeric_fields(

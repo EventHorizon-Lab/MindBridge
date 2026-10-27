@@ -25,7 +25,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode, Tracer
 
 import mindbridge.configuration as configuration_module
-import mindbridge.kernel.content as content_module
 import mindbridge.kernel.projection as projection_module
 import mindbridge.kernel.temporal as temporal_module
 import mindbridge.memory as memory_module
@@ -39,6 +38,11 @@ from mindbridge._telemetry import (
     MODEL_TTFT,
     OPERATION_TTFT,
     RECALL_NON_SELECTIVE_STEPS,
+    RECALL_QUERY_BUDGET_DROPPED,
+    RECALL_QUERY_COUNT,
+    RECALL_QUERY_GROUNDED,
+    RECALL_QUERY_NEW_CANDIDATES,
+    RECALL_QUERY_SELECTED,
     TOKEN_COMPLETE,
     TOKEN_EXPECTED_REQUEST_COUNT,
     TOKEN_REPORTED_REQUEST_COUNT,
@@ -159,7 +163,6 @@ class _FakeModels:
         self.abstentions = 0
         self.embedding_model = model
         self.embedding_space = f"{model}:2:test"
-        self._legacy_embedding_spaces: frozenset[str] = frozenset()
         self.transcription_model = "fake-transcription"
         self.transcription_space = transcription_space
         self.embedding_dimension = 2
@@ -545,10 +548,13 @@ def _memory(
     decay_half_life_days: float | None = None,
     evidence_budget_chars: int | None = None,
     minimum_relevance: float = MemoryConfig().minimum_relevance,
+    ambiguity_margin: float = MemoryConfig().ambiguity_margin,
     index_speech: bool = MemoryConfig().index_speech,
+    index_quantization: IndexQuantization = IndexQuantization.NONE,
     retrieval_mode: RetrievalMode = RetrievalMode.HYBRID,
     reinforce_on_answer: bool = True,
     recall_planning: bool = MemoryConfig().recall_planning,
+    recall_query_expansion: bool = False,
     recall_set_budget_chars: int = MemoryConfig().recall_set_budget_chars,
     recall_set_max_rows: int = MemoryConfig().recall_set_max_rows,
     recall_rounds: int = MemoryConfig().recall_rounds,
@@ -563,10 +569,13 @@ def _memory(
         decay_half_life_days=decay_half_life_days,
         evidence_budget_chars=evidence_budget_chars,
         minimum_relevance=minimum_relevance,
+        ambiguity_margin=ambiguity_margin,
         index_speech=index_speech,
+        index_quantization=index_quantization,
         retrieval_mode=retrieval_mode,
         reinforce_on_answer=reinforce_on_answer,
         recall_planning=recall_planning,
+        recall_query_expansion=recall_query_expansion,
         recall_set_budget_chars=recall_set_budget_chars,
         recall_set_max_rows=recall_set_max_rows,
         recall_rounds=recall_rounds,
@@ -757,6 +766,29 @@ def test_ask_observes_the_pre_grounding_ranking_without_affecting_answers(
     assert unaffected == result
 
 
+def test_generation_observer_sees_selected_evidence_and_cannot_change_the_answer(
+    tmp_path: Path,
+) -> None:
+    from mindbridge._telemetry import _observe_generation_inputs
+
+    observed: list[object] = []
+
+    def broken_observer(_hits: object) -> None:
+        raise RuntimeError("observer failure")
+
+    with _memory(tmp_path, _FakeModels(), reinforce_on_answer=False) as memory:
+        memory.add_many(tuple(f"red evidence {index}" for index in range(9)))
+        with _observe_generation_inputs(observed.append):
+            result = memory.ask("red", limit=3)
+        with _observe_generation_inputs(broken_observer):
+            unaffected = memory.ask("red", limit=3)
+        memory.ask("red", limit=3)
+
+    assert observed == [result.hits]
+    assert len(result.hits) == 3
+    assert unaffected == result
+
+
 def test_ask_observes_ranking_before_parallel_speech_failure(tmp_path: Path) -> None:
     class FailingSpeech(_FakeSpeech):
         def analyze(self, _assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
@@ -769,6 +801,7 @@ def test_ask_observes_ranking_before_parallel_speech_failure(tmp_path: Path) -> 
         transcriber=FailingSpeech(),
         index_speech=False,
         reinforce_on_answer=False,
+        ambiguity_margin=0,
     ) as memory:
         memory.add_many(tuple(f"red evidence {index}" for index in range(3)))
         with (
@@ -782,25 +815,15 @@ def test_ask_observes_ranking_before_parallel_speech_failure(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("write_method", ("add", "capture"))
-def test_legacy_placed_memory_keeps_its_id_without_crossing_places(
+def test_placed_memory_keeps_its_id_without_crossing_places(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     write_method: str,
 ) -> None:
     context = ObservationContext(place_id="kitchen")
-    current_identity = content_module.observation_context_identity
-
-    def legacy_identity(value: ObservationContext) -> dict[str, object]:
-        identity = current_identity(value)
-        identity.pop("place_id", None)
-        return identity
-
-    with monkeypatch.context() as legacy:
-        legacy.setattr(content_module, "observation_context_identity", legacy_identity)
-        with _memory(tmp_path, _FakeModels()) as memory:
-            original = getattr(memory, write_method)("red toolbox", context=context)
-            if write_method == "capture":
-                assert memory.settle() == 1
+    with _memory(tmp_path, _FakeModels()) as memory:
+        original = getattr(memory, write_method)("red toolbox", context=context)
+        if write_method == "capture":
+            assert memory.settle() == 1
 
     with _memory(tmp_path, _FakeModels()) as memory:
         duplicate = getattr(memory, write_method)("red toolbox", context=context)
@@ -853,11 +876,12 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
             *,
             answer_policy: AnswerPolicy = "strict",
             exhaustive: bool = False,
-        ) -> Iterator[str]:
-            del question, hits
+        ) -> Generator[str, None, AnswerResult]:
+            del question
             record_model_usage(input_tokens=5, output_tokens=3, total_tokens=8)
             yield "grounded "
             yield "answer"
+            return AnswerResult(answer="grounded answer", hits=tuple(hits))
 
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
@@ -1058,9 +1082,10 @@ def test_empty_stream_is_invalid_model_output(tmp_path: Path, chunks: tuple[str,
             *,
             answer_policy: AnswerPolicy = "strict",
             exhaustive: bool = False,
-        ) -> Iterator[str]:
-            del question, hits
+        ) -> Generator[str, None, AnswerResult]:
+            del question
             yield from chunks
+            return AnswerResult(answer="red", hits=tuple(hits))
 
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
@@ -1091,10 +1116,11 @@ def test_stream_ttft_requires_an_actual_model_request(tmp_path: Path) -> None:
             *,
             answer_policy: AnswerPolicy = "strict",
             exhaustive: bool = False,
-        ) -> Iterator[str]:
-            del question, hits
+        ) -> Generator[str, None, AnswerResult]:
+            del question
             mark_model_requests(0, token_usage_expected=0)
             yield "I do not know."
+            return AnswerResult(answer="I do not know.", hits=tuple(hits))
 
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
@@ -1127,10 +1153,10 @@ def test_streaming_answer_reports_only_the_hits_the_stream_used(tmp_path: Path) 
             *,
             answer_policy: AnswerPolicy = "strict",
             exhaustive: bool = False,
-        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+        ) -> Generator[str, None, AnswerResult]:
             del question
             yield "grounded"
-            return (hits[0],)
+            return AnswerResult(answer="grounded", hits=(hits[0],))
 
     models = SelectingStreamModels()
     with _memory(tmp_path, models) as memory:
@@ -1167,6 +1193,29 @@ def test_streaming_answer_preserves_structured_abstention(tmp_path: Path) -> Non
     assert result.abstained is True
     assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
     assert len(result.hits) == 1
+
+
+@pytest.mark.parametrize("completion", [None, ()])
+def test_streaming_answer_rejects_an_unstructured_completion(
+    tmp_path: Path, completion: object
+) -> None:
+    class InvalidStreamModels(_FakeModels):
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
+        ) -> Generator[str, None, object]:
+            del question, hits, answer_policy, exhaustive
+            yield "red"
+            return completion
+
+    with _memory(tmp_path, InvalidStreamModels()) as memory:
+        memory.add("red evidence")
+        with pytest.raises(ModelError, match="invalid answer"):
+            memory.ask("red")
 
 
 def test_openai_stream_marks_an_empty_retrieval_as_no_evidence(tmp_path: Path) -> None:
@@ -1859,6 +1908,7 @@ def test_decay_reranks_softly_and_requires_explicit_reinforcement(tmp_path: Path
         tmp_path,
         _FakeModels(),
         decay_half_life_days=7,
+        ambiguity_margin=0,
     ) as memory:
         memory.add(
             "shared memory old",
@@ -1949,57 +1999,9 @@ def test_temporal_proximity_is_a_soft_score_not_a_hard_sort_key(tmp_path: Path) 
             reference_at=reference,
         )
         assert _FakeIndex.instances[-1].dense_search_calls == 2
-        assert _FakeIndex.instances[-1].lexical_search_calls == 1
+        assert _FakeIndex.instances[-1].lexical_search_calls == 2
 
     assert [hit.id for hit in hits] == [adjacent.id, exact.id]
-
-
-def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    # The floor is pinned rather than inherited, and it has to straddle a narrow window from
-    # both sides. Below it, the deepening loop stops early: it only looks past the top-k window
-    # while too few in-range candidates would survive the floor, and the weak candidate's
-    # deepening estimate is `_LEXICAL_FULL_COVERAGE_RELEVANCE * 0.5` = 0.375, so any floor under
-    # that lets the weak candidate satisfy the loop and the target is never reached. Above it,
-    # the target's own gate value is rejected and the search returns nothing -- which is what
-    # 0.55 now does, since the full-text contribution was rescaled to stop it depending on the
-    # embedder. Measured: 0.30 stops early, 0.55 returns empty, 0.40 reproduces the case.
-    with _memory(tmp_path, _FakeModels(), minimum_relevance=0.40) as memory:
-        # `_FakeModels` maps "red" documents orthogonally to this query. That keeps this test on
-        # its lexical temporal-deepening path after persisted-vector score completion was added;
-        # cosine-one documents would instead make every candidate a full semantic match.
-        outside = memory.add_many(
-            tuple(f"red common witness outside {index}" for index in range(130)),
-            occurred_at=(datetime(2026, 1, 1, tzinfo=timezone.utc),) * 130,
-        )
-        weak = memory.add(
-            "red common witness weak",
-            occurred_at=datetime(2024, 5, 1, tzinfo=timezone.utc),
-        )
-        target = memory.add(
-            "red common witness target",
-            occurred_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
-        )
-        index = _FakeIndex.instances[-1]
-        index.dense_hits_override = ()
-        index.lexical_hits_override = tuple(
-            IndexHit(
-                id=record.id,
-                relevance=0.5 if record.id == weak.id else 1.0,
-                lexical_match=True,
-            )
-            for record in (*outside[:99], weak, *outside[99:], target)
-        )
-        hits = memory.search("common witness in 2024", limit=1)
-        assert hits and hits[0].id == target.id
-        assert index.lexical_search_calls == 2
-
-        monkeypatch.setattr(
-            memory._store.records, "read_memories", lambda _memory_ids, **_scope: ()
-        )
-        assert memory.search("common witness in 2024", limit=1) == ()
 
 
 def test_scope_filter_expands_past_unscoped_top_k_candidates(tmp_path: Path) -> None:
@@ -2357,6 +2359,9 @@ def test_ambiguity_gate_only_rejects_single_result_retrieval(tmp_path: Path) -> 
             IndexHit(id=second.id, relevance=61 / 62, confidence=0.0, lexical_match=True),
         )
         assert [hit.id for hit in memory.search("scene")] == [first.id, second.id]
+        assert memory.search("scene", limit=1) == ()
+        assert memory.ask("scene", limit=1).hits == ()
+        assert models.answer_calls[-1][1] == ()
 
         index.lexical_hits_override = (
             IndexHit(id=first.id, relevance=1.0, confidence=0.0, lexical_match=True),
@@ -3256,6 +3261,37 @@ def test_faces_requires_an_explicit_face_backend(tmp_path: Path) -> None:
             memory.faces(record.id)
 
 
+@pytest.mark.parametrize("content", ("a text observation", Blob(b"image", "image/png", "face.png")))
+def test_face_backend_can_be_enabled_after_storing_observations(
+    tmp_path: Path, content: ContentInput
+) -> None:
+    with Memory(tmp_path, embedder=_FakeEmbedder()) as memory:
+        record = memory.add(content)
+
+    with Memory(tmp_path, embedder=_FakeEmbedder(), face_analyzer=_FakeFace()) as memory:
+        assert memory.get(record.id) == record
+        if isinstance(content, Blob):
+            assert memory.faces(record.id)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    (("face.space_id",), ("face.analysis_space_id",), ("face.space_id", "face.analysis_space_id")),
+)
+def test_existing_face_analyses_require_both_space_markers(
+    tmp_path: Path, missing: tuple[str, ...]
+) -> None:
+    with Memory(tmp_path, embedder=_FakeEmbedder(), face_analyzer=_FakeFace()) as memory:
+        record = memory.add(Blob(b"image", "image/png", "face.png"))
+        assert memory.faces(record.id)
+    with LocalStore(tmp_path) as store:
+        for key in missing:
+            store.delete_metadata(key)
+
+    with pytest.raises(StorageError, match=r"metadata.*missing"):
+        Memory(tmp_path, embedder=_FakeEmbedder(), face_analyzer=_FakeFace())
+
+
 def test_face_only_identity_uses_generic_registration(tmp_path: Path) -> None:
     with Memory(tmp_path, embedder=_FakeEmbedder(), face_analyzer=_FakeFace()) as memory:
         record = memory.add(Blob(b"image", "image/png", "face.png"))
@@ -3615,38 +3651,6 @@ def test_retrieval_projection_is_stable_across_opaque_speaker_ids(tmp_path: Path
     # speaker appears under a stable alias and the per-run identity id never reaches the document.
     assert "speaker_1" in indexed[0][0]
     assert "identity_" not in indexed[0][0]
-
-
-def test_retrieval_projection_covers_atomic_embeddings_during_migration(tmp_path: Path) -> None:
-    original = _FakeModels()
-    with Memory(
-        tmp_path,
-        embedder=original,
-        transcriber=_FakeSpeech(),
-        index_speech=True,
-    ) as memory:
-        record = memory.add(Blob(b"same speech", "audio/wav", "speech.wav"))
-        speaker_id = memory.speech(record.id)[0].speaker_id
-    assert speaker_id is not None
-    with LocalStore(tmp_path) as store:
-        store.set_metadata(
-            "index.recipe",
-            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
-            "context-keys-v8:quantization-none",
-        )
-
-    migrated = _FakeModels()
-    with Memory(
-        tmp_path,
-        embedder=migrated,
-        transcriber=_FakeSpeech(),
-        index_speech=True,
-    ):
-        pass
-
-    migrated_text = tuple(value.text for batch in migrated.embed_inputs for value in batch)
-    assert any("speaker_1" in text for text in migrated_text)
-    assert all(speaker_id not in text for text in migrated_text)
 
 
 def test_retrieval_projection_preserves_user_marker_text(tmp_path: Path) -> None:
@@ -4642,71 +4646,6 @@ def test_missing_index_checkpoint_precedes_collection_creation(
         assert set(_FakeIndex.instances[-1].documents) == {record.id for record in records}
 
 
-@pytest.mark.parametrize(
-    "recipe",
-    (
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v8:quantization-none",
-    ),
-)
-def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path, recipe: str) -> None:
-    with _memory(tmp_path, _FakeModels()) as memory:
-        record = memory.add("preserved episodic memory", memory_type=MemoryType.EPISODIC)
-    with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", recipe)
-
-    reopened_models = _FakeModels()
-    with _memory(tmp_path, reopened_models):
-        document = _FakeIndex.instances[-1].documents[record.id]
-        assert document.memory_type == "episodic"
-        assert reopened_models.embed_inputs
-
-
-def test_known_embedding_space_upgrade_reembeds_and_commits_marker(tmp_path: Path) -> None:
-    legacy_space = "fake-embedding:2:legacy"
-    original = _FakeModels()
-    original.embedding_space = legacy_space
-    with _memory(tmp_path, original) as memory:
-        record = memory.add("preserved episodic memory", memory_type=MemoryType.EPISODIC)
-    with LocalStore(tmp_path) as store:
-        store.set_metadata(
-            "index.recipe",
-            "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
-        )
-
-    upgraded = _FakeModels()
-    upgraded._legacy_embedding_spaces = frozenset({legacy_space})
-    with _memory(tmp_path, upgraded):
-        document = _FakeIndex.instances[-1].documents[record.id]
-        assert document.embedding.space_id == upgraded.embedding_space
-
-    assert upgraded.embed_inputs
-    with LocalStore(tmp_path) as store:
-        assert store.get_metadata("embedding.space_id") == upgraded.embedding_space
-
-
-def test_failed_embedding_space_upgrade_keeps_legacy_marker(tmp_path: Path) -> None:
-    legacy_space = "fake-embedding:2:legacy"
-    original = _FakeModels()
-    original.embedding_space = legacy_space
-    with _memory(tmp_path, original) as memory:
-        memory.add("preserved memory")
-
-    failing = _FakeModels()
-    failing._legacy_embedding_spaces = frozenset({legacy_space})
-    failing.fail_embedding = True
-    with pytest.raises(ModelError, match="embed memory input"):
-        _memory(tmp_path, failing)
-
-    with LocalStore(tmp_path) as store:
-        assert store.get_metadata("embedding.space_id") == legacy_space
-
-
 def test_index_quantization_change_rebuilds_without_reembedding(tmp_path: Path) -> None:
     with Memory(tmp_path, embedder=_FakeModels()) as memory:
         record = memory.add("preserved memory")
@@ -4726,49 +4665,6 @@ def test_index_quantization_change_rebuilds_without_reembedding(tmp_path: Path) 
         recipe = store.get_metadata("index.recipe")
         assert recipe is not None
         assert recipe.endswith("quantization-int8")
-
-
-@pytest.mark.parametrize("previous_mode", ("none", "fp16", "int8", "rabitq"))
-@pytest.mark.parametrize("quantization", (IndexQuantization.NONE, IndexQuantization.INT8))
-def test_zvec_07_recipe_upgrade_preserves_sqlite_without_reembedding(
-    tmp_path: Path,
-    previous_mode: str,
-    quantization: IndexQuantization,
-) -> None:
-    with Memory(tmp_path, embedder=_FakeModels()) as memory:
-        record = memory.add(
-            "preserved episodic memory",
-            memory_type=MemoryType.EPISODIC,
-            metadata={"source": "before-upgrade"},
-        )
-    previous_recipe = (
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:"
-        f"context-keys-v12:quantization-{previous_mode}"
-    )
-    with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", previous_recipe)
-        stored_record = store.records.read_memory(record.id)
-        stored_documents = store.index.read_memory_index_documents((record.id,))
-    sentinel = tmp_path / "zvec" / "obsolete-index"
-    sentinel.write_text("replace this projection", encoding="utf-8")
-
-    reopened_models = _FakeModels()
-    reopened_models.fail_embedding = True
-    with Memory(tmp_path, embedder=reopened_models, index_quantization=quantization) as memory:
-        assert memory.get(record.id) == record
-        assert not sentinel.exists()
-        index = _FakeIndex.instances[-1]
-        assert index.quantization is quantization
-        assert tuple(index.documents.values()) == stored_documents
-
-    assert reopened_models.embed_inputs == []
-    with LocalStore(tmp_path) as store:
-        assert store.records.read_memory(record.id) == stored_record
-        assert store.index.read_memory_index_documents((record.id,)) == stored_documents
-        assert store.get_metadata("index.recipe") == (
-            "zvec-0.8:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:"
-            f"context-keys-v12:quantization-{quantization.value}"
-        )
 
 
 @pytest.mark.parametrize(
@@ -4807,49 +4703,6 @@ def test_unknown_index_recipe_preserves_sqlite_and_projection(
         assert store.index.read_memory_index_documents((record.id,)) == stored_documents
 
 
-@pytest.mark.parametrize(
-    "superseded",
-    [
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
-        "context-keys-v9:quantization-none",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:"
-        "context-keys-v10:quantization-none",
-    ],
-)
-def test_a_full_text_tokenizer_change_rebuilds_without_reembedding(
-    tmp_path: Path,
-    superseded: str,
-) -> None:
-    """A tokenizer change rewrites derived documents and leaves every stored vector correct.
-
-    Version 9 ran a Chinese segmenter over the CJK full-text field, which returned nothing for
-    Japanese or Korean. Version 10 tokenized that field into script-agnostic character bigrams
-    but filled it only for documents whose script was listed, and chose one field per query by
-    detecting the query's script. Version 11 decides what enters that field by what the stemmed
-    field already answers -- Latin words go to the stemmer, everything else to bigrams -- and
-    fuses both routes on any query with something for each. Both changes are derived-document
-    changes: filing either recipe alongside the
-    ones that also invalidate the embeddings would charge every existing store a full re-embed to
-    fix a tokenizer, and the storage rules require a missing index to rebuild without
-    re-embedding stored content.
-    """
-    with Memory(tmp_path, embedder=_FakeModels()) as memory:
-        record = memory.add("preserved memory")
-    with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", superseded)
-
-    reopened_models = _FakeModels()
-    with Memory(tmp_path, embedder=reopened_models):
-        assert record.id in _FakeIndex.instances[-1].documents
-
-    assert reopened_models.embed_inputs == []
-    with LocalStore(tmp_path) as store:
-        recipe = store.get_metadata("index.recipe")
-        assert recipe is not None
-        assert ":fts-bigram-fused:" in recipe
-        assert recipe.endswith("context-keys-v12:quantization-none")
-
-
 def test_index_quantization_requires_the_public_enum(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="index_quantization"):
         Memory(
@@ -4879,24 +4732,6 @@ def test_invalid_rabitq_dimension_does_not_mutate_the_current_index_recipe(
     assert sentinel.read_text(encoding="utf-8") == "still here"
     with LocalStore(tmp_path) as store:
         assert store.get_metadata("index.recipe") == recipe
-
-
-def test_failed_embedding_recipe_migration_keeps_legacy_marker(tmp_path: Path) -> None:
-    legacy = (
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5"
-    )
-    with _memory(tmp_path, _FakeModels()) as memory:
-        memory.add("preserved memory")
-    with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", legacy)
-
-    failing = _FakeModels()
-    failing.fail_embedding = True
-    with pytest.raises(ModelError, match="embed memory input"):
-        _memory(tmp_path, failing)
-
-    with LocalStore(tmp_path) as store:
-        assert store.get_metadata("index.recipe") == legacy
 
 
 def test_interrupted_reindex_is_completed_from_durable_sqlite(tmp_path: Path) -> None:
@@ -5338,12 +5173,12 @@ class _CountingStreamer(_FakeModels):
         *,
         answer_policy: AnswerPolicy = "strict",
         exhaustive: bool = False,
-    ) -> Generator[str, None, tuple[SearchHit, ...]]:
+    ) -> Generator[str, None, AnswerResult]:
         del question
         for part in ("the red ", "toolbox is ", "on the bench"):
             self.emitted.append(part)
             yield part
-        return tuple(hits[:1])
+        return AnswerResult(answer="the red toolbox is on the bench", hits=tuple(hits[:1]))
 
 
 def test_ask_stream_yields_deltas_then_the_result_ask_would_have_returned(
@@ -5474,13 +5309,16 @@ def test_abandoning_ask_stream_closes_the_generation_stream_inside_the_operation
             *,
             answer_policy: AnswerPolicy = "strict",
             exhaustive: bool = False,
-        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+        ) -> Generator[str, None, AnswerResult]:
             try:
-                yield from super().stream_answer(question, hits)
+                return (
+                    yield from super().stream_answer(
+                        question, hits, answer_policy=answer_policy, exhaustive=exhaustive
+                    )
+                )
             finally:
                 # Where a real adapter releases the provider's streaming response.
                 closed.append(True)
-            return tuple(hits[:1])
 
     models = ClosingStreamer()
     memory = Memory(
@@ -7567,37 +7405,64 @@ def test_ask_hands_the_caller_chosen_answer_policy_to_the_answerer(tmp_path: Pat
     assert policies == ["strict", "best_effort"]
 
 
-def test_a_backend_written_before_answer_policy_still_answers_at_the_default(
+def test_answer_backends_receive_the_full_current_keyword_contract(
     tmp_path: Path,
 ) -> None:
-    """`GenerationBackend` is a `runtime_checkable` Protocol, so `isinstance` proves the method
-    exists but not that it takes this keyword. The default must send nothing new, or every
-    third-party backend written against the shipped two-argument signature breaks on its first
-    `ask()`. Opting in still needs a backend that accepts the keyword, which is pinned here as
-    the accepted cost.
-    """
+    calls: list[tuple[AnswerPolicy, bool]] = []
 
-    class _LegacyAnswerer(_FakeModels):
-        def answer(  # type: ignore[override]
-            self, question: ModelInput, hits: Sequence[SearchHit]
+    class _CurrentAnswerer(_FakeModels):
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            **options: object,
         ) -> AnswerResult:
             del question
-            return AnswerResult(answer="Legacy.", hits=tuple(hits))
+            calls.append(
+                (cast(AnswerPolicy, options["answer_policy"]), cast(bool, options["exhaustive"]))
+            )
+            return AnswerResult(answer="Current.", hits=tuple(hits))
 
-    class _LegacyStreamingAnswerer(_LegacyAnswerer):
+    class _CurrentStreamingAnswerer(_CurrentAnswerer):
         def stream_answer(
-            self, question: ModelInput, hits: Sequence[SearchHit]
-        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            **options: object,
+        ) -> Generator[str, None, AnswerResult]:
             del question
-            yield "Legacy."
-            return tuple(hits)
+            calls.append(
+                (cast(AnswerPolicy, options["answer_policy"]), cast(bool, options["exhaustive"]))
+            )
+            yield "Current."
+            return AnswerResult(answer="Current.", hits=tuple(hits))
 
-    for models in (_LegacyAnswerer(), _LegacyStreamingAnswerer()):
+    for models in (_CurrentAnswerer(), _CurrentStreamingAnswerer()):
         with _memory(tmp_path / type(models).__name__, models) as memory:
             memory.add("the toolbox is red")
-            assert memory.ask("what colour is the toolbox?").answer == "Legacy."
-            with pytest.raises(ModelError):
-                memory.ask("what colour is the toolbox?", answer_policy="best_effort")
+            assert memory.ask("what colour is the toolbox?").answer == "Current."
+            assert (
+                memory.ask("what colour is the toolbox?", answer_policy="best_effort").answer
+                == "Current."
+            )
+
+    assert calls == [("strict", False), ("best_effort", False)] * 2
+
+
+def test_recall_planner_receives_empty_attempted_on_the_first_round(tmp_path: Path) -> None:
+    attempts: list[str] = []
+
+    class _CurrentPlanner(_FakeModels):
+        def plan_recall(self, question: str, **options: object) -> str | None:
+            del question
+            attempts.append(cast(str, options["attempted"]))
+            return None
+
+    with _memory(tmp_path, _CurrentPlanner(), recall_planning=True) as memory:
+        memory.add("the toolbox is red")
+        assert memory.ask("what colour is the toolbox?").answer == "Grounded in: the toolbox is red"
+
+    assert attempts == [""]
 
 
 class _PlannerlessAnswerer:
@@ -7861,6 +7726,304 @@ def test_a_point_plan_grounds_exactly_as_the_unplanned_path_does(tmp_path: Path)
     assert planned_question.text == plain_question.text
 
 
+def test_semantic_recall_delivers_evidence_outside_the_original_candidates(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("point", {"op": "similar", "query": "red wrench", "k": 100})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+        retrieval_mode=RetrievalMode.DENSE,
+    ) as memory:
+        first = memory.add("a blue crate")
+        second = memory.add("a red wrench")
+        assert [hit.id for hit in memory.search("which tool?", limit=100)] == [first.id]
+        result = memory.ask("which tool?", limit=1)
+
+    assert [hit.id for hit in result.hits] == [first.id, second.id]
+    assert [hit.id for hit in models.answer_calls[-1][1]] == [first.id, second.id]
+    assert "not a complete set" in models.answer_calls[-1][0].text
+    assert models.exhaustive_calls == [False]
+
+
+def test_semantic_recall_reuses_queries_and_bounds_work_across_replans(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "composite",
+        {"op": "similar", "query": "red wrench", "k": 1},
+        {"op": "similar", "query": "red wrench", "k": 100},
+        {"op": "similar", "query": "red tool", "k": 100},
+        {"op": "similar", "query": "red third query", "k": 100},
+    )
+    models.abstentions = 1
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+        retrieval_mode=RetrievalMode.DENSE,
+    ) as memory:
+        memory.add("a blue crate")
+        memory.add("a red wrench")
+        memory.add("a red spare")
+        start = len(models.embed_batches)
+        result = memory.ask("which tool?", limit=1, answer_policy="best_effort")
+        query_batches = models.embed_batches[start:]
+
+    assert len(models.plan_calls) == 2
+    assert len(query_batches) == 3
+    assert {text for batch in query_batches for text in batch} == {
+        "which tool?",
+        "red wrench",
+        "red tool",
+    }
+    assert len(result.hits) == 3
+    assert len({hit.id for hit in result.hits}) == 3
+
+
+def test_semantic_recall_keeps_the_callers_memory_type(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("point", {"op": "similar", "query": "red", "k": 100})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+        retrieval_mode=RetrievalMode.DENSE,
+    ) as memory:
+        memory.add("a blue crate", memory_type=MemoryType.EPISODIC)
+        memory.add("a red private wrench")
+        result = memory.ask("which tool?", memory_type=MemoryType.EPISODIC, limit=1)
+
+    assert [hit.content for hit in result.hits] == ["a blue crate"]
+
+
+def test_semantic_recall_preserves_place_scope_and_original_temporal_intent(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("point", {"op": "similar", "query": "red in October 2024", "k": 100})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+        retrieval_mode=RetrievalMode.DENSE,
+    ) as memory:
+        memory.add("a blue crate", occurred_at=DAY, context=ObservationContext(place_id="home"))
+        memory.add(
+            "a red September wrench", occurred_at=DAY, context=ObservationContext(place_id="home")
+        )
+        memory.add(
+            "a red October wrench",
+            occurred_at=DAY + timedelta(days=40),
+            context=ObservationContext(place_id="home"),
+        )
+        memory.add(
+            "a red private wrench", occurred_at=DAY, context=ObservationContext(place_id="work")
+        )
+        result = memory.ask(
+            "which tool in September 2024?",
+            limit=1,
+            reference_at=DAY,
+            scope=RetrievalScope(place_id="home"),
+        )
+
+    assert [hit.content for hit in result.hits] == ["a blue crate", "a red September wrench"]
+
+
+def test_semantic_recall_can_deepen_the_original_query_for_structured_anchors(
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "sequence",
+        {"op": "similar", "query": "which tool?", "k": 100},
+        {"op": "neighbors", "of": "step:0", "before": 0, "after": 1},
+    )
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        evidence_budget_chars=None,
+        ambiguity_margin=0,
+    ) as memory:
+        for index in range(120):
+            memory.add(f"blue tool {index}", occurred_at=DAY + timedelta(minutes=index))
+        result = memory.ask("which tool?", limit=1)
+
+    # Three initial anchors expose at most three neighbors, plus the mandatory hit and one
+    # semantic addition. More than five proves that the deeper anchor read actually happened.
+    # Adjacent anchors are excluded from neighbor results, so not all 20 add a distinct row.
+    assert len(result.hits) > 5
+
+
+def test_semantic_recall_respects_the_grounding_budget(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("point", {"op": "similar", "query": "red", "k": 100})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+        evidence_budget_chars=1,
+        retrieval_mode=RetrievalMode.DENSE,
+    ) as memory:
+        memory.add("a blue crate")
+        memory.add("a red wrench")
+        result = memory.ask("which tool?", limit=1)
+
+    assert [hit.content for hit in result.hits] == ["a blue crate"]
+
+
+def test_semantic_recall_failure_preserves_the_original_grounding(tmp_path: Path) -> None:
+    class FailedRewrite(_FakeModels):
+        def embed(
+            self,
+            inputs: Sequence[ModelInput],
+            task: EmbedTask = EmbedTask.DOCUMENT,
+        ) -> tuple[tuple[float, ...], ...]:
+            if task is EmbedTask.QUERY and any(value.text == "red" for value in inputs):
+                raise ModelError("optional rewrite failed")
+            return super().embed(inputs, task=task)
+
+    models = FailedRewrite()
+    models.recall_plan = _plan("point", {"op": "similar", "query": "red", "k": 100})
+    with _memory(tmp_path, models, recall_planning=True, recall_query_expansion=True) as memory:
+        memory.add("a blue crate")
+        result = memory.ask("which tool?", limit=1)
+
+    assert [hit.content for hit in result.hits] == ["a blue crate"]
+
+
+@pytest.mark.parametrize("failure", ["quota", "model"])
+def test_unavailable_semantic_anchors_cannot_license_a_complete_set(
+    tmp_path: Path, failure: str
+) -> None:
+    class FailedAnchor(_FakeModels):
+        def embed(
+            self,
+            inputs: Sequence[ModelInput],
+            task: EmbedTask = EmbedTask.DOCUMENT,
+        ) -> tuple[tuple[float, ...], ...]:
+            if (
+                failure == "model"
+                and task is EmbedTask.QUERY
+                and any(value.text == "unavailable" for value in inputs)
+            ):
+                raise ModelError("optional anchor failed")
+            return super().embed(inputs, task=task)
+
+    models = FailedAnchor()
+    queries = ["one", "two", "unavailable"] if failure == "quota" else ["unavailable"]
+    steps: list[dict[str, object]] = [{"op": "similar", "query": query} for query in queries]
+    models.recall_plan = _plan(
+        "sequence",
+        *steps,
+        {"op": "neighbors", "of": f"step:{len(queries) - 1}", "after": 1},
+    )
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+    ) as memory:
+        memory.add("a blue crate")
+        memory.ask("which tool?", limit=1)
+
+    note = models.answer_calls[-1][0].text
+    assert "not a complete set" in note
+    assert "a count or a list over those records is complete" not in note
+
+
+def test_semantic_recall_is_inactive_without_planning(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("point", {"op": "similar", "query": "red", "k": 100})
+    with _memory(
+        tmp_path,
+        models,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+    ) as memory:
+        memory.add("a blue crate")
+        memory.add("a red wrench")
+        start = len(models.embed_batches)
+        result = memory.ask("which tool?", limit=1)
+
+    assert len(models.embed_batches[start:]) == 1
+    assert [hit.content for hit in result.hits] == ["a blue crate"]
+
+
+@pytest.mark.parametrize("exhaustive", [False, True])
+def test_semantic_recall_caps_each_query_even_in_an_exhaustive_plan(
+    tmp_path: Path, exhaustive: bool
+) -> None:
+    models = _FakeModels()
+    steps: list[dict[str, object]] = [{"op": "similar", "query": "red", "k": 100}]
+    if exhaustive:
+        steps.insert(0, {"op": "match", "terms": ["does-not-exist"]})
+    models.recall_plan = _plan("composite" if exhaustive else "point", *steps)
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+        retrieval_mode=RetrievalMode.DENSE,
+    ) as memory:
+        memory.add("a blue crate")
+        for index in range(5):
+            memory.add(f"a red wrench {index}")
+        result = memory.ask("which tool?", limit=1)
+
+    assert len(result.hits) == 2
+    assert result.hits[0].content == "a blue crate"
+    assert result.hits[1].content.startswith("a red wrench")
+
+
+@pytest.mark.parametrize("budget, added", [(None, 1), (1, 0)])
+def test_semantic_recall_reports_candidate_selection_and_budget_losses(
+    tmp_path: Path, budget: int | None, added: int
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = _FakeModels()
+    models.recall_plan = _plan("point", {"op": "similar", "query": "red", "k": 100})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        index_quantization=IndexQuantization.INT8,
+        retrieval_mode=RetrievalMode.DENSE,
+        evidence_budget_chars=budget,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.add("a blue crate")
+        memory.add("a red wrench")
+        memory.add("a red spare")
+        memory.ask("which tool?", limit=1)
+    provider.shutdown()
+
+    grounded = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.recall.ground"
+    )
+    assert grounded.attributes is not None
+    assert grounded.attributes[RECALL_QUERY_COUNT] == 1
+    assert grounded.attributes[RECALL_QUERY_NEW_CANDIDATES] == 2
+    assert grounded.attributes[RECALL_QUERY_SELECTED] == 1
+    assert grounded.attributes[RECALL_QUERY_GROUNDED] == added
+    assert grounded.attributes[RECALL_QUERY_BUDGET_DROPPED] == 1 - added
+
+
 def test_a_set_plan_grounds_the_whole_matched_set_in_time_order(tmp_path: Path) -> None:
     """A count is only answerable from a set, so the evidence follows the predicate, not rank."""
     models = _FakeModels()
@@ -7893,7 +8056,7 @@ def test_a_window_bound_to_matched_records_reads_the_dates_their_text_states(
         {"op": "match", "terms": ["booking"]},
         {"op": "window", "time": "step:0"},
     )
-    with _memory(tmp_path, models, recall_planning=True) as memory:
+    with _memory(tmp_path, models, recall_planning=True, ambiguity_margin=0) as memory:
         memory.add(
             "Booking confirmed: Z Hotel Glasgow, June 23-24, 2022.",
             occurred_at=datetime(2022, 6, 12, 22, 45, tzinfo=timezone.utc),
@@ -8532,6 +8695,7 @@ def test_planning_and_the_reads_it_names_happen_inside_a_span(tmp_path: Path) ->
     ("setting", "value", "error"),
     [
         ("recall_planning", "yes", "recall_planning must be a boolean"),
+        ("recall_query_expansion", "yes", "recall_query_expansion must be a boolean"),
         ("recall_set_budget_chars", 0, "recall_set_budget_chars must be a positive integer"),
         ("recall_rounds", -1, "recall_rounds must be a positive integer"),
     ],

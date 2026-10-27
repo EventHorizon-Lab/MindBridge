@@ -1,11 +1,15 @@
-"""Consolidation candidate discovery for the memory control plane."""
+"""Consolidation candidate discovery for the memory control plane.
+
+Limits count eligible output, not scanned rows: an unchanged weighed prefix must not hide
+later due work. Scan and history-aggregation costs are separate from this output budget.
+"""
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
-from itertools import groupby
+from itertools import groupby, islice
 
 from mindbridge.infrastructure.local.store._codec import (
     optional_datetime_from_row,
@@ -77,10 +81,9 @@ def consumed_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime]
     The log stores IDs inside its two JSON documents rather than in columns, so this reads them
     back with `json_tree`. A rolled-back operation consumed nothing that still stands.
     """
-    # ponytail: one full scan of the standing operation log per call, JSON-parsed row by row,
-    # because both consumers need the map before they pick their candidate windows. Narrow it to
-    # `j.value IN (...)` over those windows -- which means computing them first -- once a store's
-    # log is long enough for the scan to show up next to the two window queries.
+    # One full scan of the standing operation log per call, JSON-parsed row by row. Historical
+    # aggregation is a separate cost from candidate selection: any future optimization must
+    # preserve eligibility before limiting, or settled rows can hide later due work again.
     return {
         row_text(row, "memory_id"): parse_datetime(row_text(row, "consumed_at"))
         for row in connection.execute(
@@ -106,29 +109,27 @@ def evidence_candidates(
     limit: int,
 ) -> list[StoredCandidate]:
     """Derived records that gained independent evidence nothing has weighed yet."""
-    # ponytail: over-fetch the newest window and filter, rather than push the consumed-time
-    # comparison into SQL. Raise the factor only if a store whose newest records are all already
-    # deliberated measurably under-fills the window.
+    # Count only due records with active sources toward the limit. A fixed prefetch can be
+    # occupied entirely by weighed records or forgotten sources while later work remains due.
     newest = connection.execute(
         """
         SELECT e.memory_id AS memory_id, MAX(e.recorded_at) AS newest
         FROM memory_evidence AS e
         JOIN memory_records AS r ON r.memory_id = e.memory_id
-        WHERE e.retired_at IS NULL AND r.forgotten_at IS NULL
+        JOIN memory_records AS s ON s.memory_id = e.source_memory_id
+        WHERE e.retired_at IS NULL AND r.forgotten_at IS NULL AND s.forgotten_at IS NULL
         GROUP BY e.memory_id
         ORDER BY newest DESC, e.memory_id
-        LIMIT ?
-        """,
-        (min(1_000, limit * 4),),
-    ).fetchall()
-    supported = {
-        row_text(row, "memory_id"): parse_datetime(row_text(row, "newest")) for row in newest
-    }
-    due = {
-        memory_id: consumed.get(memory_id)
-        for memory_id, latest in supported.items()
-        if memory_id not in consumed or latest > consumed[memory_id]
-    }
+        """
+    )
+    due: dict[str, datetime | None] = {}
+    for row in newest:
+        memory_id = row_text(row, "memory_id")
+        threshold = consumed.get(memory_id)
+        if threshold is None or parse_datetime(row_text(row, "newest")) > threshold:
+            due[memory_id] = threshold
+            if len(due) == limit:
+                break
     if not due:
         return []
     placeholders = ", ".join("?" for _memory_id in due)
@@ -160,7 +161,7 @@ def evidence_candidates(
         )
         for memory_id, sources in fresh.items()
         if sources
-    ][:limit]
+    ]
 
 
 def contradiction_candidates(
@@ -175,7 +176,7 @@ def contradiction_candidates(
     has changed since it was last weighed, and returns as soon as a further claim is recorded in
     it. The signal is the newest transaction time among the disagreeing claims.
     """
-    entries: dict[str, list[tuple[str, str, datetime]]] = {}
+    candidates: list[StoredCandidate] = []
     # A correlated overlap predicate made SQLite re-discover the same conflicting peers for each
     # member (and then do it again while hydrating members).  Claims in a lineage are instead
     # consumed together.  The two sweeps retain only the best two endpoints for distinct values:
@@ -194,16 +195,10 @@ def contradiction_candidates(
         """,
         FUNCTIONAL_CLAIM_PARAMETERS,
     )
-    for lineage_id, lineage_rows in groupby(rows, key=lambda row: row_text(row, "lineage_id")):
-        members = _overlapping_functional_members(lineage_rows)
-        if members:
-            entries[lineage_id] = members
-            # The old query applies the lineage limit before due-state filtering.  Stop here so a
-            # previously weighed earlier lineage continues to consume a slot in exactly the same way.
-            if len(entries) == limit:
-                break
-    candidates: list[StoredCandidate] = []
-    for lineage_entries in entries.values():
+    for _lineage_id, lineage_rows in groupby(rows, key=lambda row: row_text(row, "lineage_id")):
+        lineage_entries = _overlapping_functional_members(lineage_rows)
+        if not lineage_entries:
+            continue
         memory_ids = tuple(entry[0] for entry in lineage_entries)
         signal_at = max(entry[2] for entry in lineage_entries)
         if _is_due(signal_at, memory_ids, weighed):
@@ -214,6 +209,9 @@ def contradiction_candidates(
                     evidence_count=len({entry[1] for entry in lineage_entries}),
                 )
             )
+            # Unchanged, already-weighed conflicts must not consume the due-work budget.
+            if len(candidates) == limit:
+                break
     return candidates
 
 
@@ -340,20 +338,23 @@ def pressure_candidates(
         FROM memory_records
         WHERE forgotten_at IS NULL
         ORDER BY COALESCE(last_accessed_at, created_at), memory_id
-        LIMIT ?
-        """,
-        (min(1_000, limit * 4),),
-    ).fetchall()
+        """
+    )
     over = active - record_budget
-    return [
-        StoredCandidate(
-            trigger="pressure",
-            memory_ids=(memory_id,),
-            evidence_count=over,
+    return list(
+        islice(
+            (
+                StoredCandidate(
+                    trigger="pressure",
+                    memory_ids=(memory_id,),
+                    evidence_count=over,
+                )
+                for memory_id in (row_text(row, "memory_id") for row in rows)
+                if memory_id not in weighed
+            ),
+            limit,
         )
-        for memory_id in (row_text(row, "memory_id") for row in rows)
-        if memory_id not in weighed
-    ][:limit]
+    )
 
 
 def idle_candidates(
@@ -374,15 +375,18 @@ def idle_candidates(
         JOIN memory_records AS r ON r.memory_id = s.memory_id
         WHERE v.retired_at IS NULL AND r.forgotten_at IS NULL
         ORDER BY v.recorded_at, s.memory_id
-        LIMIT ?
-        """,
-        (min(1_000, limit * 4),),
-    ).fetchall()
-    return [
-        StoredCandidate(trigger="idle", memory_ids=(memory_id,), evidence_count=1)
-        for memory_id in (row_text(row, "memory_id") for row in rows)
-        if memory_id not in weighed
-    ][:limit]
+        """
+    )
+    return list(
+        islice(
+            (
+                StoredCandidate(trigger="idle", memory_ids=(memory_id,), evidence_count=1)
+                for memory_id in (row_text(row, "memory_id") for row in rows)
+                if memory_id not in weighed
+            ),
+            limit,
+        )
+    )
 
 
 def feedback_candidates(
@@ -401,10 +405,8 @@ def feedback_candidates(
         FROM memory_records
         WHERE last_accessed_at IS NOT NULL AND forgotten_at IS NULL
         ORDER BY last_accessed_at DESC, memory_id
-        LIMIT ?
-        """,
-        (min(1_000, limit * 4),),
-    ).fetchall()
+        """
+    )
     candidates: list[StoredCandidate] = []
     for row in rows:
         memory_id = row_text(row, "memory_id")
@@ -419,4 +421,6 @@ def feedback_candidates(
                     evidence_count=count,
                 )
             )
-    return candidates[:limit]
+            if len(candidates) == limit:
+                break
+    return candidates

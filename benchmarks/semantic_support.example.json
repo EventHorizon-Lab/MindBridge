@@ -1,0 +1,26 @@
+{
+  "fixture_version": "semantic-boundary-text-v1",
+  "producer_revision": "scripted-semantic-boundary:v1",
+  "claims": [
+    {
+      "claim_id": "tea",
+      "gold": "entailment",
+      "admitted": true,
+      "gold_locations": [[{"source_id": "observation-0", "kind": "text", "start": 0, "end": 13}]],
+      "lifecycle": {"kind": "withdrawal", "expected_absent": true, "visible_after": false}
+    },
+    {
+      "claim_id": "coffee",
+      "gold": "contradiction",
+      "admitted": true,
+      "gold_locations": [[{"source_id": "observation-0", "kind": "text", "start": 0, "end": 39}]],
+      "lifecycle": {"kind": "withdrawal", "expected_absent": true, "visible_after": false}
+    },
+    {
+      "claim_id": "bicycle",
+      "gold": "unknown",
+      "admitted": true,
+      "lifecycle": {"kind": "withdrawal", "expected_absent": true, "visible_after": false}
+    }
+  ]
+}

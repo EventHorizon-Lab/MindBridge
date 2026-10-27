@@ -1,4 +1,4 @@
-"""Startup recovery must not admit incompatible or partly migrated embedding spaces."""
+"""Startup validates current store identities before changing durable or derived state."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge import Memory, ModelError, StorageError
+from mindbridge import Memory, StorageError
 from mindbridge.infrastructure.local.store import LocalStore
 from mindbridge.models.base import EmbedTask, ModelInput
-from mindbridge.types import IndexQuantization, Modality
+from mindbridge.types import Modality
 
 
 class _Embedder:
@@ -20,18 +20,14 @@ class _Embedder:
     embedding_dimension = 2
     embedding_capabilities = frozenset({Modality.TEXT})
 
-    def __init__(self, space: str = "original", *, fail_on_batch: int | None = None) -> None:
+    def __init__(self, space: str = "original") -> None:
         self.embedding_space = space
-        self._legacy_embedding_spaces = frozenset({"original"})
-        self.fail_on_batch = fail_on_batch
         self.batches = 0
 
     def embed(
         self, inputs: Sequence[ModelInput], task: EmbedTask = EmbedTask.DOCUMENT
     ) -> tuple[tuple[float, ...], ...]:
         self.batches += 1
-        if self.batches == self.fail_on_batch:
-            raise RuntimeError("interrupted migration")
         return tuple((1.0, 0.0) for _ in inputs)
 
     def close(self) -> None:
@@ -75,7 +71,7 @@ def test_metadata_update_rolls_back_marker_changes_and_deletion_together(tmp_pat
     with LocalStore(tmp_path) as store:
         store.set_metadata("embedding.space_id", "original")
         store.set_metadata("index.recipe", "original")
-        store.set_metadata("embedding.migration_target", "pending")
+        store.set_metadata("retired.marker", "pending")
         before = _metadata(tmp_path)
         with closing(sqlite3.connect(store.database_path)) as connection:
             connection.execute(
@@ -90,46 +86,71 @@ def test_metadata_update_rolls_back_marker_changes_and_deletion_together(tmp_pat
             store.update_metadata(
                 {
                     "embedding.space_id": "upgraded",
-                    "embedding.migration_target": None,
+                    "retired.marker": None,
                     "index.recipe": "upgraded",
                 }
             )
         assert _metadata(tmp_path) == before
 
 
-@pytest.mark.parametrize("different_target", ("space", "index_recipe"))
-def test_partial_embedding_migration_rejects_other_targets_and_resumes(
-    tmp_path: Path, different_target: str
+@pytest.mark.parametrize(
+    "recipe",
+    (
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+        "context-keys-v8:quantization-none",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+        "context-keys-v9:quantization-none",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:"
+        "context-keys-v10:quantization-none",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:"
+        "context-keys-v12:quantization-none",
+    ),
+)
+def test_old_index_recipes_are_rejected_without_rewriting_the_store(
+    tmp_path: Path, recipe: str
 ) -> None:
     with Memory(tmp_path, embedder=_Embedder()) as memory:
-        memory.add_many(tuple(f"preserved memory {index}" for index in range(40)))
-
-    with pytest.raises(ModelError, match="embed memory input"):
-        Memory(tmp_path, embedder=_Embedder("upgraded", fail_on_batch=2))
-
-    # The failure follows a successful page commit, rather than the first model call.
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
-        spaces = dict(
-            connection.execute("SELECT space_id, COUNT(*) FROM embeddings GROUP BY space_id")
-        )
-    assert spaces == {"original": 8, "upgraded": 32}
-
-    incompatible = _Embedder("original" if different_target == "space" else "upgraded")
-    quantization = IndexQuantization.NONE if different_target == "space" else IndexQuantization.INT8
-    before = _metadata(tmp_path)
-    with pytest.raises(StorageError, match="unfinished embedding migration"):
-        Memory(tmp_path, embedder=incompatible, index_quantization=quantization)
-    assert incompatible.batches == 0
-    assert _metadata(tmp_path) == before
-
-    resumed = _Embedder("upgraded")
-    with Memory(tmp_path, embedder=resumed) as memory:
-        assert len(memory.list(limit=100).items) == 40
-        assert memory.search("preserved")
+        record = memory.add("preserved memory")
     with LocalStore(tmp_path) as store:
-        assert store.get_metadata("embedding.space_id") == "upgraded"
-        assert store.get_metadata("embedding.migration_target") is None
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
-        assert connection.execute("SELECT DISTINCT space_id FROM embeddings").fetchall() == [
-            ("upgraded",)
-        ]
+        store.set_metadata("index.recipe", recipe)
+        documents = store.index.read_memory_index_documents((record.id,))
+    before = _metadata(tmp_path)
+    sentinel = tmp_path / "zvec" / "preserved"
+    sentinel.write_text("derived index", encoding="utf-8")
+    embedder = _Embedder()
+
+    with pytest.raises(StorageError, match=r"index\.recipe"):
+        Memory(tmp_path, embedder=embedder)
+
+    assert embedder.batches == 0
+    assert _metadata(tmp_path) == before
+    assert sentinel.read_text(encoding="utf-8") == "derived index"
+    with LocalStore(tmp_path) as store:
+        assert store.index.read_memory_index_documents((record.id,)) == documents
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        "embedding.model_id",
+        "embedding.space_id",
+        "embedding.dimension",
+        "transcription.space_id",
+        "index.recipe",
+        "evidence.projection_recipe",
+    ),
+)
+def test_nonempty_store_requires_every_current_metadata_marker(tmp_path: Path, key: str) -> None:
+    with Memory(tmp_path, embedder=_Embedder()) as memory:
+        memory.add("preserved memory")
+    with LocalStore(tmp_path) as store:
+        store.delete_metadata(key)
+    before = _metadata(tmp_path)
+    embedder = _Embedder()
+
+    with pytest.raises(StorageError, match=r"metadata.*missing"):
+        Memory(tmp_path, embedder=embedder)
+
+    assert embedder.batches == 0
+    assert _metadata(tmp_path) == before

@@ -414,9 +414,9 @@ class RetrievalScope:
 class FormationProposal:
     """One typed, source-grounded semantic memory proposed by a model adapter.
 
-    ``evidence_ids`` is ``None`` for the legacy primary-source link. A supplied tuple declares
-    the ordered observations from the current formation batch the proposal jointly depends on;
-    the memory kernel verifies batch membership and the primary source before it commits.
+    ``evidence_ids=None`` uses the primary input as the sole evidence member. A supplied tuple
+    declares the ordered observations from the current formation batch the proposal jointly
+    depends on; the memory kernel verifies batch membership and the primary source before commit.
     """
 
     kind: MemoryKind

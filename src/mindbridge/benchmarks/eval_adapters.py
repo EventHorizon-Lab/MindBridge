@@ -197,11 +197,28 @@ class LoadedTask:
 
 
 @dataclass(frozen=True, slots=True)
-class _ManifestPart:
+class MediaPart:
     content: tuple[str | Path, ...]
     source_id: str
     start_seconds: float = 0.0
     end_seconds: float | None = None
+
+
+MediaUnit: TypeAlias = tuple[MediaPart, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MediaTask:
+    units: Mapping[str, MediaUnit]
+    unavailable_units: Mapping[str, str]
+    input_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class MediaManifest:
+    tasks: Mapping[str, MediaTask]
+    # Preserve the source spelling/default omissions for hashing and artifact merging.
+    source_json: str
 
 
 class MediaResolver:
@@ -211,13 +228,14 @@ class MediaResolver:
         self,
         task_name: str,
         root: Path | None,
-        manifest: Mapping[str, object] | None,
+        manifest: MediaManifest | None,
         manifest_directory: Path | None,
     ) -> None:
         self.task_name = task_name
         self.root = root
-        self._manifest = _task_manifest(manifest, task_name)
-        self.unavailable_units = _task_unavailable_units(manifest, task_name)
+        task = None if manifest is None else manifest.tasks.get(task_name)
+        self._manifest = {} if task is None else task.units
+        self.unavailable_units = {} if task is None else task.unavailable_units
         self._manifest_directory = manifest_directory
         self._index: dict[str, list[Path]] | None = None
 
@@ -231,7 +249,7 @@ class MediaResolver:
     ) -> tuple[MemoryItem, ...]:
         declared = self._manifest.get(unit_id)
         if declared is not None:
-            return tuple(_memory_part(part) for part in self._parse_parts(unit_id, declared))
+            return tuple(self._memory_part(part) for part in declared)
         if self.root is None:
             raise FileNotFoundError(
                 f"{self.task_name} needs media for {unit_id}; pass --media-manifest or --media-root"
@@ -253,41 +271,14 @@ class MediaResolver:
     def path(self, value: str) -> Path:
         return self._resolve(value)
 
-    def _parse_parts(self, unit_id: str, value: object) -> tuple[_ManifestPart, ...]:
-        if not isinstance(value, list) or not value:
-            raise ValueError(f"media manifest unit {unit_id} must be a non-empty list")
-        return tuple(self._parse_part(unit_id, index, part) for index, part in enumerate(value))
-
-    def _parse_part(self, unit_id: str, index: int, value: object) -> _ManifestPart:
-        if isinstance(value, str):
-            path = self._manifest_path(value)
-            return _ManifestPart((path,), path.stem)
-        if not isinstance(value, dict):
-            raise ValueError(f"media manifest part {unit_id}[{index}] must be text or an object")
-        path_value = value.get("path")
-        text_value = value.get("text")
-        content: list[str | Path] = []
-        if isinstance(text_value, str) and text_value.strip():
-            content.append(text_value.strip())
-        if isinstance(path_value, str) and path_value.strip():
-            content.append(self._manifest_path(path_value))
-        if not content:
-            raise ValueError(f"media manifest part {unit_id}[{index}] needs path or text")
-        start = _finite_number(value.get("start_seconds", 0.0), "start_seconds")
-        end_value = value.get("end_seconds")
-        end = None if end_value is None else _finite_number(end_value, "end_seconds")
-        if start < 0 or (end is not None and end <= start):
-            raise ValueError(f"media manifest part {unit_id}[{index}] has an invalid interval")
-        source = value.get("source_id")
-        source_id = (
-            source.strip()
-            if isinstance(source, str) and source.strip()
-            else f"{unit_id}:{index:05d}"
+    def _memory_part(self, part: MediaPart) -> MemoryItem:
+        content = tuple(
+            self._manifest_path(item) if isinstance(item, Path) else item for item in part.content
         )
-        return _ManifestPart(tuple(content), source_id, start, end)
+        return MemoryItem(part.source_id, content, part.start_seconds, part.end_seconds)
 
-    def _manifest_path(self, value: str) -> Path:
-        path = Path(value).expanduser()
+    def _manifest_path(self, value: Path) -> Path:
+        path = value
         if not path.is_absolute():
             if self._manifest_directory is None:
                 raise ValueError("relative media manifest paths need a manifest file directory")
@@ -361,19 +352,31 @@ class MediaResolver:
         )
 
 
-def load_media_manifest(path: Path | None) -> tuple[Mapping[str, object] | None, Path | None]:
+def load_media_manifest(path: Path | None) -> tuple[MediaManifest | None, Path | None]:
     """Load one versioned prepared-media manifest."""
     if path is None:
         return None, None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    return parse_media_manifest(
+        json.loads(path.read_text(encoding="utf-8"))
+    ), path.expanduser().resolve().parent
+
+
+def parse_media_manifest(payload: object) -> MediaManifest:
+    """Validate prepared-media JSON without reading or resolving any media files."""
     if not isinstance(payload, dict):
         raise ValueError("media manifest must be a JSON object")
     version = payload.get("version")
     if version != 1:
         raise ValueError(f"unsupported media manifest version: {version}")
-    if not isinstance(payload.get("tasks"), dict):
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, dict):
         raise ValueError("media manifest tasks must be an object")
-    return payload, path.expanduser().resolve().parent
+    return MediaManifest(
+        {name: _parse_media_task(name, task) for name, task in tasks.items()},
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+        ),
+    )
 
 
 def load_task(
@@ -382,7 +385,7 @@ def load_task(
     root: Path,
     dataset_path: Path | None = None,
     media_root: Path | None = None,
-    media_manifest: Mapping[str, object] | None = None,
+    media_manifest: MediaManifest | None = None,
     manifest_directory: Path | None = None,
     limit: Limit = None,
     offset: int = 0,
@@ -435,16 +438,9 @@ def load_task(
     }
     if dataset_layout is not None:
         inputs["dataset_layout"] = dataset_layout
-    task_manifest = _task_manifest(media_manifest, spec.name)
-    if task_manifest:
-        encoded = json.dumps(
-            task_manifest,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        inputs["media_manifest"] = hashlib.sha256(encoded).hexdigest()
+    task_manifest = None if media_manifest is None else media_manifest.tasks.get(spec.name)
+    if task_manifest is not None and task_manifest.units:
+        inputs["media_manifest"] = task_manifest.input_sha256
     inputs["memory"] = _memory_digest(units)
     unavailable_units = _selected_unavailable_units(
         spec,
@@ -1724,32 +1720,12 @@ _LOADERS = {
 }
 
 
-def _task_manifest(manifest: Mapping[str, object] | None, task_name: str) -> Mapping[str, object]:
-    if manifest is None:
-        return {}
-    tasks = manifest.get("tasks")
-    if not isinstance(tasks, dict):
-        raise ValueError("media manifest tasks must be an object")
-    task = tasks.get(task_name, {})
+def _parse_media_task(task_name: str, task: object) -> MediaTask:
     if not isinstance(task, dict):
         raise ValueError(f"media manifest task {task_name} must be an object")
-    units = task.get("units", task)
+    units = task.get("units")
     if not isinstance(units, dict):
         raise ValueError(f"media manifest task {task_name} units must be an object")
-    return units
-
-
-def _task_unavailable_units(
-    manifest: Mapping[str, object] | None, task_name: str
-) -> Mapping[str, str]:
-    if manifest is None:
-        return {}
-    tasks = manifest.get("tasks")
-    if not isinstance(tasks, dict):
-        raise ValueError("media manifest tasks must be an object")
-    task = tasks.get(task_name, {})
-    if not isinstance(task, dict):
-        raise ValueError(f"media manifest task {task_name} must be an object")
     unavailable = task.get("unavailable_units", {})
     if not isinstance(unavailable, dict) or any(
         not isinstance(unit_id, str)
@@ -1761,7 +1737,47 @@ def _task_unavailable_units(
         raise ValueError(
             f"media manifest task {task_name} unavailable_units must map IDs to reasons"
         )
-    return unavailable
+    parsed = {}
+    for unit_id, parts in units.items():
+        if not isinstance(unit_id, str) or not unit_id.strip():
+            raise ValueError("media manifest unit IDs must be non-empty text")
+        if not isinstance(parts, list) or not parts:
+            raise ValueError(f"media manifest unit {unit_id} must be a non-empty list")
+        parsed[unit_id] = tuple(
+            _parse_media_part(unit_id, index, part) for index, part in enumerate(parts)
+        )
+    encoded = json.dumps(
+        units, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return MediaTask(parsed, unavailable, hashlib.sha256(encoded).hexdigest())
+
+
+def _parse_media_part(unit_id: str, index: int, value: object) -> MediaPart:
+    if not isinstance(value, dict):
+        raise ValueError(f"media manifest part {unit_id}[{index}] must be an object")
+    for name in ("path", "text", "source_id"):
+        supplied = value.get(name)
+        if supplied is not None and not isinstance(supplied, str):
+            raise ValueError(f"media manifest part {unit_id}[{index}] {name} must be text")
+    path_value = value.get("path")
+    text_value = value.get("text")
+    content: list[str | Path] = []
+    if isinstance(text_value, str) and text_value.strip():
+        content.append(text_value.strip())
+    if isinstance(path_value, str) and path_value.strip():
+        content.append(Path(path_value).expanduser())
+    if not content:
+        raise ValueError(f"media manifest part {unit_id}[{index}] needs path or text")
+    start = _finite_number(value.get("start_seconds", 0.0), "start_seconds")
+    end_value = value.get("end_seconds")
+    end = None if end_value is None else _finite_number(end_value, "end_seconds")
+    if start < 0 or (end is not None and end <= start):
+        raise ValueError(f"media manifest part {unit_id}[{index}] has an invalid interval")
+    source = value.get("source_id")
+    source_id = (
+        source.strip() if isinstance(source, str) and source.strip() else f"{unit_id}:{index:05d}"
+    )
+    return MediaPart(tuple(content), source_id, start, end)
 
 
 def _selected_unavailable_units(
@@ -1779,10 +1795,6 @@ def _selected_unavailable_units(
     return {
         unit_id: reason for unit_id, reason in unavailable_units.items() if unit_id in selected_ids
     }
-
-
-def _memory_part(part: _ManifestPart) -> MemoryItem:
-    return MemoryItem(part.source_id, part.content, part.start_seconds, part.end_seconds)
 
 
 def _finite_number(value: object, name: str) -> float:

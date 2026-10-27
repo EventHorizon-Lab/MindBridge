@@ -11,7 +11,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from test_openai_sdk import _asset, _sdk_client, _search_hit
 
-from mindbridge import OpenAIModels, ValidationError
+from mindbridge import ModelError, OpenAIModels, ValidationError
 from mindbridge._telemetry import MODEL_REQUEST_COUNT, TOKEN_TOTAL, model_span, operation_span
 from mindbridge.types import EvidenceBasis, MemoryContext, MemoryKind, Modality
 
@@ -127,6 +127,29 @@ def test_text_only_answers_skip_diagnosis() -> None:
             "question", (_search_hit(),)
         )
     assert len(sent) == 1
+
+
+def test_diagnosis_text_ceiling_includes_system_prompt_before_http(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"pixels")
+    hit = replace(_search_hit(), assets=(image,), modality=Modality.IMAGE)
+    monkeypatch.setattr("mindbridge.models.openai_sdk._MEDIA_DIAGNOSTIC_PROMPT", "界" * 500)
+    monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_GROUNDED_TEXT_BYTES", 1_000)
+
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        pytest.fail("oversized diagnosis text reached the provider")
+
+    with httpx.Client(transport=httpx.MockTransport(unexpected_request)) as client:
+        adapter = OpenAIModels(
+            _sdk_client(client),
+            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
+            generation_media_policy="on_demand",
+        )
+        with pytest.raises(ModelError) as failure:
+            adapter.answer("question", (hit,))
+    assert failure.value.reason == "payload_too_large"
+    assert failure.value.stage == "generate"
 
 
 def test_provider_rejection_does_not_diagnose_again_or_lose_original_omissions(

@@ -8,12 +8,13 @@ from typing import Any
 import pytest
 
 from mindbridge.benchmarks.eval_regression import load_result, performance_comparisons
+from mindbridge.benchmarks.eval_results import EVAL_SCHEMA_VERSION
 
 
 def _result() -> dict[str, Any]:
     return {
-        "schema_version": 11,
-        "runner_version": "mindbridge_eval_official_v11",
+        "schema_version": EVAL_SCHEMA_VERSION,
+        "runner_version": "mindbridge_eval_official_v18",
         "status": "completed",
         "limit": -1,
         "offset": 0,
@@ -23,6 +24,7 @@ def _result() -> dict[str, Any]:
         "seeds": [0, 1234, 1234, 1234],
         "predict_only": False,
         "response_cache": None,
+        "resume": False,
         "arms": {"selected": ["mindbridge"], "ingest": "add"},
         "measurement_protocol": {"state": "cold", "repeat_index": 0},
         "model": {
@@ -54,7 +56,6 @@ def _result() -> dict[str, Any]:
                 "cpu_model": "Fixture CPU",
                 "logical_cores": 32,
                 "ram_total_bytes": 64 * 1024**3,
-                "cuda_device_uuids": {"0": "GPU-fixture"},
                 "gpus": [
                     {
                         "index": 0,
@@ -71,10 +72,14 @@ def _result() -> dict[str, Any]:
             {
                 "task": "fixture",
                 "arm": "mindbridge",
+                "dataset_sha256": "d" * 64,
+                "input_sha256": {"memory": "m" * 64},
                 "evaluation_sha256": "e" * 64,
                 "batch_size": 1,
                 "input_modalities": ["text"],
                 "question_count": 10,
+                "error_count": 0,
+                "ingest_failure_count": 0,
                 "performance": {
                     "answer": {
                         "end_to_end_time_to_first_token_ms": {
@@ -163,6 +168,22 @@ def test_performance_comparison_rejects_a_candidate_that_dropped_a_baseline_task
         performance_comparisons(candidate, baseline, {"answer_e2e_latency_p95": 0.1})
 
 
+@pytest.mark.parametrize("side", ["candidate", "baseline"])
+@pytest.mark.parametrize(
+    "row",
+    [None, {"task": "second"}, {"task": "second", "arm": ""}, {"task": "second", "arm": 1}],
+)
+def test_performance_comparison_rejects_malformed_task_rows_before_filtering(
+    side: str, row: object
+) -> None:
+    candidate, baseline = _result(), _result()
+    document = candidate if side == "candidate" else baseline
+    document["tasks"].append(row)
+
+    with pytest.raises(ValueError, match="benchmark result task"):
+        performance_comparisons(candidate, baseline, {"answer_e2e_latency_p95": 0.1})
+
+
 def test_performance_comparison_rejects_incomplete_token_usage() -> None:
     candidate = _result()
     baseline = _result()
@@ -212,11 +233,50 @@ def test_performance_comparison_rejects_incomplete_search_latency_distribution()
         performance_comparisons(candidate, baseline, {"retrieval_e2e_latency_p95": 0.1})
 
 
-def test_load_result_accepts_legacy_results_json_beside_samples(tmp_path: Path) -> None:
+@pytest.mark.parametrize("input_name", [".", "samples.jsonl", "results.jsonl"])
+def test_load_result_uses_current_result_artifacts(tmp_path: Path, input_name: str) -> None:
     result = _result()
-    result["schema_version"] = 10
-    (tmp_path / "results.json").write_text(json.dumps(result), encoding="utf-8")
+    (tmp_path / "results.jsonl").write_text(json.dumps(result) + "\n", encoding="utf-8")
+    (tmp_path / "samples.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert load_result(tmp_path / input_name) == result
+
+
+def test_load_result_requires_current_schema(tmp_path: Path) -> None:
+    result = _result()
+    result["schema_version"] = EVAL_SCHEMA_VERSION - 1
+    path = tmp_path / "results.jsonl"
+    path.write_text(json.dumps(result), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema version is unsupported"):
+        load_result(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("response_cache",),
+        ("resume",),
+        ("measurement_protocol",),
+        ("environment", "acceleration_runtime"),
+        ("environment", "hardware", "gpus"),
+    ],
+)
+def test_performance_comparison_requires_recorded_conditions(path: tuple[str, ...]) -> None:
+    baseline = _result()
+    candidate = _result()
+    for document in (candidate, baseline):
+        parent = document
+        for name in path[:-1]:
+            parent = parent[name]
+        del parent[path[-1]]
+
+    with pytest.raises(ValueError, match="benchmark result is missing"):
+        performance_comparisons(candidate, baseline, {"answer_e2e_latency_p95": 0.1})
+
+
+def test_load_result_requires_results_jsonl_beside_samples(tmp_path: Path) -> None:
     samples = tmp_path / "samples.jsonl"
     samples.write_text("{}\n", encoding="utf-8")
-
-    assert load_result(samples)["schema_version"] == 10
+    (tmp_path / "results.json").write_text(json.dumps(_result()), encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="baseline results do not exist"):
+        load_result(samples)

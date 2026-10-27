@@ -21,14 +21,12 @@ from mindbridge.infrastructure.local.store._connections import Connections
 from mindbridge.infrastructure.local.store._membership import identity_projections
 from mindbridge.infrastructure.local.store.records import write_embedding
 from mindbridge.infrastructure.local.store.rows import (
-    MEMORY_TYPES,
     IndexCandidate,
     IndexDocument,
     IndexOperation,
     StoredEmbedding,
     StoredTextSelector,
     StoredTextSpanPiece,
-    require_aware,
     require_identifier,
 )
 
@@ -42,60 +40,6 @@ class IndexOutbox:
         connections: Connections,
     ) -> None:
         self._connections = connections
-
-    def embedding_ids_in_range(
-        self,
-        occurred_from: datetime,
-        occurred_until: datetime,
-        *,
-        space_id: str,
-        task: str,
-        memory_type: str | None = None,
-    ) -> tuple[frozenset[str], int]:
-        """Return current aggregate embedding IDs in a time range and the searchable total."""
-        require_aware(occurred_from, "occurred_from")
-        require_aware(occurred_until, "occurred_until")
-        if occurred_until <= occurred_from:
-            raise ValueError("occurred_until must be later than occurred_from")
-        require_identifier(space_id, "space_id")
-        require_identifier(task, "task")
-        if memory_type is not None and memory_type not in MEMORY_TYPES:
-            raise ValueError("memory_type is invalid")
-        start = datetime_text(occurred_from)
-        until = datetime_text(occurred_until)
-        type_clause = "" if memory_type is None else "AND m.memory_type = ?"
-        scope: tuple[object, ...] = (
-            (space_id, task) if memory_type is None else (space_id, task, memory_type)
-        )
-        with self._connections.read_transaction() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT e.embedding_id
-                FROM embeddings AS e
-                JOIN memory_records AS m ON m.memory_id = e.memory_id
-                WHERE e.space_id = ? AND e.task = ? AND e.object_part = 0
-                  AND m.occurred_at IS NOT NULL
-                  AND (
-                      (m.occurred_end IS NOT NULL AND m.occurred_end > ?)
-                      OR (m.occurred_end IS NULL AND m.occurred_at >= ?)
-                  )
-                  AND m.occurred_at < ?
-                  {type_clause}
-                """,
-                (*scope[:2], start, start, until, *scope[2:]),
-            ).fetchall()
-            total_row = connection.execute(
-                f"""
-                SELECT COUNT(*) AS count
-                FROM embeddings AS e
-                JOIN memory_records AS m ON m.memory_id = e.memory_id
-                WHERE e.space_id = ? AND e.task = ? AND e.object_part = 0
-                {type_clause}
-                """,
-                scope,
-            ).fetchone()
-        total = 0 if total_row is None else int(total_row["count"])
-        return frozenset(row_text(row, "embedding_id") for row in rows), total
 
     def write_embedding(self, embedding: StoredEmbedding) -> bool:
         """Create or update one authoritative vector and enqueue its index mutation."""
@@ -196,7 +140,6 @@ class IndexOutbox:
 
     def read_index_document(self, embedding_id: str) -> IndexDocument | None:
         """Hydrate the current index payload from authoritative SQLite state."""
-        require_identifier(embedding_id, "embedding_id")
         documents = self.read_index_documents((embedding_id,))
         return documents[0] if documents else None
 
@@ -324,8 +267,8 @@ class IndexOutbox:
         with closing(
             self.iter_memory_embedding_parts(memory_ids, space_id=space_id, task=task)
         ) as parts:
-            for memory_id, _embedding_id, values in parts:
-                yield memory_id, values
+            for memory_id, _embedding_id, vector in parts:
+                yield memory_id, unpack_vector(vector, len(vector) // 4)
 
     def iter_memory_embedding_parts(
         self,
@@ -333,15 +276,15 @@ class IndexOutbox:
         *,
         space_id: str,
         task: str,
-    ) -> Generator[tuple[str, str, tuple[float, ...]], None, None]:
-        """Stream vector identities and FP32 values in deterministic part order."""
+    ) -> Generator[tuple[str, str, bytes], None, None]:
+        """Stream vector identities and FP32 buffers in deterministic order from one snapshot."""
         if not memory_ids:
             return
         for memory_id in memory_ids:
             require_identifier(memory_id, "memory_id")
         require_identifier(space_id, "space_id")
         require_identifier(task, "task")
-        with self._connections.connection() as connection:
+        with self._connections.read_transaction() as connection:
             for offset in range(0, len(memory_ids), SQLITE_PARAMETER_BATCH):
                 batch = memory_ids[offset : offset + SQLITE_PARAMETER_BATCH]
                 placeholders = ", ".join("?" for _memory_id in batch)
@@ -359,10 +302,15 @@ class IndexOutbox:
                     vector = row["vector"]
                     if not isinstance(vector, bytes):
                         raise RuntimeError("stored embedding vector is not a BLOB")
+                    dimension = int(row["dimension"])
+                    if dimension <= 0 or len(vector) != dimension * 4:
+                        raise RuntimeError(
+                            "stored embedding dimension does not match its FP32 BLOB"
+                        )
                     yield (
                         row_text(row, "memory_id"),
                         row_text(row, "embedding_id"),
-                        unpack_vector(vector, int(row["dimension"])),
+                        vector,
                     )
 
     def pending_index_operations(

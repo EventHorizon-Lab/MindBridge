@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
 from mindbridge.infrastructure.local import LocalStore, StoredMemory
+from mindbridge.infrastructure.local._lock import DataDirectoryInUseError
 from mindbridge.infrastructure.local.store._connections import Connections
 
 _NOW = datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc)
@@ -125,3 +127,51 @@ def test_close_reclaims_the_pooled_connections(tmp_path: Path) -> None:
     for connection in pooled:
         with pytest.raises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
+
+
+def test_connection_limit_includes_secure_delete_and_recovers(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        with ExitStack() as borrowers:
+            for _ in range(32):
+                borrowers.enter_context(store._connections.connection())
+            with (
+                pytest.raises(RuntimeError, match="capacity"),
+                store._connections.connection(secure_delete=True),
+            ):
+                pytest.fail("overload opened another connection")
+        with store._connections.connection(secure_delete=True) as connection:
+            assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_close_keeps_directory_ownership_until_borrowers_stop(tmp_path: Path) -> None:
+    store = LocalStore(tmp_path)
+    entered, release = Event(), Event()
+
+    def borrow() -> None:
+        with store._connections.connection() as connection:
+            entered.set()
+            assert release.wait(5)
+            assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            borrower = executor.submit(borrow)
+            try:
+                assert entered.wait(2)
+                closing = executor.submit(store.close)
+                with store._connections._pool_lock:
+                    assert store._connections._pool_lock.wait_for(
+                        lambda: store._connections._closed, timeout=1
+                    )
+                assert not closing.done()
+                with pytest.raises(DataDirectoryInUseError):
+                    LocalStore(tmp_path)
+            finally:
+                release.set()
+            borrower.result(timeout=2)
+            closing.result(timeout=2)
+        with LocalStore(tmp_path) as reopened:
+            assert reopened.records.read_memories(("absent",)) == ()
+    finally:
+        release.set()
+        store.close()

@@ -777,6 +777,11 @@ class MediaAnalyses:
                 )
             return True
 
+    def has_face_analyses(self) -> bool:
+        """Whether any face representation exists, including an empty completed analysis."""
+        with self._connections.connection() as connection:
+            return connection.execute("SELECT 1 FROM face_analyses LIMIT 1").fetchone() is not None
+
     def read_faces(
         self,
         asset_id: str,

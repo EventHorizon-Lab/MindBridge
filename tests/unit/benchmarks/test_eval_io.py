@@ -10,7 +10,7 @@ import stat
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields
+from dataclasses import asdict, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Barrier, Event, Lock
@@ -42,6 +42,7 @@ from mindbridge.benchmarks.eval_cache import (
     DescriptionCache,
     EvidenceInterval,
     ResponseCache,
+    _answer,
 )
 from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_TASK,
@@ -434,6 +435,25 @@ def test_response_cache_write_uses_the_selected_arm_namespace() -> None:
     )
 
     assert calls[0][0] == f"blind:fixture:v1:{'e' * 64}"
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "evidence",
+        "abstained",
+        "ranked_source_ids",
+        "generation_evidence",
+        "trace_id",
+        "answer_span_id",
+        "excerpt_evidence",
+    ],
+)
+def test_response_cache_requires_current_answer_fields(missing: str) -> None:
+    payload = asdict(CachedAnswer("answer", 0.5, ()))
+    del payload[missing]
+    with pytest.raises(ValueError, match="current answer fields"):
+        _answer(json.dumps(payload))
 
 
 def test_lifelong_preparation_builds_one_ordered_segment_timeline(

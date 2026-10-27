@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -200,6 +201,112 @@ def test_provider_failures_publish_recovery_contract(
     response = exception_response(failure.value)
     assert response.status_code == http_status
     assert "private" not in bytes(response.body).decode()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "code,message,reason",
+    [
+        ("context_length_exceeded", "private provider detail", "context_length_exceeded"),
+        (
+            "context_length_exceeded",
+            "private input image is too short; context overflow",
+            "context_length_exceeded",
+        ),
+        (
+            None,
+            "private decoder prompt is longer than the maximum model length of 32",
+            "context_length_exceeded",
+        ),
+        (
+            400,
+            "private decoder prompt is longer than the maximum model length of 32",
+            "context_length_exceeded",
+        ),
+        (
+            "400",
+            "private decoder prompt is longer than the maximum model length of 32",
+            "context_length_exceeded",
+        ),
+        (
+            "invalid_image",
+            "private image constraint; maximum context length is 32",
+            "request_rejected",
+        ),
+        (None, "private invalid input", "request_rejected"),
+    ],
+)
+def test_answer_context_rejection_preserves_evidence_and_does_not_retry(
+    tmp_path: Path, stream: bool, code: str | int | None, message: str, reason: str
+) -> None:
+    calls = 0
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"pixels")
+    hit = replace(_search_hit(), assets=(image,), modality=Modality.IMAGE)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = json.loads(request.content)
+        assert any(part["type"] == "image_url" for part in body["messages"][1]["content"])
+        return httpx.Response(
+            400,
+            json={"error": {"code": code, "message": message}},
+            headers={"x-request-id": "req-context"},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        adapter = OpenAIModels(
+            _sdk_client(client), generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})
+        )
+        with pytest.raises(ModelError) as failure:
+            if stream:
+                list(adapter.stream_answer("question", (hit,)))
+            else:
+                adapter.answer("question", (hit,))
+    assert calls == 1
+    assert failure.value.reason == reason
+    assert failure.value.stage == "generate"
+    assert failure.value.retryable is False
+    assert "private" not in str(failure.value)
+
+
+@pytest.mark.parametrize("media", [False, True])
+def test_answer_text_ceiling_matches_emitted_utf8_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, media: bool
+) -> None:
+    sent: list[dict[str, Any]] = []
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"pixels")
+    hit = replace(
+        _search_hit(),
+        assets=(image,) if media else (),
+        modality=Modality.IMAGE if media else Modality.TEXT,
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _reply("blue")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        adapter = OpenAIModels(
+            _sdk_client(client), generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})
+        )
+        assert adapter.answer("什么颜色?", (hit,)).answer == "blue"
+        text_bytes = sum(
+            len(part.encode("utf-8"))
+            for message in sent[0]["messages"]
+            for part in (
+                [message["content"]]
+                if isinstance(message["content"], str)
+                else [part["text"] for part in message["content"] if part["type"] == "text"]
+            )
+        )
+        monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_GROUNDED_TEXT_BYTES", text_bytes)
+        assert adapter.answer("什么颜色?", (hit,)).answer == "blue"
+        monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_GROUNDED_TEXT_BYTES", text_bytes - 1)
+        with pytest.raises(ModelError) as failure:
+            adapter.answer("什么颜色?", (hit,))
+    assert len(sent) == 2
+    assert failure.value.reason == "payload_too_large"
 
 
 @pytest.mark.parametrize("failed", [False, True])

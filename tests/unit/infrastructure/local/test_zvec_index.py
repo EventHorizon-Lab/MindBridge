@@ -221,6 +221,8 @@ def test_lexical_search_preserves_relative_bm25_score_and_all_filters() -> None:
 
     assert tuple(hit.id for hit in hits) == ("first", "second")
     assert tuple(hit.relevance for hit in hits) == (1.0, 0.5)
+    assert tuple(hit.lexical_score for hit in hits) == (0.8, 0.4)
+    assert all(hit.lexical_route == "episodic" for hit in hits)
     assert all(hit.confidence == 0.0 for hit in hits)
     assert all(hit.lexical_match for hit in hits)
     # A Latin query has nothing the bigram field could answer that the stemmer does not, so it
@@ -405,7 +407,8 @@ def test_a_query_only_fuses_the_routes_that_can_answer_it() -> None:
     index._collection = collection
     index._gate = _CollectionGate()
 
-    index.lexical_search("Alice 星期二 bakery", limit=1)
+    hits = index.lexical_search("Alice 星期二 bakery", limit=1)
+    assert hits[0].lexical_score is None
 
     assert collection.options["queries"] == [
         {"field_name": "content", "fts": {"match_string": "Alice 星期二 bakery"}},
@@ -994,12 +997,10 @@ def test_a_merge_over_a_dead_row_keeps_every_vector_bound_to_its_own_id(
             assert ranked == exhaustive[:5]
 
 
-@pytest.mark.parametrize("legacy_marker", (False, True))
 def test_updated_collections_merge_in_place_without_a_clean_marker(
     tmp_path: Path,
-    legacy_marker: bool,
 ) -> None:
-    """Zvec 0.8 can merge updates in place, including collections inherited from 0.7."""
+    """Zvec merges updates in place without an application-maintained clean marker."""
     _require_zvec()
     path = tmp_path / "index"
     marker = path / ".mindbridge-clean"
@@ -1008,16 +1009,13 @@ def test_updated_collections_merge_in_place_without_a_clean_marker(
             [_document(f"embedding_{n:02d}", f"note {n}", (1.0, float(n))) for n in range(8)]
         )
         index.flush()
-    if legacy_marker:
-        marker.touch()
-    else:
-        marker.unlink(missing_ok=True)
+    assert not marker.exists()
     inode = path.stat().st_ino
-    with ZvecIndex(path, dimension=2) as inherited:
-        inherited.delete(["embedding_00"])
-        inherited.upsert([_document("embedding_08", "note 8", (1.0, 8.0))])
-        inherited.flush()
-        inherited.optimize()
+    with ZvecIndex(path, dimension=2) as reopened:
+        reopened.delete(["embedding_00"])
+        reopened.upsert([_document("embedding_08", "note 8", (1.0, 8.0))])
+        reopened.flush()
+        reopened.optimize()
         assert path.stat().st_ino == inode
     with ZvecIndex(path, dimension=2) as verified:
         assert verified.doc_count == 8
@@ -1342,3 +1340,37 @@ def test_close_waits_for_an_in_flight_native_write() -> None:
         write.result(timeout=5)
         close.result(timeout=5)
     assert closing.is_set()
+
+
+def test_close_waits_for_an_in_flight_document_count() -> None:
+    reading = Event()
+    release = Event()
+    closing = Event()
+
+    class Collection:
+        @property
+        def stats(self) -> SimpleNamespace:
+            reading.set()
+            assert release.wait(timeout=5)
+            assert not closing.is_set(), "collection closed while reading native stats"
+            return SimpleNamespace(doc_count=7)
+
+        def close(self) -> None:
+            closing.set()
+
+    index = object.__new__(ZvecIndex)
+    index._gate = _CollectionGate()
+    index._collection = Collection()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        count = executor.submit(lambda: index.doc_count)
+        try:
+            assert reading.wait(timeout=2)
+            close = executor.submit(index.close)
+            assert not closing.wait(timeout=0.05)
+        finally:
+            release.set()
+        assert count.result(timeout=5) == 7
+        close.result(timeout=5)
+    assert closing.is_set()
+    with pytest.raises(RuntimeError, match="Zvec index is closed"):
+        _ = index.doc_count

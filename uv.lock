@@ -1747,6 +1747,7 @@ all = [
     { name = "fastapi" },
     { name = "funasr" },
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "huggingface-hub" },
     { name = "librosa" },
     { name = "mcp" },
@@ -1805,6 +1806,7 @@ observability = [
 openai = [
     { name = "av", version = "17.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "av", version = "18.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "httpx2" },
     { name = "openai" },
     { name = "pillow" },
 ]
@@ -1839,6 +1841,8 @@ requires-dist = [
     { name = "funasr", marker = "extra == 'local'", specifier = ">=1.4.6,<2" },
     { name = "httpx", marker = "extra == 'all'", specifier = ">=0.28,<1" },
     { name = "httpx", marker = "extra == 'benchmarks'", specifier = ">=0.28,<1" },
+    { name = "httpx2", marker = "extra == 'all'", specifier = ">=2.7,<3" },
+    { name = "httpx2", marker = "extra == 'openai'", specifier = ">=2.7,<3" },
     { name = "huggingface-hub", marker = "extra == 'all'", specifier = ">=0.30,<2" },
     { name = "huggingface-hub", marker = "extra == 'benchmarks'", specifier = ">=0.30,<2" },
     { name = "librosa", marker = "extra == 'all'", specifier = ">=0.11,<2" },

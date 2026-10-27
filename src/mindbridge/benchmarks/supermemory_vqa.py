@@ -44,7 +44,7 @@ class _RawSpan(BaseModel):
     video_start_time_unix: int | float
 
 
-class _RawLegacySpan(BaseModel):
+class _RawLocalSpan(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     start_time: str | int | float
@@ -54,8 +54,9 @@ class _RawLegacySpan(BaseModel):
 class _RawQuestionEvidence(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    # Both shapes occur in the pinned annotations: six questions use local timestamps.
     time_spans: list[_RawSpan] | None = None
-    time_span: _RawLegacySpan | None = None
+    time_span: _RawLocalSpan | None = None
     video_id: str | None = None
     start_time: int | float | None = None
 

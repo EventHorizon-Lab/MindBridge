@@ -1,4 +1,4 @@
-"""Run pinned MindBridge benchmarks with lmms-eval-style task selection."""
+"""Run pinned MindBridge benchmarks through the public SDK."""
 
 from __future__ import annotations
 
@@ -65,6 +65,7 @@ from mindbridge import (
 from mindbridge._telemetry import (
     OPERATION_TTFT,
     SPAN_KIND,
+    _observe_generation_inputs,
     _observe_retrieval_results,
     mark_model_requests,
     record_unmetered_model_usage,
@@ -75,9 +76,11 @@ from mindbridge.benchmarks.eval_adapters import (
     EvalQuestion,
     EvalUnit,
     LoadedTask,
+    MediaManifest,
     MemoryItem,
     load_media_manifest,
     load_task,
+    parse_media_manifest,
 )
 from mindbridge.benchmarks.eval_arms import (
     _COMPILE_SURFACE_SYSTEM_PROMPT,
@@ -108,7 +111,6 @@ from mindbridge.benchmarks.eval_config import (
     _MODALITY_BY_SUFFIX,
     _PARTIAL_SAMPLES_FILE,
     BASELINE_ARMS,
-    DEFAULT_ARM,
     DEFAULT_COMPILE_BUDGET,
     DEFAULT_FULL_CONTEXT_CHARS,
     DEFAULT_INGEST_MODE,
@@ -160,6 +162,7 @@ from mindbridge.benchmarks.eval_regression import (
     performance_comparisons,
 )
 from mindbridge.benchmarks.eval_results import (
+    DEFAULT_ARM,
     EVAL_SCHEMA_VERSION,
     FailureDetail,
     SampleResult,
@@ -238,6 +241,7 @@ from mindbridge.models.base import (
     TranscriptionBackend,
     VisionDescriptionBackend,
 )
+from mindbridge.models.openai_sdk import _answer_result
 
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v18"
 _BENCHMARK_SEARCH_REPLAY_SETUP_SPAN = "mindbridge.benchmark.search_replay_setup"
@@ -791,10 +795,8 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         return 0
     try:
         base_config = _model_config(
-            arguments.model,
             arguments.model_args,
             memory_config=memory_config,
-            overrides=overrides,
         )
         judge_config = _judge_config(base_config, arguments, overrides=overrides)
     except ValueError as error:
@@ -830,10 +832,11 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         if prepared is not None:
             generated_manifest[name] = prepared
     if generated_manifest:
-        manifest = _merged_manifest(manifest, manifest_directory, generated_manifest)
+        merged = _merged_manifest(manifest, manifest_directory, generated_manifest)
+        manifest = parse_media_manifest(merged)
         effective_manifest = arguments.output_path / _MEDIA_MANIFEST_FILE
         effective_manifest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _atomic_replace(((effective_manifest, _jsonl_bytes((manifest,))),))
+        _atomic_replace(((effective_manifest, _jsonl_bytes((merged,))),))
         arguments = replace(arguments, media_manifest=effective_manifest)
         manifest_directory = effective_manifest.parent
     loaded = _load_tasks(arguments, manifest, manifest_directory)
@@ -916,7 +919,7 @@ def _execution_has_errors(samples: Sequence[SampleResult], results: Mapping[str,
 
 def _load_tasks(
     arguments: _Arguments,
-    manifest: Mapping[str, object] | None,
+    manifest: MediaManifest | None,
     manifest_directory: Path | None,
 ) -> tuple[LoadedTask, ...]:
     return tuple(
@@ -934,7 +937,7 @@ def _load_tasks(
                     arguments.allow_unverified_data and name in arguments.dataset_overrides
                 ),
             ),
-            getattr(arguments, "fallback_reference_at", None),
+            arguments.fallback_reference_at,
         )
         for name in arguments.tasks
     )
@@ -1325,6 +1328,7 @@ def _task_completion(
     async def completed(
         task: LoadedTask, task_samples: tuple[SampleResult, ...]
     ) -> tuple[SampleResult, ...]:
+        task_samples = _with_grounding_loss(task_samples, telemetry)
         # Persist before anything that can fail. Judging raises on a missing extra or an
         # unreachable judge, and it must not be able to take the answers down with it: those cost
         # a full ingest to produce, the scores cost one more model call. Writing here also makes
@@ -1344,7 +1348,6 @@ def _task_completion(
                 else nullcontext
             )
             with measurement_exclusion():
-                task_samples = _with_grounding_loss(task_samples, telemetry)
                 if not arguments.predict_only:
                     task_samples = await _apply_judges(
                         (task,),
@@ -1417,12 +1420,14 @@ def _with_grounding_loss(
     """
     return tuple(
         sample
-        if (grounding := telemetry.sample_grounding(sample.sample_id)) is None
+        if sample.cached or (grounding := telemetry.sample_grounding(sample.sample_id)) is None
         else replace(
             sample,
             dropped_hits=grounding.dropped_hits,
             recall_shape=grounding.recall_shape,
             grounding_request=grounding.request,
+            trace_id=sample.trace_id or grounding.trace_id,
+            answer_span_id=sample.answer_span_id or grounding.answer_span_id,
         )
         for sample in samples
     )
@@ -1485,12 +1490,16 @@ async def _run_all(
 def _answers_through_ask(arm: _Arm | str, task_name: str) -> bool:
     """Report whether this arm reaches `Memory.ask` on this task.
 
-    Only that path requests an answer policy and exposes the in-answer ranked list, so every
-    check keyed on either -- the policy recorded on a row, the ranked-list diagnostic, the cache
-    guard -- asks this one question rather than `arm.name == DEFAULT_ARM` alone.
+    Only that path exposes the in-answer ranked list; baseline generators request an answer
+    policy too, while the product's compile surface follows its host-assistant prompt.
     """
     name = arm if isinstance(arm, str) else arm.name
     return name == DEFAULT_ARM and task_answer_surface(task_name) == "ask"
+
+
+def _requests_answer_policy(arm: _Arm | str, task_name: str) -> bool:
+    name = arm if isinstance(arm, str) else arm.name
+    return name in {"blind", "full-context", "compile"} or _answers_through_ask(name, task_name)
 
 
 def _generator_arms(arms: Sequence[str], task_names: Sequence[str]) -> frozenset[str]:
@@ -2257,6 +2266,11 @@ def _cached_results(
                 cached=True,
                 ranked_source_ids=answer.ranked_source_ids or (),
                 ranked_source_ids_complete=answer.ranked_source_ids is not None,
+                generation_evidence=answer.generation_evidence,
+                trace_id=answer.trace_id,
+                answer_span_id=answer.answer_span_id,
+                excerpt_evidence=answer.excerpt_evidence,
+                excerpt_source_ids=tuple(item.memory_id for item in answer.excerpt_evidence),
             )
             results[(arm.name, question.question_id)] = _sample(
                 task,
@@ -2328,6 +2342,10 @@ def _cache_outcome(
             outcome.abstained,
             outcome.abstention_reason,
             outcome.ranked_source_ids if outcome.ranked_source_ids_complete else None,
+            outcome.generation_evidence,
+            outcome.trace_id,
+            outcome.answer_span_id,
+            outcome.excerpt_evidence,
         ),
     )
 
@@ -2606,6 +2624,13 @@ async def _guarded_answer(
                     )
                     if outcome.error is not None and answer_span is not None:
                         answer_span.set_status(StatusCode.ERROR)
+                    span_context = None if answer_span is None else answer_span.get_span_context()
+                    if span_context is not None and span_context.is_valid:
+                        outcome = replace(
+                            outcome,
+                            trace_id=f"{span_context.trace_id:032x}",
+                            answer_span_id=f"{span_context.span_id:016x}",
+                        )
         if arm.generates and on_answer is not None:
             on_answer(question, outcome)
         return outcome
@@ -2782,12 +2807,17 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
     content = _content(question.content)
     ranked: tuple[SearchHit, ...] = ()
     ranked_complete = False
+    generation_evidence: tuple[EvidenceInterval, ...] | None = None
+    excerpt_evidence: tuple[EvidenceInterval, ...] = ()
+    requested_policy = task_answer_policy(task_name, answer_policy)
 
     async def attempt(operation: Callable[[], Awaitable[_Retried]]) -> _Retried:
         # Only the attempt that answered is timed: a retry's backoff is outage time, not latency.
         async def timed() -> _Retried:
-            nonlocal latency_started
+            nonlocal latency_started, ranked, ranked_complete, generation_evidence, excerpt_evidence
             latency_started = time.perf_counter()
+            ranked, ranked_complete, generation_evidence = (), False, None
+            excerpt_evidence = ()
             return await operation()
 
         return await _retry_transient(timed)
@@ -2797,6 +2827,11 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
         if isinstance(value, tuple) and all(isinstance(hit, SearchHit) for hit in value):
             ranked = value
             ranked_complete = True
+
+    def observe_generation(value: object) -> None:
+        nonlocal generation_evidence
+        if isinstance(value, tuple) and all(isinstance(hit, SearchHit) for hit in value):
+            generation_evidence = tuple(_evidence(hit) for hit in value)
 
     try:
         if arm.name == "random":
@@ -2844,8 +2879,12 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                     f"answering through Memory.compile requires a generator ({arm.name} arm, "
                     f"task {task_name})"
                 )
-            prediction = await attempt(
-                lambda: compile_generator.answer(
+
+            async def answer_compiled() -> str:
+                nonlocal generation_evidence, excerpt_evidence
+                generation_evidence = tuple(_evidence(hit) for hit in bundle.hits)
+                excerpt_evidence = tuple(_excerpt_evidence(excerpt) for excerpt in bundle.excerpts)
+                return await compile_generator.answer(
                     _question_text(question),
                     rendered,
                     question_assets=tuple(
@@ -2853,11 +2892,17 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                     ),
                     evidence_hits=bundle.hits,
                     system_prompt=_COMPILE_SURFACE_SYSTEM_PROMPT if compile_surface else None,
+                    answer_policy=requested_policy,
                 )
+
+            prediction = await attempt(answer_compiled)
+            generated = (
+                AnswerResult(prediction, ())
+                if compile_surface
+                else _answer_result(prediction, (), answer_policy=requested_policy)
             )
-            # The product arm counts a task-worded refusal on this surface as it does on `ask`;
-            # the `compile` baseline keeps the baseline rule below and counts none.
-            declined_here = compile_surface and _declined(prediction, question)
+            prediction = generated.answer
+            declined_here = generated.abstained or _declined(prediction, question)
             return _AnswerOutcome(
                 prediction,
                 (time.perf_counter() - latency_started) * 1_000,
@@ -2866,13 +2911,18 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 tuple(_evidence(hit) for hit in bundle.hits),
                 abstained=declined_here,
                 abstention_reason=(
-                    AbstentionReason.INSUFFICIENT_EVIDENCE.value if declined_here else None
+                    generated.abstention_reason.value
+                    if generated.abstention_reason is not None
+                    else AbstentionReason.INSUFFICIENT_EVIDENCE.value
+                    if declined_here
+                    else None
                 ),
                 ranked_source_ids=_source_ids(ranked),
                 compiled_chars=bundle.chars,
                 compiled_items=len(bundle.hits) + len(bundle.excerpts),
                 excerpt_source_ids=tuple(excerpt.source_memory_id for excerpt in bundle.excerpts),
                 excerpt_evidence=tuple(_excerpt_evidence(excerpt) for excerpt in bundle.excerpts),
+                generation_evidence=tuple(_evidence(hit) for hit in bundle.hits),
             )
         generator = arm.generator
         if generator is not None and arm.name != DEFAULT_ARM:
@@ -2883,33 +2933,34 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                     question_assets=tuple(
                         atom for atom in question.content if isinstance(atom, Path)
                     ),
+                    answer_policy=requested_policy,
                 )
             )
+            generated = _answer_result(prediction, (), answer_policy=requested_policy)
+            declined_here = generated.abstained or _declined(generated.answer, question)
             return _AnswerOutcome(
-                prediction,
+                generated.answer,
                 (time.perf_counter() - latency_started) * 1_000,
                 0.0,
                 (),
                 (),
+                abstained=declined_here,
+                abstention_reason=(
+                    generated.abstention_reason.value
+                    if generated.abstention_reason is not None
+                    else AbstentionReason.INSUFFICIENT_EVIDENCE.value
+                    if declined_here
+                    else None
+                ),
             )
+
         # Protocol alignment, not a scorer change: one task's official evaluation gives no credit
         # for "unknown", so the request asks for a committed answer there. `task_answer_policy`
         # owns the mapping -- `{m3-bench-robot}` -- and its rationale.
-        requested_policy = task_answer_policy(task_name, answer_policy)
-        ask_stream = getattr(memory, "ask_stream", None)
-
         async def answered() -> AnswerResult:
-            if ask_stream is None:
-                answer: AnswerResult = await memory.ask(
-                    content,
-                    limit=recall_limit,
-                    reference_at=question.reference_at,
-                    answer_policy=requested_policy,
-                )
-                return answer
             first_token_seen = False
             streamed: AnswerResult | None = None
-            async for chunk in ask_stream(
+            async for chunk in memory.ask_stream(
                 content,
                 limit=recall_limit,
                 reference_at=question.reference_at,
@@ -2928,7 +2979,10 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 raise RuntimeError("answer stream ended without a terminal result")
             return streamed
 
-        with _observe_retrieval_results(observe_retrieval):
+        with (
+            _observe_retrieval_results(observe_retrieval),
+            _observe_generation_inputs(observe_generation),
+        ):
             result = await attempt(answered)
     except Exception as error:
         if _systemic_embedding_stage_failure(error):
@@ -2944,10 +2998,11 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
             error=error,
             ranked_source_ids=_source_ids(ranked),
             ranked_source_ids_complete=ranked_complete,
+            generation_evidence=generation_evidence,
+            excerpt_evidence=excerpt_evidence,
+            excerpt_source_ids=tuple(item.memory_id for item in excerpt_evidence),
         )
-    # `_declined` stays on this path: the product cannot recognise a refusal a task worded
-    # itself, so the harness counts it. It is deliberately not extended to the baseline arms
-    # here, which would be new behaviour rather than a merge of the two intents.
+    # Count task-worded refusals on every generating arm, alongside the reader's own signal.
     declined = _declined(result.answer, question)
     return _AnswerOutcome(
         result.answer,
@@ -2963,6 +3018,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
         ),
         ranked_source_ids=_source_ids(ranked),
         ranked_source_ids_complete=ranked_complete,
+        generation_evidence=generation_evidence,
     )
 
 
@@ -2987,12 +3043,13 @@ def _full_context(items: Sequence[MemoryItem], budget_chars: int) -> str:
         text = "\n".join(str(atom) for atom in item.content if not isinstance(atom, Path))
         if not text:
             continue
-        if used + len(text) > budget_chars:
+        size = len(text) + (2 if parts else 0)
+        if used + size > budget_chars:
             # Skipped, not `break`: breaking on the first item that does not fit discarded every
             # later memory, and when that item was the first one the arm answered from an empty
             # context under the full-context prompt -- a blind arm wearing the wrong label.
             continue
-        used += len(text)
+        used += size
         parts.append(text)
     return "\n\n".join(parts)
 
@@ -3065,10 +3122,9 @@ def _sample(
         ranked_source_ids,
         predict_only=predict_only,
         arm=arm,
-        # A question whose run recorded no complete ranked list -- a replay from a cache
-        # written before the list was stored -- carries no retrieval score. Reporting the empty
-        # list as recall zero would invent one, and the task's `retrieval` block excludes exactly
-        # the same samples, so both surfaces report over one denominator.
+        # An answer surface that exposes no ranked list carries no retrieval score. Reporting
+        # its empty list as recall zero would invent one. The task's retrieval block excludes
+        # the same samples so both surfaces report over one denominator.
         retrieval_available=(
             arm.retrieves and ranked_source_ids_complete and retrieval_diagnostic_error is None
         ),
@@ -3089,6 +3145,7 @@ def _sample(
             "compile_bundle_items": float(outcome.compiled_items),
             "compile_bundle_excerpts": float(len(outcome.excerpt_source_ids)),
         }
+    labelled_sources = set(retrieval_gold_ids(task.spec.name, question.metadata))
     return SampleResult(
         task=task.spec.name,
         benchmark=task.spec.benchmark,
@@ -3128,16 +3185,30 @@ def _sample(
         metrics=metrics,
         scorer_protocol=scorer_protocol(task.spec.name),
         arm=arm.name,
-        # Only the product arm answering through `ask` requests a policy: a baseline row, and a
-        # product row on a task that answers through `Memory.compile`, carry none.
+        # Host-assistant compile tasks and the random retrieval control request no policy.
         answer_policy=(
             task_answer_policy(task.spec.name, answer_policy)
-            if _answers_through_ask(arm, task.spec.name)
+            if _requests_answer_policy(arm, task.spec.name)
             else None
         ),
         retrieval_candidates=len(ranked_source_ids),
         ranked_source_ids=tuple(ranked_source_ids),
         ranked_source_ids_complete=ranked_source_ids_complete,
+        generation_evidence=(
+            None if isinstance(outcome, BaseException) else outcome.generation_evidence
+        ),
+        input_source_ids=tuple(
+            dict.fromkeys(
+                item.source_id
+                for item in unit.memories
+                if item.source_id in labelled_sources
+                and (
+                    question.cutoff_seconds is None or _memory_end(item) <= question.cutoff_seconds
+                )
+            )
+        ),
+        trace_id=None if isinstance(outcome, BaseException) else outcome.trace_id,
+        answer_span_id=None if isinstance(outcome, BaseException) else outcome.answer_span_id,
     )
 
 
@@ -3329,7 +3400,9 @@ def _task_rows(
     # wins: the caller named it.
     blind_rows = {
         **_in_run_blind_rows(arguments, tasks, samples),
-        **_blind_baseline_rows(arguments.blind_baseline, tasks),
+        **_blind_baseline_rows(
+            arguments.blind_baseline, tasks, answer_policy=arguments.answer_policy
+        ),
     }
     product_candidate_limit = _answer_retrieval_candidate_limit(
         arguments.recall_limit,
@@ -3364,12 +3437,10 @@ def _task_rows(
                 "arm": arm,
                 "task": task.spec.name,
                 # The request policy, so a run that asked for a committed answer is not
-                # byte-indistinguishable from every earlier run of the same task. Only the
-                # product arm answering through `ask` requests one, so the baseline arms and a
-                # task answered through `Memory.compile` carry no policy.
+                # byte-indistinguishable from every earlier run of the same task.
                 "answer_policy": (
                     task_answer_policy(task.spec.name, arguments.answer_policy)
-                    if _answers_through_ask(arm, task.spec.name)
+                    if _requests_answer_policy(arm, task.spec.name)
                     else None
                 ),
                 "benchmark": task.spec.benchmark,
@@ -3422,7 +3493,7 @@ def _results(
     resources: Mapping[str, object] | None = None,
     embedding_warmup_count: int | None = None,
 ) -> dict[str, object]:
-    fallback_reference_at = getattr(arguments, "fallback_reference_at", None)
+    fallback_reference_at = arguments.fallback_reference_at
     task_rows = _task_rows(
         arguments,
         tasks,
@@ -3457,7 +3528,6 @@ def _results(
         "seeds": arguments.seeds,
         "bootstrap_samples": arguments.bootstrap_samples,
         "predict_only": arguments.predict_only,
-        "num_fewshot": arguments.num_fewshot,
         "log_samples": arguments.log_samples,
         "response_cache": None if arguments.use_cache is None else str(arguments.use_cache),
         "resume": arguments.resume,
@@ -3555,7 +3625,7 @@ def _measurement_protocol(
             if arguments.resume
             else "one newly-created physical data directory per benchmark unit"
         ),
-        "repeat_index": getattr(arguments, "repeat_index", 0),
+        "repeat_index": arguments.repeat_index,
         "repeat_execution": "independent_eval_invocation",
         "measured_response_count": len(samples) - cached,
         "cached_responses_excluded_from_performance_denominators": True,
@@ -3572,7 +3642,7 @@ def _measurement_protocol(
         "judge_in_client_resource_window": False,
         "judge_measurement_exclusion": (
             "interleaved sub-windows removed from client and model-server counters"
-            if getattr(arguments, "stream_results", False) and not arguments.predict_only
+            if arguments.stream_results and not arguments.predict_only
             else "judging runs after the product measurement window"
         ),
     }
@@ -3606,19 +3676,14 @@ def _arm_provenance(
                 if evidence_budget_chars is not None
                 else "min(100, recall_limit * 3)"
             ),
-            "answer_retrieval_candidate_limit": answer_candidate_limit,
-            "answer_retrieval_candidate_limit_basis": (
-                "full rerank pool because evidence_budget_chars is configured"
-                if evidence_budget_chars is not None
-                else "min(100, recall_limit * 3)"
-            ),
             "official_metrics": True,
         },
         "blind": {
             "answers_from": "the generator's prior, with no evidence",
             "retrieval": None,
             "prompt": BLIND_PROMPT_VERSION,
-            "media_in_question": "dropped: the baseline prompt is text only",
+            "media_in_question": "native query assets when the generator supports them",
+            "knowledge_source": "model prior; unsupported user facts must not be invented",
             "official_metrics": False,
         },
         "full-context": {
@@ -3626,6 +3691,7 @@ def _arm_provenance(
             "retrieval": None,
             "prompt": FULL_CONTEXT_PROMPT_VERSION,
             "budget_chars": arguments.full_context_chars,
+            "budget_scope": "rendered evidence text including inter-memory separators",
             "media_in_corpus": "dropped: only text atoms are stuffed",
             "official_metrics": False,
         },
@@ -3648,12 +3714,45 @@ def _arm_provenance(
             "prompt": FULL_CONTEXT_PROMPT_VERSION,
             "budget_max_items": arguments.compile_max_items,
             "budget_max_chars": arguments.compile_max_chars,
-            "allow_partial_sources": getattr(arguments, "compile_allow_partial_sources", False),
+            "budget_scope": "ContextBudget bundle; provider prompt and native media are separate",
+            "allow_partial_sources": arguments.compile_allow_partial_sources,
             "official_metrics": False,
         },
     }
+    for name in arguments.arms:
+        definition = cast(dict[str, object], definitions[name])
+        if name == DEFAULT_ARM:
+            definition["budget_chars"] = evidence_budget_chars
+            definition["budget_scope"] = (
+                "ask evidence selection; excludes prompt and media; compile caps are per task"
+            )
+            definition["budget_by_task"] = {
+                task: (
+                    {
+                        "surface": "ask",
+                        "evidence_budget_chars": evidence_budget_chars,
+                    }
+                    if _answers_through_ask(name, task)
+                    else {
+                        "surface": "compile",
+                        "max_chars": arguments.compile_max_chars,
+                        "max_items": arguments.compile_max_items,
+                    }
+                )
+                for task in sorted(arguments.tasks)
+            }
+        definition["answer_policy"] = {
+            task: (
+                task_answer_policy(task, arguments.answer_policy)
+                if _requests_answer_policy(name, task)
+                else None
+            )
+            for task in sorted(arguments.tasks)
+        }
     return {
         "selected": list(arguments.arms),
+        "comparison_scope": "end_to_end_system",
+        "memory_only_attribution": False,
         "retrieval_candidate_limit": answer_candidate_limit,
         "retrieval_candidate_limit_arm": DEFAULT_ARM,
         "retrieval_candidate_source": (
@@ -3681,7 +3780,7 @@ def _model_result(
         generation_seed = None if generation is None else generation.seed
         generation_temperature = None if generation is None else generation.temperature
     result: dict[str, object] = {
-        "adapter": arguments.model,
+        "adapter": DEFAULT_ARM,
         "embedding_model": DEFAULT_JINA_MODEL_ID,
         "embedding_revision": DEFAULT_JINA_REVISION,
         "embedding_dimension": DEFAULT_JINA_DIMENSION,
@@ -3974,15 +4073,18 @@ def _cache_namespace(
         # task's cached `ask` answers as answers from the compiled bundle.
         "answer_surface": {task: task_answer_surface(task) for task in sorted(arguments.tasks)},
         "compile_surface_prompt": COMPILE_SURFACE_PROMPT_VERSION,
+        "blind_prompt": BLIND_PROMPT_VERSION,
+        "full_context_prompt": FULL_CONTEXT_PROMPT_VERSION,
+        "full_context_chars": arguments.full_context_chars,
         "blind": arguments.blind,
         "batch_sizes": dict(sorted(batch_sizes.items())),
         "ingest": arguments.ingest,
         "deliberate": arguments.deliberate,
         "compile_max_items": arguments.compile_max_items,
         "compile_max_chars": arguments.compile_max_chars,
-        "compile_allow_partial_sources": getattr(arguments, "compile_allow_partial_sources", False),
+        "compile_allow_partial_sources": arguments.compile_allow_partial_sources,
     }
-    fallback_reference_at = getattr(arguments, "fallback_reference_at", None)
+    fallback_reference_at = arguments.fallback_reference_at
     if fallback_reference_at is not None:
         payload["fallback_reference_at"] = fallback_reference_at.isoformat()
     if memory_config is not None:

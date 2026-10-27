@@ -299,7 +299,7 @@ def test_dependency_surface_is_exact() -> None:
             "tqdm",
         },
         "observability": {"opentelemetry-sdk"},
-        "openai": {"av", "openai", "pillow"},
+        "openai": {"av", "httpx2", "openai", "pillow"},
         "face": {"opencv-python-headless"},
         "local": {
             "cairosvg",

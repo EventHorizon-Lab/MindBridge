@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from argparse import ArgumentTypeError
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -32,6 +32,7 @@ import mindbridge.benchmarks.eval as eval_module
 import mindbridge.models.base as base_module
 from mindbridge import (
     AbstentionReason,
+    AnswerChunk,
     AnswerPolicy,
     AnswerResult,
     AssetRef,
@@ -73,6 +74,7 @@ from mindbridge.benchmarks.eval_adapters import (
     EvalQuestion,
     EvalUnit,
     LoadedTask,
+    MediaManifest,
     MediaResolver,
     MemoryItem,
     _choice_parts,
@@ -80,6 +82,7 @@ from mindbridge.benchmarks.eval_adapters import (
     _gallery_memory,
     _query_parts,
     load_task,
+    parse_media_manifest,
 )
 from mindbridge.benchmarks.eval_cache import CachedAnswer, ResponseCache
 from mindbridge.benchmarks.eval_config import (
@@ -203,7 +206,7 @@ def test_query_parts_and_gallery_image_id_preserve_retrieval_evidence(tmp_path: 
     )
 
 
-def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
+def test_catalog_covers_requested_benchmarks_and_groups() -> None:
     assert {task.benchmark for task in TASKS.values()} == {
         "ATM-Bench",
         "BEAM",
@@ -223,7 +226,7 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "Video-MME-v2",
         "WorldMemArena",
     }
-    assert expand(("M3", "atm-main", "supermemory-subject-1")) == (
+    assert expand(("m3-bench", "atm-bench-main", "supermemory-vqa")) == (
         "m3-bench-robot",
         "m3-bench-web",
         "supermemory-vqa",
@@ -242,9 +245,9 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         expand(("video-mme",))
     with pytest.raises(ValueError, match="unknown task"):
         expand(("memeye",))
-    assert expand(("open-eqa",)) == ("openeqa-hm3d", "openeqa-scannet")
-    assert expand(("openeqa-scannet-v0",)) == ("openeqa-scannet",)
-    assert expand(("evoemo",)) == ("es-memeval-qa",)
+    assert expand(("openeqa",)) == ("openeqa-hm3d", "openeqa-scannet")
+    assert expand(("openeqa-scannet",)) == ("openeqa-scannet",)
+    assert expand(("es-memeval",)) == ("es-memeval-qa",)
     assert all(
         task.media_source.revision is None or len(task.media_source.revision) == 40
         for task in TASKS.values()
@@ -252,7 +255,23 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
     )
 
 
-def test_lmms_style_task_listing(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "name",
+    [
+        "M3",
+        "atm-main",
+        "supermemory-subject-1",
+        "openeqa-scannet-v0",
+        "personamem-v3-backend",
+        "m3_bench_robot",
+    ],
+)
+def test_catalog_requires_canonical_task_names(name: str) -> None:
+    with pytest.raises(ValueError, match="unknown task"):
+        expand((name,))
+
+
+def test_task_listing(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     assert main(("--tasks", "list", "--benchmarks-root", str(tmp_path))) == 0
     output = capsys.readouterr().out
     assert "groups:" in output
@@ -684,7 +703,9 @@ def test_mm_lifelong_memories_carry_their_media_offset_as_event_time(tmp_path: P
         variant="day_test",
         media_source=MediaSource("mm-lifelong"),
     )
-    manifest = {"tasks": {"mm-lifelong-day-test": {"units": {"day_test": clips}}}}
+    manifest = parse_media_manifest(
+        {"version": 1, "tasks": {"mm-lifelong-day-test": {"units": {"day_test": clips}}}}
+    )
 
     (unit,) = _mm_lifelong(
         spec, dataset, MediaResolver(spec.name, None, manifest, tmp_path), tmp_path, None, 0
@@ -851,6 +872,9 @@ def _namespace_arguments() -> eval_config_module._Arguments:
             deliberate=False,
             compile_max_items=24,
             compile_max_chars=16000,
+            compile_allow_partial_sources=False,
+            fallback_reference_at=None,
+            full_context_chars=24000,
         ),
     )
 
@@ -882,6 +906,18 @@ def test_response_cache_namespace_changes_with_the_answer_policy(
     assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
 
 
+def test_response_cache_namespace_changes_with_the_full_context_budget() -> None:
+    arguments = _namespace_arguments()
+    smaller = cast(
+        eval_config_module._Arguments,
+        SimpleNamespace(**{**vars(arguments), "full_context_chars": 1000}),
+    )
+
+    assert _cache_namespace(arguments, ModelConfig(), {}) != _cache_namespace(
+        smaller, ModelConfig(), {}
+    )
+
+
 def test_response_cache_namespace_changes_with_the_answer_surface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -900,7 +936,7 @@ def test_response_cache_namespace_changes_with_the_answer_surface(
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_results_module.EVAL_SCHEMA_VERSION == 19
+    assert eval_results_module.EVAL_SCHEMA_VERSION == 22
     assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v18"
     arguments = _namespace_arguments()
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
@@ -915,8 +951,10 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     clocked_arguments = cast(
         eval_config_module._Arguments,
         SimpleNamespace(
-            **vars(arguments),
-            fallback_reference_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
+            **{
+                **vars(arguments),
+                "fallback_reference_at": datetime(2026, 9, 8, tzinfo=timezone.utc),
+            },
         ),
     )
     assert _cache_namespace(clocked_arguments, ModelConfig(), {"text": 1}) != before
@@ -976,7 +1014,7 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
     recorded = eval_module._model_result(
         cast(
             eval_config_module._Arguments,
-            SimpleNamespace(model="mindbridge", device="cuda", seed=7, gen_kwargs=""),
+            SimpleNamespace(device="cuda", seed=7, gen_kwargs=""),
         ),
         ModelConfig(generation_model=model),
         None,
@@ -1143,17 +1181,74 @@ def test_model_base_url_override_replaces_environment_operation_urls(
 ) -> None:
     monkeypatch.setenv("MINDBRIDGE_GENERATION_BASE_URL", "https://old.example/v1")
 
-    config = _model_config("mindbridge", "base_url=https://new.example/v1")
+    config = _model_config("base_url=https://new.example/v1")
 
     assert config.generation_base_url == "https://new.example/v1"
 
 
 def test_model_short_video_limit_is_explicit_and_validated() -> None:
-    config = _model_config("mindbridge", "generation_min_video_seconds=2")
+    config = _model_config("generation_min_video_seconds=2")
 
     assert config.generation_min_video_seconds == 2.0
     with pytest.raises(ValueError, match="generation_min_video_seconds"):
-        _model_config("mindbridge", "generation_min_video_seconds=0")
+        _model_config("generation_min_video_seconds=0")
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    (
+        ("--model", "mindbridge"),
+        ("--num-fewshot", "0"),
+        ("--num_fewshot", "0"),
+        ("--memory-config", "eval.yaml"),
+        ("--model_args", "generation_model=fixture"),
+        ("--judge_model_args", "model=fixture"),
+        ("--output_path", "results"),
+        ("--gen_kwargs", "max_tokens=64"),
+        ("--batch_size", "1"),
+        ("--max_batch_size", "1"),
+        ("--use_cache", "cache"),
+        ("--blind_baseline", "results.jsonl"),
+        ("--predict_only",),
+        ("--log_samples",),
+        ("--stream_results",),
+        ("--no-stream_results",),
+        ("--check_integrity",),
+    ),
+)
+def test_eval_rejects_removed_cli_spellings(
+    tokens: tuple[str, ...], capsys: pytest.CaptureFixture[str]
+) -> None:
+    parser = eval_config_module._build_parser("eval")
+
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["--tasks", "clbench", *tokens])
+
+    assert error.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ("model", "pretrained"))
+def test_eval_model_args_reject_removed_model_aliases(key: str) -> None:
+    with pytest.raises(ValueError, match="invalid --model-args item"):
+        _model_config(f"{key}=fixture")
+
+
+def test_eval_judge_args_reject_removed_model_alias() -> None:
+    parser = eval_config_module._build_parser("eval")
+    parsed = parser.parse_args(["--tasks", "clbench", "--judge-model-args", "pretrained=fixture"])
+    arguments = eval_config_module._arguments(parser, parsed)
+
+    with pytest.raises(ValueError, match="invalid --judge-model-args item"):
+        eval_config_module._judge_config(ModelConfig(), arguments)
+
+
+def test_eval_config_rejects_removed_fewshot_setting(tmp_path: Path) -> None:
+    path = tmp_path / "eval.yaml"
+    path.write_text("benchmark:\n  run:\n    num_fewshot: 0\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="num_fewshot"):
+        eval_config_module._load_memory_config(path)
 
 
 @pytest.mark.parametrize(
@@ -1192,7 +1287,6 @@ def test_eval_config_reuses_the_declarative_memory_schema(
     assert loaded is not None
     assert overrides == HarnessOverrides()
     model = _model_config(
-        "mindbridge",
         f"generation_model={model_id}",
         memory_config=loaded,
     )
@@ -1207,14 +1301,16 @@ def test_eval_config_reuses_the_declarative_memory_schema(
             seed=7,
             device="cuda:1",
             recall_limit=20,
+            full_context_chars=24000,
             tasks=("atm-bench",),
             answer_policy=None,
-            model="mindbridge",
             blind=False,
             ingest="add",
             deliberate=False,
             compile_max_items=24,
             compile_max_chars=16000,
+            compile_allow_partial_sources=False,
+            fallback_reference_at=None,
         ),
     )
     effective = eval_config_module._evaluation_memory_config(loaded, model, arguments)
@@ -1484,7 +1580,7 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
     question = loaded.units[0].questions[0]
     observed: list[datetime | None] = []
 
-    class Memory:
+    class Memory(_FakeMemory):
         async def ask(
             self,
             _question: object,
@@ -1498,7 +1594,7 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
             return AnswerResult("Blue.")
 
     await _answer_many(
-        cast(AsyncMemory, Memory()),
+        cast(AsyncMemory, Memory([])),
         (question,),
         request_concurrency=1,
         recall_limit=5,
@@ -1597,7 +1693,7 @@ async def test_answer_many_receives_the_fallback_reference_clock() -> None:
     )
     observed: list[datetime | None] = []
 
-    class Memory:
+    class Memory(_FakeMemory):
         async def ask(
             self,
             _question: object,
@@ -1613,7 +1709,7 @@ async def test_answer_many_receives_the_fallback_reference_clock() -> None:
 
     loaded = _with_fallback_reference(task, fallback)
     await _answer_many(
-        cast(AsyncMemory, Memory()),
+        cast(AsyncMemory, Memory([])),
         loaded.units[0].questions,
         request_concurrency=1,
         recall_limit=5,
@@ -1635,8 +1731,8 @@ async def test_answer_failure_preserves_the_product_retrieval_ranking(tmp_path: 
         ),
     )
 
-    class Memory:
-        async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
+    class Memory(_FakeMemory):
+        async def ask(self, question: object, **_kwargs: object) -> AnswerResult:
             _record_retrieval_results(ranked)
             raise RuntimeError("generation unavailable")
 
@@ -1646,7 +1742,7 @@ async def test_answer_failure_preserves_the_product_retrieval_ranking(tmp_path: 
     question = EvalQuestion("q1", ("question",), references=("answer",))
     outcome = (
         await _answer_many(
-            cast(AsyncMemory, Memory()),
+            cast(AsyncMemory, Memory([])),
             (question,),
             request_concurrency=1,
             recall_limit=5,
@@ -1780,22 +1876,25 @@ def test_causal_task_requires_timestamped_prepared_media(tmp_path: Path) -> None
         spec,
         root=tmp_path,
         dataset_path=dataset,
-        media_manifest={
-            "tasks": {
-                spec.name: {
-                    "units": {
-                        "room": [
-                            {
-                                "text": "prepared segment",
-                                "source_id": "room-0001",
-                                "start_seconds": 0,
-                                "end_seconds": 9,
-                            }
-                        ]
+        media_manifest=parse_media_manifest(
+            {
+                "version": 1,
+                "tasks": {
+                    spec.name: {
+                        "units": {
+                            "room": [
+                                {
+                                    "text": "prepared segment",
+                                    "source_id": "room-0001",
+                                    "start_seconds": 0,
+                                    "end_seconds": 9,
+                                }
+                            ]
+                        }
                     }
-                }
+                },
             }
-        },
+        ),
         limit=1,
         verify_digest=False,
     )
@@ -1842,7 +1941,7 @@ def test_egotempo_limit_counts_questions_not_shared_video_units(tmp_path: Path) 
         TASKS["egotempo"],
         root=tmp_path,
         dataset_path=dataset,
-        media_manifest=manifest,
+        media_manifest=parse_media_manifest({"version": 1, **manifest}),
         limit=1,
         verify_digest=False,
     )
@@ -1878,6 +1977,21 @@ class _FakeMemory:
         del reference_at, answer_policy
         self.events.append(f"ask:{question}:{limit}")
         return AnswerResult("A")
+
+    async def ask_stream(
+        self,
+        question: object,
+        *,
+        limit: int,
+        reference_at: datetime | None = None,
+        answer_policy: AnswerPolicy = "strict",
+    ) -> AsyncIterator[AnswerChunk]:
+        result = await self.ask(
+            question, limit=limit, reference_at=reference_at, answer_policy=answer_policy
+        )
+        if result.answer:
+            yield AnswerChunk(text=result.answer)
+        yield AnswerChunk(result=result)
 
 
 class _BatchLimitedMemory(_FakeMemory):
@@ -2218,6 +2332,9 @@ async def test_a_judge_that_still_fails_after_the_wait_scores_the_answer_wrong(
     # The judge's outage is waited out inside `_judge_call`; an answer that still has no verdict
     # is scored zero like an answer that was never produced, so one dead judge call is a wrong
     # answer in the mean, not an INVALID task.
+    import httpx2 as httpx
+    from openai import AsyncOpenAI
+
     from mindbridge.benchmarks.official_scorers import judge_plan
 
     sample = replace(
@@ -2234,23 +2351,28 @@ async def test_a_judge_that_still_fails_after_the_wait_scores_the_answer_wrong(
     )
     assert plan is not None
 
-    async def dead_judge(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("judge down")
+    def dead_judge(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("judge down", request=request)
 
-    monkeypatch.setattr(eval_judge_module, "_traced_judge_call", dead_judge)
-    judged = await eval_judge_module._judge_sample(
-        sample,
-        plan,
-        client=cast(Any, object()),
-        cache=None,
-        semaphore=asyncio.Semaphore(1),
-        config=eval_config_module._JudgeConfig("judge", "https://judge.example/v1"),
-        log_samples=False,
-        tracer=trace.get_tracer("test"),
-    )
+    monkeypatch.setattr(eval_results_module, "_TRANSIENT_RETRY_SECONDS", 0.0)
+    async with AsyncOpenAI(
+        api_key="test",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(dead_judge)),
+    ) as client:
+        judged = await eval_judge_module._judge_sample(
+            sample,
+            plan,
+            client=client,
+            cache=None,
+            semaphore=asyncio.Semaphore(1),
+            config=eval_config_module._JudgeConfig("judge", "https://judge.example/v1"),
+            log_samples=False,
+            tracer=trace.get_tracer("test"),
+        )
 
     assert judged.error_code == "JudgeError"
-    assert judged.scorer_error == "RuntimeError: judge down"
+    assert judged.scorer_error == "APIConnectionError: Connection error."
     assert judged.score == 0.0
     assert judged.metrics["accuracy"] == 0.0
     assert judged.metrics["retrieval_recall@5"] == 1.0
@@ -2630,7 +2752,7 @@ async def test_a_fully_cached_unit_completes_its_ingest_share_without_writing(
 
     class Cache:
         def get(self, _task: str, _unit_id: str, _question_id: str) -> object:
-            return SimpleNamespace(
+            return CachedAnswer(
                 prediction="A",
                 confidence=0.0,
                 memory_ids=(),
@@ -3317,7 +3439,7 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             answer_policy=None,
             predict_only=False,
             log_samples=False,
-            arms=(eval_config_module.DEFAULT_ARM,),
+            arms=(eval_results_module.DEFAULT_ARM,),
             full_context_chars=24_000,
             ingest="add",
             resume=False,
@@ -3692,7 +3814,7 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
         def get(self, _task: str, _unit_id: str, question_id: str) -> object | None:
             if question_id != "fast":
                 return None
-            return SimpleNamespace(
+            return CachedAnswer(
                 prediction="A",
                 confidence=0.0,
                 memory_ids=(),
@@ -3898,24 +4020,27 @@ def _openeqa_dataset(path: Path) -> Path:
     return path
 
 
-def _openeqa_manifest(task_name: str, *units: str) -> dict[str, object]:
-    return {
-        "tasks": {
-            task_name: {
-                "units": {
-                    unit: [
-                        {
-                            "text": f"prepared segment of {unit}",
-                            "source_id": f"{unit}-00000",
-                            "start_seconds": 0,
-                            "end_seconds": 30,
-                        }
-                    ]
-                    for unit in units
+def _openeqa_manifest(task_name: str, *units: str) -> MediaManifest:
+    return parse_media_manifest(
+        {
+            "version": 1,
+            "tasks": {
+                task_name: {
+                    "units": {
+                        unit: [
+                            {
+                                "text": f"prepared segment of {unit}",
+                                "source_id": f"{unit}-00000",
+                                "start_seconds": 0,
+                                "end_seconds": 30,
+                            }
+                        ]
+                        for unit in units
+                    }
                 }
-            }
+            },
         }
-    }
+    )
 
 
 def test_openeqa_limit_counts_episodes_and_keeps_all_their_questions(tmp_path: Path) -> None:
@@ -4513,8 +4638,8 @@ benchmark:
             "clbench",
             "--limit",
             "1",
-            "--model_args",
-            "model=cli-model",
+            "--model-args",
+            "generation_model=cli-model",
             "--judge-model-args",
             "model=cli-judge,api_key=cli-judge-secret",
         ]
@@ -4526,10 +4651,8 @@ benchmark:
     )
     arguments = eval_config_module._arguments(parser, parsed, download, overrides)
     model = eval_config_module._model_config(
-        arguments.model,
         arguments.model_args,
         memory_config=memory_config,
-        overrides=overrides,
     )
     judge = eval_config_module._judge_config(model, arguments, overrides=overrides)
     effective_memory = eval_config_module._evaluation_memory_config(memory_config, model, arguments)
@@ -4680,13 +4803,13 @@ def test_eval_generation_credential_prefers_the_file_over_the_environment(
     silent = tmp_path / "silent.yaml"
     silent.write_text("generation:\n  provider: openai\n", encoding="utf-8")
 
-    config, overrides = _load_memory_config(declared)
+    config, _ = _load_memory_config(declared)
     assert config is not None and config.generation is not None
-    resolved = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
+    resolved = _model_config("", memory_config=config)
     assert resolved.generation_api_key == "file-key"
 
-    config, overrides = _load_memory_config(silent)
-    inherited = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
+    config, _ = _load_memory_config(silent)
+    inherited = _model_config("", memory_config=config)
     assert inherited.generation_api_key == "environment-key"
 
 
@@ -4703,11 +4826,11 @@ def test_eval_video_floor_has_exactly_one_home(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    config, overrides = _load_memory_config(path)
+    config, _ = _load_memory_config(path)
 
     assert config is not None and config.generation is not None
     assert config.generation.min_video_seconds == 4.0
-    resolved = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
+    resolved = _model_config("", memory_config=config)
     assert resolved.generation_min_video_seconds == 4.0
 
     path.write_text(
@@ -4873,7 +4996,7 @@ def test_committed_example_configuration_still_loads() -> None:
     assert overrides.judge.model is not None
     assert overrides.download.hf_endpoint == "https://huggingface.co"
 
-    model = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
+    model = _model_config("", memory_config=config)
     judge = eval_config_module._judge_config(
         model,
         cast(
@@ -4935,8 +5058,8 @@ def test_eval_model_config_keeps_env_model_when_file_omits_it(
         encoding="utf-8",
     )
 
-    config, overrides = _load_memory_config(path)
-    resolved = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
+    config, _ = _load_memory_config(path)
+    resolved = _model_config("", memory_config=config)
 
     assert resolved.generation_model == "environment-model"
     assert sorted(m.value for m in resolved.generation_capabilities) == [
@@ -4957,8 +5080,8 @@ def test_eval_model_config_still_prefers_a_declared_model_and_modalities(
         encoding="utf-8",
     )
 
-    config, overrides = _load_memory_config(path)
-    resolved = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
+    config, _ = _load_memory_config(path)
+    resolved = _model_config("", memory_config=config)
 
     assert resolved.generation_model == "file-model"
     assert sorted(m.value for m in resolved.generation_capabilities) == ["text"]
@@ -4978,8 +5101,8 @@ def test_eval_resolved_generation_keeps_an_env_only_credential(
     path = tmp_path / "eval.yaml"
     path.write_text("generation:\n  provider: openai\n", encoding="utf-8")
 
-    config, overrides = _load_memory_config(path)
-    model = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
+    config, _ = _load_memory_config(path)
+    model = _model_config("", memory_config=config)
     arguments = cast(
         eval_config_module._Arguments,
         SimpleNamespace(gen_kwargs="", seed=0, device=None),
@@ -4996,8 +5119,8 @@ def test_eval_resolved_generation_still_prefers_a_declared_credential(tmp_path: 
     path = tmp_path / "eval.yaml"
     path.write_text("generation:\n  provider: openai\n  api_key: file-key\n", encoding="utf-8")
 
-    config, overrides = _load_memory_config(path)
-    model = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
+    config, _ = _load_memory_config(path)
+    model = _model_config("", memory_config=config)
     arguments = cast(
         eval_config_module._Arguments,
         SimpleNamespace(gen_kwargs="", seed=0, device=None),

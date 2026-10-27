@@ -14,7 +14,7 @@ from mindbridge.infrastructure.local.store._codec import (
 )
 from mindbridge.infrastructure.local.store._connections import Connections
 from mindbridge.infrastructure.local.store._outbox import enqueue_capture
-from mindbridge.infrastructure.local.store.records import write_embedding, write_memory
+from mindbridge.infrastructure.local.store.records import write_embeddings, write_memory
 from mindbridge.infrastructure.local.store.rows import (
     StoredEmbedding,
     StoredMemory,
@@ -101,8 +101,7 @@ class CaptureQueue:
                 supplied_memories[0],
                 supplied_embedding_ids=supplied_by_memory[memory.memory_id],
             )
-            for embedding in supplied_embeddings:
-                write_embedding(connection, embedding)
+            write_embeddings(connection, supplied_embeddings)
         return True
 
     def complete_captures(self, memory_ids: Sequence[str]) -> int:

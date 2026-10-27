@@ -1,0 +1,68 @@
+{
+  "checked_on": "2026-10-27",
+  "repositories": [
+    {
+      "repository": "orionw/NevIR",
+      "url": "https://github.com/orionw/NevIR",
+      "commit": "b0f0623984d54b127a28246537966f4666e1cb54",
+      "default_branch": "main",
+      "license": "MIT",
+      "pushed_at": "2023-09-28T17:53:16Z"
+    },
+    {
+      "repository": "thijmennijdam/NevIR-reproducibility",
+      "url": "https://github.com/thijmennijdam/NevIR-reproducibility",
+      "commit": "cdb34ceb470111e60b890ecfbf4034d04bc9a5c7",
+      "default_branch": "master",
+      "license": null,
+      "pushed_at": "2025-08-15T14:25:15Z"
+    },
+    {
+      "repository": "zwh-sdu/ExcluIR",
+      "url": "https://github.com/zwh-sdu/ExcluIR",
+      "commit": "60478dd6897b180eb103394af9f6e69814de65d0",
+      "default_branch": "main",
+      "license": null,
+      "pushed_at": "2024-06-12T09:05:33Z"
+    },
+    {
+      "repository": "Easonsi/SSENE",
+      "url": "https://github.com/Easonsi/SSENE",
+      "commit": "2e70b2beb43b00a66232da2a2de3223b3679b457",
+      "default_branch": "main",
+      "license": null,
+      "pushed_at": "2023-08-11T10:05:48Z"
+    },
+    {
+      "repository": "taegyeong-lee/DEO-negation-aware-retrieval",
+      "url": "https://github.com/taegyeong-lee/DEO-negation-aware-retrieval",
+      "commit": "d8efb22211e500ccaddc26629da8613dc6664825",
+      "default_branch": "master",
+      "license": null,
+      "pushed_at": "2026-03-14T15:02:06Z"
+    },
+    {
+      "repository": "xgl-git/NS-IR-main",
+      "url": "https://github.com/xgl-git/NS-IR-main",
+      "commit": "5490b8487c2c093aab99533c295b203ac9a9fbb7",
+      "default_branch": "main",
+      "license": null,
+      "pushed_at": "2025-12-29T12:09:21Z"
+    },
+    {
+      "repository": "jenojp/negspacy",
+      "url": "https://github.com/jenojp/negspacy",
+      "commit": "39125b090b6ff880582ca4e3b49b699c43e4bf4c",
+      "default_branch": "master",
+      "license": "MIT",
+      "pushed_at": "2026-04-20T01:57:46Z"
+    },
+    {
+      "repository": "NICE-HKU/CoDeR",
+      "url": "https://github.com/NICE-HKU/CoDeR",
+      "commit": null,
+      "status": "GitHub API returned 404: This repository is empty.",
+      "checked_on": "2026-10-27"
+    }
+  ]
+}

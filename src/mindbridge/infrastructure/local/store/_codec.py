@@ -7,6 +7,7 @@ import sqlite3
 import struct
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
+from operator import mul
 from typing import Literal
 
 from mindbridge.infrastructure.local.store.rows import (
@@ -150,10 +151,10 @@ def row_blob(row: sqlite3.Row, column: str) -> bytes:
 
 def require_storable_vector(values: tuple[float, ...], *, normalized: bool) -> None:
     """Check vector content once, at the boundary where it becomes authoritative."""
-    if not values or not all(math.isfinite(value) for value in values):
+    if not values or not all(map(math.isfinite, values)):
         raise ValueError("embedding values must be finite and non-empty")
     if normalized and not math.isclose(
-        math.sqrt(sum(value * value for value in values)),
+        math.sqrt(sum(map(mul, values, values))),
         1.0,
         rel_tol=1e-4,
         abs_tol=1e-6,

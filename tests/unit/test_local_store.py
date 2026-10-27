@@ -298,6 +298,62 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
             store.index.write_embedding(_embedding(memory_id="missing-memory"))
 
 
+@pytest.mark.parametrize("version", [1, 16, 17, 18, 19, SCHEMA_VERSION + 1])
+def test_other_schema_versions_are_refused_without_changing_durable_data(
+    tmp_path: Path, version: int
+) -> None:
+    with LocalStore(tmp_path) as store:
+        store.records.write_memory(_memory(), (_embedding(),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.execute(f"PRAGMA user_version = {version}")
+        connection.commit()
+        before = tuple(connection.iterdump())
+
+    with pytest.raises(UnsupportedSchemaError, match=f"unsupported local schema version {version}"):
+        LocalStore(tmp_path)
+
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == version
+        assert tuple(connection.iterdump()) == before
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    with LocalStore(tmp_path) as store:
+        assert store.records.read_memory(_memory().memory_id) is not None
+
+
+def test_custom_lineages_keep_alias_claims_independent(tmp_path: Path) -> None:
+    recorded_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    claims = []
+    for memory_id, predicate, value in (
+        ("tea", "preferred_drink", "tea"),
+        ("coffee", "favorite_beverage", "coffee"),
+    ):
+        claim = _state_memory(
+            memory_id, "source", value, valid_from=recorded_at, recorded_at=recorded_at
+        )
+        assert claim.context is not None
+        claims.append(
+            replace(
+                claim,
+                context=replace(
+                    claim.context, lineage_id=f"custom:{memory_id}", predicate=predicate
+                ),
+            )
+        )
+    with LocalStore(tmp_path) as store:
+        store.records.write_memories((_memory("source"), *claims))
+    with LocalStore(tmp_path) as store:
+        for claim in claims:
+            restored = store.records.read_memory(claim.memory_id)
+            assert restored is not None and restored.context is not None
+            assert restored.context.lineage_id == f"custom:{claim.memory_id}"
+            assert restored.context.valid_until is None
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            assert connection.execute(
+                "SELECT predicate_key, predicate_match FROM memory_semantics "
+                "WHERE memory_id IN ('tea', 'coffee')"
+            ).fetchall() == [(None, "custom"), (None, "custom")]
+
+
 def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
     memory = _memory()
     embedding = _embedding()
@@ -488,70 +544,6 @@ def test_batch_write_ranked_hydration_and_keyset_listing(
         assert [memory.memory_id for memory in second_page] == ["memory-a"]
 
 
-def test_embedding_ids_in_range_uses_half_open_intervals_and_type(tmp_path: Path) -> None:
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    until = start + timedelta(days=1)
-    records = (
-        replace(_memory("point-from"), occurred_at=start, occurred_end=None),
-        replace(_memory("point-until"), occurred_at=until, occurred_end=None),
-        replace(
-            _memory("span-ending-at-from"),
-            occurred_at=start - timedelta(hours=2),
-            occurred_end=start,
-        ),
-        replace(
-            _memory("span-crossing-from"),
-            occurred_at=start - timedelta(hours=1),
-            occurred_end=start + timedelta(hours=1),
-        ),
-        replace(
-            _memory("episodic-point"),
-            occurred_at=start + timedelta(hours=2),
-            occurred_end=None,
-            memory_type="episodic",
-        ),
-    )
-    with LocalStore(tmp_path) as store:
-        for record in records:
-            embeddings: tuple[StoredEmbedding, ...] = (
-                _embedding(f"embedding-{record.memory_id}", record.memory_id),
-            )
-            if record.memory_id == "point-from":
-                embeddings += (
-                    _embedding(
-                        "embedding-point-from-part-1",
-                        record.memory_id,
-                        object_part=1,
-                    ),
-                )
-            store.records.write_memory(record, embeddings)
-
-        embedding_ids, total = store.index.embedding_ids_in_range(
-            start.astimezone(timezone(timedelta(hours=8))),
-            until.astimezone(timezone(timedelta(hours=8))),
-            space_id="test-space",
-            task="retrieval.document",
-        )
-        episodic_ids, episodic_total = store.index.embedding_ids_in_range(
-            start,
-            until,
-            space_id="test-space",
-            task="retrieval.document",
-            memory_type="episodic",
-        )
-
-    assert embedding_ids == frozenset(
-        {
-            "embedding-point-from",
-            "embedding-span-crossing-from",
-            "embedding-episodic-point",
-        }
-    )
-    assert total == 5
-    assert episodic_ids == frozenset({"embedding-episodic-point"})
-    assert episodic_total == 1
-
-
 def test_media_assets_round_trip_in_order_and_cache_transcript(tmp_path: Path) -> None:
     first = _asset()
     second = _asset(b"second image", name="second.png")
@@ -725,7 +717,7 @@ def test_orphan_prediction_uses_the_complete_deletion_set_across_sql_batches(
 def test_a_store_missing_the_caption_table_at_the_current_version_is_refused(
     tmp_path: Path,
 ) -> None:
-    """`_REQUIRED_TABLES` is what stops a half-migrated library from opening and writing."""
+    """Required tables prevent an incomplete database from opening and writing."""
     with LocalStore(tmp_path):
         pass
     with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:

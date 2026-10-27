@@ -72,6 +72,7 @@ from mindbridge.models.openai_sdk import (
 )
 from mindbridge.types import (
     AbstentionReason,
+    AnswerResult,
     AssetRef,
     EvidenceBasis,
     FormationProposal,
@@ -350,8 +351,10 @@ def test_embeddinggemma2_input_mode_keeps_generic_recipe() -> None:
     assert model.embedding_space == "google/embeddinggemma-2:2:l2-v1"
 
 
+@pytest.mark.parametrize("code", [None, 400, "context_length_exceeded"])
 def test_embedding_retries_a_context_length_rejection_as_ordered_stills(
     tmp_path: Path,
+    code: int | str | None,
 ) -> None:
     pytest.importorskip("PIL.Image")
     video = _video_asset(tmp_path, "clip", 12)
@@ -367,10 +370,13 @@ def test_embedding_retries_a_context_length_rejection_as_ordered_stills(
                 400,
                 json={
                     "error": {
+                        "code": code,
                         "message": (
-                            "The decoder prompt (length 58344) is longer than the maximum "
+                            "private provider detail"
+                            if code == "context_length_exceeded"
+                            else "The decoder prompt (length 58344) is longer than the maximum "
                             "model length of 35768."
-                        )
+                        ),
                     }
                 },
             )
@@ -1226,22 +1232,16 @@ def test_streamed_completion_dropped_by_the_peer_is_a_connection_failure(
     assert stream.closed is True
 
 
-@pytest.mark.parametrize("transport_name", ["httpx", "httpx2"])
-def test_provider_reason_classifies_transport_failures_from_either_http_library(
-    transport_name: str,
-) -> None:
-    # The locked environment runs the SDK on httpx2 and older ones on httpx; the exception that
-    # reaches the adapter belongs to whichever the installed SDK imported, so both are known.
-    transport = pytest.importorskip(transport_name)
-    request = transport.Request("POST", "https://sdk.example.test/v1/chat/completions")
+def test_provider_reason_classifies_sdk_transport_failures() -> None:
+    request = httpx.Request("POST", "https://sdk.example.test/v1/chat/completions")
     assert (
-        openai_backend._provider_reason(transport.RemoteProtocolError("dropped", request=request))
+        openai_backend._provider_reason(httpx.RemoteProtocolError("dropped", request=request))
         == "connection_failed"
     )
-    assert openai_backend._provider_reason(transport.ReadError("reset", request=request)) == (
+    assert openai_backend._provider_reason(httpx.ReadError("reset", request=request)) == (
         "connection_failed"
     )
-    assert openai_backend._provider_reason(transport.ReadTimeout("slow", request=request)) == (
+    assert openai_backend._provider_reason(httpx.ReadTimeout("slow", request=request)) == (
         "timeout"
     )
     # Unrelated failures stay unclassified rather than being guessed into a retry.
@@ -2891,7 +2891,9 @@ def test_stream_answer_records_exact_grounding_and_multimodal_usage(
     provider.shutdown()
 
     assert "".join(chunks) == "A greeting is audible."
-    assert grounded == (hit,)
+    assert isinstance(grounded, AnswerResult)
+    assert grounded.answer == "A greeting is audible."
+    assert grounded.hits == (hit,)
     assert grounded.abstention_reason is None
     attributes = exporter.get_finished_spans()[0].attributes
     assert attributes is not None
@@ -3125,6 +3127,38 @@ def test_multimodal_answer_budgets_the_final_text_parts(
         pytest.raises(ModelError, match="4 MiB"),
     ):
         _model(_sdk_client(client)).answer(question, hits)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("media", [False, True])
+def test_answer_text_ceiling_includes_system_prompt_before_reading_media(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stream: bool, media: bool
+) -> None:
+    # The user payload fits, but the complete input's UTF-8 text does not. No byte estimate
+    # here is a tokenizer: the model's context limit remains an independent provider constraint.
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"pixels")
+    question = ModelInput(text="Where?", assets=(image,) if media else ())
+    monkeypatch.setattr(
+        openai_backend, "_answer_system_prompt", lambda *_args, **_kwargs: "界" * 500
+    )
+    monkeypatch.setattr(openai_backend, "_MAX_GROUNDED_TEXT_BYTES", 1_000)
+
+    def unexpected_media_read(_asset: AssetRef) -> str:
+        pytest.fail("oversized complete text read media before rejection")
+
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        pytest.fail("oversized complete text reached the provider")
+
+    monkeypatch.setattr(openai_backend, "_asset_data", unexpected_media_read)
+    with httpx.Client(transport=httpx.MockTransport(unexpected_request)) as client:
+        model = _model(_sdk_client(client))
+        with pytest.raises(ModelError) as failure:
+            if stream:
+                list(model.stream_answer(question, (_search_hit(),)))
+            else:
+                model.answer(question, (_search_hit(),))
+    assert failure.value.reason == "payload_too_large"
+    assert failure.value.stage == "generate"
 
 
 def test_answer_uses_standard_inline_audio_part(tmp_path: Path) -> None:
@@ -5015,6 +5049,25 @@ def test_the_recall_planner_prompt_describes_every_op_and_shape() -> None:
         assert f"- {shape}:" in prompt
 
 
+def test_semantic_recall_capability_changes_the_actual_planner_system_instruction() -> None:
+    from mindbridge.recall import SEMANTIC_QUERY_CAPABILITY
+
+    requests: list[dict[str, object]] = []
+    plan = '{"shape":"point","steps":[{"op":"similar","query":"bridge span"}]}'
+    with httpx.Client(transport=_answer_policy_transport(requests, plan)) as client:
+        _model(_sdk_client(client)).plan_recall(
+            "which bridge?",
+            reference_at=NOW,
+            corpus_digest=f"30 text records\n{SEMANTIC_QUERY_CAPABILITY}",
+        )
+
+    messages = cast(list[dict[str, str]], requests[0]["messages"])
+    system = messages[0]["content"]
+    assert "executes a text search for query" in system
+    assert "over the question as asked, `k` deep" not in system
+    assert "At most two additional searches" in system
+
+
 def test_a_planner_that_replied_with_nothing_reports_an_invalid_response() -> None:
     """It is reported, not smoothed over: the kernel's own fallback is what keeps `ask` running.
 
@@ -5276,4 +5329,5 @@ def test_streaming_best_effort_yields_the_marker_but_completes_with_the_clean_an
     assert "".join(deltas) == f"{openai_backend._ABSTENTION_MARKER}\nProbably blue."
     assert grounded.answer == "Probably blue."
     assert grounded.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
-    assert tuple(grounded) == (hit,)
+    assert isinstance(grounded, AnswerResult)
+    assert grounded.hits == (hit,)

@@ -10,15 +10,14 @@ from __future__ import annotations
 import builtins
 from collections import Counter
 from collections.abc import Generator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, suppress
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
 from math import ceil
 from time import perf_counter
-from typing import Any, cast
+from typing import cast
 
 from opentelemetry import trace
 from opentelemetry.trace import Tracer
@@ -36,8 +35,18 @@ from mindbridge._telemetry import (
     RECALL_FALLBACK,
     RECALL_NON_SELECTIVE_STEPS,
     RECALL_OPS,
+    RECALL_QUERY_BUDGET_DROPPED,
+    RECALL_QUERY_CANDIDATES,
+    RECALL_QUERY_COUNT,
+    RECALL_QUERY_FAILURES,
+    RECALL_QUERY_GROUNDED,
+    RECALL_QUERY_LIMITED,
+    RECALL_QUERY_NEW_CANDIDATES,
+    RECALL_QUERY_OMITTED,
+    RECALL_QUERY_SELECTED,
     RECALL_REPLAN,
     RECALL_SHAPE,
+    _record_generation_inputs,
     _record_retrieval_results,
     current_model_request_count,
     mark_model_requests,
@@ -48,6 +57,7 @@ from mindbridge.infrastructure.local.store import LocalStore, RecallRead, dateti
 from mindbridge.kernel.content import PreparedContent, memory_modality
 from mindbridge.kernel.contracts import Backends, fallback_unsupported, require_audio_transcription
 from mindbridge.kernel.derived import derived_text, has_stream_description, has_stream_transcript
+from mindbridge.kernel.execution import Execution
 from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.lifecycle import Lifecycle, OperationAssets
 from mindbridge.kernel.materialization import Materializer
@@ -70,10 +80,16 @@ from mindbridge.kernel.validation import (
     validated_retrieval_scope,
 )
 from mindbridge.kernel.vision import Vision
-from mindbridge.models.base import ModelInput, RecallPlanningBackend, StreamingGenerationBackend
+from mindbridge.models.base import (
+    GenerationBackend,
+    ModelInput,
+    RecallPlanningBackend,
+    StreamingGenerationBackend,
+)
 from mindbridge.recall import (
     RECALL_NON_SELECTIVE_MIN_ROWS,
     RECALL_NON_SELECTIVE_SHARE,
+    SEMANTIC_QUERY_CAPABILITY,
     RecallPlan,
     RecallResult,
     RecallRows,
@@ -83,7 +99,6 @@ from mindbridge.recall import (
     recall_note,
 )
 from mindbridge.types import (
-    AbstentionReason,
     AnswerChunk,
     AnswerPolicy,
     AnswerResult,
@@ -100,6 +115,9 @@ from mindbridge.types import (
 # matched every clip in the corpus is bounded here rather than by the character budget alone.
 _RECALL_MEDIA_FACTOR = 2
 
+# A per-ask ceiling, shared by all steps and replans, including a deeper original-query read.
+_RECALL_QUERY_LIMIT = 2
+
 
 ASYNC_QUEUE_TIME_MS: ContextVar[float | None] = ContextVar(
     "mindbridge_async_queue_time_ms",
@@ -111,16 +129,17 @@ ASYNC_QUEUE_TIME_MS: ContextVar[float | None] = ContextVar(
 class _RecallContext:
     """What one answering round needs, so a second round repeats nothing but the reading."""
 
+    answerer: GenerationBackend
     prepared: PreparedContent
     routed: ModelInput
     assets: OperationAssets
-    # The ranked hits this question already earned. A plan's `similar` step is this list, cut to
-    # its own depth: the ranking is over the question as asked, media and temporal window
-    # included, and re-running it against a rewritten query would be query rewriting -- a
-    # separate mechanism, measured separately, and a measured null here.
+    # The original question's ranking stays the grounding floor. Semantic expansion is a
+    # separate opt-in experiment; its query-local scores never replace or rerank this list.
     ranked: tuple[SearchHit, ...]
+    ranked_depth: int
     limit: int
     reference: datetime
+    temporal_range: tuple[datetime, datetime] | None
     scope: RetrievalScope | None
     memory_type: MemoryType | None
     link_identities: bool
@@ -140,15 +159,90 @@ class _RecallReads:
         store: LocalStore,
         hydrator: Hydrator,
         context: _RecallContext,
+        retrieval: Retrieval | None = None,
     ) -> None:
         self._store = store
         self._hydrator = hydrator
         self._context = context
+        self._retrieval = retrieval
+        original = context.prepared.text.strip()
+        self._cache = {original: context.ranked}
+        self._depths = {original: context.ranked_depth}
+        self._searched: set[str] = set()
+        self._unavailable: set[str] = set()
+        self.queries = 0
+        self.failures = 0
+        self.limited: set[str] = set()
 
     def similar(self, query: str, *, k: int) -> RecallRows:
-        del query
-        rows = self._context.ranked[:k]
+        if self._retrieval is None:
+            rows = self._context.ranked[:k]
+            return RecallRows(rows, len(rows))
+        query = query.strip()
+        if k > self._depths.get(query, 0):
+            if self.queries >= _RECALL_QUERY_LIMIT:
+                self.limited.add(query)
+                self._unavailable.add(query)
+                return RecallRows(self._cache.get(query, ())[:k], k)
+            self.queries += 1
+            # Query strings are untrusted model output, interpreted only as text. A rewrite
+            # cannot replace the original media, reference clock, temporal intent or scope.
+            prepared = (
+                self._context.prepared
+                if query == self._context.prepared.text.strip()
+                else PreparedContent(query, (), Modality.TEXT, (("text", query),))
+            )
+            try:
+                rows = self._retrieval.search_prepared(
+                    prepared,
+                    limit=RERANK_CANDIDATES,
+                    operation=self._context.assets,
+                    memory_types=pushed_memory_types(self._context.memory_type),
+                    reference_at=self._context.reference,
+                    temporal_range=self._context.temporal_range,
+                    occurred_from=None,
+                    occurred_until=None,
+                    scope=self._context.scope,
+                    require_unambiguous=False,
+                    capture_trace=False,
+                ).hits
+            except ModelError:
+                # An optional expansion failure must not cost the evidence already earned.
+                # Cache the failure too: repeated steps and replans do not retry a paid call.
+                self.failures += 1
+                self._unavailable.add(query)
+                rows = self._cache.get(query, ())
+            else:
+                self._searched.add(query)
+            self._cache[query] = rows
+            self._depths[query] = RERANK_CANDIDATES
+        rows = self._cache[query][:k]
         return RecallRows(rows, len(rows))
+
+    def semantic_routes(self, plan: RecallPlan) -> tuple[tuple[SearchHit, ...], ...]:
+        """Return each executed query once, at the deepest depth this plan requested."""
+        depths: builtins.dict[str, int] = {}
+        for step in plan.steps:
+            query = (step.query or "").strip()
+            if step.op == "similar" and query in self._searched:
+                depths[query] = max(depths.get(query, 0), step.k)
+        return tuple(self._cache[query][:depth] for query, depth in depths.items())
+
+    def mark_unread(self, program: RecallResult) -> RecallResult:
+        """A failed anchor cannot make its dependent exhaustive reads complete."""
+        if not self._unavailable:
+            return program
+        unread: set[int] = set()
+        executed = list(program.executed)
+        for index, step in enumerate(program.plan.steps):
+            if (
+                (step.op == "similar" and (step.query or "").strip() in self._unavailable)
+                or step.of in unread
+                or step.time_of in unread
+            ):
+                unread.add(index)
+                executed[index] = replace(executed[index], bounded=True)
+        return replace(program, executed=tuple(executed))
 
     def match(
         self,
@@ -591,6 +685,7 @@ class Answering(Traced):
         speech: Speech,
         vision: Vision,
         retrieval: Retrieval,
+        execution: Execution,
     ) -> None:
         super().__init__(tracer)
         self._store = storage.store
@@ -603,6 +698,7 @@ class Answering(Traced):
         self._speech = speech
         self._vision = vision
         self._retrieval = retrieval
+        self._execution = execution
 
     def ask(
         self,
@@ -645,9 +741,16 @@ class Answering(Traced):
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         validate_limit(limit, maximum=100)
         validate_answer_policy(answer_policy)
-        self._require_answerer()
+        answerer = self._backends.answerer
+        if answerer is None:
+            raise ModelError(
+                "answer backend is not configured",
+                reason="backend_not_configured",
+                stage="generate",
+            )
         return self._ask_chunks(
             question,
+            answerer=answerer,
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
@@ -656,18 +759,11 @@ class Answering(Traced):
             answer_policy=answer_policy,
         )
 
-    def _require_answerer(self) -> None:
-        if self._backends.answerer is None:
-            raise ModelError(
-                "answer backend is not configured",
-                reason="backend_not_configured",
-                stage="generate",
-            )
-
     def _ask_chunks(
         self,
         question: ContentInput,
         *,
+        answerer: GenerationBackend,
         limit: int,
         memory_type: MemoryType | None,
         reference_at: datetime | None,
@@ -677,6 +773,7 @@ class Answering(Traced):
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         answer = yield from self._ask_operation(
             question,
+            answerer=answerer,
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
@@ -695,6 +792,7 @@ class Answering(Traced):
         self,
         question: ContentInput,
         *,
+        answerer: GenerationBackend,
         limit: int,
         memory_type: MemoryType | None,
         reference_at: datetime | None,
@@ -711,9 +809,6 @@ class Answering(Traced):
             queue_time_ms = ASYNC_QUEUE_TIME_MS.get()
             if queue_time_ms is not None:
                 span.set_attribute(ASYNC_QUEUE_TIME, queue_time_ms)
-            validate_limit(limit, maximum=100)
-            validate_answer_policy(answer_policy)
-            self._require_answerer()
             # `search()` opens a `mindbridge.search` operation span; `ask` reaches the same
             # retrieval plane directly. Keep its stage around every prerequisite through ranked
             # hits so the reported leg matches what answering actually waits for.
@@ -728,19 +823,21 @@ class Answering(Traced):
                 )
                 temporal_range = query_temporal_range(temporal_text, reference)
                 scope = validated_retrieval_scope(scope)
+                memory_type = optional_memory_type(memory_type)
+                ranked_depth = (
+                    RERANK_CANDIDATES
+                    if self._settings.evidence_budget is not None
+                    else min(100, limit * 3)
+                )
                 prepared_search = partial(
                     self._retrieval.search_prepared,
                     prepared,
                     # Without a budget the answer grounds on `limit` hits, so ranking three times
                     # that is enough headroom for the modality round robin. With one, the budget is
                     # what decides depth, so the whole rerank pool has to be ranked for it to spend.
-                    limit=(
-                        RERANK_CANDIDATES
-                        if self._settings.evidence_budget is not None
-                        else min(100, limit * 3)
-                    ),
+                    limit=ranked_depth,
                     operation=assets,
-                    memory_types=pushed_memory_types(optional_memory_type(memory_type)),
+                    memory_types=pushed_memory_types(memory_type),
                     reference_at=reference,
                     temporal_range=temporal_range,
                     occurred_from=None,
@@ -754,14 +851,9 @@ class Answering(Traced):
                     Modality(asset.modality) in self._backends.embedding_capabilities
                     for asset in speech_assets
                 ):
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        context = copy_context()
-                        identities = executor.submit(
-                            context.run,
-                            self._speech.recognize,
-                            speech_assets,
-                            assets,
-                        )
+                    with self._execution.overlap_speech(
+                        self._speech.recognize, speech_assets, assets
+                    ) as identities:
                         hits = prepared_search().hits
                         _record_retrieval_results(hits)
                         identities.result()
@@ -771,6 +863,7 @@ class Answering(Traced):
                     hits = prepared_search().hits
                     _record_retrieval_results(hits)
             round_context = _RecallContext(
+                answerer=answerer,
                 prepared=prepared,
                 # Every question the answerer reads as text gets the reference time, not just the
                 # ones whose phrasing a parser recognized. "How long ago did grandpa visit?"
@@ -783,10 +876,12 @@ class Answering(Traced):
                 routed=self._route_generation(prepared, assets),
                 assets=assets,
                 ranked=hits,
+                ranked_depth=ranked_depth,
                 limit=limit,
                 reference=reference,
+                temporal_range=temporal_range,
                 scope=scope,
-                memory_type=optional_memory_type(memory_type),
+                memory_type=memory_type,
                 link_identities=link_identities,
                 answer_policy=answer_policy,
             )
@@ -959,10 +1054,16 @@ class Answering(Traced):
         round, the common case and always the last one, streams as the provider produces it.
         """
         attempted = ""
+        reads = _RecallReads(
+            self._store,
+            self._hydrator,
+            context,
+            self._retrieval if self._settings.recall_query_expansion else None,
+        )
         for attempt in range(self._settings.recall_rounds if self._settings.recall_planning else 1):
             held: builtins.list[str] = []
             replannable = self._replan_possible(context, attempt=attempt)
-            with closing(self._recall_round(context, attempted=attempted)) as deltas:
+            with closing(self._recall_round(context, reads, attempted=attempted)) as deltas:
                 while True:
                     try:
                         delta = next(deltas)
@@ -982,6 +1083,7 @@ class Answering(Traced):
     def _recall_round(
         self,
         context: _RecallContext,
+        reads: _RecallReads,
         *,
         attempted: str,
     ) -> Generator[str, None, tuple[AnswerResult, tuple[SearchHit, ...]]]:
@@ -991,8 +1093,10 @@ class Answering(Traced):
         has always run: the ranking's own grounding window, the routed question with the
         reference clock last, then the answer.
         """
-        program = self._recall_program(context, attempted=attempted)
+        program = self._recall_program(context, reads, attempted=attempted)
         hits, note = self._grounded_recall(program, context)
+        if program is not None and self._settings.recall_query_expansion:
+            hits, note = self._ground_semantic_recall(program, reads, context, hits, note)
         routed = context.routed
         question = (
             _with_reference_time(_with_recall_note(routed, note), context.reference)
@@ -1013,6 +1117,7 @@ class Answering(Traced):
             self._answer_chunks(
                 question,
                 routed_hits,
+                answerer=context.answerer,
                 answer_policy=context.answer_policy,
                 # The reader cannot see that these rows are a predicate's whole set in time order
                 # rather than a ranking, and the note above says they are, so the prompt's own
@@ -1023,7 +1128,9 @@ class Answering(Traced):
             result = yield from deltas
         return result, hits
 
-    def _recall_program(self, context: _RecallContext, *, attempted: str) -> RecallResult | None:
+    def _recall_program(
+        self, context: _RecallContext, reads: _RecallReads, *, attempted: str
+    ) -> RecallResult | None:
         """Plan and run this question's reads, or None when planning is off.
 
         Inside its own stage: the `mindbridge.retrieve` leg closes on the ranked hits, and the
@@ -1043,13 +1150,14 @@ class Answering(Traced):
             )
             program = execute(
                 plan,
-                _RecallReads(self._store, self._hydrator, context),
+                reads,
                 limit=k,
                 # The digest the planner was already handed, recomputed only after a commit, so
                 # the selectivity of every step is decided against one cached read per question
                 # rather than a count per step.
                 active_records=self._store.recall.recall_digest().records,
             )
+            program = reads.mark_unread(program)
             span.set_attributes(
                 {
                     RECALL_SHAPE: plan.shape,
@@ -1065,6 +1173,67 @@ class Answering(Traced):
                 }
             )
             return program
+
+    def _ground_semantic_recall(
+        self,
+        program: RecallResult,
+        reads: _RecallReads,
+        context: _RecallContext,
+        required: tuple[SearchHit, ...],
+        note: str | None,
+    ) -> tuple[tuple[SearchHit, ...], str | None]:
+        """Append bounded query-local evidence, preserving all original grounding.
+
+        Scores from distinct queries are not comparable. Each query can add at most one
+        `limit`-sized window, after dedup; the character and media caps may narrow it further.
+        The same limits apply to point and exhaustive plans, without licensing set totals.
+        """
+        routes = reads.semantic_routes(program.plan)
+        candidates = {hit.id for route in routes for hit in route}
+        taken = {hit.id for hit in required}
+        offered: builtins.list[SearchHit] = []
+        for route in routes:
+            count = 0
+            for hit in route:
+                if hit.id not in taken:
+                    offered.append(hit)
+                    taken.add(hit.id)
+                    count += 1
+                    if count >= context.limit:
+                        break
+        budget = self._settings.recall_set_budget
+        if self._settings.evidence_budget is not None:
+            budget = min(budget, self._settings.evidence_budget)
+        with self._trace("mindbridge.recall.ground", kind="stage") as span:
+            hits, added = _packed_grounding(
+                required, offered, (), budget, media_limit=_RECALL_MEDIA_FACTOR * context.limit
+            )
+            required_ids = {hit.id for hit in required}
+            novel = candidates - required_ids
+            span.set_attributes(
+                {
+                    # Query counts are cumulative per ask; candidate/grounding counts describe
+                    # this round. Counts only: no query, evidence or provider failure text.
+                    RECALL_QUERY_COUNT: reads.queries,
+                    RECALL_QUERY_FAILURES: reads.failures,
+                    RECALL_QUERY_LIMITED: len(reads.limited),
+                    RECALL_QUERY_CANDIDATES: len(candidates),
+                    RECALL_QUERY_NEW_CANDIDATES: len(
+                        candidates - {hit.id for hit in context.ranked}
+                    ),
+                    RECALL_QUERY_GROUNDED: added,
+                    RECALL_QUERY_SELECTED: len(offered),
+                    RECALL_QUERY_BUDGET_DROPPED: len(offered) - added,
+                    RECALL_QUERY_OMITTED: len(novel) - added,
+                }
+            )
+        if added:
+            semantic_note = (
+                f"{added} further records from bounded semantic queries follow the original "
+                "evidence. They are not a complete set: do not state a total over them."
+            )
+            note = f"{note} {semantic_note}" if note else semantic_note
+        return hits, note
 
     def _grounded_recall(
         self,
@@ -1084,6 +1253,15 @@ class Answering(Traced):
         down to a refusal the unplanned path had answered. A plan says what else is relevant; it
         never says the ranking was wrong.
         """
+        if program is not None and self._settings.recall_query_expansion:
+            # Preserve the default program's ranked contribution. Query-local rows must pass
+            # the semantic row/media caps even when a plan also contains exhaustive reads.
+            depth = max((step.k for step in program.plan.steps if step.op == "similar"), default=0)
+            matched = {hit.id for hit in program.exhaustive}
+            program = replace(
+                program,
+                ranked=tuple(hit for hit in context.ranked[:depth] if hit.id not in matched),
+            )
         if program is None or not program.plan.exhaustive:
             budget = self._settings.evidence_budget
             if not self._settings.evidence_expansion:
@@ -1098,9 +1276,9 @@ class Answering(Traced):
                 media_limit=_RECALL_MEDIA_FACTOR * context.limit,
             )
             return hits, (expansion_note(added, expansion) if added else None)
-        # `evidence_budget_chars` is what a caller who cares about prompt size sets, and a set
-        # plan used to walk straight past it. The set budget may narrow that ceiling and never
-        # widen it; with no ceiling set, the set budget is the only bound.
+        # Both settings constrain supplemental packing, after charging the mandatory ranked
+        # window. A set plan may narrow that allowance, never widen it. Neither setting trims
+        # the mandatory window or promises a provider input limit.
         budget = (
             self._settings.recall_set_budget
             if self._settings.evidence_budget is None
@@ -1219,16 +1397,23 @@ class Answering(Traced):
             modalities=(Modality.TEXT,),
         ):
             mark_model_requests(1)
-            # The protocol is `runtime_checkable`, so `isinstance` proves the method exists and
-            # not that it takes this keyword. A backend written against the shorter signature
-            # keeps planning as long as the first round asks for nothing new.
-            previous: builtins.dict[str, str] = {} if not attempted else {"attempted": attempted}
+            digest = self._corpus_digest()
+            if self._settings.recall_query_expansion:
+                digest += (
+                    f"\n{SEMANTIC_QUERY_CAPABILITY}\n"
+                    "similar.query executes "
+                    "a text search for that query within the original scope and temporal intent. "
+                    "At most two additional searches are allowed across all attempts; repeated "
+                    "queries reuse results. Preserve the question's intent; use a focused "
+                    "query for a missing fact rather than an invented answer. Semantic results "
+                    "are bounded rankings and never establish completeness."
+                )
             try:
                 payload = planner.plan_recall(
                     question,
                     reference_at=reference_at,
-                    corpus_digest=self._corpus_digest(),
-                    **previous,
+                    corpus_digest=digest,
+                    attempted=attempted,
                 )
             except ModelError:
                 # Planning is not answering. A provider that refused this call has said nothing
@@ -1260,6 +1445,7 @@ class Answering(Traced):
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
+        answerer: GenerationBackend,
         answer_policy: AnswerPolicy = "strict",
         exhaustive: bool = False,
     ) -> Generator[str, None, AnswerResult]:
@@ -1268,13 +1454,7 @@ class Answering(Traced):
         A backend without `stream_answer` yields its whole answer as one delta, so every caller
         sees the same shape and `ask_stream()` never requires a streaming provider.
         """
-        if self._backends.answerer is None:
-            raise ModelError(
-                "answer backend is not configured",
-                reason="backend_not_configured",
-                stage="generate",
-            )
-        model = getattr(self._backends.answerer, "generation_model", None)
+        model = getattr(answerer, "generation_model", None)
         with self._model_trace(
             "generation",
             "chat",
@@ -1287,28 +1467,22 @@ class Answering(Traced):
             ),
         ):
             mark_model_requests(1)
+            _record_generation_inputs(tuple(hits))
             buffered = False
-            # The protocols are `runtime_checkable`, so `isinstance` proves the method exists but
-            # not that it takes these keywords. A backend written against the two-argument
-            # signature keeps working as long as the defaults ask for nothing new, so each one is
-            # sent only when the caller or the plan moved it off its default.
-            policy: dict[str, Any] = (
-                {} if answer_policy == "strict" else {"answer_policy": answer_policy}
-            )
-            if exhaustive:
-                policy["exhaustive"] = True
             try:
-                if isinstance(self._backends.answerer, StreamingGenerationBackend):
+                if isinstance(answerer, StreamingGenerationBackend):
                     started = perf_counter()
                     parts: builtins.list[str] = []
-                    stream = iter(self._backends.answerer.stream_answer(question, hits, **policy))
-                    used_hits: object = None
+                    stream = answerer.stream_answer(
+                        question, hits, answer_policy=answer_policy, exhaustive=exhaustive
+                    )
+                    result: object = None
                     try:
                         while True:
                             try:
                                 part = next(stream)
                             except StopIteration as completed:
-                                used_hits = completed.value
+                                result = completed.value
                                 break
                             if not isinstance(part, str):
                                 raise ModelError(
@@ -1328,67 +1502,23 @@ class Answering(Traced):
                         # frame's last reference is interpreter-dependent: 3.12 collects it at
                         # once, 3.10 does not, so the response stayed open there. Closing it
                         # here makes the release deterministic on every supported version.
-                        release = getattr(stream, "close", None)
-                        if callable(release):
-                            release()
+                        stream.close()
                     answer = "".join(parts)
                     if not answer.strip():
                         raise ModelError(
                             "generation model returned an invalid answer", reason="response_invalid"
                         )
-                    if isinstance(used_hits, AnswerResult):
-                        if used_hits.answer != answer:
-                            raise ModelError(
-                                "generation model returned an invalid answer",
-                                reason="response_invalid",
-                            )
-                        result = used_hits
-                    elif used_hits is None:
-                        grounded = tuple(hits)
-                    elif isinstance(used_hits, tuple) and all(
-                        isinstance(hit, SearchHit) for hit in used_hits
+                    if not isinstance(result, AnswerResult) or (
+                        answer_policy == "strict" and result.answer != answer
                     ):
-                        grounded = used_hits
-                        # A backend may report an answer that is not the concatenated deltas:
-                        # under `best_effort` the stream carries a low-confidence marker line
-                        # that belongs to `abstained`, not to the prose the caller shows. The
-                        # default path never consults `.answer`, so a hit sequence that happens
-                        # to carry that attribute cannot replace a caller's deltas there.
-                        reported = (
-                            None
-                            if answer_policy == "strict"
-                            else getattr(used_hits, "answer", None)
-                        )
-                        if reported is not None:
-                            if not isinstance(reported, str) or not reported.strip():
-                                raise ModelError(
-                                    "generation model returned an invalid answer",
-                                    reason="response_invalid",
-                                )
-                            answer = reported
-                        abstention_reason = getattr(used_hits, "abstention_reason", None)
-                        if abstention_reason is not None and not isinstance(
-                            abstention_reason, AbstentionReason
-                        ):
-                            raise ModelError(
-                                "generation model returned invalid abstention status",
-                                reason="response_invalid",
-                            )
-                    else:
                         raise ModelError(
-                            "generation model returned invalid grounding hits",
+                            "generation model returned an invalid answer",
                             reason="response_invalid",
                         )
-                    if not isinstance(used_hits, AnswerResult):
-                        reason = abstention_reason if isinstance(used_hits, tuple) else None
-                        result = AnswerResult(
-                            answer=answer,
-                            hits=grounded,
-                            abstained=reason is not None,
-                            abstention_reason=reason,
-                        )
                 else:
-                    result = self._backends.answerer.answer(question, hits, **policy)
+                    result = answerer.answer(
+                        question, hits, answer_policy=answer_policy, exhaustive=exhaustive
+                    )
                     buffered = True
             except MindBridgeError:
                 raise

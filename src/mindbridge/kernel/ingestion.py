@@ -21,7 +21,6 @@ from mindbridge.kernel.content import (
     PreparedMemory,
     embedding_row_id,
     prepare_memory,
-    resolve_prepared_memory_ids,
     stored_memory_context,
     text_selector_map,
 )
@@ -347,15 +346,6 @@ class Ingestion(Traced):
                 memory_type=memory_type,
                 context=context,
             )
-            if prepared.legacy_memory_id is not None:
-                with (
-                    self._trace("mindbridge.storage.lookup", kind="stage"),
-                    translate_storage_errors("check existing memory"),
-                ):
-                    candidates = self._store.records.read_memories(
-                        (prepared.memory_id, prepared.legacy_memory_id)
-                    )
-                prepared = resolve_prepared_memory_ids((prepared,), candidates)[0]
             # Reject here what `add()` would reject, before the commit. Committing media no
             # configured model can ever take would make the record durable and then fail every
             # `settle()` forever, which is a queue entry no retry ceiling should have to absorb.
@@ -548,22 +538,13 @@ class Ingestion(Traced):
         *,
         operation: OperationAssets,
     ) -> tuple[MemoryRecord, ...]:
-        lookup_ids = tuple(
-            dict.fromkeys(
-                candidate
-                for memory in prepared
-                for candidate in (memory.memory_id, memory.legacy_memory_id)
-                if candidate is not None
-            )
-        )
+        unique = {memory.memory_id: memory for memory in prepared}
+        ordered_ids = tuple(unique)
         with (
             self._trace("mindbridge.storage.lookup", kind="stage"),
             translate_storage_errors("check existing memories"),
         ):
-            candidates = self._store.records.read_memories(lookup_ids)
-        prepared = resolve_prepared_memory_ids(prepared, candidates)
-        unique = {memory.memory_id: memory for memory in prepared}
-        ordered_ids = tuple(unique)
+            candidates = self._store.records.read_memories(ordered_ids)
         candidates_by_id = {row.memory_id: row for row in candidates}
         existing_rows = tuple(
             candidates_by_id[memory_id]

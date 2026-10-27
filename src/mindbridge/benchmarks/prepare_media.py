@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, TypeAlias, TypeVar
 from urllib.parse import urlparse
 
 from mindbridge.benchmarks.download import acquire_media
+from mindbridge.benchmarks.eval_adapters import MediaManifest
 from mindbridge.benchmarks.task_catalog import TaskSpec
 
 if TYPE_CHECKING:
@@ -104,7 +105,7 @@ def prepare_task_media(
     root: Path,
     dataset_path: Path,
     media_root: Path | None,
-    manifest: Mapping[str, object] | None,
+    manifest: MediaManifest | None,
     limit: Limit,
     offset: int,
     download: bool,
@@ -252,11 +253,8 @@ def _acquire_selected(
     return {}
 
 
-def _manifest_has_task(manifest: Mapping[str, object] | None, task_name: str) -> bool:
-    if manifest is None:
-        return False
-    tasks = manifest.get("tasks")
-    return isinstance(tasks, dict) and task_name in tasks
+def _manifest_has_task(manifest: MediaManifest | None, task_name: str) -> bool:
+    return manifest is not None and task_name in manifest.tasks
 
 
 def _selected_patterns(spec: TaskSpec, dataset: Path, limit: Limit, offset: int) -> tuple[str, ...]:

@@ -22,11 +22,18 @@ def test_global_help_lists_only_supported_runners_without_importing_them(
     assert cli.main([]) == 0
 
     printed = capsys.readouterr().out
-    assert set(cli.RUNNERS) == {"control-plane", "eval", "local-index", "locomo-refined"}
+    assert set(cli.RUNNERS) == {
+        "control-plane",
+        "eval",
+        "local-index",
+        "locomo-refined",
+        "review-samples",
+    }
     assert "control-plane" in printed
     assert "eval" in printed
     assert "local-index" in printed
     assert "locomo-refined" in printed
+    assert "review-samples" in printed
     for removed in ("m3", "aml", "datasets", "jina", "score"):
         assert removed not in printed
 
@@ -38,6 +45,7 @@ def test_dispatch_lazily_calls_each_supported_runner(
     local = ModuleType("local")
     locomo = ModuleType("locomo")
     evaluation = ModuleType("evaluation")
+    review = ModuleType("review")
 
     def local_main(argv: Sequence[str], *, prog: str | None = None) -> int:
         calls.append(("local-index", tuple(argv), prog))
@@ -51,11 +59,18 @@ def test_dispatch_lazily_calls_each_supported_runner(
         calls.append(("eval", tuple(argv), prog))
         return 0
 
+    def review_main(argv: Sequence[str], *, prog: str | None = None) -> int:
+        calls.append(("review-samples", tuple(argv), prog))
+        return 0
+
     local.main = local_main  # type: ignore[attr-defined]
     locomo.main = locomo_main  # type: ignore[attr-defined]
     evaluation.main = eval_main  # type: ignore[attr-defined]
+    review.main = review_main  # type: ignore[attr-defined]
 
     def imported(name: str) -> ModuleType:
+        if name.endswith("eval_review"):
+            return review
         if name.endswith("locomo_refined_cli"):
             return locomo
         return evaluation if name.endswith(".eval") else local
@@ -65,6 +80,7 @@ def test_dispatch_lazily_calls_each_supported_runner(
     assert cli.main(["local-index", "--rows", "10"]) == 0
     assert cli.main(["locomo-refined", "--limit", "2"]) == 0
     assert cli.main(["eval", "--tasks", "video-mme-v2"]) == 0
+    assert cli.main(["review-samples", "--samples", "samples.jsonl"]) == 0
     assert calls == [
         ("local-index", ("--rows", "10"), "mindbridge-bench local-index"),
         (
@@ -73,6 +89,7 @@ def test_dispatch_lazily_calls_each_supported_runner(
             "mindbridge-bench locomo-refined",
         ),
         ("eval", ("--tasks", "video-mme-v2"), "mindbridge-bench eval"),
+        ("review-samples", ("--samples", "samples.jsonl"), "mindbridge-bench review-samples"),
     ]
 
 

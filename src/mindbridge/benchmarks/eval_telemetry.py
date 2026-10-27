@@ -125,6 +125,8 @@ class SampleGrounding:
     media_elided_hits: int
     recall_shape: str | None = None
     request: Mapping[str, object] | None = None
+    trace_id: str | None = None
+    answer_span_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -551,7 +553,6 @@ class _NodeDimensions:
 
     def json(self) -> dict[str, object]:
         return {
-            "model": self.requested_model,
             "requested_model": self.requested_model,
             "response_model": self.response_model,
             "response_models": self.response_models,
@@ -1166,6 +1167,16 @@ class EvaluationTelemetry(SpanProcessor):
                 self._tasks.setdefault((task, selected_arm), _TaskTelemetry()).add(span)
             if sample is not None:
                 grounding = self._samples.get(sample, SampleGrounding(0, 0))
+                if (
+                    span.name == BENCHMARK_ANSWER_SPAN
+                    and span_context is not None
+                    and span_context.is_valid
+                ):
+                    grounding = replace(
+                        grounding,
+                        trace_id=f"{span_context.trace_id:032x}",
+                        answer_span_id=f"{span_context.span_id:016x}",
+                    )
                 if (
                     _string_attribute(attributes, SPAN_KIND) == "model"
                     and _int_attribute(attributes, MODEL_REQUEST_COUNT) != 0

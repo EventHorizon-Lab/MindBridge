@@ -161,9 +161,9 @@ A durable write commits SQLite before applying Zvec changes. Zvec work is acknow
 the index flush succeeds, and that flush is batched behind the writes it covers, which are
 searchable as soon as they are applied; startup, add, delete, search, `reindex`, and `optimize`
 drain pending work.
-A missing Zvec collection or an index-recipe change can be rebuilt from stored embeddings without
-re-embedding content; an embedding-space change is a separate migration and can require
-re-embedding. Search always hydrates candidates from SQLite, so a stale index ID cannot resurrect a
+A missing Zvec collection or a change to current index quantization can be rebuilt from stored
+embeddings without re-embedding content. A different embedding space or older index recipe
+requires re-ingestion into a fresh directory. Search always hydrates candidates from SQLite, so a stale index ID cannot resurrect a
 deleted record. See [write and retrieval consistency](architecture.md#write-consistency) for
 failure ordering and recovery behavior.
 
@@ -178,6 +178,9 @@ Ranking combines semantic or lexical relevance with optional temporal proximity,
 confidence, reinforcement, and configured retention decay. The relevance floor controls evidence
 admission; an empty result is normal. With `limit=1`, an unresolved top-two ambiguity can also
 produce no result. `SearchHit.score` ranks hits within one request and is not a probability.
+Lexical route membership does not bypass this check: even complete query-term coverage may match
+conflicting records. Multiple-result requests retain alternatives; `ambiguity_margin=0` disables
+the singleton check.
 
 `search_with_trace`, or `explain=true` on REST and MCP search, returns bounded candidate diagnostics
 and terminal rejection reasons. Traces intentionally exclude memory content and metadata; use the

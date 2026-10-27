@@ -1,0 +1,197 @@
+{
+  "checked_on": "2026-10-27",
+  "scope": "Independent primary-source check of the existing research report, with the fixed-pool evaluation supplement. No model weights, training or inference runs.",
+  "literature_search": {
+    "sources": [
+      "alphaXiv keyword",
+      "alphaXiv embedding",
+      "OpenAlex"
+    ],
+    "publication_before_inclusive": "2026-10-27",
+    "publication_after": null,
+    "priority": "default",
+    "facets": [
+      "negation retrieval and multilingual scope",
+      "NevIR and ExcluIR benchmarks",
+      "Chinese negation subject/cue/scope",
+      "negative-constraint retrieval and logical structure"
+    ]
+  },
+  "primary_checks": [
+    {
+      "id": "2502.13506",
+      "version": "v4",
+      "claims": [
+        "Table 1 architecture comparison and paired-accuracy aggregation",
+        "Sections 5.3-5.4 generalization and ordinary-retrieval tradeoffs"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2502.13506"
+    },
+    {
+      "id": "2404.09830",
+      "version": "v1",
+      "claims": [
+        "subject/cue/scope triplet task; continuous non-overlapping spans in its annotation guidelines",
+        "7049 negation-containing Chinese review sentences",
+        "exact-triplet F1 75.78 in Table 2; not retrieval accuracy"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2404.09830"
+    },
+    {
+      "id": "2608.30130",
+      "version": "v3",
+      "claims": [
+        "original-query minus trap-query score",
+        "Table 1 recall/violation frontier",
+        "incidental-mention failures and extra inference cost"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2608.30130"
+    },
+    {
+      "id": "2603.09185",
+      "claims": [
+        "LLM positive/negative query decomposition and query-vector optimization",
+        "Table 1 NegConstraint and NevIR results",
+        "additional inference work despite no model fine-tuning"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2603.09185"
+    },
+    {
+      "id": "2606.13204",
+      "version": "v1",
+      "claims": [
+        "separate topical and compatibility encoders",
+        "English lexical-polarity training and in-domain-transfer limits"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2606.13204"
+    },
+    {
+      "id": "2608.05497",
+      "claims": [
+        "learned query-side exclusion span detection with inactive fallback",
+        "temporary shortlist re-embedding",
+        "MaxSim-specific repair and English-only limitation"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2608.05497"
+    },
+    {
+      "id": "2505.22299",
+      "version": "v2",
+      "claims": [
+        "NL-to-FOL query/candidate conversion and reranking",
+        "API cost and limited-candidate recall limitations"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2505.22299"
+    },
+    {
+      "id": "2404.17288",
+      "claims": [
+        "explicit exclusionary retrieval task",
+        "3452 human-annotated benchmark entries; 70293 training queries"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2404.17288"
+    },
+    {
+      "id": "2305.07614",
+      "claims": [
+        "minimal-document-pair diagnosis and architecture sensitivity"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2305.07614"
+    },
+    {
+      "id": "2507.22337",
+      "claims": [
+        "negation-type variation",
+        "pairwise synthetic classification is not large-corpus ranking"
+      ],
+      "source": "https://www.alphaxiv.org/pdf/2507.22337"
+    },
+    {
+      "id": "P15-1064",
+      "claims": [
+        "G1 includes the cue in scope, unlike NegComment's non-overlapping triplet spans; G3 contextual annotation and G6 pseudo-cue/double-negation caveat"
+      ],
+      "pdf_page_one_based": 3,
+      "source": "https://aclanthology.org/P15-1064.pdf"
+    },
+    {
+      "id": "2610.26260",
+      "version": "v1",
+      "claims": [
+        "Table II preference/position tradeoff in fixed pools",
+        "conditional coverage, fallback and tie-breaking limitations",
+        "Qwen3-14B-AWQ is not Qwen3-Reranker-0.6B"
+      ],
+      "source": "https://arxiv.org/html/2610.26260v1"
+    }
+  ],
+  "repository_checks": [
+    {
+      "url": "https://github.com/thijmennijdam/NevIR-reproducibility",
+      "result": "Official README inspected: evaluated rerankers, training and cross-dataset evaluation procedures"
+    },
+    {
+      "url": "https://github.com/orionw/NevIR/blob/main/readme.md",
+      "result": "README or implementation inspected"
+    },
+    {
+      "url": "https://github.com/Easonsi/SSENE",
+      "result": "README or implementation inspected"
+    },
+    {
+      "url": "https://github.com/taegyeong-lee/DEO-negation-aware-retrieval",
+      "result": "README or implementation inspected"
+    },
+    {
+      "url": "https://github.com/xgl-git/NS-IR-main",
+      "result": "README or implementation inspected"
+    },
+    {
+      "url": "https://github.com/zwh-sdu/ExcluIR",
+      "result": "README or implementation inspected"
+    },
+    {
+      "url": "https://github.com/jenojp/negspacy",
+      "result": "README or implementation inspected"
+    },
+    {
+      "url": "https://github.com/jenojp/negspacy/blob/master/src/negspacy/negation.py",
+      "result": "README or implementation inspected"
+    },
+    {
+      "url": "https://api.github.com/repos/NICE-HKU/CoDeR/contents",
+      "result": "GitHub API 404 explicitly reports: This repository is empty.",
+      "error": "GitHub API error 404: {\"message\":\"This repository is empty.\",\"documentation_url\":\"https://docs.github.com/v3/repos/contents/#get-contents\",\"status\":\"404\"}"
+    }
+  ],
+  "model_cards": [
+    "https://huggingface.co/BAAI/bge-reranker-v2-m3",
+    "https://huggingface.co/Qwen/Qwen3-Reranker-0.6B",
+    "https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual",
+    "https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
+  ],
+  "figure_checks": {
+    "method": "Download version-pinned original PDFs, verify existing source SHA-256, rerun the existing crop script into scratch storage, and compare output image hashes.",
+    "nevir_generalization_identical": true,
+    "chinese_negation_binding_identical": true
+  },
+  "documentation_validation": {
+    "markdownlint": "Pinned v0.23.0 command passed with zero errors",
+    "ruff_markdown_format": "Passed for the research report",
+    "git_diff_check": "Passed",
+    "full_repository_link_check": {
+      "total": 932,
+      "ok": 923,
+      "errors": 0,
+      "redirects": 8,
+      "timeouts": 1,
+      "existing_unrelated_timeout": "docs/research/2026-10-27-predicate-stability.md: https://www.w3.org/TR/skos-reference/#mapping",
+      "retry": "The same existing W3C reference timed out on the second full pinned check; no exclusion or unrelated-link edit was added"
+    }
+  },
+  "not_run": [
+    "Model inference on MindBridge cases",
+    "Author training/evaluation programs",
+    "Any new model service or model-inference API call"
+  ]
+}

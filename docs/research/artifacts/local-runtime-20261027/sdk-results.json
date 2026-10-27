@@ -1,0 +1,146 @@
+[
+  {
+    "pair": 0,
+    "variant": "baseline",
+    "cases": [
+      {
+        "case": "short",
+        "p50_ms": 42.90090099675581,
+        "p95_ms": 50.008324502414325,
+        "hit_signatures": [
+          "acf5c941824973d0b0dc28cefb4272459086a788948d9c2b5bcdedf102a3d7a6"
+        ],
+        "trace_signature": "e4dfe9dad25171a2bd46d63ed04c2303f0256c26e4f6d9baf243f41f2116053c"
+      },
+      {
+        "case": "long",
+        "p50_ms": 123.00678899919149,
+        "p95_ms": 146.15312100067968,
+        "hit_signatures": [
+          "c7e8b0f4dad9e5f71748b12fe181d53e0fab6dc5670a7945d6feaa385e13d8ce"
+        ],
+        "trace_signature": "c11bc82c24c37676c64068f4a2d99d8d7a6a23fec9ddf620d6f5638e586cc314"
+      }
+    ]
+  },
+  {
+    "pair": 0,
+    "variant": "candidate",
+    "cases": [
+      {
+        "case": "short",
+        "p50_ms": 38.57779900135938,
+        "p95_ms": 41.403628998523345,
+        "hit_signatures": [
+          "acf5c941824973d0b0dc28cefb4272459086a788948d9c2b5bcdedf102a3d7a6"
+        ],
+        "trace_signature": "e4dfe9dad25171a2bd46d63ed04c2303f0256c26e4f6d9baf243f41f2116053c"
+      },
+      {
+        "case": "long",
+        "p50_ms": 71.02658499934478,
+        "p95_ms": 85.59480999610969,
+        "hit_signatures": [
+          "c7e8b0f4dad9e5f71748b12fe181d53e0fab6dc5670a7945d6feaa385e13d8ce"
+        ],
+        "trace_signature": "c11bc82c24c37676c64068f4a2d99d8d7a6a23fec9ddf620d6f5638e586cc314"
+      }
+    ]
+  },
+  {
+    "pair": 1,
+    "variant": "candidate",
+    "cases": [
+      {
+        "case": "short",
+        "p50_ms": 40.747737999481615,
+        "p95_ms": 60.58533199757221,
+        "hit_signatures": [
+          "acf5c941824973d0b0dc28cefb4272459086a788948d9c2b5bcdedf102a3d7a6"
+        ],
+        "trace_signature": "e4dfe9dad25171a2bd46d63ed04c2303f0256c26e4f6d9baf243f41f2116053c"
+      },
+      {
+        "case": "long",
+        "p50_ms": 66.6343280026922,
+        "p95_ms": 78.86391249849112,
+        "hit_signatures": [
+          "c7e8b0f4dad9e5f71748b12fe181d53e0fab6dc5670a7945d6feaa385e13d8ce"
+        ],
+        "trace_signature": "c11bc82c24c37676c64068f4a2d99d8d7a6a23fec9ddf620d6f5638e586cc314"
+      }
+    ]
+  },
+  {
+    "pair": 1,
+    "variant": "baseline",
+    "cases": [
+      {
+        "case": "short",
+        "p50_ms": 47.494518003077246,
+        "p95_ms": 56.420115502987755,
+        "hit_signatures": [
+          "acf5c941824973d0b0dc28cefb4272459086a788948d9c2b5bcdedf102a3d7a6"
+        ],
+        "trace_signature": "e4dfe9dad25171a2bd46d63ed04c2303f0256c26e4f6d9baf243f41f2116053c"
+      },
+      {
+        "case": "long",
+        "p50_ms": 118.89687499933643,
+        "p95_ms": 132.35211999926833,
+        "hit_signatures": [
+          "c7e8b0f4dad9e5f71748b12fe181d53e0fab6dc5670a7945d6feaa385e13d8ce"
+        ],
+        "trace_signature": "c11bc82c24c37676c64068f4a2d99d8d7a6a23fec9ddf620d6f5638e586cc314"
+      }
+    ]
+  },
+  {
+    "pair": 2,
+    "variant": "baseline",
+    "cases": [
+      {
+        "case": "short",
+        "p50_ms": 43.255596996459644,
+        "p95_ms": 49.09154300185037,
+        "hit_signatures": [
+          "acf5c941824973d0b0dc28cefb4272459086a788948d9c2b5bcdedf102a3d7a6"
+        ],
+        "trace_signature": "e4dfe9dad25171a2bd46d63ed04c2303f0256c26e4f6d9baf243f41f2116053c"
+      },
+      {
+        "case": "long",
+        "p50_ms": 121.76480299967807,
+        "p95_ms": 139.78894449974177,
+        "hit_signatures": [
+          "c7e8b0f4dad9e5f71748b12fe181d53e0fab6dc5670a7945d6feaa385e13d8ce"
+        ],
+        "trace_signature": "c11bc82c24c37676c64068f4a2d99d8d7a6a23fec9ddf620d6f5638e586cc314"
+      }
+    ]
+  },
+  {
+    "pair": 2,
+    "variant": "candidate",
+    "cases": [
+      {
+        "case": "short",
+        "p50_ms": 39.94937799870968,
+        "p95_ms": 48.56031050076126,
+        "hit_signatures": [
+          "acf5c941824973d0b0dc28cefb4272459086a788948d9c2b5bcdedf102a3d7a6"
+        ],
+        "trace_signature": "e4dfe9dad25171a2bd46d63ed04c2303f0256c26e4f6d9baf243f41f2116053c"
+      },
+      {
+        "case": "long",
+        "p50_ms": 69.51264099916443,
+        "p95_ms": 86.26108049793402,
+        "hit_signatures": [
+          "c7e8b0f4dad9e5f71748b12fe181d53e0fab6dc5670a7945d6feaa385e13d8ce"
+        ],
+        "trace_signature": "c11bc82c24c37676c64068f4a2d99d8d7a6a23fec9ddf620d6f5638e586cc314"
+      }
+    ]
+  }
+]

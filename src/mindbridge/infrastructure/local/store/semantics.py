@@ -45,7 +45,7 @@ from mindbridge.infrastructure.local.store.records import (
     MemoryRecords,
     read_memories,
     replace_memory_embeddings,
-    write_embedding,
+    write_embeddings,
     write_memory,
 )
 from mindbridge.infrastructure.local.store.rows import (
@@ -137,11 +137,11 @@ class Semantics:
         be un-forgotten, and have a visible, unretired latest recorded version, if typed.
         Unlike reinforcement targets, inferred premises cannot remain hidden at commit.
 
-        The lineage rule the kernel applies to a `STATE` or user-stated `TRAIT` supersedes the
-        current version of every other record in the same lineage with overlapping validity,
-        including records nobody showed the backend. Those `(memory_id, version)` pairs are
-        recorded on the operation row as `superseded` so `rollback_operation` can restore exactly
-        them.
+        The lineage rule supersedes overlapping `STATE` versions only when the new assertion
+        has sufficient authority and confidence; a user-stated `TRAIT` supersedes every
+        overlapping version. Both include records nobody showed the backend. Those
+        `(memory_id, version)` pairs are recorded on the operation row as `superseded` so
+        `rollback_operation` can restore exactly them.
         """
         supplied_memories, supplied_embeddings, supplied_by_memory = prepare_write_batch(
             memories,
@@ -257,8 +257,7 @@ class Semantics:
                     for memory_id, place_id, metadata_json in narrowed
                 ),
             )
-            for embedding in supplied_embeddings:
-                write_embedding(connection, embedding)
+            write_embeddings(connection, supplied_embeddings)
             linked: list[tuple[str, str]] = []
             clause_changes: list[StoredEvidenceClauseChange] = []
             for memory_id, members, confidence in evidence_clauses:

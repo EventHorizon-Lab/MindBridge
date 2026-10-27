@@ -55,6 +55,15 @@ RECALL_COMPLETE = "mindbridge.recall.complete"
 RECALL_REPLAN = "mindbridge.recall.replan"
 RECALL_FALLBACK = "mindbridge.recall.fallback"
 RECALL_NON_SELECTIVE_STEPS = "mindbridge.recall.non_selective_steps"
+RECALL_QUERY_COUNT = "mindbridge.recall.query_count"
+RECALL_QUERY_FAILURES = "mindbridge.recall.query_failures"
+RECALL_QUERY_LIMITED = "mindbridge.recall.query_limited"
+RECALL_QUERY_CANDIDATES = "mindbridge.recall.query_candidates"
+RECALL_QUERY_NEW_CANDIDATES = "mindbridge.recall.query_new_candidates"
+RECALL_QUERY_GROUNDED = "mindbridge.recall.query_grounded"
+RECALL_QUERY_SELECTED = "mindbridge.recall.query_selected"
+RECALL_QUERY_BUDGET_DROPPED = "mindbridge.recall.query_budget_dropped"
+RECALL_QUERY_OMITTED = "mindbridge.recall.query_omitted"
 # Evidence expansion reports which structural edge linked the rows it added and which edge was
 # dropped for selecting too much of the corpus. Two expansions of the same size are different
 # claims about the store when one came from a capture and the other from a place.
@@ -255,6 +264,26 @@ _CURRENT_FORMATION_REFUSALS: ContextVar[_FormationRefusals | None] = ContextVar(
 _RETRIEVAL_OBSERVER: ContextVar[Callable[[object], None] | None] = ContextVar(
     "mindbridge_retrieval_observer", default=None
 )
+_GENERATION_OBSERVER: ContextVar[Callable[[object], None] | None] = ContextVar(
+    "mindbridge_generation_observer", default=None
+)
+
+
+@contextmanager
+def _observe_generation_inputs(observer: Callable[[object], None]) -> Iterator[None]:
+    """Observe the evidence passed to the answerer, before its own packing or filtering."""
+    token = _GENERATION_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _GENERATION_OBSERVER.reset(token)
+
+
+def _record_generation_inputs(hits: object) -> None:
+    observer = _GENERATION_OBSERVER.get()
+    if observer is not None:
+        with suppress(Exception):
+            observer(hits)
 
 
 @contextmanager

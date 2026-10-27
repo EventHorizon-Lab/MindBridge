@@ -8,6 +8,7 @@ from typing import ClassVar
 RETRYABLE_REASONS: frozenset[str] = frozenset(
     {
         "connection_failed",
+        "capacity_exceeded",
         "data_dir_in_use",
         "flush_failed",
         "index_missing",

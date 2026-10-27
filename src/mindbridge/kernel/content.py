@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
@@ -18,7 +18,6 @@ from typing import Literal, cast
 from mindbridge.exceptions import StorageError, ValidationError
 from mindbridge.infrastructure.local.store import (
     StoredAsset,
-    StoredMemory,
     StoredTextSelector,
     StoredTextSpanPiece,
     datetime_text,
@@ -116,10 +115,6 @@ class PreparedMemory:
     # only an `ObservationContext` has one: a formed record's `MemoryContext` deliberately has no
     # place, so formation sets this from the observation it was formed from.
     place_id: str | None = None
-    # Releases before place-scoped identity included `place_id` in the content address. Kept only
-    # long enough to reuse an existing row from such a store; newly written rows always use the
-    # current ID, so two otherwise equal observations in different places remain distinct.
-    legacy_memory_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,18 +188,10 @@ def prepare_memory(
         identity["occurred_end"] = datetime_text(normalized_occurred_end)
     if normalized_memory_type is not MemoryType.SEMANTIC:
         identity["memory_type"] = normalized_memory_type.value
-    legacy_memory_id: str | None = None
     if context is not None:
         if not isinstance(context, ObservationContext):
             raise ValidationError("context must be an ObservationContext")
-        context_identity = observation_context_identity(context)
-        identity["context"] = context_identity
-        if context.place_id is not None:
-            legacy_identity = dict(identity)
-            legacy_identity["context"] = {
-                key: value for key, value in context_identity.items() if key != "place_id"
-            }
-            legacy_memory_id = _observation_memory_id(legacy_identity)
+        identity["context"] = observation_context_identity(context)
     memory_id = _observation_memory_id(identity)
     return PreparedMemory(
         memory_id=memory_id,
@@ -215,7 +202,6 @@ def prepare_memory(
         memory_type=normalized_memory_type,
         context=context,
         place_id=None if context is None else context.place_id,
-        legacy_memory_id=(legacy_memory_id if legacy_memory_id != memory_id else None),
     )
 
 
@@ -228,23 +214,6 @@ def _observation_memory_id(identity: Mapping[str, object]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def resolve_prepared_memory_ids(
-    prepared: Sequence[PreparedMemory],
-    candidates: Sequence[StoredMemory],
-) -> tuple[PreparedMemory, ...]:
-    """Prefer current IDs, falling back only to an old row from the same explicit place."""
-    existing = {memory.memory_id: memory for memory in candidates}
-    return tuple(
-        replace(memory, memory_id=legacy_id, legacy_memory_id=None)
-        if memory.memory_id not in existing
-        and (legacy_id := memory.legacy_memory_id) is not None
-        and (legacy := existing.get(legacy_id)) is not None
-        and legacy.place_id == memory.place_id
-        else memory
-        for memory in prepared
-    )
 
 
 def observation_context_identity(context: ObservationContext) -> dict[str, object]:

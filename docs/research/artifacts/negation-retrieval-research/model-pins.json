@@ -1,0 +1,30 @@
+[
+  {
+    "model": "BAAI/bge-reranker-v2-m3",
+    "sha": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+    "last_modified": "2024-06-24T14:08:45.000Z",
+    "license": "apache-2.0",
+    "parameters": 567755777
+  },
+  {
+    "model": "Qwen/Qwen3-Reranker-0.6B",
+    "sha": "e61197ed45024b0ed8a2d74b80b4d909f1255473",
+    "last_modified": "2026-04-16T08:55:59.000Z",
+    "license": "apache-2.0",
+    "parameters": 595776512
+  },
+  {
+    "model": "jinaai/jina-reranker-v2-base-multilingual",
+    "sha": "9cfeff2df7d40d1b78e75e5e9cebec92a99813c9",
+    "last_modified": "2025-10-21T05:59:46.000Z",
+    "license": "cc-by-nc-4.0",
+    "parameters": 278437633
+  },
+  {
+    "model": "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+    "sha": "8adb042d524ecd5c26d3e3ba0e3fbcf7e2d0864c",
+    "last_modified": "2024-01-08T12:37:16.000Z",
+    "license": "mit",
+    "parameters": 278812163
+  }
+]

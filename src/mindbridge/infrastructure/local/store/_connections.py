@@ -7,9 +7,10 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from threading import Lock
+from threading import Condition
 
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
+from mindbridge.infrastructure.local.store._predicates import validate_predicate_schema
 from mindbridge.infrastructure.local.store._recall import RECALL_FOLD_FUNCTION, recall_fold
 from mindbridge.infrastructure.local.store._schema import (
     REQUIRED_TABLES,
@@ -21,12 +22,12 @@ from mindbridge.infrastructure.local.store._schema import (
     validate_text_selector_schema,
 )
 from mindbridge.infrastructure.local.store.errors import (
+    LocalStoreCapacityError,
     LocalStoreClosedError,
     UnsupportedSchemaError,
 )
 
-# Idle connections retained for reuse. Concurrency above this many simultaneous readers falls
-# back to the previous open-and-close behaviour rather than growing the pool without bound.
+# Total connections, including checked-out, opening, and idle connections.
 _CONNECTION_POOL_SIZE = 32
 
 
@@ -44,7 +45,8 @@ class Connections:
         self._schema_ready = False
         # Idle connections only: one is in the pool exactly while nobody holds it.
         self._pool: list[sqlite3.Connection] = []
-        self._pool_lock = Lock()
+        self._pool_lock = Condition()
+        self._active_connections = 0
         # Every commit invalidates the corpus digest. Counting it here rather than in the caller
         # keeps the cache where writes are observable: one data directory has one live owner, so
         # a commit this process did not make cannot exist.
@@ -67,19 +69,17 @@ class Connections:
 
     def close(self) -> None:
         """Release the pooled connections and the directory; repeated calls are harmless."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._pool_lock:
+            if self._closed:
+                return
+            self._closed = True
+            while self._active_connections:
+                self._pool_lock.wait()
         self._close_pool()
         self._directory_lock.close()
 
     def _initialize_schema(self) -> None:
-        """Create the current schema in an empty directory, or refuse any other version.
-
-        This build has no upgrade path. A directory written by an older MindBridge is refused
-        rather than converted, because SQLite is the authoritative copy: re-create the directory
-        and re-ingest, or open it with the version that wrote it.
-        """
+        """Create or validate the current schema; refuse every other version."""
         with self.connection() as connection:
             version = user_version(connection)
             tables = table_names(connection)
@@ -103,6 +103,7 @@ class Connections:
                 raise UnsupportedSchemaError(f"local schema is missing required tables: {names}")
             validate_evidence_clause_schema(connection)
             validate_text_selector_schema(connection)
+            validate_predicate_schema(connection)
 
     def _open_connection(self, *, secure_delete: bool = False) -> sqlite3.Connection:
         # `check_same_thread=False` disables sqlite3's own guard, not the ownership rule it
@@ -138,7 +139,7 @@ class Connections:
 
     @contextmanager
     def connection(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:
-        """Check one connection out of the pool, opening one when the pool is empty.
+        """Borrow exclusively, refusing overload before opening another connection.
 
         Connecting is not free: one `sqlite3_open` plus the four `PRAGMA` statements that make a
         connection usable. One `add` paid for seven of them and one `search` five, because every
@@ -152,40 +153,36 @@ class Connections:
         that failed part way through can leave a transaction open that the next borrower would
         silently join. `secure_delete` and pre-schema connections are never pooled: the first is
         a persistent per-connection pragma that would make every later DELETE pay for
-        zero-filling, and the second runs during migration.
+        zero-filling, and the second runs during schema initialization.
         """
-        self.require_open()
-        if secure_delete or not self._schema_ready:
-            connection = self._open_connection(secure_delete=secure_delete)
-            try:
-                yield connection
-            except BaseException:
-                with suppress(sqlite3.Error):
-                    connection.close()
-                raise
-            else:
-                connection.close()
-            return
         with self._pool_lock:
+            self.require_open()
+            if self._active_connections >= _CONNECTION_POOL_SIZE:
+                raise LocalStoreCapacityError("local SQLite connection capacity exceeded")
+            self._active_connections += 1
             idle = self._pool.pop() if self._pool else None
-        connection = self._open_connection() if idle is None else idle
+        connection = None
+        reusable = False
         try:
+            if idle is not None and secure_delete:
+                idle.close()
+                idle = None
+            connection = (
+                self._open_connection(secure_delete=secure_delete) if idle is None else idle
+            )
             yield connection
-        except BaseException:
-            with suppress(sqlite3.Error):
-                connection.close()
-            raise
-        else:
-            self._release_connection(connection)
-
-    def _release_connection(self, connection: sqlite3.Connection) -> None:
-        with self._pool_lock:
-            pooled = not self._closed and len(self._pool) < _CONNECTION_POOL_SIZE
-            if pooled:
-                self._pool.append(connection)
-        if not pooled:
-            with suppress(sqlite3.Error):
-                connection.close()
+            reusable = self._schema_ready and not secure_delete
+        finally:
+            # Keep admission until closing or returning the actual handle has finished.
+            with self._pool_lock:
+                if connection is not None:
+                    if reusable and not self._closed:
+                        self._pool.append(connection)
+                    else:
+                        with suppress(sqlite3.Error):
+                            connection.close()
+                self._active_connections -= 1
+                self._pool_lock.notify_all()
 
     def _close_pool(self) -> None:
         with self._pool_lock:

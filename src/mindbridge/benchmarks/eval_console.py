@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 if TYPE_CHECKING:
     pass
-from mindbridge.benchmarks.eval_config import DEFAULT_ARM
+from mindbridge.benchmarks.eval_results import DEFAULT_ARM
 
 # The log namespace this harness is allowed to be verbose about: everything under the
 # installed package, derived so a rename cannot leave a stale literal behind.

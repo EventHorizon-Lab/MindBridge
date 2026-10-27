@@ -17,6 +17,7 @@ from mindbridge.infrastructure.local.assets import AssetStore
 from mindbridge.infrastructure.local.store import (
     IndexDocument,
     LocalStore,
+    LocalStoreCapacityError,
     StaleOperationError,
     UnsupportedSchemaError,
 )
@@ -105,6 +106,12 @@ def translate_storage_errors(action: str) -> Iterator[None]:
     # sites turn it into a `"stale"` rejection, and no other store method raises it.
     except (MindBridgeError, StaleOperationError):
         raise
+    except LocalStoreCapacityError as error:
+        raise StorageError(
+            "local SQLite connection capacity exceeded",
+            reason="capacity_exceeded",
+            stage="admission",
+        ) from error
     except Exception as error:
         # `io_failed` is this wrapper's pre-existing contract and a test pins it. It is coarse by
         # design -- the wrapper catches whatever any storage action raised -- and deliberately not

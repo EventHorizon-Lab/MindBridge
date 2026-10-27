@@ -21,7 +21,7 @@ model runtimes and transports:
 | Extra | Adds |
 | --- | --- |
 | `local` | Jina and Sentence Transformers embedding, plus FunASR speech |
-| `openai` | Official OpenAI SDK adapter and media handling |
+| `openai` | Official OpenAI SDK 3.x adapter, its `httpx2` transport, and media handling |
 | `face` | Local OpenCV face analysis |
 | `server` | FastAPI and Starlette REST adapter; bring your own ASGI server |
 | `mcp` | MCP server transport |
@@ -195,16 +195,14 @@ Audio has one fallback: a configured speech backend can transcribe it for a text
 Unsupported image or video input fails instead of being stored without visual evidence.
 
 **Contract:** Changing a model, revision, dimension, or input recipe changes the vector space.
-MindBridge refuses unrecognized store metadata mismatches instead of mixing spaces.
+MindBridge refuses store metadata mismatches instead of mixing spaces.
 
-**Guidance:** Start a new data directory when intentionally changing embedding space. Reuse an
-existing directory only for a supported bundled migration; see
+**Guidance:** Start a new data directory when intentionally changing embedding space; see
 [store metadata mismatch](troubleshooting.md#store-metadata-mismatch).
 
-### Migrating the Jina provider
+### Pinned Jina checkpoint
 
-`JinaOmniEmbedder` and the `jina-omni` configuration provider have been removed. Use
-`SentenceTransformersEmbedder` or `provider: sentence-transformers` with
+Use `SentenceTransformersEmbedder` or `provider: sentence-transformers` with
 `model: jinaai/jina-embeddings-v5-omni-small-retrieval`, as in the example above. The bundled pin is
 `e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4`. Only this Jina revision is supported; another revision
 fails validation before loading remote code.
@@ -212,8 +210,8 @@ fails validation before loading remote code.
 Without a caller-supplied encoder, the constructor and declarative configuration keep this pinned
 Jina checkpoint lazy. `SentenceTransformersEmbedder.load(...)` loads it immediately. Other models
 load immediately and continue to use `trust_remote_code=False`. The Jina input recipe, embedding
-space ID, and historical space upgrades are preserved, so an existing current-recipe Jina directory
-can reopen without re-embedding. The CLI `--embedder jina-omni` remains a model recipe that constructs
+space ID are fixed by the checkpoint and adapter recipe. A current-recipe Jina directory
+reopens without re-embedding. The CLI `--embedder jina-omni` selects a model recipe that constructs
 the same Sentence Transformers backend.
 
 ### EmbeddingGemma 2
@@ -561,13 +559,14 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `index_quantization` | `none` | Zvec 0.8 projection mode: `none`, `fp16`, unrotated `int8`, or `rabitq`; changing modes rebuilds from stored embeddings |
 | `retrieval_mode` | `hybrid` | Instance candidate policy: `hybrid`, `dense`, or lexical-only `lexical`; lexical ranks by native normalized full-text relevance (RRF when both text fields apply); use physically isolated stores when comparing modes |
 | `minimum_relevance` | `0.10` | Floor on query-relevant evidence before retention and reinforcement ranking |
-| `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
-| `evidence_budget_chars` | `24000` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
+| `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1`, including lexical matches |
+| `evidence_budget_chars` | `24000` | Soft budget for widening `ask` grounding; mandatory `limit` hits survive even when over budget. `None` disables ranked-tail expansion; planning and linked expansion may still add records. No provider token guarantee |
 | `recall_planning` | `False` | Ask the answerer for a recall plan before retrieving, and ground on the set, sequence or entity it names; off means `ask` runs the one search it always has. An answerer without `plan_recall` cannot plan: the store logs one warning when it opens and every question runs that same search |
-| `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may add to the ranked window, never more than `evidence_budget_chars` when that is set (so `24000` under the defaults); a point plan keeps `limit`. Read only when `recall_planning` is on |
+| `recall_query_expansion` | `False` | Experimental execution of `similar.query` when planning is on. At most two additional searches per `ask`, shared across steps and replans; each caches up to 100 ranked hits and may append at most `limit` novel hits after existing grounding. See the controls below |
+| `recall_set_budget_chars` | `30000` | Soft character allowance used to pack a plan's additions after charging its mandatory window, narrowed by `evidence_budget_chars` when set. Also bounds experimental semantic additions; a point plan without query expansion keeps its normal ranked window. Read only when `recall_planning` is on |
 | `recall_set_max_rows` | `60` | Matched rows a set, sequence or entity plan may add at all, whatever the character budget leaves room for; the rows past it are reported as not shown, so the set is declared incomplete. Bounds the matched set only. Read only when `recall_planning` is on |
 | `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; the second runs only when the first answer was a low-confidence guess under `answer_policy="best_effort"`. `1` disables it. Read only when `recall_planning` is on |
-| `evidence_expansion` | `False` | Widen `ask` grounding with the records the grounded evidence is structurally linked to -- same capture, recognized person, symbolic place, claim lineage, or evidence edge. Costs no model call: the edges are columns the kernel already wrote. The linked rows go last and spend only budget the ranking left unspent |
+| `evidence_expansion` | `False` | Widen `ask` grounding with the records the grounded evidence is structurally linked to -- same capture, recognized person, symbolic place, claim lineage, or evidence edge. Costs no model call: the edges are columns the kernel already wrote. Linked rows spend budget the ranking left unspent; experimental semantic additions follow them |
 | `evidence_expansion_max_rows` | `24` | Linked records one expansion may add, whatever `evidence_budget_chars` leaves room for; the media rows among them stop earlier still, at twice the ask's own `limit`. Read only when `evidence_expansion` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
@@ -589,6 +588,24 @@ instance you may reopen the same `data_dir` under another mode without reindexin
 stores are required for simultaneous or isolated comparisons because one `data_dir` has one live
 owner. `lexical` skips only query embedding; ingestion still requires and writes the configured
 embedder for durable index consistency.
+
+`recall_query_expansion` requires `recall_planning=True` and is disabled by default. Without it,
+`similar(query, k)` reuses the original question's ranking; changing query text or increasing `k`
+does not initiate another search. With it, each distinct query caches a 100-hit ranking and the
+step reads its requested prefix. The original query reuses its initial ranking unless `k`
+requests greater depth; deepening consumes one of the same two additional-search slots. Failed
+embedding calls are cached and consume a slot; a third distinct search contributes no new rows.
+The cache and ceiling reset at the next `ask`. Whitespace at the ends is ignored for cache keys.
+
+All searches preserve the caller's scope, memory type, reference time and original inferred
+temporal intent; rewrites cannot widen visibility or replace query media. Semantic additions
+follow existing grounding, deduplicate by record ID and stop at `limit` novel rows per query.
+Their combined character allowance is `min(recall_set_budget_chars, evidence_budget_chars)`
+when the latter is set, otherwise `recall_set_budget_chars`; the existing grounding is charged
+first and is preserved even if already over budget. Added media stop at twice `limit` rows.
+These are bounded rankings, never complete sets. No new model or service is configured by the
+switch. The [audit and evaluation](research/2026-10-27-semantic-recall.md) records the evidence
+and the real-model checks required before enabling it for a workload.
 
 `minimum_relevance` uses the selected route's relevance scale: dense cosine in `dense`, native
 normalized full-text relevance in `lexical`, and the documented hybrid fusion in `hybrid`. Keep
@@ -621,19 +638,35 @@ Use `search_with_trace` to read the gated quantity as `gate_relevance`, beside t
 positive when set. `evidence_budget_chars` keeps the `limit` hits unconditionally and then admits
 further ranked memories while the evidence fits, charging each media asset its modality's text
 equivalent because a media part costs a model far more than its record's text. Because the `limit`
-hits are never dropped, this setting can only enlarge a prompt: to bound one, lower `limit` and
-set the budget to `None`. Setting it also removes `limit`'s effect on prompt size, since the
-budget refills the window to the same width whatever `limit` was. The default of `24000` widens a
+hits are never dropped, this setting can only enlarge the grounding set. Lowering `limit` and
+setting the budget to `None` reduces the basic ranked window; recall planning and linked expansion
+can still add records when enabled. These controls do not bound the serialized provider input.
+With a budget, lowering `limit` may leave the evidence window unchanged because packing
+can refill it. The default of `24000` widens a
 short-turn corpus to the whole 100-record rerank pool and a long-turn one to about two dozen
 records, at a proportionally larger answer prompt; the measurement behind it is recorded beside
 the field in `plugins.py` and in the
 [loss decomposition](research/2026-09-12-baseline-loss-decomposition.md).
 
+Evidence selection and provider capacity are separate constraints. Character counts and media
+text equivalents omit system instructions, question text, provenance, attachment labels, message
+framing, and model-specific media tokenization. The bundled OpenAI adapter checks the complete
+answer text (system prompt, serialized user text, and attachment labels) against 4 MiB before
+reading media, and applies separate inline-media byte and video-count limits. These are payload
+safety bounds, not token/context limits. `generation.max_tokens` bounds output, including
+reasoning for models that use it; it does not cap input. Reserve output capacity when sizing a
+request against the provider's context window. Exact input preflight needs that endpoint's own
+counting protocol for the actual request; MindBridge does not provide a universal token preflight.
+Provider-declared context overflow raises permanent `ModelError(reason="context_length_exceeded")`
+(HTTP 413), without retrying an answer after dropping evidence. The independent
+[`compile_context` budget](context-compilation.md#budget) remains a hard character ceiling on
+the bundle it renders; it also does not promise provider tokens.
+
 A set, sequence or entity recall plan grounds on its own matched set *in addition to* the ranked
 window -- the same `limit` hits and modality floor the unplanned path grounds -- and
 `recall_set_budget_chars` bounds what the plan added with the same text-equivalent cost. It is a
-ceiling rather than a floor: when `evidence_budget_chars` is also set, the lower of the two
-applies, so a caller who bounded the prompt bounded it for every question shape. Neither bound may
+ceiling on supplemental packing: when `evidence_budget_chars` is also set, the lower of the two
+applies across question shapes after charging the mandatory ranked window. Neither bound may
 trim the ranked window, which is evidence the question already had, so planning can never ground
 less than not planning. Media rows carry one further bound. Grounding a media row runs face and
 speech recognition over it, which are writes and are paid again on a replan round, so the matched

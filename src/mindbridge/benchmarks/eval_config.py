@@ -28,6 +28,7 @@ from mindbridge import (
 )
 from mindbridge.benchmarks.eval_adapters import LoadedTask
 from mindbridge.benchmarks.eval_regression import PERFORMANCE_BUDGET_NAMES
+from mindbridge.benchmarks.eval_results import DEFAULT_ARM
 from mindbridge.benchmarks.model_config import (
     DEFAULT_TIMEOUT_SECONDS,
     DownloadSettings,
@@ -37,9 +38,6 @@ from mindbridge.benchmarks.model_config import (
 from mindbridge.benchmarks.task_catalog import expand
 from mindbridge.configuration import _absolute_http_url
 from mindbridge.models._openai_protocol import reasoning_model, sampling_supported
-
-DEFAULT_ARM = "mindbridge"
-
 
 BASELINE_ARMS = ("blind", "full-context", "random", "compile")
 
@@ -130,7 +128,6 @@ class _Arguments:
     seeds: tuple[int, int, int, int]
     bootstrap_samples: int
     repeat_index: int
-    model: str
     arms: tuple[str, ...]
     full_context_chars: int
     ingest: str
@@ -143,7 +140,6 @@ class _Arguments:
     judge_model_args: str
     judge_concurrency: int
     gen_kwargs: str
-    num_fewshot: int
     use_cache: Path | None
     device: str | None
     device_lock: bool
@@ -200,8 +196,8 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         description=__doc__,
         epilog="Use `mindbridge-bench eval serve --help` for the Agent Memory Leaderboard API.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
     )
-    parser.add_argument("--model", default="mindbridge", help="evaluation adapter")
     parser.add_argument(
         "--arms",
         default=None,
@@ -265,7 +261,6 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model-args",
-        "--model_args",
         default="",
         help=(
             "comma-separated generation_model/base_url/timeout_seconds/"
@@ -274,7 +269,6 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        "--memory-config",
         dest="memory_config",
         type=Path,
         help=(
@@ -284,7 +278,6 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--judge-model-args",
-        "--judge_model_args",
         default="",
         help="comma-separated model/base_url/api_key/timeout_seconds overrides",
     )
@@ -294,7 +287,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     # distinguishable from one the caller typed.
     parser.add_argument("--benchmarks-root", type=Path, default=None)
     parser.add_argument("--data-root", type=Path, default=None)
-    parser.add_argument("--output-path", "--output_path", type=Path)
+    parser.add_argument("--output-path", type=Path)
     parser.add_argument("--run-id", type=_run_identifier)
     parser.add_argument(
         "--task-data",
@@ -317,15 +310,13 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="all (or -1), a 0-1 fraction, or an absolute example count",
     )
     parser.add_argument("--offset", type=_nonnegative_int, default=None)
-    parser.add_argument("--num-fewshot", "--num_fewshot", type=_nonnegative_int, default=None)
     parser.add_argument(
         "--gen-kwargs",
-        "--gen_kwargs",
         default="",
         help="deterministic generation settings; supports max_tokens and enable_thinking",
     )
-    parser.add_argument("--batch-size", "--batch_size", "-b", default=None)
-    parser.add_argument("--max-batch-size", "--max_batch_size", type=_positive_int, default=None)
+    parser.add_argument("--batch-size", "-b", default=None)
+    parser.add_argument("--max-batch-size", type=_positive_int, default=None)
     parser.add_argument("--unit-concurrency", type=_positive_int, default=None)
     parser.add_argument("--request-concurrency", type=_positive_int, default=None)
     parser.add_argument("--judge-concurrency", type=_positive_int, default=None)
@@ -356,7 +347,6 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--use-cache",
-        "--use_cache",
         "-c",
         type=Path,
         help="SQLite response-cache directory or .db file",
@@ -382,19 +372,17 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--blind-baseline",
-        "--blind_baseline",
         type=Path,
         help="results.jsonl from a --blind run of the same evaluation inputs",
     )
     parser.add_argument("--fail-on-regression", action="store_true", default=None)
     parser.add_argument("--regression-threshold", type=_nonnegative_float, default=None)
-    parser.add_argument("--predict-only", "--predict_only", "-x", action="store_true", default=None)
-    parser.add_argument("--log-samples", "--log_samples", action="store_true", default=None)
+    parser.add_argument("--predict-only", "-x", action="store_true", default=None)
+    parser.add_argument("--log-samples", action="store_true", default=None)
     parser.add_argument(
         "--stream-results",
-        "--stream_results",
         action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
+        default=None,
         help=(
             "judge and print each task's table as soon as that task finishes answering (default); "
             "use --no-stream-results to defer all judging until every task has answered"
@@ -422,7 +410,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
         default=None,
     )
-    parser.add_argument("--check-integrity", "--check_integrity", action="store_true")
+    parser.add_argument("--check-integrity", action="store_true")
     return parser
 
 
@@ -453,8 +441,6 @@ def _arguments(
     download: DownloadSettings | None = None,
     overrides: HarnessOverrides | None = None,
 ) -> _Arguments:
-    if parsed.model != "mindbridge":
-        parser.error("--model must be mindbridge")
     harness = HarnessOverrides() if overrides is None else overrides
     run = harness.run
     arms = _selected_arms(parser, parsed, _picked(parsed.arms, run.arms, DEFAULT_ARM))
@@ -464,7 +450,6 @@ def _arguments(
     # A flag beats the file; the file beats the built-in default. Every constant below is the
     # default the flag used to carry, moved here so that "unset" stays distinguishable.
     offset = _picked(parsed.offset, run.offset, 0)
-    num_fewshot = _picked(parsed.num_fewshot, run.num_fewshot, 0)
     batch_size = _picked(parsed.batch_size, run.batch_size, "auto")
     max_batch_size = _picked(parsed.max_batch_size, run.max_batch_size, 64)
     unit_concurrency = _picked(parsed.unit_concurrency, run.unit_concurrency, 1)
@@ -499,7 +484,7 @@ def _arguments(
     regression_threshold = _picked(parsed.regression_threshold, run.regression_threshold, 0.0)
     predict_only = _picked(parsed.predict_only, run.predict_only, False)
     log_samples = _picked(parsed.log_samples, run.log_samples, False)
-    stream_results = _picked(getattr(parsed, "stream_results", None), run.stream_results, True)
+    stream_results = _picked(parsed.stream_results, run.stream_results, True)
     allow_unverified = _picked(parsed.allow_unverified_data, run.allow_unverified_data, False)
     download_inputs = _picked(parsed.download, run.download, True)
     overwrite = _picked(parsed.overwrite, run.overwrite, False)
@@ -510,8 +495,6 @@ def _arguments(
         parser.error("--fail-on-regression requires --compare")
     if recall_limit > 100:
         parser.error("--recall-limit must not exceed 100")
-    if num_fewshot:
-        parser.error("the supported memory benchmarks are zero-shot; --num_fewshot must be 0")
     requested = tuple(part.strip() for part in tasks_value.split(",") if part.strip())
     # `--seed` and `--limit` are argparse `type=` callables, which signal a bad value with
     # `ArgumentTypeError`; that is not a `ValueError`, so a configured value has to be caught here
@@ -568,7 +551,6 @@ def _arguments(
         seeds=seeds,
         bootstrap_samples=bootstrap_samples,
         repeat_index=repeat_index,
-        model=parsed.model,
         arms=arms,
         full_context_chars=full_context_chars,
         ingest=ingest,
@@ -583,7 +565,6 @@ def _arguments(
         judge_model_args=parsed.judge_model_args,
         judge_concurrency=judge_concurrency,
         gen_kwargs=gen_kwargs,
-        num_fewshot=num_fewshot,
         use_cache=(None if use_cache is None else use_cache.expanduser().resolve()),
         device=device,
         device_lock=device_lock,
@@ -723,8 +704,7 @@ def _load_memory_config(
 ) -> tuple[MindBridgeConfig | None, HarnessOverrides]:
     """Load one harness configuration file into its product and harness halves.
 
-    The file is YAML, which parses the JSON files this flag used to take without a second code
-    path. The `benchmark:` mapping is the harness's own: credentials, judging, and corpus
+    The `benchmark:` mapping is the harness's own: credentials, judging, and corpus
     acquisition have no field in `MindBridgeConfig` and must not gain one, because that schema is
     a public contract and its credentials are deliberately kept off disk.
     """
@@ -767,14 +747,10 @@ def _load_memory_config(
 
 
 def _model_config(
-    model: str,
     arguments: str,
     *,
     memory_config: MindBridgeConfig | None = None,
-    overrides: HarnessOverrides | None = None,
 ) -> ModelConfig:
-    if model != "mindbridge":
-        raise ValueError("model must be mindbridge")
     config = ModelConfig.from_environment()
     if memory_config is not None and memory_config.generation is not None:
         generation = memory_config.generation
@@ -810,10 +786,9 @@ def _model_config(
         "generation_min_video_seconds",
         "timeout_seconds",
     }
-    aliases = {"pretrained": "generation_model", "model": "generation_model"}
     for item in (part.strip() for part in arguments.split(",") if part.strip()):
         key, separator, value = item.partition("=")
-        key = aliases.get(key.strip(), key.strip())
+        key = key.strip()
         if not separator or key not in allowed or not value.strip():
             raise ValueError(f"invalid --model-args item: {item}")
         parsed = value.strip()
@@ -848,10 +823,9 @@ def _judge_config(
         concurrency=arguments.judge_concurrency,
     )
     allowed = {"model", "base_url", "api_key", "timeout_seconds"}
-    aliases = {"pretrained": "model"}
     for item in (part.strip() for part in arguments.judge_model_args.split(",") if part.strip()):
         key, separator, value = item.partition("=")
-        key = aliases.get(key.strip(), key.strip())
+        key = key.strip()
         if not separator or key not in allowed or not value.strip():
             raise ValueError(f"invalid --judge-model-args item: {item}")
         parsed = value.strip()
@@ -1110,7 +1084,7 @@ def _generation_kwargs(  # noqa: C901 - ordered trust-boundary validation is lin
     for item in (part.strip() for part in value.split(",") if part.strip()):
         key, separator, raw = item.partition("=")
         if not separator or not key.strip() or not raw.strip() or key.strip() in supplied:
-            raise ValueError(f"invalid --gen_kwargs item: {item}")
+            raise ValueError(f"invalid --gen-kwargs item: {item}")
         supplied[key.strip()] = raw.strip()
     unsupported = set(supplied) - {
         "temperature",
@@ -1121,7 +1095,7 @@ def _generation_kwargs(  # noqa: C901 - ordered trust-boundary validation is lin
     }
     if unsupported:
         raise ValueError(
-            "MindBridge eval supports deterministic --gen_kwargs only: temperature, do_sample, "
+            "MindBridge eval supports deterministic --gen-kwargs only: temperature, do_sample, "
             "seed, max_tokens, enable_thinking"
         )
     if "temperature" in supplied and float(supplied["temperature"]) != 0:
@@ -1129,21 +1103,21 @@ def _generation_kwargs(  # noqa: C901 - ordered trust-boundary validation is lin
     if "do_sample" in supplied and supplied["do_sample"].casefold() not in {"false", "0"}:
         raise ValueError("reproducible evaluation requires do_sample=false")
     if "seed" in supplied and int(supplied["seed"]) != seed:
-        raise ValueError("--gen_kwargs seed must match the first --seed value")
+        raise ValueError("--gen-kwargs seed must match the first --seed value")
     if "max_tokens" in supplied:
         try:
             max_tokens = int(supplied["max_tokens"])
         except ValueError:
-            raise ValueError("--gen_kwargs max_tokens must be a positive integer") from None
+            raise ValueError("--gen-kwargs max_tokens must be a positive integer") from None
         if max_tokens <= 0:
-            raise ValueError("--gen_kwargs max_tokens must be a positive integer")
+            raise ValueError("--gen-kwargs max_tokens must be a positive integer")
     if "enable_thinking" in supplied and supplied["enable_thinking"].casefold() not in {
         "true",
         "false",
         "1",
         "0",
     }:
-        raise ValueError("--gen_kwargs enable_thinking must be true or false")
+        raise ValueError("--gen-kwargs enable_thinking must be true or false")
     normalized = ["temperature=0", "do_sample=false", f"seed={seed}"]
     if "max_tokens" in supplied:
         normalized.append(f"max_tokens={max_tokens}")

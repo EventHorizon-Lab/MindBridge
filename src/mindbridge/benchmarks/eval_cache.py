@@ -1,4 +1,4 @@
-"""SQLite response cache compatible with lmms-eval's directory and file path shapes."""
+"""SQLite answer and judge caches with run-local write shards."""
 
 from __future__ import annotations
 
@@ -56,9 +56,13 @@ class CachedAnswer:
     evidence: tuple[EvidenceInterval, ...] = ()
     abstained: bool = False
     abstention_reason: str | None = None
-    # None means an older cache entry did not retain the diagnostic. An empty tuple is a
-    # successful diagnostic that returned no candidates; those two cases score differently.
+    # None means this answer surface does not expose ranked candidates. An empty tuple is an
+    # observed retrieval that returned no candidates; those two cases score differently.
     ranked_source_ids: tuple[str, ...] | None = None
+    generation_evidence: tuple[EvidenceInterval, ...] | None = None
+    trace_id: str | None = None
+    answer_span_id: str | None = None
+    excerpt_evidence: tuple[EvidenceInterval, ...] = ()
 
 
 class ResponseCache:
@@ -97,6 +101,14 @@ class ResponseCache:
                 "abstained": answer.abstained,
                 "abstention_reason": answer.abstention_reason,
                 "ranked_source_ids": answer.ranked_source_ids,
+                "generation_evidence": (
+                    None
+                    if answer.generation_evidence is None
+                    else tuple(item.json() for item in answer.generation_evidence)
+                ),
+                "trace_id": answer.trace_id,
+                "answer_span_id": answer.answer_span_id,
+                "excerpt_evidence": tuple(item.json() for item in answer.excerpt_evidence),
             },
             ensure_ascii=False,
             allow_nan=False,
@@ -168,8 +180,20 @@ def _open(path: Path, ddl: str, *, check_same_thread: bool = True) -> sqlite3.Co
 
 def _answer(payload: str) -> CachedAnswer:
     value = json.loads(payload)
-    if not isinstance(value, dict):
-        raise ValueError("response cache payload must be an object")
+    if not isinstance(value, dict) or set(value) != {
+        "prediction",
+        "confidence",
+        "memory_ids",
+        "evidence",
+        "abstained",
+        "abstention_reason",
+        "ranked_source_ids",
+        "generation_evidence",
+        "trace_id",
+        "answer_span_id",
+        "excerpt_evidence",
+    }:
+        raise ValueError("response cache payload must use the current answer fields")
     (
         prediction,
         confidence,
@@ -179,13 +203,13 @@ def _answer(payload: str) -> CachedAnswer:
         abstention_reason,
         ranked_source_ids,
     ) = (
-        value.get("prediction"),
-        value.get("confidence"),
-        value.get("memory_ids"),
-        value.get("evidence", []),
-        value.get("abstained", False),
-        value.get("abstention_reason"),
-        value.get("ranked_source_ids"),
+        value["prediction"],
+        value["confidence"],
+        value["memory_ids"],
+        value["evidence"],
+        value["abstained"],
+        value["abstention_reason"],
+        value["ranked_source_ids"],
     )
     if (
         not isinstance(prediction, str)
@@ -209,6 +233,18 @@ def _answer(payload: str) -> CachedAnswer:
         raise ValueError("response cache payload is invalid")
     try:
         intervals = tuple(_evidence(item) for item in evidence)
+        generation = value["generation_evidence"]
+        if generation is not None and not isinstance(generation, list):
+            raise ValueError("invalid generation evidence")
+        generation_intervals = (
+            None if generation is None else tuple(_evidence(item) for item in generation)
+        )
+        excerpts = value["excerpt_evidence"]
+        if not isinstance(excerpts, list):
+            raise ValueError("invalid excerpt evidence")
+        excerpt_intervals = tuple(_evidence(item) for item in excerpts)
+        trace_id = _trace_identifier(value["trace_id"], 32)
+        answer_span_id = _trace_identifier(value["answer_span_id"], 16)
     except (TypeError, ValueError):
         raise ValueError("response cache payload is invalid") from None
     return CachedAnswer(
@@ -219,7 +255,24 @@ def _answer(payload: str) -> CachedAnswer:
         abstained,
         abstention_reason,
         None if ranked_source_ids is None else tuple(ranked_source_ids),
+        generation_intervals,
+        trace_id,
+        answer_span_id,
+        excerpt_intervals,
     )
+
+
+def _trace_identifier(value: object, length: int) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or any(character not in "0123456789abcdef" for character in value)
+        or int(value, 16) == 0
+    ):
+        raise ValueError("invalid trace identifier")
+    return value
 
 
 def _evidence(value: object) -> EvidenceInterval:

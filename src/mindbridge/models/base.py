@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -21,6 +21,8 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     SearchHit,
+    _require_aware,
+    _require_interval,
 )
 
 
@@ -77,6 +79,8 @@ class FormationInput:
     History is background, not additional targets. A proposal must still cite its target;
     a historical record may be cited only while its current version remains active.
     ``history_truncated`` reports an incomplete window, never absence of counterevidence.
+    Resolve relative dates against ``occurred_at``, falling back to ``created_at``; these
+    source timestamps are separate from the assertion validity in ``context``.
     """
 
     memory_id: str
@@ -84,6 +88,9 @@ class FormationInput:
     context: ObservationContext
     history: tuple[MemoryRecord, ...] = ()
     history_truncated: bool = False
+    occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
+    created_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.memory_id, str) or not self.memory_id.strip():
@@ -92,6 +99,8 @@ class FormationInput:
             raise ValidationError("formation input content must be a ModelInput")
         if not isinstance(self.context, ObservationContext):
             raise ValidationError("formation input context must be an ObservationContext")
+        _require_interval(self.occurred_at, self.occurred_end)
+        _require_aware(self.created_at, "formation input created_at")
         try:
             history = tuple(self.history)
         except TypeError:
@@ -349,11 +358,9 @@ class FaceBackend(Protocol):
 class GenerationBackend(Protocol):
     """One thread-safe grounded-answer adapter over a provider SDK.
 
-    Both keyword arguments are defaulted and sent only when they are not their default, so a
-    backend written against the two-argument signature keeps answering. `exhaustive` says the
-    hits are every record a recall program's predicate matched, in time order, rather than a
-    ranking -- the one thing a grounded prompt cannot infer from the hits themselves and gets
-    wrong by describing their order as rank.
+    `exhaustive` says the hits are every record a recall program's predicate matched, in time
+    order, rather than a ranking -- the one thing a grounded prompt cannot infer from the hits
+    themselves and gets wrong by describing their order as rank.
     """
 
     @property
@@ -373,7 +380,11 @@ class GenerationBackend(Protocol):
 
 @runtime_checkable
 class StreamingGenerationBackend(Protocol):
-    """Optional generation capability that yields answer text in provider order."""
+    """Optional capability that yields provider deltas and returns their grounded result.
+
+    The terminal `AnswerResult` carries the exact grounding and abstention status. Its answer
+    matches the deltas under `strict`; `best_effort` may remove a confidence marker from it.
+    """
 
     def stream_answer(
         self,
@@ -382,7 +393,7 @@ class StreamingGenerationBackend(Protocol):
         *,
         answer_policy: AnswerPolicy = "strict",
         exhaustive: bool = False,
-    ) -> Iterator[str]: ...
+    ) -> Generator[str, None, AnswerResult]: ...
 
 
 @runtime_checkable
@@ -394,8 +405,7 @@ class RecallPlanningBackend(Protocol):
     search and nothing else. `corpus_digest` is one line describing what is in the store, so a
     plan cannot ask for a time span or a modality that does not exist. `attempted` describes what
     an earlier round of the same question already read and why it was not enough; it is empty on
-    the first round and sent only when it is not, so a backend written against the shorter
-    signature keeps planning.
+    the first round.
     """
 
     def plan_recall(

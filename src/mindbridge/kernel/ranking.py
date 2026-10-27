@@ -69,9 +69,6 @@ LEXICAL_FULL_COVERAGE_RELEVANCE = 0.75
 MAX_LEXICAL_RERANK_BONUS = 0.3
 
 
-_NEGATION_WEIGHT = 6.0
-
-
 _LEXICAL_NOISE_TERMS = frozenset(
     {
         "a",
@@ -150,17 +147,12 @@ _TOKEN_BREAK = re.compile(r"[\W_]")
 # conjunctions, pronouns, and interrogatives. Stripping them matters more than it does in
 # English, because every one of them otherwise carries IDF weight into the coverage ratio that
 # performs cross-route fusion, and a question is mostly these characters. Negation characters
-# are excluded on purpose; `_NEGATION_TERMS` weights those up rather than away.
+# are excluded on purpose: their actual word/bigram matches remain lexical evidence.
 _CJK_NOISE_CHARACTERS = frozenset(
     "的了着地得之吗呢吧啊呀嘛么们"
     "是在就都也还把被给对从跟和与"
     "或及而但因所以什谁哪怎何我你"
     "他她它这那其请"
-)
-
-
-_NEGATION_TERMS = frozenset(
-    {"no", "not", "never", "neither", "nor", "without", "不", "没", "未", "无", "非", "别"}
 )
 
 
@@ -202,8 +194,59 @@ def merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
                     relevance=max(current.relevance, hit.relevance),
                     confidence=max(cast(float, current.confidence), cast(float, hit.confidence)),
                     lexical_match=current.lexical_match or hit.lexical_match,
+                    lexical_score=max(
+                        (
+                            score
+                            for score in (current.lexical_score, hit.lexical_score)
+                            if score is not None
+                        ),
+                        default=None,
+                    ),
+                    lexical_route=current.lexical_route or hit.lexical_route,
                 )
     return tuple(merged.values())
+
+
+def merge_temporal_lexical_hits(
+    preferred: Sequence[IndexHit],
+    fallback: Sequence[IndexHit],
+) -> tuple[IndexHit, ...]:
+    """Discover within time, but retain the global route's lexical scoring scale.
+
+    Filtered BM25 shares corpus statistics with the matching global type route. RRF ranks do
+    not: unseen filtered hits have no known global rank, so their scores are conservatively
+    capped below that route's tail. Known global scores always win, including exact matches.
+    """
+    global_ids = {hit.id for hit in fallback}
+    maxima: dict[str | None, float] = {}
+    tails: dict[str | None, float] = {}
+    for hit in fallback:
+        route = hit.lexical_route
+        tails[route] = min(tails.get(route, 1.0), hit.relevance)
+        if hit.lexical_score is not None:
+            maxima[route] = max(maxima.get(route, 0.0), hit.lexical_score)
+    added = []
+    for hit in preferred:
+        if hit.id in global_ids:
+            continue
+        tail = tails.get(hit.lexical_route, 0.0)
+        maximum = maxima.get(hit.lexical_route, 0.0)
+        relevance = (
+            min(tail, hit.lexical_score / maximum)
+            if hit.lexical_score is not None and maximum > 0.0
+            else math.nextafter(tail, 0.0) * hit.relevance
+        )
+        added.append(
+            IndexHit(
+                id=hit.id,
+                relevance=relevance,
+                confidence=hit.confidence,
+                lexical_match=hit.lexical_match,
+                lexical_score=hit.lexical_score,
+                lexical_route=hit.lexical_route,
+            )
+        )
+    return (*fallback, *added)
 
 
 def search_outcome(
@@ -537,8 +580,8 @@ def retrieval_is_ambiguous(
     if margin == 0.0 or len(ranked) < 2:
         return False
     first, second = ranked[:2]
-    if first[3]:
-        return False
+    # Lexical coverage already contributes to relevance. Route membership cannot resolve a
+    # close pair: even complete query coverage can describe contradictory facts or an echo.
     difference = first[1] - second[1] if temporal_range is not None else first[2] - second[2]
     return difference < margin
 
@@ -604,6 +647,12 @@ def lexical_relevance(
     query: str,
     memories: Sequence[StoredMemory],
 ) -> dict[str, float]:
+    """Measure observed IDF coverage, without inferring a term's grammatical role.
+
+    A word or bigram does not establish polarity, its scope, or its object. Giving such
+    terms extra weight can reward an unrelated clause or a fragment of an ordinary word.
+    Literal negative evidence still contributes through its matching words and bigrams.
+    """
     query_terms = lexical_query_terms(query)
     if not query_terms or not memories:
         return {}
@@ -611,9 +660,7 @@ def lexical_relevance(
     frequencies = Counter(term for terms in documents.values() for term in query_terms & terms)
     count = len(documents)
     weights = {
-        term: (math.log((count + 1.0) / (frequencies[term] + 1.0)) + 1.0)
-        * (_NEGATION_WEIGHT if term in _NEGATION_TERMS else 1.0)
-        for term in query_terms
+        term: math.log((count + 1.0) / (frequencies[term] + 1.0)) + 1.0 for term in query_terms
     }
     total = sum(weights.values())
     return {

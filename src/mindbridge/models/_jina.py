@@ -22,13 +22,6 @@ DEFAULT_JINA_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 DEFAULT_JINA_REVISION = "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4"
 DEFAULT_JINA_DIMENSION = 1024
 _JINA_RECIPE = "jina-v5-omni-official-sentence-transformers-v6"
-_JINA_LEGACY_RECIPES = frozenset(
-    {
-        "jina-v5-omni-official-sentence-transformers-v3",
-        "jina-v5-omni-official-sentence-transformers-v4",
-        "jina-v5-omni-official-sentence-transformers-v5",
-    }
-)
 _JINA_CAPABILITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 _JINA_DIMENSIONS = frozenset({32, 64, 128, 256, 512, 1024})
 _JINA_VIDEO_FRAMES = 32

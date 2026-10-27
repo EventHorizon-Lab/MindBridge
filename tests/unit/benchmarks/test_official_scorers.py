@@ -450,6 +450,8 @@ async def test_unified_eval_applies_and_records_the_official_judge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from openai import APIError
+
     calls: list[dict[str, object]] = []
 
     class Completions:
@@ -468,6 +470,7 @@ async def test_unified_eval_applies_and_records_the_official_judge(
 
     fake_openai = ModuleType("openai")
     fake_openai.AsyncOpenAI = Client  # type: ignore[attr-defined]
+    fake_openai.APIError = APIError  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
 
     question = EvalQuestion(

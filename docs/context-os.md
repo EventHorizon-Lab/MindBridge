@@ -66,7 +66,7 @@ whose life is observed is also a first-class participant even when they never ca
 
 | Participant | Role | Authority |
 | --- | --- | --- |
-| Developer or operator | Select models, connect sensors, set policy, diagnose, migrate, and recover the runtime. | Full instance administration inside the host's security boundary. |
+| Developer or operator | Select models, connect sensors, set policy, diagnose, re-ingest data, and recover the runtime. | Full instance administration inside the host's security boundary. |
 | Agent | Request context, add explicit observations, and report outcomes or feedback. | Bounded capabilities granted by the host. |
 | Human data subject | Own consent, identity naming, correction, export, retention, and physical deletion decisions. | Final authority over sensitive personal context. |
 
@@ -261,8 +261,9 @@ application requirement.
 ## Models, modalities, and plugins
 
 Model independence means replacement behind a declared capability contract. It does not mean that
-durable representation spaces can be swapped without migration. Embedding model, dimension, input
-recipe, identity space, and formation recipe remain explicit compatibility identities.
+durable representation spaces can be swapped in an existing directory. Embedding model, dimension,
+input recipe, identity space, and formation recipe have explicit identities. A changed embedding
+space requires re-ingestion into a fresh directory.
 
 New modalities enter through the smallest adapter that can normalize them to immutable content,
 declared capability, event time, provenance, and optional spatial context. Accepting a file format

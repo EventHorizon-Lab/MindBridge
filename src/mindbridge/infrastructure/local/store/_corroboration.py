@@ -30,14 +30,17 @@ def independent_evidence_enabled(connection: sqlite3.Connection) -> bool:
 def evidence_support(
     connection: sqlite3.Connection,
     memory_id: str,
+    *,
+    pending_assessment: Assessment | None = None,
 ) -> SupportSummary:
     """Load at most 256 records and 4096 clause members, then compute a support lower bound.
 
     Missing and omitted nodes have no proofs. A partial AND clause is discarded in its entirety.
     Forgotten records remain evidence: consolidation intentionally soft-forgets its inputs while
     retaining their provenance. Withdrawal instead retires clauses or deletes the records.
+    A pending assessment replaces the same source set, just like durable clause insertion.
     """
-    nodes, truncated = _load_nodes(connection, memory_id)
+    nodes, truncated = _load_nodes(connection, memory_id, pending_assessment=pending_assessment)
     support = independent_support(nodes, memory_id)
     result = replace(support, truncated=support.truncated or truncated)
     if result.truncated:
@@ -52,6 +55,8 @@ def evidence_support(
 def _load_nodes(
     connection: sqlite3.Connection,
     memory_id: str,
+    *,
+    pending_assessment: Assessment | None = None,
 ) -> tuple[dict[str, EvidenceNode], bool]:
     nodes: dict[str, EvidenceNode] = {}
     pending = deque([memory_id])
@@ -67,6 +72,29 @@ def _load_nodes(
         truncated = truncated or clipped
         if node is None:
             continue
+        if current == memory_id and pending_assessment is not None:
+            # Formation must compare grounded support before retiring another state, although
+            # its explicit clause is not inserted until the semantic row has been written.
+            members = len(pending_assessment.sources)
+            pending_sources = frozenset(pending_assessment.sources)
+            node = replace(
+                node,
+                root_group=None,
+                assessments=tuple(
+                    assessment
+                    for assessment in node.assessments
+                    if frozenset(assessment.sources) != pending_sources
+                ),
+            )
+            if member_rows + members > _MAX_MEMBER_ROWS:
+                truncated = True
+            else:
+                member_rows += members
+                node = replace(
+                    node,
+                    root_group=None,
+                    assessments=(*node.assessments, pending_assessment),
+                )
         nodes[current] = node
         sources = sorted(
             {source for assessment in node.assessments for source in assessment.sources}

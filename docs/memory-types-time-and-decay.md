@@ -163,27 +163,25 @@ commits derived records. Two kinds carry extra visibility rules:
   and those alternatives survive one another's withdrawal. A derived record of any kind other
   than `OBSERVATION` whose basis is not a host assertion (`USER_STATEMENT`, `RESPONSE_FEEDBACK`)
   is visible only while it has at least one active evidence clause. `add()` accepts only an
-  `ObservationContext`, so no public surface can write a derived record without evidence; a store
-  written before schema 17 may hold some, and the upgrade logs how many will stay hidden.
+  `ObservationContext`, so no public surface can write a derived record without evidence.
 
 A custom `FormationBackend` may set `FormationProposal.evidence_ids` to the ordered IDs of every
 observation in the current `FormationInput` batch that the proposal jointly depends on. The
 primary input's ID must be present; empty, duplicate, foreign, and out-of-batch IDs reject the
-formation response before any derived record commits. `None` retains the legacy primary-source
-link. These IDs declare dependencies, not independent corroboration or a semantic proof that the
+formation response before any derived record commits. `None` uses the primary input as the sole
+evidence member. These IDs declare dependencies, not independent corroboration or a semantic proof that the
 model cited every fact it used.
 
 One explicit tuple is one conjunctive support clause: `{A, B}` means the derived record depends on
 both observations. Several separately emitted clauses are alternatives, so `{A, B}` and `{C}` mean
 `support(claim) = (A AND B) OR C`. Deleting either member retires the whole first clause; it never
 turns into the unsupported singleton `{B}` or `{A}`. `MemoryContext.evidence_ids` is the ordered union of
-members from complete active clauses, so existing callers keep one flat list. An explicit automatic
+members from complete active clauses. An explicit automatic
 `FormationProposal.evidence_ids` tuple creates a conjunction. Each new `CONSOLIDATE` operation also
 treats its complete cited `evidence_ids` set as one conjunction; separate operations can add
-alternative clauses for the same stable derived record. A legacy/custom former that leaves its
-field as `None`, already-persisted consolidation evidence, general `MemoryContext.evidence_ids`,
-and `REINFORCE` retain independent singleton alternatives. Existing rows are not reinterpreted or
-backfilled. A joint proposal contributes one confidence assessment, while singleton alternatives
+alternative clauses for the same stable derived record. A former that leaves its field as `None`
+creates a singleton clause over its primary input. General `MemoryContext.evidence_ids` and
+`REINFORCE` declare independent singleton alternatives. A joint proposal contributes one confidence assessment, while singleton alternatives
 retain capture-group maximum and noisy-OR combination; current confidence is the greater of those
 projections. These declarations are dependencies, not proof that model prose cited every fact it
 used.
@@ -194,7 +192,7 @@ probabilities. This is ordinary truth-maintenance and how-provenance bookkeeping
 claim that Boolean support expressions are new. The compiler's cycle guard remains conservative:
 it may refuse a cyclic evidence union even when another clause grounds the record independently.
 
-SQLite schema 17 stores current clauses, their ordered members, and append-only clause versions.
+SQLite stores current clauses, their ordered members, and append-only clause versions.
 Retirement, reactivation, confidence changes, and operation rollback each close or append an
 interval at their actual transaction time. Historical `known_at` reads therefore retain periods
 when a clause was active or inactive. An inverse version points to the exact predecessor it
@@ -205,7 +203,7 @@ physical-erasure guarantee and cannot recover records removed by `delete`.
 
 Deleting evidence traverses only that source's reverse-dependency region and evaluates the region
 to a grounded fixed point; it does not scan or reinterpret unrelated records. Observations and host
-assertions are roots on both native clauses and schema-16 links migrated to singleton clauses. A
+assertions are roots in the clause graph. A
 derived record remains only when at least one complete clause is grounded. Unsupported mutual
 cycles cannot keep each other alive, while a cycle reached from an independent observation can
 survive.
@@ -299,7 +297,7 @@ evidence can change the retained subset at these bounds; monotonicity is not pro
 These are bounds per projected memory, not a constant-time bound on a whole dependent closure.
 
 Changes to evidence reproject the dependent closure in the same SQLite transaction, including
-cases where the older scalar capture-group label did not change. Source deletion and operation
+cases where the scalar capture-group label did not change. Source deletion and operation
 rollback continue to withdraw whole conjunctions and preserve independent alternatives. The
 compiled context consumes the resulting visibility and confidence through its existing evidence
 and budget checks. Proof evaluation makes no model request. Formation, apply, and rollback
@@ -308,12 +306,10 @@ rolls back the change. This holds that transaction open during embedding. Deleti
 batch from its exact rollback-only preview before committing the deletion and text replacement.
 No new storage service is introduced.
 
-The `evidence.projection_recipe` store metadata pins `legacy-v1` or `independent-v1`. Changing the
-setting when reopening raises `StorageError`. Existing unmarked nonempty stores are legacy;
-enabling the experiment requires a fresh directory and replaying the original observations and
-operations. There is no automatic migration or rewrite of historical versions. Open experimental
-stores only with a version that understands this policy marker; older binaries do not enforce it.
-The SQLite schema version and public operation schemas are unchanged.
+The `evidence.projection_recipe` store metadata pins `complete-v1` or `independent-v1`. Changing the
+setting when reopening raises `StorageError`. A nonempty store without the marker is rejected.
+Enabling the experiment requires a fresh directory and replaying the original observations and
+operations. Opening a store never rewrites historical versions or changes its evidence policy.
 
 See the [experiment protocol](research/2026-09-12-corroboration-protocol.md). Structural SDK tests
 with fixed proposals do not establish real multimodal perception or natural-interaction quality.
@@ -352,10 +348,32 @@ what_we_believed_then = memory.search(
 ```
 
 Overlapping state assertions share a deterministic lineage keyed by kind, normalized subject,
-predicate, and spatial frame/anchor. A later assertion retires the previous transaction version and
-splits any unaffected before/after validity segments into carry-forward versions, which is what
-supports bounded backfill and A to B to A evolution. Assertions conflict only within one SQLite
-write batch; equal wall-clock timestamps in separate transactions are still ordered.
+predicate, and spatial frame/anchor. A later `STATE` assertion retires an overlapping standing
+version only when its evidence is at least as strong. Compare the **derived proposal's** basis
+first: `USER_STATEMENT` and `RESPONSE_FEEDBACK` are explicit assertions and take precedence over
+`MODEL_INFERENCE`. Within the same authority tier, the new confidence must be at least the
+standing version's current evidence confidence. Confidence is an operational support score,
+not a calibrated probability; a higher-authority assertion can replace an inference even with a
+lower score. Raw user-statement observations do not promote a model-inferred proposal's basis.
+
+An insufficiently supported alternative is retained with its own evidence and confidence,
+beside the stronger state, as an unresolved conflict. For example, a `0.1` inferred coffee
+preference cannot retire a `0.99` inferred tea preference. `search()` still reaches tea for
+the overlapping interval. `compile()` preserves its existing conservative conflict handling:
+if `ContextBudget.min_confidence` excludes a known competing value, it reports unavailable
+competing evidence instead of asserting the other value alone. Resolve a wrong assertion with
+an explicit `CORRECT` and replacement rather than lowering query thresholds to conceal it.
+
+Accepted supersession splits unaffected before/after validity segments into carry-forward
+versions, supporting bounded backfill and A to B to A evolution. Independent assertions within
+one SQLite write batch remain conflicting, without a winner chosen by insertion order. Equal
+wall-clock timestamps in separate transactions are still ordered; equal-strength later
+assertions retain that ordering. Deleting evidence replays with the same authority comparison
+and the surviving evidence confidence, including transitive evidence changes. Explicitly
+corrected assertions stay withdrawn unless deliberately reasserted or the correction is rolled
+back. With independent evidence enabled, a pending STATE assessment is grounded against its
+source proofs before it can retire another state. Reinforcement updates support, without itself
+asserting a new valid-time interval or revision order.
 
 ### Spatial scope
 
@@ -446,9 +464,10 @@ inside the window the kernel gathered, which is the shown set plus whatever the 
 of it.
 
 Named targets and cited evidence are what the window bounds. Lineage supersession is not a
-backend choice at all: a new `STATE` or user-stated `TRAIT` retires the current version of every
-other record in its lineage whose validity it overlaps, by the kernel's own deterministic rule,
-including records the backend never saw. Those versions are recorded on the log row as
+backend choice at all: a new `STATE` retires overlapping versions its evidence is strong enough
+to replace, and a user-stated `TRAIT` retires every overlapping version in its lineage, by the
+kernel's own deterministic rule, including records the backend never saw. Those versions are
+recorded on the log row as
 `MemoryOperationRecord.superseded` and `rollback()` restores exactly them. Because a later
 consolidation can supersede an earlier one's record, operations on one lineage reverse newest
 first: `rollback()` returns `False` for an operation a standing later one has built on.
@@ -498,9 +517,10 @@ signal: it attaches an independent source to a derived record, is logged, and is
 `FORGET` has a host entry point for its intent, because `forget()` is a policy decision a host
 makes without a model; the other three intents exist only as backend proposals.
 
-"Update" is not a separate intent. It is what a `CONSOLIDATE` into an existing lineage does: the
-new version supersedes the prior one at transaction time and history is kept. That reconciliation
-runs for `STATE` and for `USER_STATEMENT` `TRAIT`. Any other kind gains a second record in the
+"Update" is not a separate intent. It is what a `CONSOLIDATE` into an existing lineage does when
+the replacement qualifies: the new version supersedes the prior one at transaction time and
+history is kept. That reconciliation runs for evidence-qualified `STATE` and for
+`USER_STATEMENT` `TRAIT`. Any other kind gains a second record in the
 same lineage rather than superseding. Multi-valued `RELATION` and model-inferred `TRAIT` records
 accumulate and do not create `CONTRADICTION` work merely because their values differ. Proposing a
 replacement value for a wrong inference is a `CORRECT` and a `CONSOLIDATE` in the same batch, which the

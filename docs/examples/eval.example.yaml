@@ -285,16 +285,12 @@ benchmark:
     #   video-mme-v2: /corpus/video-mme-v2/videos
     # media_manifest: /corpus/.benchmarks/results/prepared/media-manifest.jsonl
 
-    # Zero-shot is the only supported setting for these benchmarks.
-    num_fewshot: 0
-
 # ---------------------------------------------------------------------------------------------
 # Not expressible here, and why
 # ---------------------------------------------------------------------------------------------
-# Only four kinds of input stay on the command line:
+# These inputs stay on the command line:
 #
 #   --config              this file's own path
-#   --model               must be the literal `mindbridge`
 #   --list-tasks          modes that do something other than evaluate, so they are actions
 #   --check-integrity     rather than settings
 #
