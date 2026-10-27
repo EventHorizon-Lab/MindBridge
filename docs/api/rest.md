@@ -531,6 +531,8 @@ evidence. It is permanent for that request and never includes the provider's ref
 answer evidence or select a provider with sufficient capacity; an identical retry cannot fix it.
 Answer requests are not retried after silently trimming evidence. This reason is distinct from
 the adapter's byte-based `payload_too_large` and the output limit's `output_truncated`.
+An upstream HTTP 413, including a non-JSON proxy rejection, maps to `payload_too_large` and
+REST HTTP 413 with `retryable=false`; it previously surfaced as an unclassified HTTP 502.
 `quota_exhausted` includes exhausted credits and provider project or organization spend/usage
 limits. `provider_unavailable` covers temporary upstream server failures after the SDK's own retry
 budget; callers still need a bounded retry policy. See OpenAI's

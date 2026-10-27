@@ -183,6 +183,10 @@ token limits. Answer overflow is not retried with evidence silently removed.
 
 For `code="model_output_truncated"`, generation reached its output-token limit: raise the adapter's
 generation limit or reduce the `ask()` evidence limit. Retrying the identical request is not a fix.
+For `reason="payload_too_large"`, check both MindBridge's byte ceilings and the provider or proxy
+upload limit. An upstream HTTP 413 has this reason even when the proxy returns HTML. Reduce the
+request or choose sufficient serving capacity; the adapter does not silently remove evidence
+and retry. This classification does not increase the provider's upload limit.
 Provider-specific controls and media limits are in the
 [Python adapter reference](api/python-sdk.md#bundled-adapters) and
 [REST input limits](api/rest.md#input-limits).

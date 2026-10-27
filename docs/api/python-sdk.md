@@ -1667,6 +1667,10 @@ budget, so lowering it alone may leave the mandatory `limit` hits over capacity.
 it is independent of the model's token window. Answer and media-diagnostic text overflows report
 `payload_too_large` at stage `generate`. See [evidence and provider budgets](../configuration.md#local-memory-settings).
 
+Provider HTTP 413 responses also map to `payload_too_large`, including non-JSON proxy errors.
+The failure is permanent for that request; the adapter preserves the selected evidence and
+does not retry by silently dropping media. Provider response bodies remain private.
+
 Stable input bounds are:
 
 | Bound | Value |

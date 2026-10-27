@@ -1,0 +1,23 @@
+{
+  "upstream_commit": "ef4e5dff1a47ec71213a06e359f02753defa8fb1",
+  "query_source": "memqa/qa_agent_baselines/oracle/config.py:PROMPTS.ORACLE_SYSTEM",
+  "judge_source": "memqa/utils/evaluator/config.py:LLM_JUDGE_PROMPT",
+  "deterministic_source": "memqa/utils/evaluator/evaluate_qa.py",
+  "query_sha256": "eab942574cdc1165b45645b03a0ee4d016d2d819c6258954cd4dda8ebc122e86",
+  "judge_sha256": "d5669b9effea50bad2abbed3e141a4710a1731d1cccc93c211a06560448a2210",
+  "query_bytes_match": true,
+  "judge_bytes_match": true,
+  "vendored_function_ast_matches": [
+    "_extract_list_ids_from_text",
+    "date_component_match",
+    "date_token_match",
+    "dates_match",
+    "tokens_match",
+    "_deterministic_accuracy_core",
+    "deterministic_accuracy",
+    "_prediction_list_items",
+    "_list_jaccard_core",
+    "list_jaccard_score"
+  ],
+  "scope": "Static parity only; no model requests or benchmark score measured"
+}

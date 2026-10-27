@@ -2290,6 +2290,10 @@ def _provider_reason(error: Exception) -> str | None:
         return "quota_exhausted" if error.code in _QUOTA_ERRORS else "rate_limited"
     if _is_context_length_rejection(error):
         return "context_length_exceeded"
+    # Proxies can reject before returning a JSON error body. The SDK represents HTTP 413
+    # as APIStatusError rather than BadRequestError; status is authoritative in either form.
+    if isinstance(error, openai.APIStatusError) and error.status_code == 413:
+        return "payload_too_large"
     # ``APITimeoutError`` subclasses ``APIConnectionError``, so the narrower class is checked first.
     for provider_error, reason in (
         (openai.AuthenticationError, "auth_failed"),

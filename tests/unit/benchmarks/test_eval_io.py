@@ -361,7 +361,7 @@ def test_atm_raw_media_filename_supplies_capture_time(tmp_path: Path, stem: str)
     assert {
         spec.adapter_version for name, spec in TASKS.items() if name.startswith("atm-bench-")
     } == {ATM_BENCH_ADAPTER_VERSION}
-    assert ATM_BENCH_ADAPTER_VERSION == "atm_bench_official_v3"
+    assert ATM_BENCH_ADAPTER_VERSION == "atm_bench_official_v4"
     assert _cache_task(task) == (
         f"atm-bench-main:{ATM_BENCH_ADAPTER_VERSION}:{task.evaluation_sha256}"
     )
@@ -369,6 +369,62 @@ def test_atm_raw_media_filename_supplies_capture_time(tmp_path: Path, stem: str)
     assert email.occurred_at == datetime(2024, 4, 23, 10, tzinfo=timezone.utc)
     captured = next(item for item in task.units[0].memories if item.source_id == stem)
     assert captured.occurred_at == datetime(2024, 4, 23, 19, 55, 26, tzinfo=timezone.utc)
+
+
+def test_atm_query_does_not_expose_answer_type_or_labels(tmp_path: Path) -> None:
+    from mindbridge.benchmarks.eval_adapters import MediaResolver, _atm
+
+    question = "When is the pickup scheduled?"
+    dataset = tmp_path / "questions.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "id": qtype,
+                    "question": question,
+                    "answer": "2040-06-18, 14:45",
+                    "qtype": qtype,
+                    "evidence_ids": ["email204006170001"],
+                }
+                for qtype in ("number", "list_recall", "open_end")
+            ]
+        ),
+        encoding="utf-8",
+    )
+    spec = TASKS["atm-bench-main"]
+    emails = tmp_path / spec.auxiliary[0]
+    emails.parent.mkdir(parents=True)
+    emails.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "email204006170001",
+                    "timestamp": "2040-06-17 10:00:00",
+                    "short_summary": "Pickup",
+                    "detail": "Pickup on June 18 at 14:45.",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "20400617_100000.jpg").write_bytes(b"image")
+    (unit,) = _atm(spec, dataset, MediaResolver(spec.name, media, None, None), tmp_path, None, 0)
+    assert len({item.content for item in unit.questions}) == 1
+    prompt = str(unit.questions[0].content[0])
+    assert question in prompt
+    assert "number alone" not in prompt
+    assert "2040-06-18" not in prompt
+    assert "email204006170001" not in prompt
+    assert unit.questions[0].content == (
+        question,
+        "You are a QA assistant. Use ONLY the provided evidence to answer. "
+        "If the evidence is insufficient, answer 'Unknown'. Respond with only the answer. "
+        "If the question asks to recall or list items (photos/emails/videos), respond with "
+        "the corresponding evidence IDs only, comma-separated, with no extra text.",
+    )
+    assert all(item.refusal == "Unknown" for item in unit.questions)
 
 
 def test_response_cache_merges_run_shards_into_the_shared_cache(tmp_path: Path) -> None:

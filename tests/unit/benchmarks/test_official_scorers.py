@@ -150,6 +150,71 @@ def test_official_judge_response_parsers_keep_upstream_mappings() -> None:
     }
 
 
+@pytest.mark.parametrize("separator", [" ", "\n", ", ", "; "])
+def test_atm_id_lists_use_only_the_pinned_official_score(separator: str) -> None:
+    reference = separator.join(("20400618_144500", "email204006170001"))
+    scores = _scores(
+        "atm-bench-main",
+        "20400618_144500, email204006170001, email204006170002",
+        reference,
+        {"qtype": "list_recall"},
+    )
+    from mindbridge.benchmarks._official.atm_score import list_jaccard_score
+
+    assert scores == {
+        "accuracy": list_jaccard_score(
+            reference, "20400618_144500, email204006170001, email204006170002"
+        )
+    }
+    if separator == " ":
+        assert scores["accuracy"] == 0.0
+
+
+def test_atm_list_score_keeps_non_id_items() -> None:
+    scores = _scores("atm-bench-main", "apples, pears", "apples, plums", {"qtype": "list_recall"})
+    assert scores == {"accuracy": pytest.approx(1 / 3)}
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (True, 1.0),
+        (False, 0.0),
+        (1, 1.0),
+        (0, 0.0),
+        (0.5, 0.5),
+        ("0.5", 0.5),
+        (2, 1.0),
+        (-1, 0.0),
+        (None, 0.0),
+        ("true", 0.0),
+        ("false", 0.0),
+        ([], 0.0),
+    ],
+)
+def test_atm_judge_scores_match_upstream_numeric_coercion(value: object, expected: float) -> None:
+    import json
+
+    plan = JudgePlan("p", "atm", ((JudgeMessage("user", "prompt"),),))
+    assert parse_judge_response(plan, json.dumps({"accuracy": value})) == {"accuracy": expected}
+
+
+def test_atm_judge_prompt_matches_the_pinned_upstream_bytes() -> None:
+    import hashlib
+
+    plan = judge_plan(
+        "atm-bench-main",
+        question="{{question}}",
+        references=("{{answer}}",),
+        prediction="{{prediction}}",
+        metadata={"qtype": "open_end"},
+    )
+    assert plan is not None
+    assert hashlib.sha256(plan.calls[0][0].content.encode()).hexdigest() == (
+        "d5669b9effea50bad2abbed3e141a4710a1731d1cccc93c211a06560448a2210"
+    )
+
+
 def test_memlens_and_locomo_plans_preserve_official_protocol_details() -> None:
     locomo = judge_plan(
         "locomo-refined",

@@ -270,6 +270,39 @@ def test_answer_context_rejection_preserves_evidence_and_does_not_retry(
     assert "private" not in str(failure.value)
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("structured", [False, True])
+def test_provider_payload_rejection_is_permanent_and_private(
+    stream: bool, structured: bool
+) -> None:
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if structured:
+            return httpx.Response(
+                413, json={"error": {"message": "private provider detail", "code": "413"}}
+            )
+        return httpx.Response(413, text="<html>private provider detail</html>")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        adapter = OpenAIModels(_sdk_client(client))
+        with pytest.raises(ModelError) as failure:
+            if stream:
+                list(adapter.stream_answer("question", (_search_hit(),)))
+            else:
+                adapter.answer("question", (_search_hit(),))
+    assert calls == 1
+    assert failure.value.reason == "payload_too_large"
+    assert failure.value.stage == "generate"
+    assert failure.value.retryable is False
+    response = exception_response(failure.value)
+    assert response.status_code == 413
+    assert "private" not in bytes(response.body).decode()
+    assert "private" not in str(failure.value)
+
+
 @pytest.mark.parametrize("media", [False, True])
 def test_answer_text_ceiling_matches_emitted_utf8_text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, media: bool

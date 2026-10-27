@@ -124,7 +124,7 @@ _PROTOCOLS = {
     "memlens": "memlens_judge_77f3ab9a52fa",
     "mm-lifelong": "mm_lifelong_judge_248aa82039a5",
     "supermemory-vqa": "supermemory_vqa_metrics_1d228e0f1004",
-    "atm-bench": "atm_bench_scorer_ef4e5dff1a47_minimal_v1",
+    "atm-bench": "atm_bench_scorer_ef4e5dff1a47_minimal_v2",
     "mem-gallery": "mem_gallery_scorer_a93959e1e978",
     "longmemeval": "longmemeval_anscheck_2ec2a557f339",
     "clbench": "clbench_binary_rubric_b28a5832a09b",
@@ -1407,19 +1407,32 @@ def _json_object(value: str) -> Mapping[str, object]:
     return payload
 
 
-def _atm_judge_accuracy(value: str) -> bool:
+def _atm_judge_accuracy(value: str) -> float:
     try:
         payload = _json_object(value)
     except (ValueError, json.JSONDecodeError):
         payload = {}
     if "accuracy" in payload:
-        return str(payload["accuracy"]).lower() == "true"
+        # Match upstream's `_coerce_accuracy` after its JSON parser. In particular,
+        # numeric scores retain partial credit; string "true" is not a JSON boolean.
+        accuracy = payload["accuracy"]
+        if isinstance(accuracy, bool):
+            return float(accuracy)
+        try:
+            score = float(cast(str | int | float, accuracy))
+        except (TypeError, ValueError):
+            return 0.0
+        if score < 0.0:
+            return 0.0
+        if score > 1.0:
+            return 1.0
+        return score
     lowered = value.lower()
     if '"accuracy": true' in lowered or '"accuracy":true' in lowered:
-        return True
+        return 1.0
     if '"accuracy": false' in lowered or '"accuracy":false' in lowered:
-        return False
-    return any(word in lowered for word in ("accurate", "correct", "matches", "true", "yes"))
+        return 0.0
+    return float(any(word in lowered for word in ("accurate", "correct", "matches", "true", "yes")))
 
 
 def _gallery_judge_score(value: str) -> float:
@@ -1597,10 +1610,10 @@ _ATM_PROMPT = (
     'statement is reasonable, if it conflicts with or does not match the ground truth, "accuracy" '
     'should be "false".  2.4. "Accuracy" is true if the ground truth information is covered by '
     "the prediction. The prediction is allowed to provide more information but should not be "
-    "against the ground truth. If it is hard to decide whether the prediction matches ground "
+    "against the ground truth. If it is hard to  decide whether the prediction matches ground "
     'truth, "accuracy" should be "false".  Think step by step following the instructions above, '
     'and then make a judgment. Respond with only a single JSON blob with an "explanation" field '
-    'that has your short(less than 100 word) reasoning steps and an "accuracy" field which is '
+    'that has your short(less than 100 word) reasoning  steps and an "accuracy" field which is '
     '"true" or "false".  Question: {{question}}  Ground truth: {{answer}}  '
     "Prediction: {{prediction}}"
 )

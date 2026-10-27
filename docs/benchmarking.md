@@ -152,6 +152,58 @@ The fallback is passed only as the question's `reference_at`; it does not write 
 knowledge-visibility timestamps. Results record the normalized clock and the number of questions
 that used it. Invalid or timezone-naive values fail before provider clients are created.
 
+When a dated corpus supplies the default question clock, a structured question date takes
+precedence over an explicit `Today is ...` date in the original question, which takes precedence
+over the latest memory timestamp. An omitted year uses the corpus year. The execution clock and
+dates in adapter instructions do not override the original question.
+
+ATM adapters use `atm_bench_official_v4` and one shared answer-only/list-ID query instruction
+(`atm_bench_query_v3`) for every question. The shared instruction reproduces the pinned official
+Oracle wording, including the `Unknown` refusal. `qtype`, reference answers, and annotated evidence
+remain scorer-side labels. Dates and combined date/time answers are no longer constrained to
+"the number alone". Older predictions retain their original identities and need regeneration
+before comparison with v4; changing their scores does not repair their original inputs.
+
+ATM answer scoring follows `JingbiaoMei/ATM-Bench@ef4e5dff1a47` without repairing or normalizing
+the released reference answers. This includes the upstream whitespace-separated ID-list edge
+case; no alternative normalized-ID answer score is emitted. The judge prompt and response
+interpretation follow the same revision, including numeric scores clamped to 0--1. The scorer
+identity is `atm_bench_scorer_ef4e5dff1a47_minimal_v2`; earlier judge responses need rejudging
+under this identity. The configured judge model remains selectable and is recorded independently;
+using another model is still marked non-official. Retrieval and joint metrics remain separate
+MindBridge diagnostics and do not replace the official answer score.
+
+Parity fixtures cover unchanged ID-list references, scalar/list dispatch, the exact upstream
+judge prompt, boolean and numeric judge outputs, and the shared query/refusal instruction.
+The [static parity record](research/artifacts/atm-official-parity-20261027.json) verifies both
+instruction strings byte-for-byte and all ten vendored deterministic scoring functions by AST
+against the pinned upstream source. This establishes protocol parity, not answer quality.
+
+A bounded local reader check uses six synthetic text fixtures: a pickup date/time, a photo date,
+a currency value, photo IDs, missing private information, and an instruction embedded in stored
+evidence. It compares the legacy type-specific query with the current official shared instruction,
+using product evidence serialization and three requests per prompt and fixture. Passing requires
+complete grounded values, the exact requested ID set, refusal for missing information, and a
+grounded answer that ignores the stored instruction. Every current-prompt repetition must pass.
+
+```bash
+uv run --frozen python benchmarks/atm_adapter_quality.py \
+  --repeats 3 --output /tmp/mindbridge-atm-adapter-quality.json
+```
+
+The [reader record](research/artifacts/atm-adapter-quality-20261027.json) pins the local
+`qwen2.5:7b` digest and effective CPU controls; it retains outcomes and hashes, not generated
+answer bodies. An [initial check with incomplete evidence serialization](research/artifacts/atm-adapter-quality-20261027-unqualified-input.json)
+failed acceptance and is retained separately. Its results are not pooled with the final fixtures.
+All six current-prompt fixtures passed in each of three repetitions; the legacy query failed the
+currency criterion in all three. These are repeated observations on six fixtures, not 18 distinct
+questions or an estimate of benchmark uplift.
+These checks do not measure retrieval, native visual understanding, the deployed DeepSeek reader,
+or a new full ATM score. The original 57.36% run is not a result of the repaired adapter.
+Passing requires the pinned upstream values and wording, including its separator edge case.
+No reader or judge model revision was evaluated for this correction, and no real-service or
+full-dataset rerun is claimed; protocol parity does not establish an answer-quality improvement.
+
 ES-MemEval's QA task is selected through its family name; `--limit 1` means one seeker and all of
 that seeker's questions:
 

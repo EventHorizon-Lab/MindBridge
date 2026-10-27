@@ -77,7 +77,7 @@ from mindbridge.benchmarks.atm_bench import (
 )
 from mindbridge.benchmarks.longmemeval import load_longmemeval
 from mindbridge.benchmarks.official_scorers import judge_plan, local_scores, parse_judge_response
-from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT, atm_format_constraint
+from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT
 from mindbridge.context import evidence_cost
 from mindbridge.exceptions import ModelError
 from mindbridge.models.openai_sdk import OpenAIModels
@@ -633,7 +633,6 @@ def _atm_outcomes(
                     gold = frozenset(question.evidence_ids)  # type: ignore[attr-defined]
                     prompt = ATM_BENCH_QUERY_PROMPT.text.format(
                         question=question.question,  # type: ignore[attr-defined]
-                        format_constraint=atm_format_constraint(question.qtype),  # type: ignore[attr-defined]
                     )
                     _reset_billing()
                     result = memory.ask(prompt, limit=RECALL_LIMIT)

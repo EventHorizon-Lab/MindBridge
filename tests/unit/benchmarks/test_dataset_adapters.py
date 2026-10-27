@@ -986,6 +986,71 @@ def test_undated_questions_are_anchored_at_the_end_of_their_corpus() -> None:
     assert _with_corpus_reference(untimed) is untimed
 
 
+@pytest.mark.parametrize(
+    "question,expected",
+    [
+        ("Today is 2024-05-02. When was dinner last week?", (2024, 5, 2)),
+        ("Today is May 2, 2024. When was dinner last week?", (2024, 5, 2)),
+        ("Today is Dec 21. What happened yesterday?", (2025, 12, 21)),
+        ("When was dinner last week?", (2025, 7, 22)),
+    ],
+)
+def test_question_clock_precedes_corpus_fallback(
+    question: str, expected: tuple[int, int, int]
+) -> None:
+    from mindbridge.benchmarks.eval_adapters import (
+        EvalQuestion,
+        EvalUnit,
+        MemoryItem,
+        _with_corpus_reference,
+    )
+    from mindbridge.kernel.temporal import query_temporal_range
+
+    latest = datetime(2025, 7, 22, tzinfo=timezone.utc)
+    unit = EvalUnit(
+        "archive",
+        (MemoryItem("last", ("last memory",), occurred_at=latest),),
+        (EvalQuestion("q", (question,), ("answer",), source_question=question),),
+    )
+    anchored = _with_corpus_reference(unit).questions[0]
+    assert anchored.reference_at == datetime(*expected, tzinfo=timezone.utc)
+    if expected == (2024, 5, 2):
+        assert query_temporal_range("last week", anchored.reference_at) == (
+            datetime(2024, 4, 22, tzinfo=timezone.utc),
+            datetime(2024, 4, 29, tzinfo=timezone.utc),
+        )
+    # Re-anchoring cannot replace an already resolved question clock.
+    assert _with_corpus_reference(_with_corpus_reference(unit)) == _with_corpus_reference(unit)
+
+
+def test_question_clock_uses_original_text_and_preserves_explicit_dates() -> None:
+    from mindbridge.benchmarks.eval_adapters import (
+        EvalQuestion,
+        EvalUnit,
+        MemoryItem,
+        _with_corpus_reference,
+    )
+
+    explicit = datetime(2023, 1, 1, tzinfo=timezone.utc)
+    original = "Today is 2024-05-02. When was dinner last week?"
+    unit = EvalUnit(
+        "archive",
+        (MemoryItem("last", ("memory",), occurred_at=datetime(2025, 7, 22, tzinfo=timezone.utc)),),
+        (
+            EvalQuestion("structured", (original,), ("answer",), reference_at=explicit),
+            EvalQuestion(
+                "original",
+                ("Today is 2099-01-01. Adapter example.", original),
+                ("answer",),
+                source_question=original,
+            ),
+        ),
+    )
+    anchored = _with_corpus_reference(unit)
+    assert anchored.questions[0].reference_at == explicit
+    assert anchored.questions[1].reference_at == datetime(2024, 5, 2, tzinfo=timezone.utc)
+
+
 def test_longmemeval_labels_the_answer_turn_and_every_block_it_was_split_into(
     tmp_path: Path,
 ) -> None:

@@ -23,6 +23,7 @@ from mindbridge.benchmarks.openeqa import OpenEqaQuestion
 from mindbridge.benchmarks.personamem_v3 import PersonaMemQuery
 from mindbridge.benchmarks.supermemory_vqa import SuperMemoryQuestion
 from mindbridge.benchmarks.task_catalog import TaskSpec
+from mindbridge.kernel.temporal import temporal_context
 
 ScoreKind = Literal["choice", "text", "submission"]
 Limit: TypeAlias = int | float | None
@@ -1117,7 +1118,7 @@ def _atm(
         load_atm_emails,
         load_atm_sgm,
     )
-    from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT, atm_format_constraint
+    from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT
 
     email_path = root / spec.auxiliary[0]
     memories = [
@@ -1145,11 +1146,11 @@ def _atm(
             _query_parts(
                 ATM_BENCH_QUERY_PROMPT.text,
                 question.question,
-                format_constraint=atm_format_constraint(question.qtype),
             ),
             (question.reference_answer,),
             metadata={"qtype": question.qtype, "evidence_ids": question.evidence_ids},
             source_question=question.question,
+            refusal=ATM_BENCH_QUERY_PROMPT.refusal,
         )
         for question in _selected(load_atm_bench(dataset), limit, offset)
     )
@@ -1814,7 +1815,9 @@ def _with_corpus_reference(unit: EvalUnit) -> EvalUnit:
     questions therefore retrieved different memories for the same seed depending on when the run
     started, and a replay hours later could not reproduce it. The one instant such a corpus
     defines is the time of its last memory: the question is asked after everything it can
-    remember. Datasets that date their questions keep those dates untouched.
+    remember. Structured question dates take precedence; otherwise the product's pure parser
+    reads an explicit "Today is ..." anchor from the original question. An omitted year uses
+    the corpus year, never the execution clock. Only genuinely undated questions use `latest`.
     """
     if all(question.reference_at is not None for question in unit.questions):
         return unit
@@ -1832,7 +1835,15 @@ def _with_corpus_reference(unit: EvalUnit) -> EvalUnit:
         questions=tuple(
             question
             if question.reference_at is not None
-            else replace(question, reference_at=latest)
+            else replace(
+                question,
+                reference_at=temporal_context(
+                    question.source_question
+                    or "\n".join(part for part in question.content if isinstance(part, str)),
+                    latest,
+                    infer_reference=True,
+                )[0],
+            )
             for question in unit.questions
         ),
     )
