@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Generator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
-from threading import Condition, Event
+from threading import BoundedSemaphore, Condition, Event
 
 import pytest
 from _feature_support import TinyEmbedder
@@ -84,6 +84,92 @@ def test_child_workers_are_shared_across_requests(tmp_path: Path, plane: str, li
                 release.set()
             assert [future.result(timeout=5) for future in futures] == [(7, 7)] * 8
         assert peak == limit
+
+
+@pytest.mark.parametrize(("plane", "limit"), (("index", 4), ("speech", 2)))
+def test_waiting_child_routes_do_not_occupy_another_directorys_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plane: str, limit: int
+) -> None:
+    release, saturated = Event(), Event()
+    changed = Condition()
+    attempts = 0
+
+    class ObservedSlots(BoundedSemaphore):
+        def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+            nonlocal attempts
+            with changed:
+                attempts += 1
+                if attempts == limit + 2:
+                    saturated.set()
+            return super().acquire(blocking, timeout)
+
+        def __enter__(self, blocking: bool = True, timeout: float | None = None, /) -> bool:
+            return self.acquire(blocking, timeout)
+
+    def held() -> int:
+        assert release.wait(5)
+        return 7
+
+    with (
+        Memory(tmp_path / "busy", embedder=TinyEmbedder()) as busy,
+        Memory(tmp_path / "independent", embedder=TinyEmbedder()) as independent,
+        ThreadPoolExecutor(max_workers=limit + 2) as children,
+        ThreadPoolExecutor(max_workers=9) as callers,
+    ):
+        monkeypatch.setattr(busy._execution, f"_{plane}", children)
+        monkeypatch.setattr(independent._execution, f"_{plane}", children)
+        monkeypatch.setattr(busy._execution, f"_{plane}_slots", ObservedSlots(limit))
+
+        def dispatch(memory: Memory, *, block: bool) -> tuple[int, ...]:
+            call = held if block else lambda: 11
+            if plane == "index":
+                return memory._execution.index_routes((call,))
+            with memory._execution.overlap_speech(call) as future:
+                return (future.result(),)
+
+        pending = [callers.submit(dispatch, busy, block=True) for _ in range(8)]
+        try:
+            assert saturated.wait(2)
+            fresh = callers.submit(dispatch, independent, block=False)
+            assert fresh.result(timeout=1) == (11,)
+        finally:
+            release.set()
+        assert [future.result(timeout=3) for future in pending] == [(7,)] * 8
+
+
+def test_partial_route_submission_failure_waits_for_started_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, failed, release = Event(), Event(), Event()
+    submitted = 0
+
+    def route() -> int:
+        entered.set()
+        assert release.wait(5)
+        return 7
+
+    with Memory(tmp_path, embedder=TinyEmbedder()) as memory, ThreadPoolExecutor() as caller:
+        original = memory._execution._index.submit
+
+        def submit(fn: Callable[[Callable[[], int]], int], call: Callable[[], int]) -> Future[int]:
+            nonlocal submitted
+            submitted += 1
+            if submitted == 2:
+                failed.set()
+                raise RuntimeError("injected submission failure")
+            return original(fn, call)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(memory._execution._index, "submit", submit)
+            pending = caller.submit(memory._execution.index_routes, (route, route))
+            try:
+                assert entered.wait(2) and failed.wait(2)
+                assert not pending.done()
+            finally:
+                release.set()
+            with pytest.raises(RuntimeError, match="injected submission failure"):
+                pending.result(timeout=3)
+        assert memory._execution.index_routes((lambda: 11,) * 4) == (11,) * 4
 
 
 @pytest.mark.asyncio

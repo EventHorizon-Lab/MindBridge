@@ -3352,8 +3352,8 @@ def test_answer_retries_provider_rejected_hit_video_as_text(
         if not image_capable:
             monkeypatch.setattr(
                 openai_backend,
-                "_short_video_frame_urls",
-                lambda *_args: pytest.fail("preflight ran without image capability"),
+                "_video_frame_urls",
+                lambda *_args, **_kwargs: pytest.fail("preflight ran without image capability"),
             )
         model = _model(
             _sdk_client(client),
@@ -4614,6 +4614,42 @@ _FORMATION_REQUIREMENTS = {
     # (`_formation_refusal`), so asking the former for a kind that can only be thrown away
     # spends tokens on refusals. The host authorizes one through `apply()` instead.
 }
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"valid_from": "2026-01-01T00:00:00"},
+        {"valid_until": "2026-01-01T00:00:00"},
+        {
+            "spatial": {
+                "frame_id": "map",
+                "anchor": "observer",
+                "x": 0,
+                "y": 0,
+                "orientation_xyzw": [0, 0, 1],
+            }
+        },
+        {
+            "spatial": {
+                "frame_id": "map",
+                "anchor": "observer",
+                "x": 0,
+                "y": 0,
+                "orientation_xyzw": [0, 0, 0, 0],
+            }
+        },
+    ],
+)
+def test_formation_value_constructors_reject_invalid_time_and_orientation(
+    fields: dict[str, object],
+) -> None:
+    assert (
+        openai_backend._formation_proposal(
+            {"kind": "event", "content": "an event", "confidence": 1, **fields}
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(("kind", "extra"), sorted(_FORMATION_REQUIREMENTS.items()))

@@ -7,7 +7,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -15,12 +15,14 @@ from io import BytesIO
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from opentelemetry import trace
 
 if TYPE_CHECKING:
+    from av import VideoFrame
     from openai import OpenAI
+    from PIL.Image import Image
 
 from mindbridge._telemetry import (
     EMBEDDING_VIDEO_SAMPLED,
@@ -60,11 +62,13 @@ from mindbridge.types import (
     FormationProposal,
     IdentityClaim,
     MemoryIntent,
+    MemoryKind,
     MemoryOperation,
     MemoryRecord,
     MemoryTrigger,
     Modality,
     SearchHit,
+    SpatialAnchor,
     SpatialContext,
 )
 
@@ -852,7 +856,7 @@ class OpenAIModels:
                     cast_to=CreateEmbeddingResponse,
                     body=body,
                 )
-            create_embedding = cast(Any, client.embeddings.create)
+            create_embedding = cast(Callable[..., object], client.embeddings.create)
             return create_embedding(
                 input=(
                     [value.text for value in batch]
@@ -1003,7 +1007,9 @@ class OpenAIModels:
         was billed whether or not its reply parsed, so the usage is summed in `finally` rather
         than recorded per attempt, which would report only the last.
         """
-        create_completion = cast(Any, self._client("generation").chat.completions.create)
+        create_completion = cast(
+            Callable[..., object], self._client("generation").chat.completions.create
+        )
         usages: list[_ModelUsage | None] = []
         attempted = 0
         invalid_content: str | None = None
@@ -1284,7 +1290,7 @@ class OpenAIModels:
             emitted = False
             answer_parts = []
             first_chunk = False
-            for response in cast(Any, responses):
+            for response in cast(Iterable[object], responses):
                 elapsed = time.perf_counter() - started
                 span = trace.get_current_span()
                 _record_openai_provenance(response)
@@ -1388,7 +1394,9 @@ class OpenAIModels:
         exhaustive: bool = False,
     ) -> tuple[object, tuple[SearchHit, ...], frozenset[Modality], int]:
         request, grounded, modalities = prepared
-        create_completion = cast(Any, self._client("generation").chat.completions.create)
+        create_completion = cast(
+            Callable[..., object], self._client("generation").chat.completions.create
+        )
 
         def create() -> object:
             if stream:
@@ -1664,9 +1672,9 @@ class OpenAIModels:
                 response = None
                 mark_model_requests(1)
                 try:
-                    response = cast(Any, self._client("generation").chat.completions.create)(
-                        **request
-                    )
+                    response = cast(
+                        Callable[..., object], self._client("generation").chat.completions.create
+                    )(**request)
                     content = _json_completion_text(
                         response, subject="media diagnosis", stage="generate"
                     )
@@ -1726,7 +1734,7 @@ class OpenAIModels:
                     "transcription", frozenset({modality}), self.transcription_capabilities
                 )
                 create_transcription = cast(
-                    Any,
+                    Callable[..., object],
                     self._client("transcription").audio.transcriptions.create,
                 )
                 try:
@@ -2643,20 +2651,21 @@ def _formation_proposal(
     fields = set(value)
     if not {"kind", "content", "confidence"} <= fields or fields - _FORMATION_FIELDS:
         return None
+    # The wire boundary checks shape; the value constructors own field validation.
     try:
         return FormationProposal(
-            kind=cast(Any, value["kind"]),
-            content=cast(Any, value["content"]),
-            subject=cast(Any, value.get("subject")),
-            predicate=cast(Any, value.get("predicate")),
-            value=cast(Any, value.get("value")),
-            confidence=cast(Any, value["confidence"]),
+            kind=cast(MemoryKind, value["kind"]),
+            content=cast(str, value["content"]),
+            subject=cast(str | None, value.get("subject")),
+            predicate=cast(str | None, value.get("predicate")),
+            value=cast(str | None, value.get("value")),
+            confidence=cast(float, value["confidence"]),
             valid_from=_formation_datetime(value.get("valid_from")),
             valid_until=_formation_datetime(value.get("valid_until")),
             spatial=_formation_spatial(value.get("spatial")),
-            cue_modality=cast(Any, value.get("cue_modality")),
-            valence=cast(Any, value.get("valence")),
-            arousal=cast(Any, value.get("arousal")),
+            cue_modality=cast(Modality | None, value.get("cue_modality")),
+            valence=cast(float | None, value.get("valence")),
+            arousal=cast(float | None, value.get("arousal")),
             evidence_ids=evidence_ids,
         )
     except (TypeError, ValueError, ValidationError):
@@ -2668,10 +2677,7 @@ def _formation_datetime(value: object) -> datetime | None:
         return None
     if not isinstance(value, str):
         raise ValueError
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.utcoffset() is None:
-        raise ValueError
-    return parsed
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _formation_spatial(value: object) -> SpatialContext | None:
@@ -2688,16 +2694,14 @@ def _formation_spatial(value: object) -> SpatialContext | None:
         if isinstance(orientation, (str, bytes)) or not isinstance(orientation, Sequence):
             raise ValueError
         orientation = tuple(orientation)
-        if len(orientation) != 4:
-            raise ValueError
     return SpatialContext(
-        frame_id=cast(Any, value["frame_id"]),
-        anchor=cast(Any, value["anchor"]),
-        x=cast(Any, value["x"]),
-        y=cast(Any, value["y"]),
-        z=cast(Any, value.get("z", 0.0)),
-        orientation_xyzw=cast(Any, orientation),
-        position_uncertainty_m=cast(Any, value.get("position_uncertainty_m")),
+        frame_id=cast(str, value["frame_id"]),
+        anchor=cast(SpatialAnchor, value["anchor"]),
+        x=cast(float, value["x"]),
+        y=cast(float, value["y"]),
+        z=cast(float, value.get("z", 0.0)),
+        orientation_xyzw=cast(tuple[float, float, float, float] | None, orientation),
+        position_uncertainty_m=cast(float | None, value.get("position_uncertainty_m")),
     )
 
 
@@ -2823,13 +2827,6 @@ def _consolidation_results(
     evidence: Sequence[MemoryRecord],
 ) -> tuple[MemoryOperation, ...]:
     """Validate operations without copying model text into public errors."""
-    return _consolidation_operations(content, evidence)
-
-
-def _consolidation_operations(
-    content: str,
-    evidence: Sequence[MemoryRecord],
-) -> tuple[MemoryOperation, ...]:
     try:
         payload = json.loads(content)
     except (json.JSONDecodeError, RecursionError):
@@ -2868,12 +2865,12 @@ def _consolidation_operation(
     cited = _cited_ids(value.get("evidence"), evidence)
     try:
         return MemoryOperation(
-            intent=cast(Any, value["intent"]),
+            intent=cast(MemoryIntent, value["intent"]),
             evidence_ids=() if value["intent"] in _TARGET_ONLY_INTENTS else cited,
             target_ids=_cited_ids(value.get("targets"), evidence),
             proposal=proposal,
             claim=None if claimed is None else _cited_claim(claimed, evidence),
-            rationale=cast(Any, value.get("rationale")),
+            rationale=cast(str | None, value.get("rationale")),
         )
     except (TypeError, ValueError, ValidationError) as error:
         raise _invalid_consolidation_response() from error
@@ -2898,9 +2895,9 @@ def _cited_claim(value: object, evidence: Sequence[MemoryRecord]) -> IdentityCla
         raise _invalid_consolidation_response()
     try:
         return IdentityClaim(
-            identity_id=cast(Any, value["identity_id"]),
-            name=cast(Any, value.get("name")),
-            relationship=cast(Any, value.get("relationship")),
+            identity_id=cast(str, value["identity_id"]),
+            name=cast(str, value.get("name")),
+            relationship=cast(str | None, value.get("relationship")),
         )
     except (TypeError, ValueError, ValidationError) as error:
         raise _invalid_consolidation_response() from error
@@ -2909,7 +2906,7 @@ def _cited_claim(value: object, evidence: Sequence[MemoryRecord]) -> IdentityCla
 def _cited_ids(value: object, evidence: Sequence[MemoryRecord]) -> tuple[str, ...]:
     if value is None:
         return ()
-    if isinstance(value, (str, bytes)) or not isinstance(value, list):
+    if not isinstance(value, list):
         raise _invalid_consolidation_response()
     resolved: list[str] = []
     for index in value:
@@ -3122,11 +3119,11 @@ def _collect_streamed_completion(  # noqa: C901 - validates one streamed respons
     cleanup_error: Exception | None = None
     _record_provider_request_id(responses)
     try:
-        for response in cast(Any, responses):
+        for response in cast(Iterable[object], responses):
             model = getattr(response, "model", None) or model
             fingerprint = getattr(response, "system_fingerprint", None) or fingerprint
-            if getattr(response, "usage", None) is not None:
-                usage = response.usage
+            if (response_usage := getattr(response, "usage", None)) is not None:
+                usage = response_usage
             choices = getattr(response, "choices", None)
             if not isinstance(choices, list):
                 raise _invalid_json_response(subject, stage)
@@ -3720,7 +3717,7 @@ def _generation_asset_parts(
     maximum_encoded_bytes: int,
 ) -> tuple[dict[str, object], ...]:
     if asset.modality is Modality.VIDEO and minimum_video_seconds is not None:
-        frames = _short_video_frame_urls(asset, minimum_video_seconds)
+        frames = _video_frame_urls(asset, below_seconds=minimum_video_seconds)
         if (
             frames is not None
             and all(len(frame.encode()) <= _MAX_INLINE_MODEL_ITEM_BYTES for frame in frames)
@@ -3737,14 +3734,6 @@ def _image_parts_size(parts: Sequence[Mapping[str, object]]) -> int:
         len(cast(Mapping[str, str], part["image_url"])["url"].partition(",")[2].encode())
         for part in parts
     )
-
-
-def _short_video_frame_urls(
-    asset: AssetRef,
-    minimum_video_seconds: float,
-) -> tuple[str, str, str, str] | None:
-    """Decode four ordered JPEG stills when an optional local video is below a provider limit."""
-    return _video_frame_urls(asset, below_seconds=minimum_video_seconds)
 
 
 def _video_frame_urls(
@@ -3770,8 +3759,8 @@ def _video_frame_urls(
                 else 0.0
             )
             targets = tuple(start + duration * index / 3 for index in range(3))
-            sampled: list[Any] = []
-            last: Any = None
+            sampled: list[VideoFrame] = []
+            last: VideoFrame | None = None
             for index, frame in enumerate(container.decode(stream)):
                 last = frame
                 timestamp = frame.time
@@ -3794,9 +3783,11 @@ def _video_frame_urls(
         return None
 
 
-def _jpeg_frame_url(frame: object) -> str:
+def _jpeg_frame_url(frame: VideoFrame) -> str:
     encoded = BytesIO()
-    cast(Any, frame).to_image().convert("RGB").save(encoded, format="JPEG", quality=85)
+    cast("Callable[[], Image]", frame.to_image)().convert("RGB").save(
+        encoded, format="JPEG", quality=85
+    )
     return f"data:image/jpeg;base64,{base64.b64encode(encoded.getvalue()).decode('ascii')}"
 
 

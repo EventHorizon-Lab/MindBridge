@@ -14,6 +14,7 @@ import random
 import re
 import sys
 import time
+from bisect import bisect_right
 from collections.abc import (
     Awaitable,
     Callable,
@@ -1646,12 +1647,9 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     stores_ready = [False] * len(task.units)
     queue: asyncio.Queue[tuple[int, EvalUnit]] = asyncio.Queue()
     worker_count = min(unit_concurrency, 16, len(task.units))
-    # Each unit can have one ingest or settlement outside answer admission. Reserve those
-    # process model slots before opening the answer window, rather than recording overload as
-    # a model-quality failure. Requested concurrency remains a ceiling.
-    request_semaphore = asyncio.Semaphore(
-        min(request_concurrency, max(1, _SDK_OPERATION_LIMIT - worker_count))
-    )
+    request_semaphore = asyncio.Semaphore(request_concurrency)
+    # Ingest and answers borrow the same process budget only while doing work.
+    model_semaphore = asyncio.Semaphore(_SDK_OPERATION_LIMIT)
     completed = 0
     total = sum(len(unit.questions) for unit in task.units) * len(arms)
     notify_progress = on_progress or _ignore_progress
@@ -1724,6 +1722,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 batch_size=batch_size,
                 request_concurrency=request_concurrency,
                 request_semaphore=request_semaphore,
+                model_semaphore=model_semaphore,
                 recall_limit=recall_limit,
                 predict_only=predict_only,
                 log_samples=log_samples,
@@ -1753,7 +1752,13 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
-    await asyncio.gather(*workers)
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        for pending_worker in workers:
+            pending_worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
     if any(group is None for group in slots):
         raise RuntimeError("evaluation worker exited before every unit completed")
 
@@ -1765,7 +1770,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             stores_ready=stores_ready,
             memory_factory=memory_factory,
             unit_concurrency=unit_concurrency,
-            request_semaphore=request_semaphore,
+            request_semaphore=asyncio.Semaphore(min(request_concurrency, _SDK_OPERATION_LIMIT)),
             recall_limit=recall_limit,
             arms=arms,
             tracer=tracer,
@@ -2031,7 +2036,9 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     on_activity: Callable[[str], None] | None = None,
     on_store_ready: Callable[[], None] | None = None,
     prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[SampleResult, ...]:
+    model_semaphore = model_semaphore or asyncio.Semaphore(_SDK_OPERATION_LIMIT)
     ordered = tuple((arm, question) for arm in arms for question in unit.questions)
     notify_store_ready = on_store_ready or _ignore_store_ready
     notify_ingested = on_ingested or _ignore_ingested
@@ -2117,11 +2124,14 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                             checkpoint, ingested, ingest_failure_details, notify_ingested
                         ),
                         prefetch=prefetch_speech,
+                        model_semaphore=model_semaphore,
                     )
                     ingested = end
                     if deliberate:
                         notify_activity("deliberating")
-                        await _deliberate_after_ingest(memory)
+                        await _model_operation(
+                            model_semaphore, lambda: _deliberate_after_ingest(memory)
+                        )
                 pending = end
                 context = (
                     _full_context(memories[:pending], full_context_chars) if stuffs_context else ""
@@ -2140,6 +2150,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                     ingest_failure_details=tuple(ingest_failure_details),
                     request_concurrency=request_concurrency,
                     request_semaphore=request_semaphore,
+                    model_semaphore=model_semaphore,
                     recall_limit=recall_limit,
                     predict_only=predict_only,
                     log_samples=log_samples,
@@ -2202,6 +2213,7 @@ async def _answer_arms(
     answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> dict[tuple[str, str], SampleResult]:
     """Answer one cutoff's pending questions once per arm, against one ingested store."""
     results: dict[tuple[str, str], SampleResult] = {}
@@ -2215,6 +2227,7 @@ async def _answer_arms(
             questions,
             request_concurrency=request_concurrency,
             request_semaphore=request_semaphore,
+            model_semaphore=model_semaphore,
             recall_limit=recall_limit,
             arm=arm,
             task_name=task.spec.name,
@@ -2404,6 +2417,7 @@ async def _capture_chunk(
     on_failure: Callable[[FailureDetail], None] | None,
     tracer: Tracer | None,
     arm: str = DEFAULT_ARM,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> int:
     """Ingest one chunk through `capture()` + `settle()`, so both produce real
     `mindbridge.capture` and `mindbridge.settle` spans -- the only way `--ingest capture` makes
@@ -2433,7 +2447,7 @@ async def _capture_chunk(
         # drains what this unit itself captured.
         while True:
             try:
-                settled = await memory.settle(limit=100)
+                settled = await _model_operation(model_semaphore, lambda: memory.settle(limit=100))
             except IndexUnavailableError:
                 raise
             except Exception as error:
@@ -2469,6 +2483,7 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
     mode: str = DEFAULT_INGEST_MODE,
     arm: str = DEFAULT_ARM,
     prefetch: Callable[[Sequence[MemoryItem]], None] | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> int:
     # An arm that reads no memory never reaches here: `_run_unit` skips ingestion for it, so the
     # blind control cannot accidentally score a store it was supposed to run without.
@@ -2499,7 +2514,7 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
                 )
 
         try:
-            await _retry_transient(add_all)
+            await _retry_transient(lambda: _model_operation(model_semaphore, add_all))
             return 0
         except IndexUnavailableError:
             raise
@@ -2511,7 +2526,7 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
                 middle = len(chunk) // 2
                 return await add_chunk(chunk[:middle]) + await add_chunk(chunk[middle:])
         try:
-            await _retry_transient(add_first)
+            await _retry_transient(lambda: _model_operation(model_semaphore, add_first))
         except IndexUnavailableError:
             raise
         except Exception as error:
@@ -2531,6 +2546,7 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
             on_failure=on_failure,
             tracer=tracer,
             arm=arm,
+            model_semaphore=model_semaphore,
         )
 
     chunk_ingest = capture_chunk if mode == "capture" else add_chunk
@@ -2567,12 +2583,35 @@ async def _ingest_chunks(
 def _candidate_count(unit: EvalUnit, question: EvalQuestion) -> int:
     """Count distinct sources a ranker could return for one question at its cutoff."""
     boundary = math.inf if question.cutoff_seconds is None else question.cutoff_seconds
-    return len({item.source_id for item in unit.memories if _memory_end(item) <= boundary})
+    return bisect_right(unit._source_ends, boundary)
 
 
 def _require_active_embedding_service(systemic_stop: asyncio.Event) -> None:
     if systemic_stop.is_set():
         raise _SystemicEmbeddingFailure("systemic query embedding failure; queued question aborted")
+
+
+async def _model_operation(
+    semaphore: asyncio.Semaphore | None, operation: Callable[[], Awaitable[_Retried]]
+) -> _Retried:
+    if semaphore is None:
+        return await operation()
+    async with semaphore:
+        pending = asyncio.ensure_future(operation())
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # Cancelling the waiter cannot stop synchronous SDK work or release its slot early.
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not pending.cancelled():
+                pending.exception()
+            raise
 
 
 async def _guarded_answer(
@@ -2581,6 +2620,7 @@ async def _guarded_answer(
     *,
     semaphore: asyncio.Semaphore,
     instance_semaphore: asyncio.Semaphore,
+    model_semaphore: asyncio.Semaphore,
     systemic_stop: asyncio.Event,
     arm: _Arm,
     task_name: str,
@@ -2595,54 +2635,46 @@ async def _guarded_answer(
 ) -> _AnswerOutcome:
     identity = f"{task_name}/{unit_id}/{question.question_id}"
     sample_id = identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
+
+    async def answer() -> _AnswerOutcome:
+        _require_active_embedding_service(systemic_stop)
+        return await _arm_answer(
+            memory,
+            question,
+            arm=arm,
+            task_name=task_name,
+            recall_limit=recall_limit,
+            context=context,
+            compile_budget=compile_budget,
+            answer_policy=answer_policy,
+            tracer=tracer,
+            sample_id=sample_id,
+            started=started if arm.generates else time.perf_counter(),
+            answer_span=answer_span,
+            model_semaphore=model_semaphore,
+            systemic_stop=systemic_stop,
+        )
+
     try:
         _require_active_embedding_service(systemic_stop)
-        if not arm.generates:
+        # Start the caller span before admission so latency and TTFT retain queueing time.
+        span = (
+            _answer_span(tracer, task_name, sample_id, arm.name)
+            if arm.generates
+            else nullcontext((None, 0.0))
+        )
+        with span as (answer_span, started):
             async with instance_semaphore, semaphore:
-                _require_active_embedding_service(systemic_stop)
-                outcome = await _arm_answer(
-                    memory,
-                    question,
-                    arm=arm,
-                    task_name=task_name,
-                    recall_limit=recall_limit,
-                    context=context,
-                    compile_budget=compile_budget,
-                    answer_policy=answer_policy,
-                    tracer=tracer,
-                    sample_id=sample_id,
-                    started=time.perf_counter(),
-                    answer_span=None,
-                )
-        else:
-            # This caller span starts before request admission. Its latency and TTFT therefore
-            # include benchmark queueing; nested SDK/model spans expose service time.
-            with _answer_span(tracer, task_name, sample_id, arm.name) as (answer_span, started):
-                async with instance_semaphore, semaphore:
-                    _require_active_embedding_service(systemic_stop)
-                    outcome = await _arm_answer(
-                        memory,
-                        question,
-                        arm=arm,
-                        task_name=task_name,
-                        recall_limit=recall_limit,
-                        context=context,
-                        compile_budget=compile_budget,
-                        answer_policy=answer_policy,
-                        tracer=tracer,
-                        sample_id=sample_id,
-                        started=started,
-                        answer_span=answer_span,
+                outcome = await answer()
+                if outcome.error is not None and answer_span is not None:
+                    answer_span.set_status(StatusCode.ERROR)
+                span_context = None if answer_span is None else answer_span.get_span_context()
+                if span_context is not None and span_context.is_valid:
+                    outcome = replace(
+                        outcome,
+                        trace_id=f"{span_context.trace_id:032x}",
+                        answer_span_id=f"{span_context.span_id:016x}",
                     )
-                    if outcome.error is not None and answer_span is not None:
-                        answer_span.set_status(StatusCode.ERROR)
-                    span_context = None if answer_span is None else answer_span.get_span_context()
-                    if span_context is not None and span_context.is_valid:
-                        outcome = replace(
-                            outcome,
-                            trace_id=f"{span_context.trace_id:032x}",
-                            answer_span_id=f"{span_context.span_id:016x}",
-                        )
         if arm.generates and on_answer is not None:
             on_answer(question, outcome)
         return outcome
@@ -2670,8 +2702,10 @@ async def _answer_many(
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
+    model_semaphore = model_semaphore or asyncio.Semaphore(_SDK_OPERATION_LIMIT)
     # The SDK's documented limits are per physical instance, while the request semaphore is
     # shared across units. Queue excess callers here before they can occupy global slots or
     # become immediate admission errors. Each unit owns its store and runs its arms in order.
@@ -2690,6 +2724,7 @@ async def _answer_many(
                         question,
                         semaphore=semaphore,
                         instance_semaphore=instance_semaphore,
+                        model_semaphore=model_semaphore,
                         systemic_stop=systemic_stop,
                         arm=arm,
                         task_name=task_name,
@@ -2822,6 +2857,8 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
+    systemic_stop: asyncio.Event | None = None,
 ) -> _AnswerOutcome:
     latency_started = time.perf_counter()
     content = _content(question.content)
@@ -2834,11 +2871,21 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
     async def attempt(operation: Callable[[], Awaitable[_Retried]]) -> _Retried:
         # Only the attempt that answered is timed: a retry's backoff is outage time, not latency.
         async def timed() -> _Retried:
-            nonlocal latency_started, ranked, ranked_complete, generation_evidence, excerpt_evidence
-            latency_started = time.perf_counter()
-            ranked, ranked_complete, generation_evidence = (), False, None
-            excerpt_evidence = ()
-            return await operation()
+            async def admitted() -> _Retried:
+                nonlocal \
+                    latency_started, \
+                    ranked, \
+                    ranked_complete, \
+                    generation_evidence, \
+                    excerpt_evidence
+                if systemic_stop is not None:
+                    _require_active_embedding_service(systemic_stop)
+                latency_started = time.perf_counter()
+                ranked, ranked_complete, generation_evidence = (), False, None
+                excerpt_evidence = ()
+                return await operation()
+
+            return await _model_operation(model_semaphore, admitted)
 
         return await _retry_transient(timed)
 

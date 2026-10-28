@@ -138,11 +138,6 @@ class IndexOutbox:
             embedding_id: tuple(grouped.get(embedding_id, ())) for embedding_id in embedding_ids
         }
 
-    def read_index_document(self, embedding_id: str) -> IndexDocument | None:
-        """Hydrate the current index payload from authoritative SQLite state."""
-        documents = self.read_index_documents((embedding_id,))
-        return documents[0] if documents else None
-
     def read_index_documents(
         self,
         embedding_ids: Sequence[str],
@@ -190,27 +185,32 @@ class IndexOutbox:
             return ()
         for embedding_id in embedding_ids:
             require_identifier(embedding_id, "embedding_id")
-        by_id: dict[str, IndexCandidate] = {}
+        rows: list[sqlite3.Row] = []
         with self._connections.connection() as connection:
             for offset in range(0, len(embedding_ids), SQLITE_PARAMETER_BATCH):
                 batch = embedding_ids[offset : offset + SQLITE_PARAMETER_BATCH]
                 placeholders = ", ".join("?" for _embedding_id in batch)
-                for row in connection.execute(
-                    f"""
-                    SELECT e.embedding_id, e.memory_id, m.occurred_at, m.occurred_end
-                    FROM embeddings AS e
-                    JOIN memory_records AS m ON m.memory_id = e.memory_id
-                    WHERE e.embedding_id IN ({placeholders})
-                    """,
-                    tuple(batch),
-                ):
-                    candidate = IndexCandidate(
-                        embedding_id=row_text(row, "embedding_id"),
-                        memory_id=row_text(row, "memory_id"),
-                        occurred_at=optional_datetime_from_row(row, "occurred_at"),
-                        occurred_end=optional_datetime_from_row(row, "occurred_end"),
-                    )
-                    by_id[candidate.embedding_id] = candidate
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        SELECT e.embedding_id, e.memory_id, m.occurred_at, m.occurred_end
+                        FROM embeddings AS e
+                        JOIN memory_records AS m ON m.memory_id = e.memory_id
+                        WHERE e.embedding_id IN ({placeholders})
+                        """,
+                        tuple(batch),
+                    ).fetchall()
+                )
+        # Decoding holds no SQLite state; return the exclusive connection before doing it.
+        by_id: dict[str, IndexCandidate] = {}
+        for row in rows:
+            candidate = IndexCandidate(
+                embedding_id=row_text(row, "embedding_id"),
+                memory_id=row_text(row, "memory_id"),
+                occurred_at=optional_datetime_from_row(row, "occurred_at"),
+                occurred_end=optional_datetime_from_row(row, "occurred_end"),
+            )
+            by_id[candidate.embedding_id] = candidate
         return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
 
     def read_memory_index_documents(

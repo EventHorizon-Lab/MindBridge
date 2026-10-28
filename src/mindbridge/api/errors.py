@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, status
@@ -106,7 +105,7 @@ class ErrorEnvelope(BaseModel):
     issues: tuple[ErrorIssue, ...] = ()
 
 
-def error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
+def error_responses(*status_codes: int) -> dict[int | str, dict[str, object]]:
     """Expose the shared error envelope in OpenAPI."""
     return {code: {"model": ErrorEnvelope} for code in status_codes}
 

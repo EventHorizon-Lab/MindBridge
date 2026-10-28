@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from threading import Condition
+from weakref import ReferenceType, ref
 
 from mindbridge.infrastructure.local._capacity import (
     FILE_DESCRIPTOR_LOCK,
     Capacity,
+    ProcessLock,
     file_descriptor_usage,
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
@@ -34,8 +37,59 @@ from mindbridge.infrastructure.local.store.errors import (
 
 # Total connections, including checked-out, opening, and idle connections.
 _CONNECTION_POOL_SIZE = 32
+# Idle handles stay directory-owned, with half the process budget available to active work.
+_PROCESS_IDLE_CONNECTIONS = 64
+_DIRECTORY_IDLE_RESERVE = 4
 _PROCESS_INSTANCES = Capacity(16)
 _PROCESS_CONNECTIONS = Capacity(128)
+
+
+class _IdleConnections:
+    """Coordinate directory-owned idle handles; never lend one across directories."""
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self.condition = Condition()
+        self.entries: OrderedDict[int, ReferenceType[Connections]] = OrderedDict()
+
+    def take_oldest(
+        self, *, minimum_retained: int = 0
+    ) -> tuple[Connections, sqlite3.Connection] | None:
+        # The condition protects every directory's idle list as well as this eviction order.
+        for handle_id in tuple(self.entries):
+            owner = self.entries[handle_id]()
+            if owner is None:
+                del self.entries[handle_id]
+                continue
+            if len(owner._pool) <= minimum_retained:
+                continue
+            del self.entries[handle_id]
+            connection = next(handle for handle in owner._pool if id(handle) == handle_id)
+            owner._pool.remove(connection)
+            owner._closing_connections += 1
+            return owner, connection
+        return None
+
+    def finish_eviction(self, evicted: tuple[Connections, sqlite3.Connection]) -> None:
+        owner, connection = evicted
+        try:
+            owner._discard(connection)
+        finally:
+            with self.condition:
+                owner._closing_connections -= 1
+                self.condition.notify_all()
+
+
+_IDLE_CONNECTIONS = _IdleConnections()
+_IDLE_CONNECTIONS_LOCK = ProcessLock()
+
+
+def _process_idle_connections() -> _IdleConnections:
+    global _IDLE_CONNECTIONS
+    with _IDLE_CONNECTIONS_LOCK:
+        if _IDLE_CONNECTIONS.pid != os.getpid():
+            _IDLE_CONNECTIONS = _IdleConnections()
+        return _IDLE_CONNECTIONS
 
 
 class Connections:
@@ -52,8 +106,10 @@ class Connections:
         self._schema_ready = False
         # Idle connections only: one is in the pool exactly while nobody holds it.
         self._pool: list[sqlite3.Connection] = []
-        self._pool_lock = Condition()
+        self._idle = _process_idle_connections()
+        self._pool_lock = self._idle.condition
         self._active_connections = 0
+        self._closing_connections = 0
         # Every commit invalidates the corpus digest. Counting it here rather than in the caller
         # keeps the cache where writes are observable: one data directory has one live owner, so
         # a commit this process did not make cannot exist.
@@ -85,7 +141,7 @@ class Connections:
             if self._closed:
                 return
             self._closed = True
-            while self._active_connections:
+            while self._active_connections or self._closing_connections:
                 self._pool_lock.wait()
         self._close_pool()
         self._directory_lock.close()
@@ -123,8 +179,12 @@ class Connections:
         # approximates. A pooled connection is checked out to exactly one caller at a time, so
         # no two threads ever execute on it concurrently; without this, a connection could only
         # ever be reused by the thread that happened to open it.
-        if not _PROCESS_CONNECTIONS.acquire():
-            raise LocalStoreCapacityError("process SQLite connection capacity exceeded")
+        while not _PROCESS_CONNECTIONS.acquire():
+            with self._pool_lock:
+                evicted = self._idle.take_oldest()
+            if evicted is None:
+                raise LocalStoreCapacityError("process SQLite connection capacity exceeded")
+            self._idle.finish_eviction(evicted)
         try:
             with FILE_DESCRIPTOR_LOCK:
                 usage = file_descriptor_usage()
@@ -185,10 +245,12 @@ class Connections:
         """
         with self._pool_lock:
             self.require_open()
-            if self._active_connections >= _CONNECTION_POOL_SIZE:
+            if self._active_connections + self._closing_connections >= _CONNECTION_POOL_SIZE:
                 raise LocalStoreCapacityError("local SQLite connection capacity exceeded")
             self._active_connections += 1
             idle = self._pool.pop() if self._pool else None
+            if idle is not None:
+                del self._idle.entries[id(idle)]
         connection = None
         reusable = False
         try:
@@ -202,26 +264,55 @@ class Connections:
             yield connection
             reusable = self._schema_ready and not secure_delete
         finally:
-            # Keep admission until closing or returning the actual handle has finished.
-            with self._pool_lock:
-                if connection is not None:
-                    if reusable and not self._closed:
+            self._return_connection(connection, reusable=reusable)
+
+    def _return_connection(self, connection: sqlite3.Connection | None, *, reusable: bool) -> None:
+        # Keep admission until closing or returning the actual handle has finished.
+        evicted = None
+        discard = False
+        with self._pool_lock:
+            if connection is not None:
+                if reusable and not self._closed:
+                    if len(self._idle.entries) >= _PROCESS_IDLE_CONNECTIONS:
+                        evicted = self._idle.take_oldest(minimum_retained=_DIRECTORY_IDLE_RESERVE)
+                    if len(self._idle.entries) < _PROCESS_IDLE_CONNECTIONS:
                         self._pool.append(connection)
+                        self._idle.entries[id(connection)] = ref(self)
                     else:
-                        with suppress(sqlite3.Error):
-                            connection.close()
-                        _PROCESS_CONNECTIONS.release()
+                        discard = True
+                else:
+                    discard = True
+            pending_cleanup = evicted is not None or discard
+            if not pending_cleanup:
                 self._active_connections -= 1
                 self._pool_lock.notify_all()
+        if pending_cleanup:
+            try:
+                if evicted is not None:
+                    self._idle.finish_eviction(evicted)
+                elif connection is not None:
+                    self._discard(connection)
+            finally:
+                with self._pool_lock:
+                    self._active_connections -= 1
+                    self._pool_lock.notify_all()
+
+    @staticmethod
+    def _discard(connection: sqlite3.Connection) -> None:
+        try:
+            with suppress(sqlite3.Error):
+                connection.close()
+        finally:
+            _PROCESS_CONNECTIONS.release()
 
     def _close_pool(self) -> None:
         with self._pool_lock:
             connections = tuple(self._pool)
             self._pool.clear()
+            for connection in connections:
+                del self._idle.entries[id(connection)]
         for connection in connections:
-            with suppress(sqlite3.Error):
-                connection.close()
-            _PROCESS_CONNECTIONS.release()
+            self._discard(connection)
 
     @contextmanager
     def transaction(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:

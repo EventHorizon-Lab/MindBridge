@@ -1508,28 +1508,23 @@ class Answering(Traced):
                         raise ModelError(
                             "generation model returned an invalid answer", reason="response_invalid"
                         )
-                    if not isinstance(result, AnswerResult) or (
-                        answer_policy == "strict" and result.answer != answer
-                    ):
-                        raise ModelError(
-                            "generation model returned an invalid answer",
-                            reason="response_invalid",
-                        )
                 else:
                     result = answerer.answer(
                         question, hits, answer_policy=answer_policy, exhaustive=exhaustive
                     )
                     buffered = True
+                if not isinstance(result, AnswerResult) or (
+                    not buffered and answer_policy == "strict" and result.answer != answer
+                ):
+                    raise ModelError(
+                        "generation model returned an invalid answer", reason="response_invalid"
+                    )
             except MindBridgeError:
                 raise
             except Exception as error:
                 raise ModelError(
                     "failed to generate a grounded answer", reason="model_failed"
                 ) from error
-            if not isinstance(result, AnswerResult):
-                raise ModelError(
-                    "generation model returned an invalid answer", reason="response_invalid"
-                )
             if buffered:
                 yield result.answer
             return result

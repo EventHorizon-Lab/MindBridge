@@ -13,6 +13,7 @@ the repository. An archived command may require those artifacts or an older chec
 
 | Record | Scope |
 | --- | --- |
+| [Eval concurrency and resource reuse — 2026-10-27](2026-10-27-eval-concurrency.md) | Dynamic model admission, idle connection reclamation, child-worker fairness, cancellation, and deterministic paired SDK evaluation |
 | [Local runtime performance — 2026-10-27](2026-10-27-local-runtime-performance.md) | FP32 buffer scoring, scoped SQLite hydration, exact-result checks, and frozen SDK latency comparisons |
 | [否定敏感检索的论文与开源方案评估 — 2026-10-27](2026-10-27-negation-retrieval-research.md) | Cross-encoder evidence, Chinese subject/scope extraction, exclusion-query methods, implementation status, and MindBridge evaluation priorities |
 | [质量损失分层审查 — 2026-10-27](2026-10-27-quality-diagnostics.md) | Five observed question boundaries, trace correlation, source coverage limits and stratified human annotation |

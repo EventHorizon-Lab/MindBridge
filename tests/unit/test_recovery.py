@@ -45,8 +45,9 @@ def test_rejected_open_does_not_write_missing_or_matching_metadata(tmp_path: Pat
     with Memory(tmp_path, embedder=_Embedder()) as memory:
         memory.add("preserved memory")
     with LocalStore(tmp_path) as store:
-        store.delete_metadata("embedding.model_id")
-        store.set_metadata("transcription.space_id", "incompatible")
+        store.update_metadata(
+            {"embedding.model_id": None, "transcription.space_id": "incompatible"}
+        )
     before = _metadata(tmp_path)
     sentinel = tmp_path / "zvec" / "preserved"
     sentinel.write_text("derived index", encoding="utf-8")
@@ -69,9 +70,13 @@ def test_matching_open_leaves_metadata_timestamps_unchanged(tmp_path: Path) -> N
 
 def test_metadata_update_rolls_back_marker_changes_and_deletion_together(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
-        store.set_metadata("embedding.space_id", "original")
-        store.set_metadata("index.recipe", "original")
-        store.set_metadata("retired.marker", "pending")
+        store.update_metadata(
+            {
+                "embedding.space_id": "original",
+                "index.recipe": "original",
+                "retired.marker": "pending",
+            }
+        )
         before = _metadata(tmp_path)
         with closing(sqlite3.connect(store.database_path)) as connection:
             connection.execute(
@@ -113,7 +118,7 @@ def test_old_index_recipes_are_rejected_without_rewriting_the_store(
     with Memory(tmp_path, embedder=_Embedder()) as memory:
         record = memory.add("preserved memory")
     with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", recipe)
+        store.update_metadata({"index.recipe": recipe})
         documents = store.index.read_memory_index_documents((record.id,))
     before = _metadata(tmp_path)
     sentinel = tmp_path / "zvec" / "preserved"
@@ -145,7 +150,7 @@ def test_nonempty_store_requires_every_current_metadata_marker(tmp_path: Path, k
     with Memory(tmp_path, embedder=_Embedder()) as memory:
         memory.add("preserved memory")
     with LocalStore(tmp_path) as store:
-        store.delete_metadata(key)
+        store.update_metadata({key: None})
     before = _metadata(tmp_path)
     embedder = _Embedder()
 

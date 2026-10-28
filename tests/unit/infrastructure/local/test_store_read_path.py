@@ -19,15 +19,19 @@ import shutil
 import sqlite3
 import struct
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 
 import pytest
 
 from mindbridge import Memory
 from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local import LocalStore, StoredEmbedding, StoredMemory
+from mindbridge.infrastructure.local.store import index as index_module
+from mindbridge.infrastructure.local.store._codec import optional_datetime_from_row
 from mindbridge.infrastructure.local.store.records import MemoryRecords
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import Modality
@@ -70,6 +74,38 @@ def _store_one(store: LocalStore, suffix: str, content: str) -> tuple[str, str]:
     store.records.write_memory(_memory(memory_id, content))
     store.index.write_embedding(_embedding(embedding_id, memory_id))
     return memory_id, embedding_id
+
+
+def test_candidate_decoding_leaves_connection_available_to_another_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, release = Event(), Event()
+
+    def decode(row: sqlite3.Row, key: str) -> datetime | None:
+        entered.set()
+        assert release.wait(5)
+        return optional_datetime_from_row(row, key)
+
+    with LocalStore(tmp_path) as store:
+        memory_id, embedding_id = _store_one(store, "live", "a candidate")
+        _stale_memory, stale_id = _store_one(store, "stale", "a deleted candidate")
+        assert store.records.delete_memory("memory-stale")
+        with store._connections.connection() as warm:
+            pass
+        monkeypatch.setattr(index_module, "optional_datetime_from_row", decode)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                store.index.read_index_candidates, (stale_id, embedding_id, "absent", embedding_id)
+            )
+            try:
+                assert entered.wait(2)
+                with store._connections.connection() as borrowed:
+                    assert borrowed is warm
+                    assert borrowed.execute("SELECT 1").fetchone()[0] == 1
+            finally:
+                release.set()
+            candidates = future.result(timeout=2)
+        assert tuple(candidate.memory_id for candidate in candidates) == (memory_id, memory_id)
 
 
 def test_hydration_does_not_re_validate_a_stored_vector(tmp_path: Path) -> None:
@@ -154,10 +190,10 @@ def test_hydration_drops_index_ids_sqlite_no_longer_knows(tmp_path: Path) -> Non
         # raising or shifting a neighbour into its place.
         hydrated = store.index.read_index_documents((stale, live, "embedding-never-existed"))
         assert [document.embedding.embedding_id for document in hydrated] == [live]
-        assert store.index.read_index_document(stale) is None
-        assert store.index.read_memory_index_documents((stale_memory, live_memory)) == (
-            store.index.read_index_document(live),
-        )
+        assert store.index.read_index_documents((stale,)) == ()
+        assert store.index.read_memory_index_documents(
+            (stale_memory, live_memory)
+        ) == store.index.read_index_documents((live,))
 
 
 class _CountingEmbedder:

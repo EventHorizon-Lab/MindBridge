@@ -52,10 +52,10 @@ from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.prepare_media import (
     _OPENEQA_FRAME_RATE,
     _cached_segments,
-    _find_media,
     _has_preprocessable_video,
     _has_structural_video,
     _m3_manifest,
+    _MediaFinder,
     _openeqa_episode,
     _openeqa_segments,
     _segment_video,
@@ -261,10 +261,11 @@ def test_media_lookup_keeps_direct_precedence_and_ambiguous_error(
 
     monkeypatch.setattr(Path, "rglob", rglob)
 
-    assert _find_media(media, "missing/direct.mp4") == direct.resolve()
+    find_media = _MediaFinder(media)
+    assert find_media("missing/direct.mp4") == direct.resolve()
     assert scans == 0
     with pytest.raises(FileNotFoundError) as error:
-        _find_media(media, "duplicate.mp4")
+        find_media("duplicate.mp4")
     assert str(error.value) == f"expected one of duplicate.mp4 under {media}"
     assert scans == 1
 

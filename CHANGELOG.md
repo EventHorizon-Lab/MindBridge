@@ -68,6 +68,15 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Fixed
 
+- Evaluation shares model capacity dynamically between ingestion and answers. Bounded idle
+  SQLite pools and child-worker admission preserve progress across independent directories;
+  cancellation waits for in-flight work and store cleanup. See [benchmarking](docs/benchmarking.md).
+- Candidate metadata decoding releases its SQLite connection before constructing results.
+  Evaluation bootstrap statistics avoid flattened sample copies and repeated paired draws while
+  preserving seeded results and cluster weighting.
+- Directory-owned SQLite pools share a bounded idle budget, preserving each directory's base
+  allocation while reusing spare capacity for bursts. Active admission reclaims idle handles,
+  and directory ownership outlasts eviction cleanup.
 - Index replay, missing-index recovery, stale search-ID hydration, dead-row maintenance, and
   rejected-open metadata handling preserve SQLite authority and recovery work.
 - Concurrent retrieval, deletion, asset leasing, streamed ingestion, and pooled reads preserve
@@ -86,6 +95,8 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Removed
 
+- Unused single-item storage wrappers and the unused media-size query; internal callers use
+  the existing batch operations.
 - PostgreSQL/pgvector, Celery, Redis, S3, service workers, and the service-specific APIs and
   benchmark runners from the superseded design.
 - Tenant, user, run, and other implicit isolation identifiers; metadata remains application data.

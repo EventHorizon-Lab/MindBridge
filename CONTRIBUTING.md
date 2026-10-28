@@ -179,6 +179,11 @@ Store temporary implementation plans and review notes under the ignored `.superp
 The former `docs/superpowers/` location is ignored to prevent completed work plans from returning
 to the documentation tree.
 
+Repository cleanup may remove generated `build/`, `dist/`, Python bytecode, tool caches, and
+validation logs. Keep source snapshots, benchmark results, model revision pins, dataset checksums,
+and research manifests used to reproduce archived measurements. Files inside a live SQLite or
+Zvec data directory, including RocksDB `.log` files, are storage data rather than disposable logs.
+
 ## Pull requests
 
 Use a concise imperative commit subject such as `Add index recovery test`. A pull request should:

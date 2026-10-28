@@ -13,16 +13,22 @@ import hashlib
 import json
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, cast
+from typing import cast
 
-from mindbridge.exceptions import StorageError
+from mindbridge.exceptions import StorageError, ValidationError
 from mindbridge.types import (
     ConsentClaim,
+    ConsentState,
+    EvidenceBasis,
     FormationProposal,
     IdentityChange,
     IdentityClaim,
+    MemoryIntent,
+    MemoryKind,
     MemoryOperation,
     MemoryOperationRecord,
+    Modality,
+    SpatialAnchor,
     SpatialContext,
 )
 
@@ -75,17 +81,25 @@ def load_operation(payload: str) -> MemoryOperation:
         claim = value.get("claim")
         consent = value.get("consent")
         identity = value.get("identity")
+        # Constructors own value validation; these casts do not coerce untrusted JSON.
         return MemoryOperation(
-            intent=cast(Any, value["intent"]),
+            intent=cast(MemoryIntent, value["intent"]),
             evidence_ids=tuple(value.get("evidence_ids") or ()),
             target_ids=tuple(value.get("target_ids") or ()),
             proposal=None if proposal is None else _proposal(proposal),
             claim=None if claim is None else _claim(claim),
             consent=None if consent is None else _consent(consent),
             identity=None if identity is None else _identity_change(identity),
-            rationale=cast(Any, value.get("rationale")),
+            rationale=cast(str | None, value.get("rationale")),
         )
-    except Exception as error:
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+        ValidationError,
+    ) as error:
         raise StorageError("a logged memory operation could not be read") from error
 
 
@@ -107,65 +121,56 @@ def _identity(operation: MemoryOperation) -> dict[str, object]:
         "proposal": None if proposal is None else proposal_payload(proposal),
         # Part of the idempotency identity: renaming the same person supersedes rather than
         # replays, so two claims that differ only in the name must be two operations.
-        "claim": None if claim is None else _claim_payload(claim),
+        "claim": None
+        if claim is None
+        else {
+            "identity_id": claim.identity_id,
+            "name": claim.name,
+            "relationship": claim.relationship,
+        },
         # Part of the idempotency identity: re-stating the state that already stands is the same
         # operation and logs nothing, while moving to a different state is a different one.
-        "consent": None if consent is None else _consent_payload(consent),
+        "consent": None
+        if consent is None
+        else {
+            "identity_id": consent.identity_id,
+            "state": consent.state.value,
+            "note": consent.note,
+        },
         # Part of the idempotency identity: merging or splitting a different pair of people is a
         # different operation, so two merges of one pair stay one row and two pairs stay two.
-        "identity": None if change is None else _identity_change_payload(change),
+        "identity": None
+        if change is None
+        else {"identity_id": change.identity_id, "moved_ids": sorted(change.moved_ids)},
     }
-
-
-def _identity_change_payload(change: IdentityChange) -> dict[str, object]:
-    return {"identity_id": change.identity_id, "moved_ids": sorted(change.moved_ids)}
 
 
 def _identity_change(value: object) -> IdentityChange:
     if not isinstance(value, dict):
         raise ValueError
     return IdentityChange(
-        identity_id=cast(Any, value["identity_id"]),
-        moved_ids=cast(Any, tuple(value.get("moved_ids") or ())),
+        identity_id=cast(str, value["identity_id"]),
+        moved_ids=tuple(value.get("moved_ids") or ()),
     )
-
-
-def _consent_payload(consent: ConsentClaim) -> dict[str, object]:
-    return {
-        "identity_id": consent.identity_id,
-        "state": consent.state.value,
-        # Part of the identity too, unlike `rationale`: the note is the subject's own words
-        # about their own decision, so restating a standing state with different words is a
-        # second statement worth its own row rather than a duplicate the log drops.
-        "note": consent.note,
-    }
 
 
 def _consent(value: object) -> ConsentClaim:
     if not isinstance(value, dict):
         raise ValueError
     return ConsentClaim(
-        identity_id=cast(Any, value["identity_id"]),
-        state=cast(Any, value["state"]),
-        note=cast(Any, value.get("note")),
+        identity_id=cast(str, value["identity_id"]),
+        state=cast(ConsentState, value["state"]),
+        note=cast(str | None, value.get("note")),
     )
-
-
-def _claim_payload(claim: IdentityClaim) -> dict[str, object]:
-    return {
-        "identity_id": claim.identity_id,
-        "name": claim.name,
-        "relationship": claim.relationship,
-    }
 
 
 def _claim(value: object) -> IdentityClaim:
     if not isinstance(value, dict):
         raise ValueError
     return IdentityClaim(
-        identity_id=cast(Any, value["identity_id"]),
-        name=cast(Any, value["name"]),
-        relationship=cast(Any, value.get("relationship")),
+        identity_id=cast(str, value["identity_id"]),
+        name=cast(str, value["name"]),
+        relationship=cast(str | None, value.get("relationship")),
     )
 
 
@@ -211,22 +216,20 @@ def _proposal(value: object) -> FormationProposal:
         raise ValueError
     spatial = value.get("spatial")
     return FormationProposal(
-        kind=cast(Any, value["kind"]),
-        content=cast(Any, value["content"]),
-        basis=cast(Any, value["basis"]),
-        subject=cast(Any, value.get("subject")),
-        predicate=cast(Any, value.get("predicate")),
-        value=cast(Any, value.get("value")),
-        confidence=cast(Any, value["confidence"]),
+        kind=cast(MemoryKind, value["kind"]),
+        content=cast(str, value["content"]),
+        basis=cast(EvidenceBasis, value["basis"]),
+        subject=cast(str | None, value.get("subject")),
+        predicate=cast(str | None, value.get("predicate")),
+        value=cast(str | None, value.get("value")),
+        confidence=cast(float, value["confidence"]),
         valid_from=_time(value.get("valid_from")),
         valid_until=_time(value.get("valid_until")),
         spatial=None if spatial is None else _spatial(spatial),
-        cue_modality=cast(Any, value.get("cue_modality")),
-        valence=cast(Any, value.get("valence")),
-        arousal=cast(Any, value.get("arousal")),
-        evidence_ids=(
-            None if value.get("evidence_ids") is None else cast(Any, tuple(value["evidence_ids"]))
-        ),
+        cue_modality=cast(Modality | None, value.get("cue_modality")),
+        valence=cast(float | None, value.get("valence")),
+        arousal=cast(float | None, value.get("arousal")),
+        evidence_ids=(None if value.get("evidence_ids") is None else tuple(value["evidence_ids"])),
     )
 
 
@@ -235,13 +238,17 @@ def _spatial(value: object) -> SpatialContext:
         raise ValueError
     orientation = value.get("orientation_xyzw")
     return SpatialContext(
-        frame_id=cast(Any, value["frame_id"]),
-        anchor=cast(Any, value["anchor"]),
-        x=cast(Any, value["x"]),
-        y=cast(Any, value["y"]),
-        z=cast(Any, value.get("z", 0.0)),
-        orientation_xyzw=None if orientation is None else cast(Any, tuple(orientation)),
-        position_uncertainty_m=cast(Any, value.get("position_uncertainty_m")),
+        frame_id=cast(str, value["frame_id"]),
+        anchor=cast(SpatialAnchor, value["anchor"]),
+        x=cast(float, value["x"]),
+        y=cast(float, value["y"]),
+        z=cast(float, value.get("z", 0.0)),
+        orientation_xyzw=(
+            None
+            if orientation is None
+            else cast(tuple[float, float, float, float], tuple(orientation))
+        ),
+        position_uncertainty_m=cast(float | None, value.get("position_uncertainty_m")),
     )
 
 

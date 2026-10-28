@@ -63,9 +63,6 @@ DEFAULT_COMPILE_BUDGET = ContextBudget()
 RETRIEVAL_CANDIDATE_LIMIT = 100
 
 
-# The `compile` arm reuses this prompt verbatim rather than defining its own: its context is
-# `ContextBundle.render()` instead of the raw stuffed corpus, but it is still context handed to
-# the same generator the same way, so it is honestly the same prompt, not a new one to version.
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 
 

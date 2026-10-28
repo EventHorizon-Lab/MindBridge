@@ -184,7 +184,7 @@ def test_nonempty_store_without_policy_marker_is_rejected(
     with _open(tmp_path, False) as memory:
         _root(memory, "preserved record")
     with LocalStore(tmp_path) as store:
-        store.delete_metadata("evidence.projection_recipe")
+        store.update_metadata({"evidence.projection_recipe": None})
     with pytest.raises(StorageError, match=r"evidence\.projection_recipe"):
         _open(tmp_path, independent)
 

@@ -77,7 +77,7 @@ from mindbridge.benchmarks.eval_adapters import (
     MediaManifest,
     MediaResolver,
     MemoryItem,
-    _choice_parts,
+    _choice_prompt,
     _free_text_parts,
     _gallery_memory,
     _query_parts,
@@ -199,10 +199,9 @@ def test_query_parts_and_gallery_image_id_preserve_retrieval_evidence(tmp_path: 
         format_constraint="Answer briefly.",
     ) == ("Where is it?", "Instruction", "Answer briefly.")
     assert _free_text_parts("Where is it?")[0] == "Where is it?"
-    assert _choice_parts("Where is it?", ("Desk", "Shelf")) == (
-        "Where is it?",
+    assert _choice_prompt("Where is it?", ("Desk", "Shelf")) == (
         "Select the best answer using only the memories. Reply with one letter (A, B).\n"
-        "A. Desk\nB. Shelf\nAnswer:",
+        "Question: Where is it?\nA. Desk\nB. Shelf\nAnswer:"
     )
 
 

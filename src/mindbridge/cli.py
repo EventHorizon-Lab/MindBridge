@@ -21,12 +21,12 @@ import math
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import asdict
+from dataclasses import Field, asdict
 from datetime import datetime, timedelta
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, TextIO, TypeAlias, cast
+from typing import ClassVar, Protocol, TextIO, TypeAlias, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -48,6 +48,15 @@ from mindbridge.exceptions import (
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
 from mindbridge.kernel.contracts import declared_capabilities
 from mindbridge.memory import Memory
+from mindbridge.models.base import (
+    ConsolidationBackend,
+    EmbeddingBackend,
+    FormationBackend,
+    GenerationBackend,
+    SpeechBackend,
+    TranscriptionBackend,
+    VisionDescriptionBackend,
+)
 from mindbridge.types import (
     AffectCue,
     AssetRef,
@@ -79,6 +88,11 @@ from mindbridge.types import (
     SpatialContext,
     StreamInput,
 )
+
+
+class _DataclassInstance(Protocol):
+    __dataclass_fields__: ClassVar[dict[str, Field[object]]]
+
 
 PROGRAM = "mindbridge"
 CONFIGURATION_ERROR = "configuration_error"
@@ -472,12 +486,14 @@ def _doctor_capabilities(loaded: Mapping[str, object]) -> _Document | None:
         return None
     try:
         capabilities = declared_capabilities(
-            embedder=cast(Any, embedder),
-            answerer=cast(Any, loaded.get("answerer")),
-            transcriber=cast(Any, loaded.get("transcriber")),
-            vision_describer=cast(Any, loaded.get("vision")),
-            former=cast(Any, loaded.get("former")),
-            consolidator=cast(Any, loaded.get("consolidator")),
+            embedder=cast(EmbeddingBackend, embedder),
+            answerer=cast(GenerationBackend | None, loaded.get("answerer")),
+            transcriber=cast(
+                SpeechBackend | TranscriptionBackend | None, loaded.get("transcriber")
+            ),
+            vision_describer=cast(VisionDescriptionBackend | None, loaded.get("vision")),
+            former=cast(FormationBackend | None, loaded.get("former")),
+            consolidator=cast(ConsolidationBackend | None, loaded.get("consolidator")),
         )
     except MindBridgeError:
         # A backend that declares an invalid contract is already reported per slot above; the
@@ -1777,14 +1793,14 @@ def _encode_time(value: datetime) -> str:
     return f"{text[:-6]}Z" if text.endswith("+00:00") else text
 
 
-def _document(value: object) -> _Document:
+def _document(value: _DataclassInstance) -> _Document:
     """One JSON-native document for one frozen SDK value, field for declared field.
 
     `asdict` flattens the nested values; this only encodes what `json` cannot write itself, so a
     field added to an SDK value reaches every command that prints it without a line here naming
     it. The result stays JSON-native because it is also what a `--url` request body carries.
     """
-    return cast("_Document", _json_native(asdict(cast(Any, value))))
+    return cast("_Document", _json_native(asdict(value)))
 
 
 def _json_native(value: object) -> object:

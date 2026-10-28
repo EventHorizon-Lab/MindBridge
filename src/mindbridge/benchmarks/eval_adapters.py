@@ -132,6 +132,7 @@ class EvalUnit:
     unit_id: str
     memories: tuple[MemoryItem, ...]
     questions: tuple[EvalQuestion, ...]
+    _source_ends: tuple[float, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.unit_id.strip() or not self.questions:
@@ -139,6 +140,11 @@ class EvalUnit:
         question_ids = tuple(question.question_id for question in self.questions)
         if len(set(question_ids)) != len(question_ids):
             raise ValueError("evaluation question IDs must be unique within a unit")
+        ends: dict[str, float] = {}
+        for memory in self.memories:
+            end = math.inf if memory.end_seconds is None else memory.end_seconds
+            ends[memory.source_id] = min(ends.get(memory.source_id, math.inf), end)
+        object.__setattr__(self, "_source_ends", tuple(sorted(ends.values())))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1869,11 +1875,6 @@ def _choice_prompt(question: str, choices: Sequence[str]) -> str:
         f"Select the best answer using only the memories. Reply with one letter ({labels}).\n"
         f"Question: {question}\n{options}\nAnswer:"
     )
-
-
-def _choice_parts(question: str, choices: Sequence[str]) -> tuple[str, str]:
-    prompt = _choice_prompt(question, choices)
-    return question, prompt.replace(f"Question: {question}\n", "", 1)
 
 
 def _free_text_prompt(question: str) -> str:

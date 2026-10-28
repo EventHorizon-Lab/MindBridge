@@ -354,10 +354,13 @@ generation, and comparison options.
 
 `request_concurrency` bounds in-flight requests across units. Within each physical store, the
 runner queues SDK work at the runtime's fixed limits: eight streaming answers or 28
-model operations. It opens at most 16 stores and reserves one model-operation slot per unit
-worker for ingestion or settlement before choosing its shared answer window from the 28-slot
-process budget. Requested concurrency is a ceiling; values above these budgets wait in the
-harness. Waiting for admission is included in caller latency and TTFT. See
+model operations. It opens at most 16 stores. Ingestion batches, settlement, deliberation, and
+answers share a 28-slot process budget, borrowing slots only while work is in flight; idle unit
+workers reserve none. Answer requests also respect `request_concurrency`. Retry backoff releases
+model capacity. Cancellation retains the slot until the current SDK call finishes and cleans up,
+then stops further retries. Requested concurrency is a ceiling;
+values above these budgets wait in the harness. Waiting for admission is included in caller latency
+and TTFT. See
 [runtime limits](operations.md#concurrency-and-overload).
 
 Unless `--quiet` is set, `eval` reports ingest, sample, and judge progress to stderr. On a
@@ -1411,6 +1414,10 @@ breakdown family against that single table.
 Questions sharing one memory are clustered as one independent unit. Confidence intervals and
 regression significance remain unavailable when fewer than two independent units are present;
 `score.confidence_interval_95` remains present in the JSON with the value `null`.
+Bootstrap draws retain the configured seed, sample count, and sample-weighted cluster resampling.
+Integer scores use exact cluster totals within the floating-point integer range; other scores
+retain their original summation order. Paired confidence intervals and improvement probabilities
+reuse the same draws.
 Partial, failed, or unverified runs remain useful for development but are not leaderboard-comparable.
 
 `--compare` is a regression guard, not a baseline. It pairs the current `mindbridge` arm against a

@@ -167,19 +167,28 @@ class Execution:
         self._async_slots.release()
 
     @staticmethod
-    def _limited(slots: BoundedSemaphore, call: Callable[[], _T]) -> _T:
-        with slots:
-            return call()
+    def _submit(executor: Executor, slots: BoundedSemaphore, call: Callable[[], _T]) -> Future[_T]:
+        # Wait in the parent: a directory waiting for its quota must not occupy another's worker.
+        slots.acquire()
+        try:
+            future = executor.submit(copy_context().run, call)
+        except BaseException:
+            slots.release()
+            raise
+        future.add_done_callback(lambda _done: slots.release())
+        return future
 
     def index_routes(self, calls: Sequence[Callable[[], _T]]) -> tuple[_T, ...]:
         results: list[_T] = []
         # At most four pending routes per admitted operation, including temporal supplements.
         for offset in range(0, len(calls), 4):
-            futures = tuple(
-                self._index.submit(copy_context().run, self._limited, self._index_slots, call)
-                for call in calls[offset : offset + 4]
-            )
-            wait(futures)
+            futures: list[Future[_T]] = []
+            try:
+                for call in calls[offset : offset + 4]:
+                    futures.append(self._submit(self._index, self._index_slots, call))
+            finally:
+                # Even a later submission failure cannot release the caller's assets early.
+                wait(futures)
             results.extend(future.result() for future in futures)
         return tuple(results)
 
@@ -187,9 +196,7 @@ class Execution:
     def overlap_speech(
         self, fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs
     ) -> Iterator[Future[_T]]:
-        future = self._speech.submit(
-            copy_context().run, self._limited, self._speech_slots, partial(fn, *args, **kwargs)
-        )
+        future = self._submit(self._speech, self._speech_slots, partial(fn, *args, **kwargs))
         try:
             yield future
         finally:

@@ -17,7 +17,7 @@ from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.models import _jina
 from mindbridge.models._media import fetch_videos
 from mindbridge.models.base import EmbedTask, ModelInput
-from mindbridge.types import AssetRef, Modality
+from mindbridge.types import Modality
 
 _ATOMIC_MODALITIES = (Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
 _STANDARD_RECIPE = "sentence-transformers-standard-input-v1"
@@ -258,7 +258,13 @@ class SentenceTransformersEmbedder:
         return capabilities
 
     def _prepare(self, value: ModelInput) -> object:
-        parts = _parts(value)
+        parts: list[tuple[str, str]] = []
+        if value.text:
+            parts.append((Modality.TEXT.value, value.text))
+        # ModelInput owns the resolved-asset check.
+        parts.extend(
+            (cast(Modality, asset.modality).value, str(asset.path)) for asset in value.assets
+        )
         if self._jina:
             values = tuple(
                 _jina._Text(part) if modality == Modality.TEXT.value else part
@@ -281,7 +287,13 @@ class SentenceTransformersEmbedder:
         return [
             {
                 "role": "user",
-                "content": [_message_part(modality, part) for modality, part in parts],
+                "content": [
+                    {
+                        "type": modality,
+                        "text" if modality == Modality.TEXT.value else modality: part,
+                    }
+                    for modality, part in parts
+                ],
             }
         ]
 
@@ -409,32 +421,6 @@ def _first_module(encoder: object) -> object | None:
         return cast(object, encoder[0])  # type: ignore[index]
     except (IndexError, KeyError, TypeError):
         return None
-
-
-def _parts(value: ModelInput) -> tuple[tuple[str, str], ...]:
-    parts: list[tuple[str, str]] = []
-    if value.text:
-        parts.append((Modality.TEXT.value, value.text))
-    parts.extend((_asset_modality(asset), _asset_path(asset)) for asset in value.assets)
-    return tuple(parts)
-
-
-def _asset_modality(asset: AssetRef) -> str:
-    modality = asset.modality
-    if modality is None:  # ModelInput already enforces resolved assets.
-        raise ValidationError("model input assets must be resolved")
-    return modality.value
-
-
-def _asset_path(asset: AssetRef) -> str:
-    path = asset.path
-    if path is None:  # ModelInput already enforces resolved assets.
-        raise ValidationError("model input assets must be resolved")
-    return str(path)
-
-
-def _message_part(modality: str, value: str) -> dict[str, str]:
-    return {"type": modality, "text" if modality == Modality.TEXT.value else modality: value}
 
 
 def _vectors(

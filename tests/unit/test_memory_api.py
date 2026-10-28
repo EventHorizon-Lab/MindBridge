@@ -3345,8 +3345,7 @@ def test_existing_face_analyses_require_both_space_markers(
         record = memory.add(Blob(b"image", "image/png", "face.png"))
         assert memory.faces(record.id)
     with LocalStore(tmp_path) as store:
-        for key in missing:
-            store.delete_metadata(key)
+        store.update_metadata(dict.fromkeys(missing))
 
     with pytest.raises(StorageError, match=r"metadata.*missing"):
         Memory(tmp_path, embedder=_FakeEmbedder(), face_analyzer=_FakeFace())
@@ -4748,7 +4747,7 @@ def test_unknown_index_recipe_preserves_sqlite_and_projection(
     with Memory(tmp_path, embedder=_FakeModels()) as memory:
         record = memory.add("preserved memory")
     with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", recipe)
+        store.update_metadata({"index.recipe": recipe})
         stored_record = store.records.read_memory(record.id)
         stored_documents = store.index.read_memory_index_documents((record.id,))
     sentinel = tmp_path / "zvec" / "preserved-index"
