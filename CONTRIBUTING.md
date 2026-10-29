@@ -50,14 +50,17 @@ uv lock --check --default-index https://pypi.org/simple
 uv run --frozen ruff format --check .
 uv run --frozen ruff check .
 uv run --frozen mypy
-uv run --frozen pytest -W error
 git diff --check
 ```
 
 Mypy runs in strict mode over `src` and `tests`. Ruff holds the project to Python 3.10 syntax and
 formats Python code blocks inside Markdown. Pytest treats warnings as errors.
 
-Run a focused test while iterating, then run the complete gate before handoff. For example:
+Select the smallest tests covering the changed behavior and its direct callers. Include contract
+tests when a public surface changes. Once the relevant checks pass, do not expand or repeat them
+unless a new change, failure, or unresolved concern warrants it. Local full-suite runs require an
+explicit user request; CI continues to run its configured checks. Record the commands actually run
+and relevant checks not run. For example:
 
 ```bash
 uv run --frozen pytest -W error tests/unit/test_memory_api.py
