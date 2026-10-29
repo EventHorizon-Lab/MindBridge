@@ -3,7 +3,6 @@
 Formation validates declared provenance, activity, modality and spatial frames. Those checks do
 not establish that the evidence entails the proposed sentence. An independent review can measure
 this boundary before introducing a semantic verifier into high-risk formation or consolidation.
-The [audit and research record](research/2026-10-27-semantic-support-audit.md) explains the decision.
 
 ## Run the scorer
 

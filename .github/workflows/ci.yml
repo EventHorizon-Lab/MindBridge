@@ -148,6 +148,7 @@ jobs:
           args: >-
             --no-progress
             --root-dir "${{ github.workspace }}"
+            --exclude-path 'docs/research/'
             './*.md'
             './docs/**/*.md'
             './.github/**/*.md'

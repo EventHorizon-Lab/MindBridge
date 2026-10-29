@@ -31,6 +31,10 @@ dist/
 # Autoresearch workspaces and generated artifacts are local-only.
 /autoresearch/
 
+# Private research notes and evidence stay on this machine.
+/docs/research/
+/research/
+
 # Audit receipts written by the protect-mcp tooling, not by this project. It writes them
 # relative to the working directory it is invoked from, so they appear at the repo root and
 # under src/ alike -- the latter would otherwise land inside the wheel's package root. The

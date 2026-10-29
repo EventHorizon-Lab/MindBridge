@@ -72,33 +72,9 @@ contract.
 
 ## Evaluate
 
-- [Mem-Gallery evaluation audit](research/2026-10-27-mem-gallery-evaluation-audit.md) — official
-  scorer parity, protocol differences, and limits on attributing quality losses.
-- [FunASR main adoption](research/2026-10-28-funasr-main.md) — pinned runtime, speaker attribution,
-  thread and device controls, and bounded real-model validation.
-- [Negation retrieval research](research/2026-10-27-negation-retrieval-research.md) — original
-  papers, open implementations, Chinese scope extraction, and evaluation priorities.
-- [Controlled semantic recall](research/2026-10-27-semantic-recall.md) — R01 audit, bounded
-  opt-in query execution, candidate/grounding loss decomposition and quality limits.
-- [Quality diagnosis audit](research/2026-10-27-quality-diagnostics.md) — five observed boundaries,
-  source-coverage limits and human evidence review.
-- [Predicate stability](research/2026-10-27-predicate-stability.md) — exact aliases, conservative
-  claim keys and deterministic correction fixtures.
-- [Negation and lexical evidence](research/2026-10-27-chinese-negation.md) — R02 root cause,
-  language-neutral IDF, paired retrieval fixtures, and disclosed ranking tradeoffs.
-- [Top1 ambiguity](research/2026-10-27-top1-ambiguity.md) — R03 reproduction, policy risk–coverage
-  comparison and correct-candidate losses.
-- [Accuracy-first retrieval](research/2026-10-26-accuracy-first-retrieval.md) — authoritative
-  quantized scoring, candidate retention, quality fixtures, and measured latency tradeoffs.
-- [ATM-Bench and Mem-Gallery research strategy](research/2026-10-26-atm-mem-gallery-sota-strategy.md) —
-  current competitive results, MindBridge evidence gaps, and experiments for validating improvements.
-- [Zvec 0.8 adoption](research/2026-10-26-zvec-08.md) — index migration, concurrency and
-  quantization decisions, measured recall, and native API limits.
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
 - [Grounded multimodal recall](grounded-multimodal-recall.md) — bounded semantic routes,
   transient query vision, optional concise answers, and native-media transport.
-- [Grounded recall quality evidence](research/2026-10-29-grounded-recall-quality.md) — completed
-  benchmark combinations, real-service checks, and limits of the promoted changes.
 - [Offline semantic support audit](semantic-support-audit.md) — atomic-claim review, evidence
   localization, withdrawal residue and verification costs before changing formation admission.
 - [Model quality gate](operations.md#model-quality-gate) — synthetic real-model regression cases,

@@ -77,6 +77,7 @@ docker run --rm -v "$PWD:/workdir:ro" davidanson/markdownlint-cli2:v0.23.0 \
   "!.superpowers/**" "!docs/superpowers/**" "!.claude/worktrees/**" "!autoresearch/**"
 docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
   --no-progress --root-dir /input \
+  --exclude-path 'docs/research/' \
   './*.md' './docs/**/*.md' './.github/**/*.md'
 ```
 
@@ -168,15 +169,15 @@ page.
 Keep `CHANGELOG.md` focused on the final changes a release delivers. Link to the owning guides
 for detailed contracts; omit intermediate implementations, review transcripts, and test counts.
 
-Keep the [research archive](docs/research/README.md) indexed when adding dated reports or design
-records. Preserve original measurements, source pins, rejected hypotheses, and verbatim protocols.
-Historical examples may require their frozen checkout; current guides must use the public API in
-this checkout. A documentation review should compare signatures, defaults, exports, transport
-switches, and example configurations against their implementations, not only check Markdown.
+Research reports, protocols, measurements, source pins, and rejected hypotheses belong in the
+ignored local `docs/research/` directory. Do not force-add, upload, or include them in distributions.
+Public guides must stand alone without links into that directory and use the public API in this
+checkout. A documentation review should compare signatures, defaults, exports, transport switches,
+and example configurations against their implementations, not only check Markdown.
 
 Remove superseded implementation specifications once the owning guides and regression tests cover
 their shipped behavior. Keep agent checklists, review transcripts, build output, and logs out of
-versioned documentation; retain reproducible research evidence and its limitations in the archive.
+versioned documentation; retain reproducible research evidence and its limitations locally.
 Store temporary implementation plans and review notes under the ignored `.superpowers/` directory.
 The former `docs/superpowers/` location is ignored to prevent completed work plans from returning
 to the documentation tree.

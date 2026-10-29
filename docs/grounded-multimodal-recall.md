@@ -66,5 +66,4 @@ support conjunction is rejected whole; removing only that member would authorize
 claim. Independent valid proposals still proceed. This guard does not claim better semantic
 state formation or enable formation/consolidation by default.
 
-See the [Python API](api/python-sdk.md), [configuration](configuration.md), and
-[quality evidence](research/2026-10-29-grounded-recall-quality.md).
+See the [Python API](api/python-sdk.md) and [configuration](configuration.md).

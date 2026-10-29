@@ -94,8 +94,7 @@ anchor, value type, and cardinality policy in that key. STATE is functional, REL
 and TRAIT retains its existing basis-dependent override rule. Naming and consent are outside the
 registry. Unknown predicates and compound objects retain literal keys. SQLite schema 20 preserves
 the original predicate alongside its key, registry revision, and match method. Only the current
-schema is accepted; opening a directory never upgrades an older schema. See
-[predicate stability](research/2026-10-27-predicate-stability.md) for scope and evaluation limits.
+schema is accepted; opening a directory never upgrades an older schema.
 
 The store also records the embedding model, space, dimension, transcription space, configured face
 spaces, and the index recipe. A mismatch fails at open instead of mixing representations.
@@ -298,8 +297,6 @@ SQLite still drops stale candidates and enforces hard filters. Known global lexi
 remain unchanged. New preferred-window BM25 hits use the matching global type route's score
 normalizer; rank-fused hits with unknown global ranks are conservatively capped below that
 route's tail. This bounded approximation does not promise identical global ranks for unseen hits.
-See the [temporal lexical evaluation](research/2026-10-27-temporal-lexical-retrieval.md) for
-the Zvec version, quality fixtures, and measurement limits.
 
 Unquantized routes start with 100 parents. Quantized routes retain 200 parents for authoritative
 rescoring; the index does not multiply that expanded group budget again. After SQLite visibility
@@ -319,8 +316,7 @@ words and adjacent-character bigrams. Negative words and bigrams remain evidence
 same frequency-based weighting rule as other terms; English contractions retain their `not`
 normalization. A word or bigram cannot establish grammatical polarity, its scope, or its
 object, so coverage has no negation-specific multiplier. Single-character tokens are not
-added. See the [negation evaluation](research/2026-10-27-chinese-negation.md) for paired
-fixtures and limitations. `RetrievalScope` filters apply as authoritative SQLite checks rather than
+added. `RetrievalScope` filters apply as authoritative SQLite checks rather than
 projection ranking: `valid_at` and `known_at` select the assertion valid in the world and known to
 the system at those instants, while `near` and `radius_m` compare distance only within a matching
 spatial frame and anchor, with no implicit frame transform.
@@ -372,7 +368,7 @@ Alternate queries are text only. After normal grounding, each executed query may
 `limit` novel rows within the existing character and media budgets. Query-local scores are
 never fused with the original ranking. This applies even when a plan contains only `similar`:
 new candidates must reach grounding to affect an answer. The supplemental note explicitly
-withholds completeness. See the [audit and evaluation](research/2026-10-27-semantic-recall.md).
+withholds completeness.
 
 With `evidence_expansion` enabled, the grounded window gains a third source beside the ranking
 and the recall program, and it is the one that costs no model call. After the window is grounded,

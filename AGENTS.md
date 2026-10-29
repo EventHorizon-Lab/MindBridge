@@ -18,6 +18,8 @@ MindBridge is a Python package under `src/mindbridge/`.
 - Keep tests in `tests/unit/`, `tests/contracts/`, `tests/integration/`, and
   `tests/benchmarks/`.
 - Keep user documentation in `docs/`, indexed by `docs/README.md`.
+- Keep research notes, protocols, and artifacts local-only in the ignored `docs/research/`.
+  Never force-add, upload, or package them.
 
 Product modules must not import benchmark modules. Dataset and behavior benchmarks should call the
 public SDK. A narrowly scoped storage microbenchmark may use the local adapters when its purpose is

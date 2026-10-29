@@ -282,16 +282,13 @@ Quantized retrieval keeps a wider parent candidate pool and recalculates final c
 SQLite's FP32 embeddings before ranking or applying `minimum_relevance`. This improves score
 calibration and near-tie ordering without another model call, at the cost of reading and scoring
 the surviving candidate vectors. It does not repair ANN candidates that were never discovered.
-The [accuracy-first evaluation](research/2026-10-26-accuracy-first-retrieval.md) records the
-synthetic quality and latency tradeoffs; these are not real-model semantic accuracy measurements.
 
 Zvec 0.8 INT8 uses `enable_rotate=False`: the rotated cosine path returned unrelated neighbors
 in the upgrade evaluation. Grouped retrieval does not support native refinement, so enabling a
 refiner is not a repair for that path. Uniform UINT4/7/8 require L2, and unrotated INT4 reduced
 grouped recall without a demonstrated speed gain. These modes remain outside the public
 configuration. Embedded Jieba is available upstream, but MindBridge retains the stemmed/bigram
-fields for multilingual and mixed-script recall. See the
-[Zvec 0.8 evaluation](research/2026-10-26-zvec-08.md) for measurements and API limitations.
+fields for multilingual and mixed-script recall.
 
 ## Capacity
 

@@ -311,8 +311,8 @@ setting when reopening raises `StorageError`. A nonempty store without the marke
 Enabling the experiment requires a fresh directory and replaying the original observations and
 operations. Opening a store never rewrites historical versions or changes its evidence policy.
 
-See the [experiment protocol](research/2026-09-12-corroboration-protocol.md). Structural SDK tests
-with fixed proposals do not establish real multimodal perception or natural-interaction quality.
+Structural SDK tests with fixed proposals do not establish real multimodal perception or
+natural-interaction quality.
 
 ## Valid time and transaction time
 

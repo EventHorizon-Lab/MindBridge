@@ -175,9 +175,7 @@ MindBridge diagnostics and do not replace the official answer score.
 
 Parity fixtures cover unchanged ID-list references, scalar/list dispatch, the exact upstream
 judge prompt, boolean and numeric judge outputs, and the shared query/refusal instruction.
-The [static parity record](research/artifacts/atm-official-parity-20261027.json) verifies both
-instruction strings byte-for-byte and all ten vendored deterministic scoring functions by AST
-against the pinned upstream source. This establishes protocol parity, not answer quality.
+These checks establish protocol parity, not answer quality.
 
 A bounded local reader check uses six synthetic text fixtures: a pickup date/time, a photo date,
 a currency value, photo IDs, missing private information, and an instruction embedded in stored
@@ -191,15 +189,8 @@ uv run --frozen python benchmarks/atm_adapter_quality.py \
   --repeats 3 --output /tmp/mindbridge-atm-adapter-quality.json
 ```
 
-The [reader record](research/artifacts/atm-adapter-quality-20261027.json) pins the local
-`qwen2.5:7b` digest and effective CPU controls; it retains outcomes and hashes, not generated
-answer bodies. An [initial check with incomplete evidence serialization](research/artifacts/atm-adapter-quality-20261027-unqualified-input.json)
-failed acceptance and is retained separately. Its results are not pooled with the final fixtures.
-All six current-prompt fixtures passed in each of three repetitions; the legacy query failed the
-currency criterion in all three. These are repeated observations on six fixtures, not 18 distinct
-questions or an estimate of benchmark uplift.
 These checks do not measure retrieval, native visual understanding, the deployed DeepSeek reader,
-or a new full ATM score. The original 57.36% run is not a result of the repaired adapter.
+or a new full ATM score.
 
 ES-MemEval's QA task is selected through its family name; `--limit 1` means one seeker and all of
 that seeker's questions:
@@ -393,8 +384,7 @@ sampling and optional `generation.answer_style`. Seeds do not guarantee identica
 The [ATM raw example](examples/atm-raw-qwen-wemm.yaml) and
 [Mem-Gallery example](examples/mem-gallery-qwen-wemm.yaml) preserve the verified task-specific
 budgets with replaceable localhost endpoints and no stored credentials. Run them with the
-documented temperature override. Their provenance and limits are in the
-[quality evidence](research/2026-10-29-grounded-recall-quality.md).
+documented temperature override.
 
 ATM `number` questions request the complete value, including requested dates, times, ranges,
 units and currencies. This adapter instruction does not change questions, references or the
@@ -579,8 +569,7 @@ Arm results are end-to-end comparisons (`comparison_scope: end_to_end_system`,
 `memory_only_attribution: false`). Aligned refusal policies remove one confound, but differing
 knowledge sources, evidence representation, budgets, planning, and model calls still prevent
 attributing the entire score difference to memory alone. Report answerable and abstention
-subsets separately alongside the unchanged overall official metric. See the
-[E01 review](research/2026-10-27-benchmark-answer-policy.md) for evidence and validation limits.
+subsets separately alongside the unchanged overall official metric.
 
 `compile` measures downstream task success from `Memory.compile()`'s bundle rather than
 `Memory.ask()`: it calls `compile(question, budget=ContextBudget(max_items=..., max_chars=...))`,
@@ -1307,8 +1296,6 @@ To distinguish causes after annotation, compare paired offline conditions with t
 reader/model revision and scorer: original evidence only, stored representation only, selected
 evidence and actual prepared context. Keep gold inputs outside normal retrieval and generation.
 Record the intervention and denominator; post-hoc coverage alone cannot establish causality.
-See the [quality diagnosis audit](research/2026-10-27-quality-diagnostics.md) for the rationale and
-research limits.
 
 ## Results and reproducibility
 

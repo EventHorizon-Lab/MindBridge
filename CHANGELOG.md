@@ -160,8 +160,8 @@ The [documentation index](docs/README.md) describes the current contracts.
   artifacts, duplicate scoring runners, the unused evaluation journal, and unused registries.
   Video-MME-v2 remains supported.
 - Completed implementation audits and intermediate development notes duplicated by current
-  guides and regression tests. Research protocols, measurements, source pins, and scorer notices
-  remain in the [research archive](docs/research/README.md).
+  guides and regression tests. Research protocols, measurements, and source pins stay local-only;
+  third-party scorer notices remain in the benchmark package.
 
 ### Limits
 

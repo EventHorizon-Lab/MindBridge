@@ -8,8 +8,7 @@ owns the typed-record contract, [context compilation](context-compilation.md) ow
 current contracts.
 
 Scope: this is a direction document. The implemented status below refers to this checkout;
-research citations support the design discussion, not a benchmark claim for MindBridge. Frozen
-experiments and rejected integration paths are indexed in the [research archive](research/README.md).
+research citations support the design discussion, not a benchmark claim for MindBridge.
 
 ## Positioning
 

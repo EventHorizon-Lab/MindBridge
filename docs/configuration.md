@@ -427,8 +427,7 @@ The transcription-space identity includes the pinned FunASR source revision and 
 model recipe. Device placement and CPU budgets do not create another semantic space. This
 revision replaces the previous speech space: opening an old directory with the new transcriber
 fails with a transcription-space metadata mismatch. Allocate a fresh `data_dir` and replay the
-original inputs; old speaker assignments are not reused or migrated. See the
-[adoption evidence and limits](research/2026-10-28-funasr-main.md).
+original inputs; old speaker assignments are not reused or migrated.
 
 ## Automatic memory formation
 
@@ -799,9 +798,8 @@ characters per read record, deduplicated by record ID. Omitted records and trunc
 reported. The note explicitly marks its evidence as untrusted data, and the kernel still
 validates every proposed read. Ordinary planning retains its best-effort-only retry rule and
 count/date summary. A replaceable round is buffered, so streaming releases only the answer that
-stands. No new model or service is configured by the switch. The
-[historical audit](research/2026-10-27-semantic-recall.md) describes the original mechanism and
-its quality-evaluation limits; mechanism tests alone do not establish natural-language gains.
+stands. No new model or service is configured by the switch. Mechanism tests alone do not
+establish natural-language gains.
 
 `minimum_relevance` uses the selected route's relevance scale: dense cosine in `dense`, native
 normalized full-text relevance in `lexical`, and the documented hybrid fusion in `hybrid`. Keep
@@ -838,11 +836,7 @@ hits are never dropped, this setting can only enlarge the grounding set. Lowerin
 setting the budget to `None` reduces the basic ranked window; recall planning and linked expansion
 can still add records when enabled. These controls do not bound the serialized provider input.
 With a budget, lowering `limit` may leave the evidence window unchanged because packing
-can refill it. The default of `24000` widens a
-short-turn corpus to the whole 100-record rerank pool and a long-turn one to about two dozen
-records, at a proportionally larger answer prompt; the measurement behind it is recorded beside
-the field in `plugins.py` and in the
-[loss decomposition](research/2026-09-12-baseline-loss-decomposition.md).
+can refill it. Increasing the budget can enlarge the answer prompt.
 
 Evidence selection and provider capacity are separate constraints. Character counts and media
 text equivalents omit system instructions, question text, provenance, attachment labels, message

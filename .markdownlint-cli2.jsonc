@@ -1,6 +1,6 @@
 {
-  // This git-ignored upstream model checkout is downloaded locally, not project documentation.
-  "ignores": ["WeMM-Embedding-2B/**"],
+  // Local model checkouts and private research are not published documentation.
+  "ignores": ["WeMM-Embedding-2B/**", "docs/research/**"],
   "config": {
     "MD013": false,
     // A reference organised one section per dataset repeats the same sub-structure under each

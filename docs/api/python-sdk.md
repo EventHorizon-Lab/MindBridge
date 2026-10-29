@@ -918,8 +918,7 @@ and `喜欢的饮料` share a claim key across languages. The original `MemoryCo
 unchanged. Kind, subject identity, and spatial scope still separate claims; `home_city` and
 `current_location` remain different slots. RELATION values accumulate, and user-stated TRAIT
 assertions retain priority over model inferences. Unknown predicates, compound values, and
-unregistered paraphrases keep literal keys. See the
-[registry and upgrade notes](../research/2026-10-27-predicate-stability.md).
+unregistered paraphrases keep literal keys.
 
 Multi-target operations are all or nothing. A proposal whose targets are not all eligible is
 rejected whole -- `"unknown_target"`, `"not_derived"`, or `"already_forgotten"` -- so an applied
