@@ -393,8 +393,7 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
         assert len(changed_operation) == 1
         assert changed_operation[0].action == "upsert"
 
-        document = store.index.read_index_document(embedding.embedding_id)
-        assert document is not None
+        (document,) = store.index.read_index_documents((embedding.embedding_id,))
         assert document.content == changed.content
         assert document.memory_type == "semantic"
         assert document.occurred_at == changed.occurred_at
@@ -405,15 +404,15 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
         assert store.records.delete_memory(memory.memory_id) is True
         assert store.records.read_memory(memory.memory_id) is None
         assert store.index.read_embedding(embedding.embedding_id) is None
-        assert store.index.read_index_document(embedding.embedding_id) is None
+        assert store.index.read_index_documents((embedding.embedding_id,)) == ()
         deletion = store.index.pending_index_operations()
         assert len(deletion) == 1
         assert deletion[0].embedding_id == embedding.embedding_id
         assert deletion[0].action == "delete"
 
-        store.set_metadata("embedding.dimension", "2")
+        store.update_metadata({"embedding.dimension": "2"})
         assert store.get_metadata("embedding.dimension") == "2"
-        assert store.delete_metadata("embedding.dimension") is True
+        store.update_metadata({"embedding.dimension": None})
         assert store.get_metadata("embedding.dimension") is None
 
     with pytest.raises(LocalStoreClosedError, match="closed"):
@@ -560,21 +559,20 @@ def test_media_assets_round_trip_in_order_and_cache_transcript(tmp_path: Path) -
         assert store.records.read_memory(memory.memory_id) == memory
         assert store.records.read_memories((memory.memory_id,)) == (memory,)
         assert store.records.list_memories() == (memory,)
-        document = store.index.read_index_document(embedding.embedding_id)
-        assert document is not None
+        (document,) = store.index.read_index_documents((embedding.embedding_id,))
         assert document.content == ""
         assert store.media.read_assets((first.asset_id, "0" * 64, first.asset_id)) == (
             first,
             first,
         )
-        assert store.media.set_asset_transcript(first.asset_id, "a red workbench") is True
+        assert store.media.set_asset_transcripts(((first.asset_id, "a red workbench"),)) == 1
         assert store.media.read_asset(first.asset_id) == replace(
             first,
             transcript="a red workbench",
         )
-        assert store.media.set_asset_transcript(first.asset_id, "") is True
+        assert store.media.set_asset_transcripts(((first.asset_id, ""),)) == 1
         assert store.media.read_asset(first.asset_id) == replace(first, transcript="")
-        assert store.media.set_asset_transcript("f" * 64, "missing") is False
+        assert store.media.set_asset_transcripts((("f" * 64, "missing"),)) == 0
 
 
 def test_visual_descriptions_are_keyed_by_asset_and_space(tmp_path: Path) -> None:
@@ -3462,6 +3460,32 @@ def test_neighbor_memories_merges_anchors_without_repeating_them(tmp_path: Path)
 
         assert [memory.memory_id for memory in merged] == ["turn-2", "turn-5"]
         assert [memory.memory_id for memory in bounded] == ["turn-2"]
+
+
+def test_recall_orders_selected_ids_by_event_time_and_insertion_across_sql_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("mindbridge.infrastructure.local.store.recall.SQLITE_PARAMETER_BATCH", 2)
+    start = datetime(2024, 9, 10, 9, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        store.records.write_memories(
+            (
+                _turn("z-first", "first", occurred_at=start),
+                _turn("m-middle", "middle", occurred_at=start),
+                _turn("a-last", "last", occurred_at=start),
+                _turn("later", "later", occurred_at=start + timedelta(days=1)),
+                _turn("earlier", "earlier", occurred_at=start - timedelta(days=1)),
+                _turn("forgotten", "forgotten", occurred_at=start),
+            )
+        )
+        store.records.set_forgotten(("forgotten",), forgotten_at=start)
+
+        ordered = store.recall.order_memory_ids(
+            ("later", "a-last", "missing", "m-middle", "z-first", "earlier", "a-last", "forgotten")
+        )
+
+        assert ordered == ("earlier", "z-first", "m-middle", "a-last", "later")
+        assert store.recall.order_memory_ids(()) == ()
 
 
 @pytest.mark.parametrize(

@@ -116,8 +116,7 @@ secrets or caller-owned clients, bound requests and output tokens, and report un
 checks explicitly. Retain aggregate case outcomes and safe model/request identifiers rather than
 private prompts or response bodies. See the [model quality gate](docs/operations.md#model-quality-gate)
 for the small recurring regression suite and [benchmarking](docs/benchmarking.md) for dataset
-evaluation. This follows OpenAI's [evaluation guidance](https://developers.openai.com/api/docs/guides/evaluation-best-practices)
-and [adversarial testing guidance](https://developers.openai.com/api/docs/guides/safety-best-practices).
+evaluation.
 
 ## Architecture rules
 
@@ -178,6 +177,14 @@ versioned documentation; retain reproducible research evidence and its limitatio
 Store temporary implementation plans and review notes under the ignored `.superpowers/` directory.
 The former `docs/superpowers/` location is ignored to prevent completed work plans from returning
 to the documentation tree.
+
+Repository cleanup may remove generated `build/`, `dist/`, Python bytecode, tool caches, and
+validation logs. Check for running jobs before deleting their outputs. Hash-named cache entries
+are disposable; hashes used for asset identity, idempotency, integrity checks, or reproducibility
+are part of the current contract. Keep source snapshots, benchmark results, model revision pins,
+dataset checksums, and research manifests used to reproduce archived measurements. Files inside
+a live SQLite or Zvec data directory, including RocksDB `.log` files, are storage data rather
+than disposable logs.
 
 ## Pull requests
 

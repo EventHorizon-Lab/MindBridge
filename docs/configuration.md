@@ -101,12 +101,12 @@ In this table, connection fields are `base_url`, `api_key`, `timeout`, and `max_
 | Slot and provider | Required | Optional defaults |
 | --- | --- | --- |
 | `embedding: sentence-transformers` | `model` | `revision=None`, `dimension=None`, `device=None`, `batch_size=32` |
-| `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
-| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
-| `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
-| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
+| `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, `image_max_pixels=None`, plus connection fields |
+| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `answer_style=default`, `video_limit=8`, `min_video_seconds=None`, `image_max_pixels=None`, `offline_gazetteer=None`, `extra_body=None`, plus connection fields |
+| `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `image_max_pixels=None`, `extra_body=None`, plus connection fields |
+| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `video_frames=4` (2–64), `image_max_pixels=None`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
 | `consolidation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
-| `speech: funasr` | — | `device=auto` |
+| `speech: funasr` | — | `device=auto`, `ncpu=4`, `vad_device=None`, `speaker_device=None` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
 | `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
 
@@ -124,7 +124,7 @@ operation path. For an endpoint supporting strict structured output, select
 consolidation, visual descriptions, media diagnosis, and recall planning. Free-text answers remain
 text. The compatible-server default is `json_object`; it guarantees JSON syntax, not the shape or
 meaning of a response. Both modes retain local validation, and a configured strict schema is never
-silently downgraded. See OpenAI's [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs).
+silently downgraded.
 
 Sampling controls are model-dependent. Known reasoning models do not receive incompatible automatic
 `temperature` or `seed` settings; explicitly configuring unsupported controls raises
@@ -133,6 +133,87 @@ sent as `max_completion_tokens` for reasoning models, including their reasoning 
 compatible models retain `max_tokens`. Leave headroom for reasoning when budgeting visible
 answers. Model snapshots make quality comparisons reproducible; changing a model or prompt still
 requires the [quality gate](operations.md#model-quality-gate).
+
+`generation.answer_style` accepts `default` or `concise`. The default keeps the existing reader
+prompt unchanged. `concise` asks the reader to return only the entities, relations, values or list
+items the question requests, without explanations, citations or introductory phrases, and to
+honor a requested output format. It still resolves relative times internally, but includes dates
+or durations only when asked for them. The evidence policy and insufficient-evidence marker keep
+their existing meanings. This is an opt-in presentation policy, not an established quality
+improvement; evaluate it with the chosen model and task. Formation, visual description and
+consolidation do not accept this answer-only control.
+
+`generation.offline_gazetteer` optionally supplies external-world map knowledge while answering.
+It is disabled by default and requires the `gazetteer` extra in addition to `openai`:
+
+```yaml
+generation:
+  provider: openai
+  model: your-vision-model
+  modalities: [text, image]
+  offline_gazetteer:
+    index_path: /absolute/path/named-geometries.sqlite3
+    index_sha256: "<complete lowercase SHA256>"
+    radius_m: 500
+    limit: 8
+    budget_chars: 16000
+```
+
+The path and complete index SHA are required. Radius must be positive and at most 500 metres,
+candidate limit is 1–8, and the additional serialized-character budget must be a positive integer.
+The defaults are 500, 8 and 16000. This accepts the explicitly identified named-geometry v1
+single-region or v2 multi-region SQLite formats described in the
+[Python SDK](api/python-sdk.md#offline-gazetteer), with the same configuration fields. Every
+source's URL, source-file SHA, snapshot date, region bounds and OpenStreetMap attribution/license
+are mandatory and fixed by
+the index SHA. Supply a complete, checkpointed main SQLite snapshot. The adapter verifies that
+file once and opens it read-only with SQLite's immutable option; adjacent WAL/SHM files are not
+read or included in the input. Keep the main file immutable: replacement or changes to its size
+or modification time reject further lookups, including cached ones. It does not download or
+build indexes.
+Missing geometry dependencies or invalid provenance fail configuration before a model request.
+V2 validates each feature's source index and rejects duplicate OSM identities. Lookups filter
+by each source's own bounds and apply one distance order and candidate limit across eligible
+regions. Answer metadata identifies the admitted sources individually through `map_sources`;
+headers and repeated metadata occurrences count toward the same global character budget.
+V1 request fields are unchanged, and the feature remains disabled by default.
+
+Only original image GPS that passes the existing asset-integrity check is used. Nearby named
+nodes, roads, waterways and areas are untrusted candidates; real line/polygon distances and
+polygon holes determine proximity. A covering or nearest feature does not identify the photo's
+subject, a mentioned place or a street address. Address tags describe the map feature only.
+Map snapshot time does not establish historical presence at capture time, and rounded distances
+do not express GPS accuracy. Outside-region and empty results do not prove that no place exists.
+
+Candidates are added beside the attachment's original `untrusted_source_metadata`; native pixels,
+GPS, capture time, source IDs and caller metadata retain their values. Only attachments actually
+retained for the answer receive map context. Whole candidate prefixes fit the single answer-wide
+budget in attachment order; repeated per-memory/query metadata occurrences are all charged.
+No name or address is truncated to fit. Omitted candidates are counted in scalar tracing.
+Geometry lookup is local and sends no coordinates over a network; the answer provider receives
+the selected context alongside the existing source metadata.
+
+This answer-only resource does not change `place_id`, durable records, embeddings, visual
+descriptions, formation or retrieval. Existing stores need no replay. Comparisons with it enabled
+must explicitly report the additional map source/index condition; it is not a memory-only baseline.
+
+The OpenAI embedding, generation, formation, and vision slots accept `image_max_pixels`, an integer from
+`1` through `64_000_000`, default `None`. When enabled, the adapter checks image headers before
+decoding and rejects sources above 64 million pixels without changing Pillow's global limit.
+Images exceeding the configured pixel bound or the 20 MiB inline item bound are EXIF-oriented,
+converted to RGB JPEG at quality 85 with 4:2:0 subsampling, and resized proportionally with
+LANCZOS. If necessary, the pixel budget is repeatedly halved until the encoded image fits.
+Images already within both bounds retain their original request bytes. Request fitting counts
+the actual outbound representation, including its base64 size; the 64 MiB aggregate bound still
+applies. Resizing can reduce OCR and fine-detail accuracy, so choose a bound for the task.
+
+Conversion is cached only within a model request. Stored files, asset IDs, digests, and record
+references remain unchanged. An undecodable or oversized image fails embedding, formation, or description;
+answer fitting can omit it from retrieved evidence, but a required question attachment raises an
+error. Missing or changed source files still raise integrity errors. The pixel setting joins the
+embedding-space identity even when `space` is explicit, and joins the visual-description and formation recipes.
+Enabling or changing it for a persisted capability requires a fresh data directory and replay;
+`None` preserves the previous identity.
 
 The adapter recognizes GPT-5/GPT-6 reasoning names and snapshots and the `o1`, `o3`, and `o4`
 families. GPT-5 Chat names and unrelated compatible model names retain generic sampling controls.
@@ -156,6 +237,15 @@ inappropriate content" -- the same request is sent once more with that modality'
 media omitted and the omission declared in the prompt, because the memories' text still answers
 and the provider names the modality, never the clip. Formation and consolidation have neither
 field because they shape answer evidence, not proposals.
+
+Answer evidence declares each record's original `source_modality`: `text`, `image`, `video`,
+`audio`, or `omni` for a record containing multiple media kinds. Derived text records remain
+`text`; this field does not infer the types of their supporting sources. Each attached question
+or memory asset also has a `media_modalities` entry keyed by its numbered attachment alias.
+These entries describe the original asset types actually supplied, so video frames remain
+identified as video sources, with an ordered-still sampling label. Omitted media has no attachment
+entry and is reported separately; a video record retaining only its caption still declares its
+original video source. Attachment aliases, ordering, stored assets, and media limits are unchanged.
 
 `generation.media_policy="on_demand"` enables one text-only diagnostic call before each answer
 that has eligible memory media. It selects original attachments only for a missing detail or
@@ -285,6 +375,44 @@ describe the actual server checkpoint and input recipe. Pin the server's model r
 reproducible deployment. HTTP fixture tests verify request construction and SDK wiring; live vLLM
 numerical parity has not been tested in this checkout.
 
+## Local speech with FunASR
+
+The `local` and `all` extras install FunASR from the immutable main-branch commit
+[`940b0d2463141a2e9ace8a9fd965b4aea93f2db5`](https://github.com/modelscope/FunASR/commit/940b0d2463141a2e9ace8a9fd965b4aea93f2db5).
+Git is required when installing these extras. This includes the upstream speaker-overlap,
+CAM++ clustering, Nano punctuation-timestamp, and resampled speaker-input fixes that are absent
+from the 1.4.16 PyPI release. The default model recipe remains pinned Fun-ASR-Nano, FSMN-VAD,
+and CAM++; Nano covers Chinese, English, and Japanese, not the separate MLT checkpoint's
+31-language contract.
+
+```yaml
+speech:
+  provider: funasr
+  device: cuda:0
+  ncpu: 2
+  vad_device: cpu
+  speaker_device: cpu
+```
+
+`device` accepts `auto`, `cpu`, `cuda`, or `cuda:<index>`. With `auto`, FunASR chooses its
+default accelerator and falls back to CPU if unavailable. `vad_device` and `speaker_device`
+accept `cpu`, `cuda`, or `cuda:<index>`; `None` inherits the resolved ASR device. Explicit
+submodel placement preserves the pinned VAD segment limit. Placement is selected when the
+models first load and does not change during inference. CPU submodels can reduce GPU memory
+use; measure latency on the target hardware before selecting them.
+
+`ncpu` is a strictly positive integer. Upstream applies it to both PyTorch and BLAS for the
+entire process when loading models; another `AutoModel` can replace that budget. Embedding
+and other numerical work in the same process share these limits. It does not enable concurrent
+calls to one transcriber: MindBridge serializes inference over its loaded FunASR pipeline.
+
+The transcription-space identity includes the pinned FunASR source revision and the complete
+model recipe. Device placement and CPU budgets do not create another semantic space. This
+revision replaces the previous speech space: opening an old directory with the new transcriber
+fails with a transcription-space metadata mismatch. Allocate a fresh `data_dir` and replay the
+original inputs; old speaker assignments are not reused or migrated. See the
+[adoption evidence and limits](research/2026-10-28-funasr-main.md).
+
 ## Automatic memory formation
 
 The optional `formation` slot builds the bundled OpenAI-compatible `FormationBackend`. It proposes
@@ -325,6 +453,13 @@ instead when the server supports the strict schema contract. A `finish_reason` o
 An explicit provider refusal raises `ModelError(reason="model_refused")` and is not retried as
 malformed JSON. Truncation, refusal, and schema validation apply to streamed responses as well.
 
+Strict formation schemas require exactly one item per input observation and restrict
+`observation_id` to that batch's aliases. An item may contain no proposals; these constraints do
+not require inventing a fact. The parser still rejects duplicate or missing observations and
+invalid evidence references. This batch-envelope policy is part of the strict formation schema;
+the other schema recipes retain their existing identities. The provider must
+support `minItems`, `maxItems`, and string enums; select `json_object` explicitly when it does not.
+
 Formation stays off when the slot is omitted. Configuring `generation` does not enable it, and the
 two slots use separate clients so they may select different models, endpoints, and credentials.
 `modalities` controls which observations reach the former; unsupported observations are skipped.
@@ -357,8 +492,13 @@ times, and permits a proposal to cite only its target, this batch, and its own a
 History selects semantic versions recorded by the target's capture time, including retired
 versions as background. Records and contexts share one database read snapshot without loading
 media metadata. A typed record with no version known by that cutoff does not consume the row
-window. Each target owns its history aliases and grounding snapshot, even when another target
-reads a different version of the same record.
+window. Each target owns its grounding snapshot, even when another target reads a different
+version of the same record. Within one request, the adapter serializes identical complete,
+ordered history snapshots once and gives their targets explicit read-only group references.
+Different versions, provenance, truncation flags, or model-visible values remain separate;
+sharing does not authorize another target to cite that history. Content budgets still exclude
+protocol overhead. This presentation policy changes the formation recipe in both JSON modes,
+without changing the public formation input or its grounding checks.
 
 With history enabled, a named event, state, relation, trait, or affect about an entity in that
 history must jointly cite a still-standing entity record naming the subject. Retired names cannot
@@ -418,12 +558,15 @@ observation, and where the dialogue itself states a diarised speaker's name that
 registers the name against the recognized identity, so every later clip resolving to the same
 person is indexed under it.
 
-Three things bound what it costs and what it can do:
+These controls bound what it costs and what it can do:
 
 - `modalities` is the visual capability set and accepts only `image` and `video`. An asset outside
   it is left undescribed, silently and by design.
-- Video is described from four ordered stills decoded locally, never by uploading the file, so it
-  costs four image parts per memory; that is why the default is `[image]` and video is opted into.
+- Video is described from ordered stills decoded locally, never by uploading the file.
+  `vision.video_frames` selects an integer from `2` through `64`, default `4`, and each clip costs
+  that many image parts; that is why the default is `[image]` and video is opted into.
+  Sampling covers the clip in order, including its last frame. A non-default count participates
+  in the visual-description recipe and cache identity; the default retains the four-frame recipe.
   A clip with no readable video stream is left without a caption rather than falling back to
   sending it. The
   request marks such a visual with its still count (`Visual 2, as 4 ordered stills:`) and asks for
@@ -477,6 +620,16 @@ Three things bound what it costs and what it can do:
 
 Description tokens are reported under their own model module, so a deployment that meters usage
 can separate what captioning costs from what answering costs.
+
+`settings.query_vision=True` also uses the configured image-capable vision backend during
+`search`, `ask`, and `compile`. It describes query images temporarily and adds independent text
+search routes for the full description and its exact `Text:` OCR line, alongside the original
+question and native media routes. Dense/hybrid modes additionally embed these descriptions when
+the embedder supports text; lexical mode uses them only for full-text retrieval. It does not
+replace the original query media or add support for a modality the normal route cannot accept.
+The switch defaults to `False` and has no effect without an applicable vision backend. Query
+descriptions, including failed attempts, are cached only inside that operation. They create no
+durable description, identity, or memory, and a description failure keeps the original search.
 
 ## Agentic memory management
 
@@ -551,6 +704,11 @@ consolidator may propose and what the kernel refuses.
 
 ## Local memory settings
 
+The opt-in `settings.query_vision` flag, `generation.answer_style`, per-OpenAI-slot
+`image_max_pixels`, and `vision.video_frames` controls are documented in
+[grounded multimodal recall](grounded-multimodal-recall.md). Their defaults preserve the existing
+query path and reader style; enabling query vision adds model work on image queries.
+
 The `settings` mapping is the value-only `MemoryConfig` policy:
 
 | Field | Default | Meaning |
@@ -561,13 +719,14 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `minimum_relevance` | `0.10` | Floor on query-relevant evidence before retention and reinforcement ranking |
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1`, including lexical matches |
 | `evidence_budget_chars` | `24000` | Soft budget for widening `ask` grounding; mandatory `limit` hits survive even when over budget. `None` disables ranked-tail expansion; planning and linked expansion may still add records. No provider token guarantee |
-| `recall_planning` | `False` | Ask the answerer for a recall plan before retrieving, and ground on the set, sequence or entity it names; off means `ask` runs the one search it always has. An answerer without `plan_recall` cannot plan: the store logs one warning when it opens and every question runs that same search |
-| `recall_query_expansion` | `False` | Experimental execution of `similar.query` when planning is on. At most two additional searches per `ask`, shared across steps and replans; each caches up to 100 ranked hits and may append at most `limit` novel hits after existing grounding. See the controls below |
+| `recall_planning` | `False` | Ask the answerer for a recall plan during `ask`, and ground on the set, sequence or entity it names; off means `ask` runs the one search it always has. An answerer without `plan_recall` cannot plan: the store logs one warning when it opens and every question runs that same search |
+| `recall_query_expansion` | `False` | Experimental execution of `similar.query` when planning is on. At most two additional searches per `ask`, shared across steps and replans; each caches up to 100 ranked hits and may add at most `limit` novel hits before the replaceable ranked tail. Also enables bounded evidence-driven retries of strict abstentions. See the controls below |
+| `query_vision` | `False` | Describe query images through the configured image-capable vision backend and add transient description/OCR search routes. Retains native routes, caches only inside the operation, and writes no memory or description rows |
 | `recall_set_budget_chars` | `30000` | Soft character allowance used to pack a plan's additions after charging its mandatory window, narrowed by `evidence_budget_chars` when set. Also bounds experimental semantic additions; a point plan without query expansion keeps its normal ranked window. Read only when `recall_planning` is on |
 | `recall_set_max_rows` | `60` | Matched rows a set, sequence or entity plan may add at all, whatever the character budget leaves room for; the rows past it are reported as not shown, so the set is declared incomplete. Bounds the matched set only. Read only when `recall_planning` is on |
-| `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; the second runs only when the first answer was a low-confidence guess under `answer_policy="best_effort"`. `1` disables it. Read only when `recall_planning` is on |
-| `evidence_expansion` | `False` | Widen `ask` grounding with the records the grounded evidence is structurally linked to -- same capture, recognized person, symbolic place, claim lineage, or evidence edge. Costs no model call: the edges are columns the kernel already wrote. Linked rows spend budget the ranking left unspent; experimental semantic additions follow them |
-| `evidence_expansion_max_rows` | `24` | Linked records one expansion may add, whatever `evidence_budget_chars` leaves room for; the media rows among them stop earlier still, at twice the ask's own `limit`. Read only when `evidence_expansion` is on |
+| `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend. A later round requires an abstention under `best_effort`, or under `strict` when `recall_query_expansion=True`. `1` disables retries. Read only when `recall_planning` is on |
+| `evidence_expansion` | `False` | Widen `ask` grounding with exact query-media source context and existing structural links. An exact source in the scoped ranking can add its immediate corpus neighbors before semantic additions and the ranked tail; capture, person, place, lineage and evidence links spend the remaining budget. Adds no model call |
+| `evidence_expansion_max_rows` | `24` | Joint cap on added exact-source context and structural rows, within the remaining character and supplemental media budgets. Read only when `evidence_expansion` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
 | `independent_evidence` | `False` | Experimental capture-grounded AND/OR corroboration for formation and consolidation; fixed when a store is created. See [independent evidence](memory-types-time-and-decay.md#experimental-independent-evidence) |
@@ -596,16 +755,36 @@ step reads its requested prefix. The original query reuses its initial ranking u
 requests greater depth; deepening consumes one of the same two additional-search slots. Failed
 embedding calls are cached and consume a slot; a third distinct search contributes no new rows.
 The cache and ceiling reset at the next `ask`. Whitespace at the ends is ignored for cache keys.
+Successful routes remain eligible across internal rounds, at the greatest depth actually
+requested, in discovery order. A later plan can name only its new query without losing an earlier
+bridge fact. Retained routes reuse their cache and continue to share the same per-query window,
+character allowance and media cap; they do not add another grounding budget.
+Multiple routes offer one novel record each in turn, skipping duplicates, before any route
+offers its next record against that shared budget.
 
 All searches preserve the caller's scope, memory type, reference time and original inferred
 temporal intent; rewrites cannot widen visibility or replace query media. Semantic additions
-follow existing grounding, deduplicate by record ID and stop at `limit` novel rows per query.
+deduplicate by record ID and stop at `limit` novel rows per query.
 Their combined character allowance is `min(recall_set_budget_chars, evidence_budget_chars)`
-when the latter is set, otherwise `recall_set_budget_chars`; the existing grounding is charged
-first and is preserved even if already over budget. Added media stop at twice `limit` rows.
-These are bounded rankings, never complete sets. No new model or service is configured by the
-switch. The [audit and evaluation](research/2026-10-27-semantic-recall.md) records the evidence
-and the real-model checks required before enabling it for a workload.
+when the latter is set, otherwise `recall_set_budget_chars`. The original `limit` window and its
+modality floor remain mandatory, even if already over budget, and matched set rows keep their
+own budget, media caps and completeness accounting. New semantic evidence spends the remaining
+budget before the optional original ranked tail; linked rows follow the tail. Thus useful
+new-query evidence can replace supplemental ranked records without removing the initial window.
+If no semantic row fits, the original grounding is restored. Added semantic media stop at twice
+`limit` rows. These are bounded rankings, never complete sets; semantic or tail packing cannot
+readmit matched rows omitted by a set's caps.
+
+With this switch on, an abstained `strict` answer can also trigger another internal round within
+`recall_rounds`. The next planner receives a JSON note of at most `6000` characters, containing
+the missing-evidence status, local `R` source aliases, source IDs, event dates and up to `1500`
+characters per read record, deduplicated by record ID. Omitted records and truncated excerpts are
+reported. The note explicitly marks its evidence as untrusted data, and the kernel still
+validates every proposed read. Ordinary planning retains its best-effort-only retry rule and
+count/date summary. A replaceable round is buffered, so streaming releases only the answer that
+stands. No new model or service is configured by the switch. The
+[historical audit](research/2026-10-27-semantic-recall.md) describes the original mechanism and
+its quality-evaluation limits; mechanism tests alone do not establish natural-language gains.
 
 `minimum_relevance` uses the selected route's relevance scale: dense cosine in `dense`, native
 normalized full-text relevance in `lexical`, and the documented hybrid fusion in `hybrid`. Keep
@@ -667,8 +846,9 @@ window -- the same `limit` hits and modality floor the unplanned path grounds --
 `recall_set_budget_chars` bounds what the plan added with the same text-equivalent cost. It is a
 ceiling on supplemental packing: when `evidence_budget_chars` is also set, the lower of the two
 applies across question shapes after charging the mandatory ranked window. Neither bound may
-trim the ranked window, which is evidence the question already had, so planning can never ground
-less than not planning. Media rows carry one further bound. Grounding a media row runs face and
+trim the mandatory `limit` window. With semantic query expansion enabled, supplemental ranked
+rows can instead yield budget to new-query evidence. Media rows carry one further bound.
+Grounding a media row runs face and
 speech recognition over it, which are writes and are paid again on a replan round, so the matched
 set keeps at most twice `limit` media rows however many its predicate matched -- the ranked window,
 whose width is `limit`, is outside that cap. Text rows are unaffected, and the matched rows either
@@ -676,13 +856,29 @@ bound dropped are reported to the reader as matched records not shown. `recall_s
 is the same bound on the other axis: a corpus of short records fits hundreds of matched rows
 inside 30 000 characters, and the rows past the cap are dropped in favour of the earliest ones --
 the read's own chronological order, not a second ranking -- and counted as not shown.
+For a `sequence` plan, the final selected evidence is presented in corpus time order, using
+SQLite insertion order when event times tie, across matched, ranked and supplemental records;
+this presentation order does not establish a complete event history or answer set.
 
-`evidence_expansion` widens the window along a different axis from either bound above, and it is
-the only widening that costs no model call. After the window is grounded, the kernel reads the
+`evidence_expansion` widens the window without another model call. If an original query attachment
+has exactly the same asset ID and SHA as a source in the already scoped ranking, the kernel can
+include that source and the immediately preceding and following corpus records. At most `limit`
+source occurrences are followed; repeated attachments do not duplicate records. These additions
+share the character and supplemental media budgets with semantic additions, and are considered
+before the replaceable ranked tail. If no new context fits, the original grounding path is used.
+The original grounding window remains protected. Nearby
+records retain the caller's scope and memory type; adjacency does not establish a shared event or
+a complete answer set. A similar-looking image with different bytes does not activate this read.
+
+After those additions and the ranked tail, the kernel reads the
 records that window is *structurally* linked to -- committed under the same capture, about the
 same recognized person, labelled with the same symbolic place, in the same claim lineage, or
 joined to it by an evidence edge -- and admits them into whatever budget the ranking left unspent.
-Each edge is one read over a column the kernel already wrote, indexed for every edge but the
+Exact-source context and structural additions share `evidence_expansion_max_rows`. Predicate rows
+omitted by their own caps cannot reenter through these routes. Required evidence is charged before
+supplemental admission, so only a required window that itself exceeds the character budget may
+exceed that soft budget. Each structural edge is one read over a column the kernel already wrote,
+indexed for every edge but the
 capture, whose `memory_semantics.source_id` carries no index yet and is scanned instead.
 The linked media rows are capped at twice `limit` on top of `evidence_expansion_max_rows`, the
 same bound a recall program's matched media rows hit and for the same reason: a media row reaching

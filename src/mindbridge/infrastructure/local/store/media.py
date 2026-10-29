@@ -444,13 +444,6 @@ class MediaAnalyses:
         with self._connections.connection() as connection:
             return read_unreferenced_assets(connection, tuple(dict.fromkeys(asset_ids)))
 
-    def set_asset_transcript(self, asset_id: str, text: str) -> bool:
-        """Fill or replace an asset's cached transcript.
-
-        Empty text is meaningful: it records that transcription completed without speech.
-        """
-        return self.set_asset_transcripts(((asset_id, text),)) == 1
-
     def set_asset_transcripts(self, values: Sequence[tuple[str, str]]) -> int:
         """Cache a batch of transcripts in one durable SQLite transaction."""
         supplied = tuple(values)
@@ -940,8 +933,7 @@ class MediaAnalyses:
         privacy mechanism. This is the read half only: it reports what a policy could drop,
         never drops anything, and includes assets a memory still references -- `memory_assets`
         holds those under RESTRICT, so dropping one is a separate decision with its own
-        contract. Pair with `asset_storage_bytes` for a size budget and
-        `list_unreferenced_assets` for the already-collectable subset.
+        contract. Use `list_unreferenced_assets` for the already-collectable subset.
         """
         if not 1 <= limit <= 10_000:
             raise ValueError("limit must be between 1 and 10000")
@@ -989,14 +981,6 @@ class MediaAnalyses:
                     ).fetchall()
                 )
         return tuple(dict.fromkeys(found))
-
-    def asset_storage_bytes(self) -> int:
-        """Return the total size of every stored media asset descriptor."""
-        with self._connections.connection() as connection:
-            row = connection.execute(
-                "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM media_assets"
-            ).fetchone()
-        return int(row["total"])
 
     def delete_asset_if_unreferenced(self, asset_id: str) -> bool:
         """Delete one unreferenced descriptor after its CAS file has been removed."""

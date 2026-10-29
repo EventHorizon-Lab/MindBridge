@@ -1428,6 +1428,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
             answer_policy=None,
             full_context_chars=24_000,
             ingest="add",
+            ingest_concurrency=1,
             deliberate=False,
             compile_max_items=24,
             compile_max_chars=16_000,
@@ -1554,6 +1555,7 @@ def test_product_budget_provenance_distinguishes_ask_and_compile_tasks() -> None
             compile_allow_partial_sources=False,
             seed=7,
             ingest="add",
+            ingest_concurrency=1,
         ),
     )
     provenance = eval_module._arm_provenance(arguments)

@@ -30,6 +30,7 @@ DEFAULT_FUNASR_VAD_MODEL_ID = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 DEFAULT_FUNASR_VAD_REVISION = "f9a8b8274674755d925277e27063869038d41515"
 DEFAULT_FUNASR_SPEAKER_MODEL_ID = "iic/speech_campplus_sv_zh-cn_16k-common"
 DEFAULT_FUNASR_SPEAKER_REVISION = "a045b2afcaa9c3049c98a9215a2bc274407ab237"
+_FUNASR_REVISION = "940b0d2463141a2e9ace8a9fd965b4aea93f2db5"
 _MAX_TURNS = 10_000
 _MAX_TURN_CHARACTERS = 4_096
 _SPECIAL_TOKEN = re.compile(r"<\|[^|]*\|>")
@@ -121,17 +122,22 @@ class FunASRTranscriber:
         recipe: FunASRRecipe = DEFAULT_FUNASR_RECIPE,
         *,
         device: str = "auto",
+        ncpu: int = 4,
+        vad_device: str | None = None,
+        speaker_device: str | None = None,
     ) -> None:
         if not isinstance(recipe, FunASRRecipe):
             raise ValidationError("recipe must be a FunASRRecipe value")
-        normalized_device = device.strip().lower() if isinstance(device, str) else ""
-        if (
-            normalized_device not in {"auto", "cpu"}
-            and re.fullmatch(r"cuda(?::\d+)?", normalized_device) is None
-        ):
-            raise ValidationError("device must be auto, cpu, cuda, or cuda:<index>")
+        if isinstance(ncpu, bool) or not isinstance(ncpu, int) or ncpu <= 0:
+            raise ValidationError("ncpu must be a positive integer")
         self._recipe = recipe
-        self._device = normalized_device
+        self._device = _device(device, allow_auto=True)
+        self._ncpu = ncpu
+        self._submodel_devices = {
+            name: _device(value)
+            for name, value in (("vad_kwargs", vad_device), ("spk_kwargs", speaker_device))
+            if value is not None
+        }
         self._pipeline: _Pipeline | None = None
         # ponytail: FunASR inference is serialized per loaded model; relax only after its
         # AutoModel composition demonstrates thread safety and concurrent throughput gains.
@@ -149,12 +155,10 @@ class FunASRTranscriber:
     @property
     def transcription_space(self) -> str:
         identity = self._recipe.auto_model_arguments()
-        if self._recipe.punctuation_model is None:
-            # This only makes FunASR's existing no-punctuation fallback explicit. Excluding it
-            # keeps stores created with the v3 recipe readable after the runtime fix.
-            identity.pop("spk_mode", None)
         payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(f"funasr-automodel-v3:{payload}".encode()).hexdigest()[:16]
+        digest = hashlib.sha256(
+            f"funasr-automodel-v4:{_FUNASR_REVISION}:{payload}".encode()
+        ).hexdigest()[:16]
         return f"{self.transcription_model}:speech:{digest}"
 
     def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
@@ -226,8 +230,11 @@ class FunASRTranscriber:
                 "FunASR is required for local speech; install mindbridge[local]"
             ) from None
         arguments = self._recipe.auto_model_arguments()
+        arguments["ncpu"] = self._ncpu
         if self._device != "auto":
             arguments["device"] = self._device
+        for name, device in self._submodel_devices.items():
+            arguments[name] = {**cast(dict[str, object], arguments.get(name, {})), "device": device}
         try:
             pipeline = funasr.AutoModel(
                 **arguments,
@@ -318,6 +325,15 @@ class FunASRTranscriber:
         return _analysis(output[0], speaker_analysis=speaker_analysis)
 
 
+def _device(value: str, *, allow_auto: bool = False) -> str:
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    allowed = {"auto", "cpu"} if allow_auto else {"cpu"}
+    if normalized not in allowed and re.fullmatch(r"cuda(?::\d+)?", normalized) is None:
+        choices = "auto, cpu, cuda, or cuda:<index>" if allow_auto else "cpu, cuda, or cuda:<index>"
+        raise ValidationError(f"speech device must be {choices}")
+    return normalized
+
+
 def _speech_path(asset: AssetRef) -> str:
     path = asset.path
     if path is None:  # AssetRef.is_resolved was checked at the boundary.
@@ -396,7 +412,8 @@ def _untagged_turns(result: Mapping[str, object], text: str) -> tuple[SpeechTurn
             or not math.isfinite(start)
             or not math.isfinite(end)
             or start < 0
-            or end <= start
+            # Nano anchors punctuation to a zero-width span between spoken tokens.
+            or end < start
         ):
             raise ModelError("FunASR returned invalid transcription timestamps")
         bounds.append((start * scale, end * scale))
@@ -475,7 +492,10 @@ def _turn(item: object) -> SpeechTurn | None:
         or isinstance(start, bool)
         or not isinstance(end, int | float)
         or isinstance(end, bool)
+        or not math.isfinite(start)
+        or not math.isfinite(end)
         or text is None
+        or isinstance(speaker, bool)
         or (speaker is not None and not isinstance(speaker, str | int))
     ):
         raise ModelError("FunASR returned an invalid speaker turn")

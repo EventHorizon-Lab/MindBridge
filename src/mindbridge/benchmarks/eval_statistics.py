@@ -8,6 +8,7 @@ import re
 import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from itertools import chain
 from typing import cast
 
 _DIRECT_CHOICE = re.compile(r"(?:option\s+)?[([]?([A-J])[]).]?", re.IGNORECASE)
@@ -82,6 +83,19 @@ def summarize(
     clamp: tuple[float, float] | None = (0.0, 1.0),
 ) -> dict[str, object]:
     """Summarize a mean with cluster-robust SE and a deterministic cluster bootstrap CI."""
+    summary, _draws = _summarize(
+        values, seed=seed, bootstrap_samples=bootstrap_samples, clamp=clamp
+    )
+    return summary
+
+
+def _summarize(
+    values: Sequence[ScoredValue],
+    *,
+    seed: int,
+    bootstrap_samples: int,
+    clamp: tuple[float, float] | None,
+) -> tuple[dict[str, object], tuple[float, ...]]:
     if not values:
         return {
             "sample_count": 0,
@@ -91,7 +105,7 @@ def summarize(
             "confidence_interval_95": None,
             "normal_confidence_interval_95": None,
             "bootstrap_samples": bootstrap_samples,
-        }
+        }, ()
     if bootstrap_samples < 1:
         raise ValueError("bootstrap_samples must be positive")
     scores = tuple(value.value for value in values)
@@ -99,6 +113,7 @@ def summarize(
     clusters = _clusters(values)
     standard_error = _cluster_standard_error(clusters, mean, len(scores))
     interval = None
+    bootstrapped: tuple[float, ...] = ()
     if len(clusters) > 1:
         bootstrapped = _cluster_bootstrap(clusters, seed=seed, samples=bootstrap_samples)
         low = cast(float, percentile(bootstrapped, 0.025, presorted=True))
@@ -122,7 +137,7 @@ def summarize(
         "confidence_interval_95": interval,
         "normal_confidence_interval_95": normal,
         "bootstrap_samples": bootstrap_samples,
-    }
+    }, bootstrapped
 
 
 def paired_comparison(
@@ -150,17 +165,11 @@ def paired_comparison(
     if not paired:
         raise ValueError("candidate and baseline contain no scored samples")
     deltas = tuple(value.value for value in paired)
-    summary = summarize(
+    summary, draws = _summarize(
         paired,
         seed=seed,
         bootstrap_samples=bootstrap_samples,
         clamp=None,
-    )
-    clusters = _clusters(paired)
-    draws = (
-        _cluster_bootstrap(clusters, seed=seed, samples=bootstrap_samples)
-        if len(clusters) > 1
-        else ()
     )
     return {
         **summary,
@@ -197,11 +206,23 @@ def _cluster_bootstrap(
 ) -> tuple[float, ...]:
     generator = random.Random(seed)
     count = len(clusters)
+    totals = tuple(sum(cluster) for cluster in clusters)
+    sizes = tuple(len(cluster) for cluster in clusters)
+    # Integer-valued scores can be regrouped exactly within the float integer range.
+    integral = (
+        all(float(score).is_integer() for cluster in clusters for score in cluster)
+        and max(sum(abs(int(score)) for score in cluster) for cluster in clusters) * count <= 2**53
+    )
     draws = []
     for _ in range(samples):
-        selected = tuple(clusters[generator.randrange(count)] for _ in range(count))
-        flattened = tuple(score for cluster in selected for score in cluster)
-        draws.append(sum(flattened) / len(flattened))
+        selected = tuple(generator.randrange(count) for _ in range(count))
+        if integral:
+            total = sum(totals[index] for index in selected)
+            size = sum(sizes[index] for index in selected)
+        else:
+            total = sum(chain.from_iterable(clusters[index] for index in selected))
+            size = sum(sizes[index] for index in selected)
+        draws.append(total / size)
     return tuple(sorted(draws))
 
 

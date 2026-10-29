@@ -145,6 +145,8 @@ def _record_payload(hit: SearchHit, label: str | None) -> dict[str, object]:
         "content": hit.content,
         "memory_type": hit.memory_type.value,
     }
+    if hit.modality.value != "text":
+        payload["source_modality"] = hit.modality.value
     if hit.occurred_at is not None:
         payload["occurred_at"] = hit.occurred_at.isoformat()
     else:

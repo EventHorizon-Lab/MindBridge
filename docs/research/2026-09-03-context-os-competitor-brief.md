@@ -107,7 +107,7 @@ come from context templates — `%{user_summary}`, `%{thread_summaries}`, `%{ent
 Anthropic, [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents):
 organise prompts "into distinct sections (like `<background_information>`, `<instructions>`, `## Tool guidance`, `## Output description`, etc)" using "XML tagging or Markdown headers to delineate these sections", "striving for the minimal set of information that fully outlines your expected behavior". Retrieval should be just-in-time — agents "maintain lightweight identifiers (file paths, stored queries, web links, etc.) and use these references to dynamically load data into context at runtime using tools" — with a hybrid that retrieves "some data up front for speed". Metadata is named as signal: "Folder hierarchies, naming conventions, and timestamps all provide important signals that help both humans and agents understand how and when to utilize information." Long-horizon primitives are compaction ("distills the contents of a context window in a high-fidelity manner"), structured note-taking persisted outside the window, and sub-agent isolation.
 
-OpenAI, [Context engineering for personalization](https://developers.openai.com/cookbook/examples/agents_sdk/context_personalization)
+OpenAI, [Context engineering for personalization](https://github.com/openai/openai-cookbook/blob/main/examples/agents_sdk/context_personalization.ipynb)
 (Agents SDK cookbook, 2026-01-05), is the closest published analogue of a compiled bundle with
 provenance and freshness. State is `global_memory = {"notes": []}` and
 `session_memory = {"notes": []}`; each note is `{"text", "last_update_date" (YYYY-MM-DD),

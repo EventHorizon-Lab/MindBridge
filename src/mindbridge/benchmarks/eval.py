@@ -14,6 +14,7 @@ import random
 import re
 import sys
 import time
+from bisect import bisect_right
 from collections.abc import (
     Awaitable,
     Callable,
@@ -123,6 +124,7 @@ from mindbridge.benchmarks.eval_config import (
     _description_cache_path,
     _evaluation_config,
     _evaluation_memory_config,
+    _generation_temperature,
     _judge_config,
     _JudgeConfig,
     _load_memory_config,
@@ -227,7 +229,7 @@ from mindbridge.models._jina import (
     DEFAULT_JINA_MODEL_ID,
     DEFAULT_JINA_REVISION,
 )
-from mindbridge.models._openai_protocol import reasoning_model, sampling_supported
+from mindbridge.models._openai_protocol import reasoning_model
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -310,6 +312,8 @@ class _CachedVisionDescriber:
     def __init__(self, backend: VisionDescriptionBackend, cache: DescriptionCache) -> None:
         self._backend = backend
         self._cache = cache
+        self._key_locks: dict[str, Lock] = {}
+        self._registry_lock = Lock()
 
     @property
     def vision_capabilities(self) -> frozenset[Modality]:
@@ -326,6 +330,20 @@ class _CachedVisionDescriber:
     def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
         batch = tuple(inputs)
         keys = tuple(_description_digest(value) for value in batch)
+        with self._registry_lock:
+            locks = [
+                self._key_locks.setdefault(key, Lock())
+                for key in sorted({key for key in keys if key is not None})
+            ]
+        with ExitStack() as acquired:
+            for lock in locks:
+                acquired.enter_context(lock)
+            # A prior batch may have filled a shared digest while this batch waited.
+            return self._describe_batch(batch, keys)
+
+    def _describe_batch(
+        self, batch: tuple[ModelInput, ...], keys: tuple[str | None, ...]
+    ) -> tuple[str, ...]:
         known = tuple(None if key is None else self._cache.get(key) for key in keys)
         pending = tuple(value for value, found in zip(batch, known, strict=True) if found is None)
         span = trace.get_current_span()
@@ -618,11 +636,6 @@ class _BackendPool:
             from openai import OpenAI
         except ImportError:
             raise RuntimeError("benchmark execution requires mindbridge[openai]") from None
-        self.client = OpenAI(
-            api_key=config.generation_api_key,
-            base_url=config.generation_base_url,
-            timeout=config.timeout_seconds,
-        )
         generation_options = dict(
             item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item
         )
@@ -632,14 +645,20 @@ class _BackendPool:
             if enable_thinking is None
             else {"chat_template_kwargs": {"enable_thinking": enable_thinking == "true"}}
         )
+        temperature = _generation_temperature(
+            config.generation_model, generation_options, extra_body
+        )
+        self.client = OpenAI(
+            api_key=config.generation_api_key,
+            base_url=config.generation_base_url,
+            timeout=config.timeout_seconds,
+        )
         self.models = OpenAIModels(
             generation_client=self.client,
             generation_model=config.generation_model,
             generation_capabilities=config.generation_capabilities,
             generation_seed=None if reasoning_model(config.generation_model) else seed,
-            generation_temperature=(
-                0.0 if sampling_supported(config.generation_model, extra_body) else None
-            ),
+            generation_temperature=temperature,
             generation_max_tokens=(
                 None
                 if "max_tokens" not in generation_options
@@ -772,9 +791,21 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         print(listing(download.benchmarks_root, list_mode))
         return 0
     arguments = _arguments(parser, parsed, download, overrides=overrides)
+    if arguments.ingest_concurrency > 1 and (
+        memory_config is None
+        or any(getattr(memory_config, name) is not None for name in ("formation", "speech", "face"))
+    ):
+        parser.error(
+            "--ingest-concurrency above 1 requires an explicit --config without formation, "
+            "speech, or face backends"
+        )
     if parsed.check_integrity:
         manifest, manifest_directory = load_media_manifest(arguments.media_manifest)
         loaded = _load_tasks(arguments, manifest, manifest_directory)
+        if arguments.ingest_concurrency > 1 and _has_question_cutoffs(loaded):
+            parser.error(
+                "--ingest-concurrency above 1 requires static units without question cutoffs"
+            )
         print(
             _jsonl_bytes(
                 (
@@ -843,6 +874,8 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         arguments = replace(arguments, media_manifest=effective_manifest)
         manifest_directory = effective_manifest.parent
     loaded = _load_tasks(arguments, manifest, manifest_directory)
+    if arguments.ingest_concurrency > 1 and _has_question_cutoffs(loaded):
+        parser.error("--ingest-concurrency above 1 requires static units without question cutoffs")
     config = _evaluation_config(base_config, loaded)
     memory_config = _evaluation_memory_config(memory_config, config, arguments)
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
@@ -1582,6 +1615,7 @@ async def _run_arms(
                 prefetch_speech=prefetch_speech,
                 batch_size=batch_sizes[task.spec.name],
                 unit_concurrency=arguments.unit_concurrency,
+                ingest_concurrency=arguments.ingest_concurrency,
                 request_concurrency=arguments.request_concurrency,
                 recall_limit=arguments.recall_limit,
                 predict_only=arguments.predict_only,
@@ -1610,6 +1644,15 @@ async def _run_arms(
     return tuple(results)
 
 
+def _has_question_cutoffs(tasks: Sequence[LoadedTask]) -> bool:
+    return any(
+        question.cutoff_seconds is not None
+        for task in tasks
+        for unit in task.units
+        for question in unit.questions
+    )
+
+
 async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated replay barrier
     task: LoadedTask,
     *,
@@ -1629,6 +1672,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     ingest_mode: str = DEFAULT_INGEST_MODE,
     ingest_digest: str | None = None,
     deliberate: bool = False,
+    ingest_concurrency: int = 1,
     tracer: Tracer | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     on_ingest_progress: Callable[[int, int], None] | None = None,
@@ -1637,8 +1681,15 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     """Run normalized units with bounded workers while preserving release order."""
-    if min(batch_size, unit_concurrency, request_concurrency, recall_limit) <= 0:
+    if (
+        min(batch_size, unit_concurrency, request_concurrency, recall_limit, ingest_concurrency)
+        <= 0
+    ):
         raise ValueError("batch size, concurrency, and recall limit must be positive")
+    if ingest_concurrency > 1 and (ingest_mode != "add" or deliberate):
+        raise ValueError("concurrent ingest requires add without deliberation")
+    if ingest_concurrency > 1 and _has_question_cutoffs((task,)):
+        raise ValueError("concurrent ingest requires static units without question cutoffs")
     if recall_limit > 100:
         raise ValueError("recall limit must not exceed 100")
     slots: list[tuple[SampleResult, ...] | None] = [None] * len(task.units)
@@ -1646,12 +1697,9 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     stores_ready = [False] * len(task.units)
     queue: asyncio.Queue[tuple[int, EvalUnit]] = asyncio.Queue()
     worker_count = min(unit_concurrency, 16, len(task.units))
-    # Each unit can have one ingest or settlement outside answer admission. Reserve those
-    # process model slots before opening the answer window, rather than recording overload as
-    # a model-quality failure. Requested concurrency remains a ceiling.
-    request_semaphore = asyncio.Semaphore(
-        min(request_concurrency, max(1, _SDK_OPERATION_LIMIT - worker_count))
-    )
+    request_semaphore = asyncio.Semaphore(request_concurrency)
+    # Ingest and answers borrow the same process budget only while doing work.
+    model_semaphore = asyncio.Semaphore(_SDK_OPERATION_LIMIT)
     completed = 0
     total = sum(len(unit.questions) for unit in task.units) * len(arms)
     notify_progress = on_progress or _ignore_progress
@@ -1724,6 +1772,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 batch_size=batch_size,
                 request_concurrency=request_concurrency,
                 request_semaphore=request_semaphore,
+                model_semaphore=model_semaphore,
                 recall_limit=recall_limit,
                 predict_only=predict_only,
                 log_samples=log_samples,
@@ -1733,6 +1782,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 compile_budget=compile_budget,
                 answer_policy=answer_policy,
                 ingest_mode=ingest_mode,
+                ingest_concurrency=ingest_concurrency,
                 checkpoint=checkpoint,
                 deliberate=deliberate,
                 tracer=tracer,
@@ -1753,7 +1803,13 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
-    await asyncio.gather(*workers)
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        for pending_worker in workers:
+            pending_worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
     if any(group is None for group in slots):
         raise RuntimeError("evaluation worker exited before every unit completed")
 
@@ -1765,7 +1821,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             stores_ready=stores_ready,
             memory_factory=memory_factory,
             unit_concurrency=unit_concurrency,
-            request_semaphore=request_semaphore,
+            request_semaphore=asyncio.Semaphore(min(request_concurrency, _SDK_OPERATION_LIMIT)),
             recall_limit=recall_limit,
             arms=arms,
             tracer=tracer,
@@ -2023,6 +2079,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     answer_policy: AnswerPolicy | None = None,
     ingest_mode: str = DEFAULT_INGEST_MODE,
+    ingest_concurrency: int = 1,
     checkpoint: _IngestCheckpoint | None = None,
     deliberate: bool = False,
     tracer: Tracer | None = None,
@@ -2031,7 +2088,9 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     on_activity: Callable[[str], None] | None = None,
     on_store_ready: Callable[[], None] | None = None,
     prefetch_speech: Callable[[Sequence[MemoryItem]], None] | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[SampleResult, ...]:
+    model_semaphore = model_semaphore or asyncio.Semaphore(_SDK_OPERATION_LIMIT)
     ordered = tuple((arm, question) for arm in arms for question in unit.questions)
     notify_store_ready = on_store_ready or _ignore_store_ready
     notify_ingested = on_ingested or _ignore_ingested
@@ -2109,6 +2168,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                         memory,
                         memories[ingested:end],
                         batch_size=batch_size,
+                        ingest_concurrency=ingest_concurrency,
                         on_failure=ingest_failure_details.append,
                         tracer=tracer,
                         mode=ingest_mode,
@@ -2117,11 +2177,14 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                             checkpoint, ingested, ingest_failure_details, notify_ingested
                         ),
                         prefetch=prefetch_speech,
+                        model_semaphore=model_semaphore,
                     )
                     ingested = end
                     if deliberate:
                         notify_activity("deliberating")
-                        await _deliberate_after_ingest(memory)
+                        await _model_operation(
+                            model_semaphore, lambda: _deliberate_after_ingest(memory)
+                        )
                 pending = end
                 context = (
                     _full_context(memories[:pending], full_context_chars) if stuffs_context else ""
@@ -2140,6 +2203,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                     ingest_failure_details=tuple(ingest_failure_details),
                     request_concurrency=request_concurrency,
                     request_semaphore=request_semaphore,
+                    model_semaphore=model_semaphore,
                     recall_limit=recall_limit,
                     predict_only=predict_only,
                     log_samples=log_samples,
@@ -2202,6 +2266,7 @@ async def _answer_arms(
     answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> dict[tuple[str, str], SampleResult]:
     """Answer one cutoff's pending questions once per arm, against one ingested store."""
     results: dict[tuple[str, str], SampleResult] = {}
@@ -2215,6 +2280,7 @@ async def _answer_arms(
             questions,
             request_concurrency=request_concurrency,
             request_semaphore=request_semaphore,
+            model_semaphore=model_semaphore,
             recall_limit=recall_limit,
             arm=arm,
             task_name=task.spec.name,
@@ -2404,6 +2470,7 @@ async def _capture_chunk(
     on_failure: Callable[[FailureDetail], None] | None,
     tracer: Tracer | None,
     arm: str = DEFAULT_ARM,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> int:
     """Ingest one chunk through `capture()` + `settle()`, so both produce real
     `mindbridge.capture` and `mindbridge.settle` spans -- the only way `--ingest capture` makes
@@ -2433,7 +2500,7 @@ async def _capture_chunk(
         # drains what this unit itself captured.
         while True:
             try:
-                settled = await memory.settle(limit=100)
+                settled = await _model_operation(model_semaphore, lambda: memory.settle(limit=100))
             except IndexUnavailableError:
                 raise
             except Exception as error:
@@ -2469,13 +2536,21 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
     mode: str = DEFAULT_INGEST_MODE,
     arm: str = DEFAULT_ARM,
     prefetch: Callable[[Sequence[MemoryItem]], None] | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
+    ingest_concurrency: int = 1,
 ) -> int:
     # An arm that reads no memory never reaches here: `_run_unit` skips ingestion for it, so the
     # blind control cannot accidentally score a store it was supposed to run without.
     if mode not in INGEST_MODES:
         raise ValueError(f"unknown ingest mode {mode!r}; choose from {', '.join(INGEST_MODES)}")
 
-    async def add_chunk(chunk: Sequence[MemoryItem]) -> int:
+    if ingest_concurrency <= 0 or (ingest_concurrency > 1 and mode != "add"):
+        raise ValueError("concurrent ingest requires a positive limit and add mode")
+
+    async def add_chunk(
+        chunk: Sequence[MemoryItem],
+        failure_callback: Callable[[FailureDetail], None] | None = on_failure,
+    ) -> int:
         contents = tuple(_memory_content(item) for item in chunk)
 
         async def add_all() -> None:
@@ -2499,7 +2574,7 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
                 )
 
         try:
-            await _retry_transient(add_all)
+            await _retry_transient(lambda: _model_operation(model_semaphore, add_all))
             return 0
         except IndexUnavailableError:
             raise
@@ -2509,9 +2584,11 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
             )
             if len(chunk) > 1:
                 middle = len(chunk) // 2
-                return await add_chunk(chunk[:middle]) + await add_chunk(chunk[middle:])
+                return await add_chunk(chunk[:middle], failure_callback) + await add_chunk(
+                    chunk[middle:], failure_callback
+                )
         try:
-            await _retry_transient(add_first)
+            await _retry_transient(lambda: _model_operation(model_semaphore, add_first))
         except IndexUnavailableError:
             raise
         except Exception as error:
@@ -2519,8 +2596,8 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
                 error, "systemic embedding provider failure; single-item fallback aborted"
             )
             _announce_first_ingest_failure(error, chunk[0].source_id)
-            if on_failure is not None:
-                on_failure(_failure_detail(error, source_id=chunk[0].source_id))
+            if failure_callback is not None:
+                failure_callback(_failure_detail(error, source_id=chunk[0].source_id))
             return 1
         return 0
 
@@ -2531,28 +2608,108 @@ async def _ingest(  # noqa: C901 - bisection, systemic-outage abort, and transie
             on_failure=on_failure,
             tracer=tracer,
             arm=arm,
+            model_semaphore=model_semaphore,
         )
 
     chunk_ingest = capture_chunk if mode == "capture" else add_chunk
+    buffered_failures: dict[int, list[FailureDetail]] = {}
+
+    async def concurrent_chunk(chunk: Sequence[MemoryItem]) -> int:
+        details: list[FailureDetail] = []
+        buffered_failures[id(chunk)] = details
+        return await add_chunk(chunk, details.append)
+
+    def release_chunk(chunk: Sequence[MemoryItem]) -> None:
+        # Later chunks may finish first. Publish only this prefix's failures before checkpointing.
+        details = buffered_failures.pop(id(chunk))
+        if on_failure is not None:
+            for detail in details:
+                on_failure(detail)
+
     return await _ingest_chunks(
-        chunk_ingest, items, batch_size=batch_size, on_chunk=on_chunk, prefetch=prefetch
+        chunk_ingest if ingest_concurrency == 1 else concurrent_chunk,
+        items,
+        batch_size=batch_size,
+        on_chunk=on_chunk,
+        prefetch=prefetch,
+        ingest_concurrency=ingest_concurrency,
+        on_released=None if ingest_concurrency == 1 else release_chunk,
     )
 
 
-async def _ingest_chunks(
+async def _ingest_chunks(  # noqa: C901 - bounded waves drain before releasing ordered receipts
     ingest_chunk: Callable[[Sequence[MemoryItem]], Awaitable[int]],
     items: Sequence[MemoryItem],
     *,
     batch_size: int,
     on_chunk: Callable[[int], None] | None,
     prefetch: Callable[[Sequence[MemoryItem]], None] | None = None,
+    ingest_concurrency: int = 1,
+    on_released: Callable[[Sequence[MemoryItem]], None] | None = None,
 ) -> int:
-    """Ingest one chunk at a time, noting each boundary a killed run could restart from.
+    """Release completed chunk boundaries in input order, after a bounded wave settles.
 
-    Chunks still commit in order; `prefetch` only lets the speech model start on the next chunk
-    while the store embeds and writes this one.
+    The default commits sequentially and prefetches speech for its next chunk. Opt-in waves
+    preserve arrival order for overlapping event times; independent times can commit out of
+    order. Receipts describe only completed contiguous prefixes.
     """
     failures = 0
+    if ingest_concurrency > 1:
+
+        async def after_predecessors(
+            chunk: Sequence[MemoryItem], predecessors: Sequence[asyncio.Task[int]]
+        ) -> int:
+            if predecessors:
+                # Fatal predecessors must prevent a later same-time write from overtaking them
+                # on resume. Admission to the shared model budget happens inside ingest_chunk.
+                await asyncio.gather(*predecessors)
+            return await ingest_chunk(chunk)
+
+        width = min(ingest_concurrency, _SDK_OPERATION_LIMIT)
+        for start in range(0, len(items), batch_size * width):
+            offsets = range(start, min(start + batch_size * width, len(items)), batch_size)
+            chunks = [items[offset : offset + batch_size] for offset in offsets]
+            tasks: list[asyncio.Task[int]] = []
+            tails: dict[datetime | None, asyncio.Task[int]] = {}
+            unknown_barrier: asyncio.Task[int] | None = None
+            for chunk in chunks:
+                # Neighbors use occurred_at; interval/latest reads can use occurred_end.
+                times = {item.occurred_at for item in chunk} | {
+                    item.occurred_end or item.occurred_at for item in chunk
+                }
+                predecessors = (
+                    set(tasks)
+                    if None in times
+                    else {tails[moment] for moment in times if moment in tails}
+                )
+                if unknown_barrier is not None:
+                    predecessors.add(unknown_barrier)
+                task = asyncio.create_task(after_predecessors(chunk, tuple(predecessors)))
+                tasks.append(task)
+                tails.update(dict.fromkeys(times, task))
+                if None in times:
+                    unknown_barrier = task
+            pending = asyncio.gather(*tasks, return_exceptions=True)
+            cancelled = False
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    # A cancelled parent must not close Memory while SDK writes are still active.
+                    cancelled = True
+            for offset, chunk, result in zip(offsets, chunks, pending.result(), strict=True):
+                if isinstance(result, BaseException):
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    raise result
+                failures += result
+                if on_released is not None:
+                    on_released(chunk)
+                if on_chunk is not None:
+                    on_chunk(min(offset + batch_size, len(items)))
+            if cancelled:
+                raise asyncio.CancelledError
+        return failures
     for offset in range(0, len(items), batch_size):
         if prefetch is not None and offset + batch_size < len(items):
             prefetch(items[offset + batch_size : offset + 2 * batch_size])
@@ -2567,12 +2724,35 @@ async def _ingest_chunks(
 def _candidate_count(unit: EvalUnit, question: EvalQuestion) -> int:
     """Count distinct sources a ranker could return for one question at its cutoff."""
     boundary = math.inf if question.cutoff_seconds is None else question.cutoff_seconds
-    return len({item.source_id for item in unit.memories if _memory_end(item) <= boundary})
+    return bisect_right(unit._source_ends, boundary)
 
 
 def _require_active_embedding_service(systemic_stop: asyncio.Event) -> None:
     if systemic_stop.is_set():
         raise _SystemicEmbeddingFailure("systemic query embedding failure; queued question aborted")
+
+
+async def _model_operation(
+    semaphore: asyncio.Semaphore | None, operation: Callable[[], Awaitable[_Retried]]
+) -> _Retried:
+    if semaphore is None:
+        return await operation()
+    async with semaphore:
+        pending = asyncio.ensure_future(operation())
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # Cancelling the waiter cannot stop synchronous SDK work or release its slot early.
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not pending.cancelled():
+                pending.exception()
+            raise
 
 
 async def _guarded_answer(
@@ -2581,6 +2761,7 @@ async def _guarded_answer(
     *,
     semaphore: asyncio.Semaphore,
     instance_semaphore: asyncio.Semaphore,
+    model_semaphore: asyncio.Semaphore,
     systemic_stop: asyncio.Event,
     arm: _Arm,
     task_name: str,
@@ -2595,54 +2776,46 @@ async def _guarded_answer(
 ) -> _AnswerOutcome:
     identity = f"{task_name}/{unit_id}/{question.question_id}"
     sample_id = identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
+
+    async def answer() -> _AnswerOutcome:
+        _require_active_embedding_service(systemic_stop)
+        return await _arm_answer(
+            memory,
+            question,
+            arm=arm,
+            task_name=task_name,
+            recall_limit=recall_limit,
+            context=context,
+            compile_budget=compile_budget,
+            answer_policy=answer_policy,
+            tracer=tracer,
+            sample_id=sample_id,
+            started=started if arm.generates else time.perf_counter(),
+            answer_span=answer_span,
+            model_semaphore=model_semaphore,
+            systemic_stop=systemic_stop,
+        )
+
     try:
         _require_active_embedding_service(systemic_stop)
-        if not arm.generates:
+        # Start the caller span before admission so latency and TTFT retain queueing time.
+        span = (
+            _answer_span(tracer, task_name, sample_id, arm.name)
+            if arm.generates
+            else nullcontext((None, 0.0))
+        )
+        with span as (answer_span, started):
             async with instance_semaphore, semaphore:
-                _require_active_embedding_service(systemic_stop)
-                outcome = await _arm_answer(
-                    memory,
-                    question,
-                    arm=arm,
-                    task_name=task_name,
-                    recall_limit=recall_limit,
-                    context=context,
-                    compile_budget=compile_budget,
-                    answer_policy=answer_policy,
-                    tracer=tracer,
-                    sample_id=sample_id,
-                    started=time.perf_counter(),
-                    answer_span=None,
-                )
-        else:
-            # This caller span starts before request admission. Its latency and TTFT therefore
-            # include benchmark queueing; nested SDK/model spans expose service time.
-            with _answer_span(tracer, task_name, sample_id, arm.name) as (answer_span, started):
-                async with instance_semaphore, semaphore:
-                    _require_active_embedding_service(systemic_stop)
-                    outcome = await _arm_answer(
-                        memory,
-                        question,
-                        arm=arm,
-                        task_name=task_name,
-                        recall_limit=recall_limit,
-                        context=context,
-                        compile_budget=compile_budget,
-                        answer_policy=answer_policy,
-                        tracer=tracer,
-                        sample_id=sample_id,
-                        started=started,
-                        answer_span=answer_span,
+                outcome = await answer()
+                if outcome.error is not None and answer_span is not None:
+                    answer_span.set_status(StatusCode.ERROR)
+                span_context = None if answer_span is None else answer_span.get_span_context()
+                if span_context is not None and span_context.is_valid:
+                    outcome = replace(
+                        outcome,
+                        trace_id=f"{span_context.trace_id:032x}",
+                        answer_span_id=f"{span_context.span_id:016x}",
                     )
-                    if outcome.error is not None and answer_span is not None:
-                        answer_span.set_status(StatusCode.ERROR)
-                    span_context = None if answer_span is None else answer_span.get_span_context()
-                    if span_context is not None and span_context.is_valid:
-                        outcome = replace(
-                            outcome,
-                            trace_id=f"{span_context.trace_id:032x}",
-                            answer_span_id=f"{span_context.span_id:016x}",
-                        )
         if arm.generates and on_answer is not None:
             on_answer(question, outcome)
         return outcome
@@ -2670,8 +2843,10 @@ async def _answer_many(
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
+    model_semaphore = model_semaphore or asyncio.Semaphore(_SDK_OPERATION_LIMIT)
     # The SDK's documented limits are per physical instance, while the request semaphore is
     # shared across units. Queue excess callers here before they can occupy global slots or
     # become immediate admission errors. Each unit owns its store and runs its arms in order.
@@ -2690,6 +2865,7 @@ async def _answer_many(
                         question,
                         semaphore=semaphore,
                         instance_semaphore=instance_semaphore,
+                        model_semaphore=model_semaphore,
                         systemic_stop=systemic_stop,
                         arm=arm,
                         task_name=task_name,
@@ -2822,6 +2998,8 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
+    model_semaphore: asyncio.Semaphore | None = None,
+    systemic_stop: asyncio.Event | None = None,
 ) -> _AnswerOutcome:
     latency_started = time.perf_counter()
     content = _content(question.content)
@@ -2834,11 +3012,21 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
     async def attempt(operation: Callable[[], Awaitable[_Retried]]) -> _Retried:
         # Only the attempt that answered is timed: a retry's backoff is outage time, not latency.
         async def timed() -> _Retried:
-            nonlocal latency_started, ranked, ranked_complete, generation_evidence, excerpt_evidence
-            latency_started = time.perf_counter()
-            ranked, ranked_complete, generation_evidence = (), False, None
-            excerpt_evidence = ()
-            return await operation()
+            async def admitted() -> _Retried:
+                nonlocal \
+                    latency_started, \
+                    ranked, \
+                    ranked_complete, \
+                    generation_evidence, \
+                    excerpt_evidence
+                if systemic_stop is not None:
+                    _require_active_embedding_service(systemic_stop)
+                latency_started = time.perf_counter()
+                ranked, ranked_complete, generation_evidence = (), False, None
+                excerpt_evidence = ()
+                return await operation()
+
+            return await _model_operation(model_semaphore, admitted)
 
         return await _retry_transient(timed)
 
@@ -3576,6 +3764,8 @@ def _results(
         ),
         "media_roots": media_roots,
         "unit_concurrency": arguments.unit_concurrency,
+        "ingest_concurrency": arguments.ingest_concurrency,
+        "effective_ingest_concurrency": min(arguments.ingest_concurrency, _SDK_OPERATION_LIMIT),
         "request_concurrency": arguments.request_concurrency,
         "recall_limit": arguments.recall_limit,
         "answer_policy_override": arguments.answer_policy,
@@ -3782,6 +3972,7 @@ def _arm_provenance(
         "search_e2e_source": "post-answer public Memory.search replay",
         "evidence_budget_chars": evidence_budget_chars,
         "ingest": arguments.ingest,
+        "ingest_concurrency": arguments.ingest_concurrency,
         "definitions": {name: definitions[name] for name in arguments.arms},
     }
 
@@ -3794,11 +3985,15 @@ def _model_result(
     embedding_warmup_count: int | None = None,
 ) -> dict[str, object]:
     generation_seed = None if reasoning_model(config.generation_model) else arguments.seed
-    generation_temperature = 0.0 if sampling_supported(config.generation_model, None) else None
     if memory_config is not None:
         generation = memory_config.generation
         generation_seed = None if generation is None else generation.seed
         generation_temperature = None if generation is None else generation.temperature
+    else:
+        options = dict(
+            item.split("=", 1) for item in arguments.gen_kwargs.split(",") if "=" in item
+        )
+        generation_temperature = _generation_temperature(config.generation_model, options)
     result: dict[str, object] = {
         "adapter": DEFAULT_ARM,
         "embedding_model": DEFAULT_JINA_MODEL_ID,
@@ -3817,6 +4012,11 @@ def _model_result(
         ),
         "generation_seed": generation_seed,
         "generation_temperature": generation_temperature,
+        "generation_answer_style": (
+            memory_config.generation.answer_style
+            if memory_config is not None and memory_config.generation is not None
+            else "default"
+        ),
         "generation_kwargs": arguments.gen_kwargs,
         "generation_min_video_seconds": config.generation_min_video_seconds,
         "transcription_model": DEFAULT_FUNASR_MODEL_ID,
@@ -4034,6 +4234,7 @@ def _ingest_digest(
         "transcription_model": DEFAULT_FUNASR_MODEL_ID,
         "device": arguments.device or "auto",
         "ingest": arguments.ingest,
+        "ingest_concurrency": arguments.ingest_concurrency,
         # `--deliberate` applies consolidation operations to the store between chunks, so a store
         # built with it holds different memories than one built without it.
         "deliberate": arguments.deliberate,
@@ -4099,6 +4300,7 @@ def _cache_namespace(
         "blind": arguments.blind,
         "batch_sizes": dict(sorted(batch_sizes.items())),
         "ingest": arguments.ingest,
+        "ingest_concurrency": arguments.ingest_concurrency,
         "deliberate": arguments.deliberate,
         "compile_max_items": arguments.compile_max_items,
         "compile_max_chars": arguments.compile_max_chars,

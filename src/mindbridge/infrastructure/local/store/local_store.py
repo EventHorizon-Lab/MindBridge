@@ -72,10 +72,6 @@ class LocalStore:
         """Release the pooled connections and the directory; repeated calls are harmless."""
         self._connections.close()
 
-    def set_metadata(self, key: str, value: str) -> None:
-        """Set one store-level identity or setting."""
-        self.update_metadata({key: value})
-
     def update_metadata(self, values: Mapping[str, str | None]) -> None:
         """Commit marker changes together; a value of None removes a marker."""
         for key in values:
@@ -106,10 +102,3 @@ class LocalStore:
                 (key,),
             ).fetchone()
         return None if row is None else row_text(row, "value")
-
-    def delete_metadata(self, key: str) -> bool:
-        """Delete one store-level identity or setting."""
-        require_identifier(key, "metadata key")
-        with self._connections.transaction() as connection:
-            cursor = connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))
-        return cursor.rowcount > 0

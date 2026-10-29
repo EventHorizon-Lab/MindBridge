@@ -65,6 +65,9 @@ MCP session limits still belong to the serving host.
 
 Index routes use batches of at most four per admitted operation; temporal supplements reuse
 the same pool. At most 128 route jobs and 32 speech-overlap jobs can be pending or running.
+Each route obtains its directory's quota before entering the shared worker pool, so waiting for
+that quota does not occupy another directory's worker. A failed submission still waits for any
+earlier routes to finish before releasing the operation's assets.
 Parent asynchronous calls use a separate pool so they cannot occupy the workers their child
 routes need. Cancelling an asynchronous waiter retains capacity until its synchronous work
 actually stops. Stream workers remain pinned through queued cleanup and are reusable before
@@ -78,6 +81,13 @@ directory can also use one cleanup thread. File-descriptor exhaustion is reporte
 SQLite connection opens and native index allocations share one descriptor admission lock and
 preserve filesystem descriptor headroom before allocating; the numeric connection ceiling is
 also subject to the process's actual file-descriptor limit.
+SQLite retains at most 64 idle connections across the process. Every handle remains in its own
+directory's pool. Each directory's first four idle handles are protected from idle-budget
+eviction; spare budget lets a busy directory retain more. The oldest surplus handles close when
+that budget fills. Active requests can reclaim idle handles before reporting process overload.
+Directory closure waits for both its borrowers and any eviction already closing one of its
+handles. The active limits remain 32 per directory and 128 per process.
+Handles already being closed by eviction still count toward the directory limit.
 
 These bounds cover MindBridge-owned submissions, workers, stores, and SQLite handles. The byte
 budget charges UTF-8 text and media sizes before materialization and releases them on operation
@@ -217,16 +227,11 @@ If Zvec cannot open or appears corrupt:
 Never edit `search_index_queue`, replace `zvec/`, or move authoritative files while a `Memory` is
 live.
 
-Zvec 0.8 fixes the deleted-row mapping defect that required copying a collection after an
-update or deletion. Ordinary `optimize()` now merges in place, including after reopening a
-collection. The old `zvec/.mindbridge-clean` marker is no longer used.
-
-On the first open after upgrading from the recognized Zvec 0.7 index recipes, MindBridge
-rebuilds the disposable projection from SQLite's stored FP32 embeddings. This also repairs
-old vector-to-ID mapping damage and changes INT8 projections to unrotated cosine quantization.
-It does not call the embedding model. Allow time and space for the rebuild before accepting
-traffic; keep the original SQLite and media backup if you need to restore the old application.
-Unknown recipes still fail rather than guessing how to interpret stored state.
+`optimize()` merges in place, including after reopening a collection. Changing quantization
+within the current index recipe rebuilds the projection from SQLite's stored FP32 embeddings
+without calling the embedding model. Allow time and space for the rebuild before accepting
+traffic. Older and unknown index recipes are rejected without rewriting SQLite or the index;
+read their source data with the original runtime and re-ingest it into a fresh directory.
 
 Compaction remains necessary when accumulated idmap files or process file-descriptor pressure
 cannot be reclaimed by an in-place merge. It copies live documents into a replacement collection,
@@ -434,8 +439,7 @@ Provider request IDs are recorded as `gen_ai.request.id` for a single request an
 `mindbridge.model.request_ids` when one model span covers multiple requests. They are taken from
 the SDK response or provider error, including failure paths; an absent ID is left absent rather
 than invented. A local trace ID identifies the MindBridge operation, while the provider request
-ID identifies the upstream call for support. Keep both in protected operator telemetry. This
-follows OpenAI's [request debugging guidance](https://developers.openai.com/api/reference/overview#debugging-requests).
+ID identifies the upstream call for support. Keep both in protected operator telemetry.
 
 The first-output clocks deliberately use different scopes and units:
 

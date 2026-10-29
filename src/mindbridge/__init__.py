@@ -12,6 +12,7 @@ from mindbridge.exceptions import (
     StorageError,
     ValidationError,
 )
+from mindbridge.infrastructure.local.gazetteer import OfflineGazetteer
 from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     ConsolidationBackend,
@@ -219,6 +220,7 @@ __all__ = [
     "ModelOutputTruncatedError",
     "NamedActor",
     "ObservationContext",
+    "OfflineGazetteer",
     "OpenAIModels",
     "OpenCVFaceAnalyzer",
     "PCMChunk",

@@ -274,10 +274,6 @@ def _media_type_matches(expected: str, actual: str) -> bool:
 def _validate_data_url(value: str) -> tuple[str, bytes]:
     if not value.startswith("data:"):
         raise ValueError("remote URLs are not accepted; fetch media before calling MindBridge")
-    return _decode_data_url(value)
-
-
-def _decode_data_url(value: str) -> tuple[str, bytes]:
     header, separator, payload = value.partition(",")
     if not separator or not header.endswith(";base64"):
         raise ValueError("data URL must contain base64 media bytes")

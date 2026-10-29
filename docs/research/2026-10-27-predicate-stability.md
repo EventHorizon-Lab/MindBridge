@@ -15,10 +15,9 @@ alias, so production incidence remains unknown. This justifies a bounded determi
 not unrestricted semantic merging.
 
 Recent practice supports explicit schemas and conservative equivalence: Graphiti exposes
-[custom edge types and pair mappings](https://help.getzep.com/graphiti/core-concepts/custom-entity-and-edge-types),
-while [SKOS](https://www.w3.org/TR/skos-reference/#mapping) distinguishes exact equivalence from
-non-transitive close matches. These are design precedents, not evidence of MindBridge incidence
-or of the correctness of an arbitrary alias.
+[custom edge types and pair mappings](https://help.getzep.com/graphiti/core-concepts/custom-entity-and-edge-types).
+This is a design precedent, not evidence of MindBridge incidence or of the correctness of an
+arbitrary alias.
 
 Use immutable predicate identifiers, an explicitly versioned exact-alias registry, and a scalar
 label guard. Preserve original predicates and persist the resolution method. Existing kind and

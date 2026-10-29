@@ -306,8 +306,8 @@ def test_forgetting_replaces_the_indexed_memories_in_the_same_commit(tmp_path: P
         assert erased is not None
         stored = store.records.read_memory("alice-first")
         assert stored is not None and "Alice" not in stored.content
-        document = store.index.read_index_document("alice-first:0")
-        assert document is not None and "Alice" not in document.content
+        (document,) = store.index.read_index_documents(("alice-first:0",))
+        assert "Alice" not in document.content
         # The projection is only told after SQLite committed, through the durable outbox. Three
         # entries: the erasure re-enqueues the memory whose indexed identity projection named
         # the forgotten person, then the caller's replacement deletes and re-adds the vector.
@@ -397,9 +397,6 @@ def test_asset_retention_candidates_are_oldest_first_and_filter_by_age(tmp_path:
             asset.asset_id
             for asset in store.media.asset_retention_candidates(created_before=elsewhere)
         ] == [old.asset_id, middle.asset_id]
-        assert store.media.asset_storage_bytes() == sum(
-            asset.size_bytes for asset in (old, middle, recent)
-        )
         with pytest.raises(ValueError, match="limit"):
             store.media.asset_retention_candidates(limit=0)
         with pytest.raises(ValueError, match="created_before"):

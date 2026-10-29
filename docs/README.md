@@ -74,6 +74,8 @@ contract.
 
 - [Mem-Gallery evaluation audit](research/2026-10-27-mem-gallery-evaluation-audit.md) — official
   scorer parity, protocol differences, and limits on attributing quality losses.
+- [FunASR main adoption](research/2026-10-28-funasr-main.md) — pinned runtime, speaker attribution,
+  thread and device controls, and bounded real-model validation.
 - [Negation retrieval research](research/2026-10-27-negation-retrieval-research.md) — original
   papers, open implementations, Chinese scope extraction, and evaluation priorities.
 - [Controlled semantic recall](research/2026-10-27-semantic-recall.md) — R01 audit, bounded
@@ -93,6 +95,10 @@ contract.
 - [Zvec 0.8 adoption](research/2026-10-26-zvec-08.md) — index migration, concurrency and
   quantization decisions, measured recall, and native API limits.
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
+- [Grounded multimodal recall](grounded-multimodal-recall.md) — bounded semantic routes,
+  transient query vision, optional concise answers, and native-media transport.
+- [Grounded recall quality evidence](research/2026-10-29-grounded-recall-quality.md) — completed
+  benchmark combinations, real-service checks, and limits of the promoted changes.
 - [Offline semantic support audit](semantic-support-audit.md) — atomic-claim review, evidence
   localization, withdrawal residue and verification costs before changing formation admission.
 - [Model quality gate](operations.md#model-quality-gate) — synthetic real-model regression cases,

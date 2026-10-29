@@ -10,6 +10,9 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Added
 
+- Optional `OfflineGazetteer` and `generation.offline_gazetteer` add bounded, explicitly untrusted
+  external map candidates from a pinned read-only local OSM index to answer evidence. The default
+  remains disabled; no coordinates leave the machine for lookup and no memory facts are written.
 - Public `Memory` and `AsyncMemory` facades for ordered text, image, video, audio, and composite
   observations. Semantic, episodic, and procedural roles share event-time intervals, metadata,
   spatial context, explicit retrieval scopes, and typed results.
@@ -23,6 +26,15 @@ The [documentation index](docs/README.md) describes the current contracts.
   provenance and temporal versions.
 - Face and speaker recognition, named identities, identity linking and erasure, sourced affect
   hypotheses, visual descriptions, automatic typed formation, and bounded optional history.
+- Opt-in `query_vision` adds transient query-image description and OCR retrieval routes through
+  the configured vision backend. `vision.video_frames` selects 2–64 description stills, default 4;
+  non-default counts participate in the visual-description recipe identity.
+- OpenAI embedding, generation, and vision adapters accept opt-in `image_max_pixels` bounds for
+  request-local image conversion without changing stored assets. Embedding and answering can
+  send oversized videos as bounded ordered stills, with explicit sampling limitations.
+- Optional `generation.answer_style: concise` requests only the question's answer without
+  unrelated dates, explanations or citations. The default reader prompt and both evidence-policy
+  refusal rules are preserved; benchmark baseline arms honor the same configured style.
 - Explicit backend composition through `MemoryPlugins`, `MemoryConfig`, declarative
   configuration, and named recipes. Local Sentence Transformers/Jina, FunASR, OpenCV face, and
   caller-supplied OpenAI SDK adapters load their optional dependencies lazily.
@@ -38,6 +50,12 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Changed
 
+- Answer requests identify original record and attachment modalities, including video sources
+  shown as ordered stills or retained only as text after media omission.
+- Local speech uses a pinned FunASR main revision with corrected speaker attribution and bounded
+  CAM++ clustering work. `ncpu`, `vad_device`, and `speaker_device` expose thread and placement
+  controls. The new transcription space requires a fresh directory and replay; see
+  [local speech configuration](docs/configuration.md#local-speech-with-funasr).
 - SQLite is authoritative for records, FP32 embeddings, metadata, and the durable index outbox.
   Zvec 0.8 provides a derived dense/full-text search projection. Writes commit SQLite before
   flushing Zvec and acknowledging outbox work; missing indexes rebuild without model calls.
@@ -53,9 +71,14 @@ The [documentation index](docs/README.md) describes the current contracts.
 - Retrieval shares authoritative hydration and ranking across search, answering, compilation,
   and control. Relevance and singleton ambiguity gates can abstain; multimodal keys, lexical
   coverage, event-time filters, decay, and reinforcement contribute under explicit settings.
-- Answering exposes `grounded` and `best_effort` policies, bounded supplemental evidence, optional
+- Answering exposes `strict` and `best_effort` policies, bounded supplemental evidence, optional
   recall planning, and opt-in semantic query expansion. Planned reads retain their resolved time
   bounds and completeness limits. These options do not establish a general quality improvement.
+- Semantic query evidence can replace the supplemental ranked tail while retaining the original
+  `limit` window and matched-set limits. With query expansion enabled, strict abstentions can
+  retry internally using bounded JSON evidence excerpts; streaming emits only the final round.
+  Successful query routes remain eligible across rounds within the same evidence budget, so a
+  later query can retain an earlier bridge fact.
 - OpenAI completion slots support explicit JSON Schema outputs alongside JSON object mode.
   Known reasoning models use supported sampling controls and completion-token parameters.
   Model output is validated before durable writes; stored evidence remains untrusted input.
@@ -63,11 +86,28 @@ The [documentation index](docs/README.md) describes the current contracts.
   PersonaMem-v3 uses compiled context; MEMLENS session labels supply grouped retrieval evidence.
   Resolved configuration, effective controls, answer policies, source questions, and cache
   identities make the actual evaluation protocol inspectable.
+- Benchmark `--gen-kwargs` accepts finite temperatures from 0 through 2, default 0, with consistent
+  sampling flags and a fixed run seed. Product and baseline requests share these controls, and
+  effective artifacts and cache identities record them; conflicting YAML controls remain rejected.
 - Wheel packages retain runtime code, typing metadata, and third-party notices while excluding
   contributor instructions.
 
 ### Fixed
 
+- Sequence answers order selected evidence by event time and insertion order. ATM numeric
+  instructions preserve complete dates, times and ranges.
+- Judge requests omit unsupported automatic sampling controls. Judge failures retain local
+  answer metrics, and saved `JudgeError` predictions can restore those metrics and be rejudged
+  without repeating generation.
+- Evaluation shares model capacity dynamically between ingestion and answers. Bounded idle
+  SQLite pools and child-worker admission preserve progress across independent directories;
+  cancellation waits for in-flight work and store cleanup. See [benchmarking](docs/benchmarking.md).
+- Candidate metadata decoding releases its SQLite connection before constructing results.
+  Evaluation bootstrap statistics avoid flattened sample copies and repeated paired draws while
+  preserving seeded results and cluster weighting.
+- Directory-owned SQLite pools share a bounded idle budget, preserving each directory's base
+  allocation while reusing spare capacity for bursts. Active admission reclaims idle handles,
+  and directory ownership outlasts eviction cleanup.
 - Index replay, missing-index recovery, stale search-ID hydration, dead-row maintenance, and
   rejected-open metadata handling preserve SQLite authority and recovery work.
 - Concurrent retrieval, deletion, asset leasing, streamed ingestion, and pooled reads preserve
@@ -88,6 +128,8 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 - Unused generic token-F1 scoring helpers and the withdrawn raw-video experiment proposal.
   Dataset-specific official scorers and the historical measurement records remain available.
+- Unused single-item storage wrappers and the unused media-size query; internal callers use
+  the existing batch operations.
 - PostgreSQL/pgvector, Celery, Redis, S3, service workers, and the service-specific APIs and
   benchmark runners from the superseded design.
 - Tenant, user, run, and other implicit isolation identifiers; metadata remains application data.

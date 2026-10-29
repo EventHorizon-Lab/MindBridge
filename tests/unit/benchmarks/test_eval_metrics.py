@@ -1285,9 +1285,11 @@ def test_candidate_pool_stops_at_the_question_cutoff() -> None:
     unit = EvalUnit(
         unit_id="unit",
         memories=(
+            MemoryItem("a", ("later fragment",), end_seconds=30.0),
             MemoryItem("a", ("first",), end_seconds=10.0),
             MemoryItem("b", ("second",), end_seconds=20.0),
             MemoryItem("c", ("third",), end_seconds=30.0),
+            MemoryItem("d", ("uncut",)),
         ),
         questions=(
             EvalQuestion("q", ("question",), references=("reference",), cutoff_seconds=20.0),
@@ -1295,7 +1297,11 @@ def test_candidate_pool_stops_at_the_question_cutoff() -> None:
     )
 
     assert eval_module._candidate_count(unit, unit.questions[0]) == 2
-    assert eval_module._candidate_count(unit, replace(unit.questions[0], cutoff_seconds=None)) == 3
+    for cutoff, count in ((0.0, 0), (10.0, 1), (29.9, 2), (30.0, 3), (None, 4), (20.0, 2)):
+        assert (
+            eval_module._candidate_count(unit, replace(unit.questions[0], cutoff_seconds=cutoff))
+            == count
+        )
 
 
 def test_noise_floor_applies_the_measured_floor_to_a_tiny_standard_error() -> None:

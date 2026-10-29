@@ -229,6 +229,8 @@ benchmark:
     # Throughput. `unit_concurrency` is the strongest lever: tasks run serially by design so that
     # timing stays clean, and this overlaps the units inside one task.
     unit_concurrency: 1
+    # Static corpora only; values above 1 require add, no deliberate, formation, speech, or face.
+    ingest_concurrency: 1
     request_concurrency: 4
     judge_concurrency: 8
     batch_size: auto

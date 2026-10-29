@@ -194,6 +194,57 @@ class Vision(Traced):
         operation.descriptions.update(fresh)
         return {**cached, **fresh}
 
+    def query_descriptions(
+        self,
+        content: PreparedContent,
+        operation: OperationAssets,
+    ) -> tuple[str, ...]:
+        """Describe query images as transient search anchors, never stored observations."""
+        if self._backends.vision_describer is None or Modality.IMAGE not in (
+            self._backends.vision_capabilities
+        ):
+            return ()
+        images = tuple(
+            {
+                asset.asset_id: asset
+                for asset in content.assets
+                if asset.modality == Modality.IMAGE.value
+            }.values()
+        )
+        pending = tuple(
+            asset for asset in images if asset.asset_id not in operation.query_descriptions
+        )
+        if pending:
+            try:
+                descriptions = self._vision_descriptions(
+                    tuple(self._hydrator.model_input(asset_content(asset)) for asset in pending)
+                )
+            except ModelError as error:
+                _LOGGER.warning(
+                    "query image description failed for %d asset(s): %s",
+                    len(pending),
+                    error.reason,
+                )
+                descriptions = ("",) * len(pending)
+            # Kept separately from write-path descriptions: query pixels and model text must
+            # never create a cache row, a named identity, or a durable memory.
+            operation.query_descriptions.update(
+                zip((asset.asset_id for asset in pending), descriptions, strict=True)
+            )
+        anchors: dict[str, None] = {}
+        for asset in images:
+            description = operation.query_descriptions[asset.asset_id]
+            if not description:
+                continue
+            anchors[description] = None
+            # The bundled caption recipe transcribes visible text on this labelled line.
+            # Keep its exact words searchable without all the scene's other terms.
+            for line in description.splitlines():
+                label, separator, value = line.partition(":")
+                if separator and label.strip().casefold() == "text" and value.strip():
+                    anchors[value.strip()] = None
+        return tuple(anchors)
+
     def _described_batch(
         self,
         pending: Sequence[StoredAsset],

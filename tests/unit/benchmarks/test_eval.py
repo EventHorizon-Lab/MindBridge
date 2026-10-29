@@ -77,7 +77,7 @@ from mindbridge.benchmarks.eval_adapters import (
     MediaManifest,
     MediaResolver,
     MemoryItem,
-    _choice_parts,
+    _choice_prompt,
     _free_text_parts,
     _gallery_memory,
     _query_parts,
@@ -199,10 +199,9 @@ def test_query_parts_and_gallery_image_id_preserve_retrieval_evidence(tmp_path: 
         format_constraint="Answer briefly.",
     ) == ("Where is it?", "Instruction", "Answer briefly.")
     assert _free_text_parts("Where is it?")[0] == "Where is it?"
-    assert _choice_parts("Where is it?", ("Desk", "Shelf")) == (
-        "Where is it?",
+    assert _choice_prompt("Where is it?", ("Desk", "Shelf")) == (
         "Select the best answer using only the memories. Reply with one letter (A, B).\n"
-        "A. Desk\nB. Shelf\nAnswer:",
+        "Question: Where is it?\nA. Desk\nB. Shelf\nAnswer:"
     )
 
 
@@ -869,6 +868,7 @@ def _namespace_arguments() -> eval_config_module._Arguments:
             recall_limit=8,
             blind=False,
             ingest="add",
+            ingest_concurrency=1,
             deliberate=False,
             compile_max_items=24,
             compile_max_chars=16000,
@@ -1273,6 +1273,7 @@ def test_eval_config_reuses_the_declarative_memory_schema(
             answer_policy=None,
             blind=False,
             ingest="add",
+            ingest_concurrency=1,
             deliberate=False,
             compile_max_items=24,
             compile_max_chars=16000,
@@ -1483,7 +1484,7 @@ def test_every_lent_backend_declares_each_method_only_capability_its_pool_has() 
             assert not isinstance(proxy(object()), protocol), (proxy.__name__, protocol.__name__)
 
 
-@pytest.mark.parametrize("key", ("temperature", "seed", "max_tokens"))
+@pytest.mark.parametrize("key", ("temperature", "seed", "max_tokens", "do_sample"))
 def test_eval_config_rejects_benchmark_controls_in_extra_body(
     key: str,
     tmp_path: Path,
@@ -1509,6 +1510,70 @@ def test_generation_kwargs_normalize_bounded_non_thinking_inference() -> None:
     )
     with pytest.raises(ValueError, match="positive integer"):
         _generation_kwargs("max_tokens=0", 7)
+
+
+@pytest.mark.parametrize(
+    ("value", "normalized"),
+    (
+        ("", "temperature=0,do_sample=false,seed=7"),
+        ("temperature=-0.0", "temperature=0,do_sample=false,seed=7"),
+        ("temperature=.70", "temperature=0.7,do_sample=true,seed=7"),
+        ("temperature=0.7123456789", "temperature=0.7123456789,do_sample=true,seed=7"),
+        ("temperature=2.0,do_sample=1", "temperature=2,do_sample=true,seed=7"),
+    ),
+)
+def test_generation_kwargs_normalize_sampling(value: str, normalized: str) -> None:
+    assert _generation_kwargs(value, 7) == normalized
+
+
+def test_cli_sampling_override_reaches_the_normalized_run_arguments() -> None:
+    parser = eval_config_module._build_parser("eval")
+    parsed = parser.parse_args(
+        ["--tasks", "mem-gallery", "--gen-kwargs", "temperature=0.7", "--seed", "7"]
+    )
+
+    assert eval_config_module._arguments(parser, parsed).gen_kwargs == (
+        "temperature=0.7,do_sample=true,seed=7"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "temperature=nan",
+        "temperature=inf",
+        "temperature=-inf",
+        "temperature=-0.1",
+        "temperature=2.1",
+        "temperature=invalid",
+        "temperature=0.7,do_sample=false",
+        "temperature=0,do_sample=true",
+        "do_sample=true",
+        "do_sample=invalid",
+        "temperature=0.7,seed=9",
+    ),
+)
+def test_generation_kwargs_reject_invalid_or_contradictory_sampling(value: str) -> None:
+    with pytest.raises(ValueError, match=r"temperature|do_sample|seed"):
+        _generation_kwargs(value, 7)
+
+
+def test_sampling_controls_participate_in_the_response_cache_identity() -> None:
+    arguments = _namespace_arguments()
+    deterministic = cast(
+        eval_config_module._Arguments,
+        SimpleNamespace(**{**vars(arguments), "gen_kwargs": _generation_kwargs("", 7)}),
+    )
+    sampled = cast(
+        eval_config_module._Arguments,
+        SimpleNamespace(
+            **{**vars(arguments), "gen_kwargs": _generation_kwargs("temperature=0.7", 7)}
+        ),
+    )
+
+    assert _cache_namespace(deterministic, ModelConfig(), {}) != _cache_namespace(
+        sampled, ModelConfig(), {}
+    )
 
 
 @pytest.mark.asyncio
@@ -2977,6 +3042,7 @@ def test_ingest_digest_ignores_the_answer_model(tmp_path: Path) -> None:
         SimpleNamespace(
             device=None,
             ingest="add",
+            ingest_concurrency=1,
             deliberate=False,
             benchmarks_root=tmp_path,
             media_manifest=None,
@@ -3401,6 +3467,7 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             data_root=tmp_path / "stores",
             run_id="run",
             unit_concurrency=1,
+            ingest_concurrency=1,
             request_concurrency=1,
             recall_limit=3,
             answer_policy=None,
@@ -5105,8 +5172,8 @@ def test_eval_resolved_generation_still_prefers_a_declared_credential(tmp_path: 
 def test_eval_config_rejects_sampling_controls_the_harness_pins(field: str, tmp_path: Path) -> None:
     """Declaring a pinned control must fail loudly rather than be accepted and discarded.
 
-    The harness always sends temperature 0 and the seed `--seed` names, so a file that sets
-    either would otherwise describe a run that never happens.
+    The CLI owns temperature and the seed, so a file that sets either would otherwise describe
+    controls silently overridden by the resolved run.
     """
     path = tmp_path / "eval.yaml"
     path.write_text(
@@ -5593,6 +5660,7 @@ def _streaming_arguments(output_path: Path, **overrides: object) -> eval_config_
         "blind_baseline": None,
         "bootstrap_samples": 32,
         "deliberate": False,
+        "ingest_concurrency": 1,
         "device": None,
         "media_manifest": None,
         "media_overrides": {},

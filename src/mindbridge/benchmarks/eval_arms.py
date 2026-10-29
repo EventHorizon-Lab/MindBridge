@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from opentelemetry import trace
 from opentelemetry.trace import Tracer
@@ -29,13 +29,12 @@ from mindbridge._telemetry import (
     mark_model_requests,
     model_span,
 )
-from mindbridge.benchmarks.eval_config import _MODALITY_BY_SUFFIX
+from mindbridge.benchmarks.eval_config import _MODALITY_BY_SUFFIX, _generation_temperature
 from mindbridge.benchmarks.eval_results import DEFAULT_ARM
 from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.models._openai_protocol import (
     output_limit_parameter,
     reasoning_model,
-    sampling_supported,
 )
 from mindbridge.models.base import ModelInput
 from mindbridge.models.openai_sdk import (
@@ -46,6 +45,7 @@ from mindbridge.models.openai_sdk import (
     _model_usage,
     _record_openai_provenance,
     _record_usage_batch,
+    _styled_answer_prompt,
 )
 
 # Baseline transport belongs to the harness. Evidence readers reuse the product's policy;
@@ -132,11 +132,6 @@ class _BaselineGenerator:
             from openai import AsyncOpenAI
         except ImportError:
             raise RuntimeError("baseline arms require mindbridge[openai]") from None
-        self._client = AsyncOpenAI(
-            api_key=config.generation_api_key,
-            base_url=config.generation_base_url,
-            timeout=config.timeout_seconds,
-        )
         self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
         options = dict(item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item)
         self._model = config.generation_model
@@ -155,16 +150,24 @@ class _BaselineGenerator:
         # a thinking model answers at all: without the deployment's `reasoning_effort` the model
         # spends its budget on reasoning tokens and every reply ends `finish_reason=length`, which
         # would score as "the baseline knows nothing" rather than "the baseline was misconfigured".
-        # Deterministic controls are sent only where the shared provider policy supports them.
+        # Sampling controls are sent only where the shared provider policy supports them.
         # Explicit controls in extra_body still reach the adapter's validation.
         stanza = None if generation is None else generation.generation
+        self._answer_style: Literal["default", "concise"] = (
+            "default" if stanza is None else stanza.answer_style
+        )
         if stanza is not None:
             if stanza.extra_body is not None:
                 extra_body.update(stanza.extra_body)
             if stanza.max_tokens is not None and self._max_tokens is None:
                 self._max_tokens = stanza.max_tokens
         self._extra_body = extra_body or None
-        self._temperature = 0.0 if sampling_supported(self._model, self._extra_body) else None
+        self._temperature = _generation_temperature(self._model, options, self._extra_body)
+        self._client = AsyncOpenAI(
+            api_key=config.generation_api_key,
+            base_url=config.generation_base_url,
+            timeout=config.timeout_seconds,
+        )
         self._generation_capabilities = config.generation_capabilities
         self._query_asset_cache: dict[Path, AssetRef] = {}
         self._native_media = OpenAIModels(
@@ -177,6 +180,7 @@ class _BaselineGenerator:
             generation_min_video_seconds=config.generation_min_video_seconds,
             generation_video_limit=(8 if stanza is None else stanza.video_limit),
             generation_extra_body=self._extra_body,
+            generation_answer_style=self._answer_style,
         )
 
     async def answer(
@@ -203,6 +207,7 @@ class _BaselineGenerator:
                 if answer_policy == "strict"
                 else _BEST_EFFORT_SYSTEM_PROMPT
             )
+        system = _styled_answer_prompt(system, self._answer_style)
         user = question if context is None else f"Context:\n{context}\n\nQuestion:\n{question}"
         resolved_question_assets = tuple(self._query_asset(path) for path in question_assets)
         if resolved_question_assets or any(hit.assets for hit in evidence_hits):

@@ -3222,7 +3222,15 @@ def test_answer_converts_only_videos_below_the_configured_provider_minimum(
 
     def respond(request: httpx.Request) -> httpx.Response:
         content = json.loads(request.content)["messages"][1]["content"]
-        assert content[2] == {"type": "text", "text": "attachment 1"}
+        memory = json.loads(content[1]["text"])["memory"]
+        assert memory["source_modality"] == "video"
+        assert memory["media_modalities"] == {"attachment 1": "video"}
+        expected_label = (
+            "attachment 1 (video sampled as 4 ordered stills; motion, audio and exact timing are not supplied)"
+            if converted
+            else "attachment 1"
+        )
+        assert content[2] == {"type": "text", "text": expected_label}
         media = content[3:]
         if converted:
             assert [part["type"] for part in media] == ["image_url"] * 4
@@ -3313,7 +3321,9 @@ def test_answer_retries_provider_rejected_hit_video_as_text(
         )
         memory = json.loads(content)["hits"][0]
         assert memory["content"] == "The blue toolbox is beside the door."
+        assert memory["source_modality"] == "video"
         assert memory["media_omitted"] == {"video": 1}
+        assert "media_modalities" not in memory
         if payload.get("stream"):
             chunk = {
                 "id": "chatcmpl-test",
@@ -3352,8 +3362,8 @@ def test_answer_retries_provider_rejected_hit_video_as_text(
         if not image_capable:
             monkeypatch.setattr(
                 openai_backend,
-                "_short_video_frame_urls",
-                lambda *_args: pytest.fail("preflight ran without image capability"),
+                "_video_frame_urls",
+                lambda *_args, **_kwargs: pytest.fail("preflight ran without image capability"),
             )
         model = _model(
             _sdk_client(client),
@@ -3472,9 +3482,11 @@ def test_answer_sends_shared_media_once_and_bounds_inline_bytes(
                 {
                     "content": "shared image",
                     "memory_type": "semantic",
+                    "source_modality": "image",
                     "created_at": NOW.isoformat(),
                     "metadata": {},
                     "media": ["attachment 1"],
+                    "media_modalities": {"attachment 1": "image"},
                 }
             ]
             * 2
@@ -3560,8 +3572,16 @@ def test_answer_numbers_attachments_instead_of_listing_asset_hashes(tmp_path: Pa
         )
 
     assert seen[0]["media"] == ["attachment 1"]
+    assert seen[0]["media_modalities"] == {"attachment 1": "image"}
     assert seen[1]["memory"]["media"] == ["attachment 2"]
+    assert seen[1]["memory"]["source_modality"] == "image"
+    assert seen[1]["memory"]["media_modalities"] == {"attachment 2": "image"}
     assert seen[2]["memory"]["media"] == ["attachment 3", "attachment 2"]
+    assert seen[2]["memory"]["source_modality"] == "omni"
+    assert seen[2]["memory"]["media_modalities"] == {
+        "attachment 3": "video",
+        "attachment 2": "image",
+    }
     text = json.dumps(seen)
     assert "assets" not in text
     assert not any(asset.id in text for asset in (asked, first, clip))
@@ -3805,6 +3825,12 @@ def test_answer_caps_grounding_videos_without_dropping_their_text(tmp_path: Path
             {"video": 1},
         ]
         assert memories[2]["content"] == "transcript 2"
+        assert [memory["source_modality"] for memory in memories] == ["video"] * 3
+        assert [memory["media_modalities"] for memory in memories] == [
+            {"attachment 1": "video"},
+            {"attachment 2": "video"},
+            {},
+        ]
         return httpx.Response(
             200,
             json={
@@ -3826,6 +3852,42 @@ def test_answer_caps_grounding_videos_without_dropping_their_text(tmp_path: Path
     assert [len(hit.assets) for hit in result.hits] == [1, 1, 0]
     assert result.hits[2].content == "transcript 2"
     assert result.hits[2].modality is Modality.TEXT
+
+
+def test_answer_preserves_mixed_source_type_when_only_an_image_is_supplied(tmp_path: Path) -> None:
+    first = _asset(tmp_path, "first", Modality.VIDEO, "video/mp4", b"first-video")
+    omitted = _asset(tmp_path, "omitted", Modality.VIDEO, "video/mp4", b"omitted-video")
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
+    hits = (
+        SearchHit("first", "first caption", 0.9, NOW, assets=(first,), modality=Modality.VIDEO),
+        SearchHit(
+            "mixed", "mixed caption", 0.8, NOW, assets=(omitted, image), modality=Modality.OMNI
+        ),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        memories = [
+            json.loads(part["text"])["memory"]
+            for part in content
+            if part["type"] == "text" and '"memory"' in part["text"]
+        ]
+        assert memories[1]["source_modality"] == "omni"
+        assert memories[1]["media"] == ["attachment 2"]
+        assert memories[1]["media_modalities"] == {"attachment 2": "image"}
+        assert memories[1]["media_omitted"] == {"video": 1}
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"index": 0, "message": {"content": "answer"}, "finish_reason": "stop"}]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client), generation_video_limit=1).answer("What?", hits)
+    assert result.hits[1].modality is Modality.IMAGE
+    assert result.hits[1].assets == (image,)
+    assert hits[1].modality is Modality.OMNI and hits[1].assets == (omitted, image)
 
 
 def test_answer_combines_typed_provenance_with_later_media_omission(tmp_path: Path) -> None:
@@ -4614,6 +4676,42 @@ _FORMATION_REQUIREMENTS = {
     # (`_formation_refusal`), so asking the former for a kind that can only be thrown away
     # spends tokens on refusals. The host authorizes one through `apply()` instead.
 }
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"valid_from": "2026-01-01T00:00:00"},
+        {"valid_until": "2026-01-01T00:00:00"},
+        {
+            "spatial": {
+                "frame_id": "map",
+                "anchor": "observer",
+                "x": 0,
+                "y": 0,
+                "orientation_xyzw": [0, 0, 1],
+            }
+        },
+        {
+            "spatial": {
+                "frame_id": "map",
+                "anchor": "observer",
+                "x": 0,
+                "y": 0,
+                "orientation_xyzw": [0, 0, 0, 0],
+            }
+        },
+    ],
+)
+def test_formation_value_constructors_reject_invalid_time_and_orientation(
+    fields: dict[str, object],
+) -> None:
+    assert (
+        openai_backend._formation_proposal(
+            {"kind": "event", "content": "an event", "confidence": 1, **fields}
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(("kind", "extra"), sorted(_FORMATION_REQUIREMENTS.items()))

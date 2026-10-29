@@ -154,6 +154,7 @@ class Memory:
         evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         recall_planning: bool = _DEFAULT_CONFIG.recall_planning,
         recall_query_expansion: bool = _DEFAULT_CONFIG.recall_query_expansion,
+        query_vision: bool = _DEFAULT_CONFIG.query_vision,
         recall_set_budget_chars: int = _DEFAULT_CONFIG.recall_set_budget_chars,
         recall_set_max_rows: int = _DEFAULT_CONFIG.recall_set_max_rows,
         recall_rounds: int = _DEFAULT_CONFIG.recall_rounds,
@@ -186,6 +187,7 @@ class Memory:
             evidence_budget_chars=evidence_budget_chars,
             recall_planning=recall_planning,
             recall_query_expansion=recall_query_expansion,
+            query_vision=query_vision,
             recall_set_budget_chars=recall_set_budget_chars,
             recall_set_max_rows=recall_set_max_rows,
             recall_rounds=recall_rounds,
@@ -337,6 +339,7 @@ class Memory:
             materializer=materializer,
             speech=speech,
             embedding=embedding,
+            vision=self._vision,
             projection=self._projection,
             execution=self._execution,
         )

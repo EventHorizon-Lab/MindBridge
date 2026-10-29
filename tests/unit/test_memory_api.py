@@ -150,7 +150,7 @@ class _FakeModels:
         self.embed_inputs: list[tuple[ModelInput, ...]] = []
         self.embed_tasks: list[EmbedTask] = []
         self.answer_calls: list[tuple[ModelInput, tuple[SearchHit, ...]]] = []
-        # Whether each answer was told its hits are a matched set in time order, not a ranking.
+        # Whether the reader uses program order (predicate or sequence), rather than rank order.
         self.exhaustive_calls: list[bool] = []
         self.transcribe_calls: list[tuple[AssetRef, ...]] = []
         # The recall plan this backend replies with, and every planning call it was asked for.
@@ -3345,8 +3345,7 @@ def test_existing_face_analyses_require_both_space_markers(
         record = memory.add(Blob(b"image", "image/png", "face.png"))
         assert memory.faces(record.id)
     with LocalStore(tmp_path) as store:
-        for key in missing:
-            store.delete_metadata(key)
+        store.update_metadata(dict.fromkeys(missing))
 
     with pytest.raises(StorageError, match=r"metadata.*missing"):
         Memory(tmp_path, embedder=_FakeEmbedder(), face_analyzer=_FakeFace())
@@ -4748,7 +4747,7 @@ def test_unknown_index_recipe_preserves_sqlite_and_projection(
     with Memory(tmp_path, embedder=_FakeModels()) as memory:
         record = memory.add("preserved memory")
     with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", recipe)
+        store.update_metadata({"index.recipe": recipe})
         stored_record = store.records.read_memory(record.id)
         stored_documents = store.index.read_memory_index_documents((record.id,))
     sentinel = tmp_path / "zvec" / "preserved-index"
@@ -7965,6 +7964,30 @@ def test_semantic_recall_failure_preserves_the_original_grounding(tmp_path: Path
     assert [hit.content for hit in result.hits] == ["a blue crate"]
 
 
+def test_a_rewrite_that_fits_no_new_evidence_keeps_the_original_ranked_tail(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("point", {"op": "similar", "query": "red", "k": 100})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        evidence_budget_chars=100,
+        recall_set_budget_chars=1,
+        index_quantization=IndexQuantization.INT8,
+        ambiguity_margin=0.0,
+        retrieval_mode=RetrievalMode.DENSE,
+    ) as memory:
+        for index in range(3):
+            memory.add(f"a blue crate {index}")
+        memory.add("a red wrench")
+        ranked = memory.search("which tool?", limit=100)
+        result = memory.ask("which tool?", limit=1)
+
+    assert len(ranked) == 3
+    assert [hit.id for hit in result.hits] == [hit.id for hit in ranked]
+
+
 @pytest.mark.parametrize("failure", ["quota", "model"])
 def test_unavailable_semantic_anchors_cannot_license_a_complete_set(
     tmp_path: Path, failure: str
@@ -8051,6 +8074,34 @@ def test_semantic_recall_caps_each_query_even_in_an_exhaustive_plan(
     assert result.hits[1].content.startswith("a red wrench")
 
 
+def test_semantic_recall_cannot_readmit_matched_rows_over_the_set_cap(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "composite",
+        {"op": "match", "terms": ["wrench"]},
+        {"op": "similar", "query": "red wrench", "k": 100},
+    )
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=True,
+        recall_set_max_rows=1,
+        evidence_budget_chars=1_000,
+        retrieval_mode=RetrievalMode.DENSE,
+    ) as memory:
+        anchor = memory.add("a blue crate")
+        matched = tuple(
+            memory.add(f"a red wrench {index}", occurred_at=DAY + timedelta(days=index))
+            for index in range(3)
+        )
+        result = memory.ask("which tool?", limit=1)
+
+    assert {hit.id for hit in result.hits} == {anchor.id, matched[0].id}
+    assert "2 further matched records are not shown" in models.answer_calls[-1][0].text
+    assert "do not state a total" in models.answer_calls[-1][0].text
+
+
 @pytest.mark.parametrize("budget, added", [(None, 1), (1, 0)])
 def test_semantic_recall_reports_candidate_selection_and_budget_losses(
     tmp_path: Path, budget: int | None, added: int
@@ -8101,7 +8152,57 @@ def test_a_set_plan_grounds_the_whole_matched_set_in_time_order(tmp_path: Path) 
     assert [hit.content for hit in grounded] == ["a red wrench", "a blue wrench"]
     assert [hit.content for hit in answered.hits] == ["a red wrench", "a blue wrench"]
     assert "Recall program (set): records containing wrench (2)." in question.text
-    assert "every record those reads matched, in time order" in question.text
+    assert "complete for their predicates" in question.text
+
+
+def test_recall_merges_same_time_match_window_and_neighbors_in_sqlite_order(
+    tmp_path: Path,
+) -> None:
+    """One SDK batch shares both clocks; multiple reads discover its turns backwards."""
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "sequence",
+        {"op": "match", "terms": ["last"]},
+        {"op": "match", "terms": ["middle"]},
+        {"op": "neighbors", "of": "step:1", "before": 1, "after": 1},
+        {"op": "window", "time": ["2024-09-10", "2024-09-11"]},
+    )
+    at = datetime(2024, 9, 10, 9, tzinfo=timezone.utc)
+    with _memory(tmp_path, models, recall_planning=True, ambiguity_margin=0) as memory:
+        records = memory.add_many(
+            ("the first red turn 3", "the middle blue turn", "the last green turn"),
+            occurred_at=(at, at, at),
+        )
+        assert len({record.created_at for record in records}) == 1
+        expected = [record.id for record in records]
+        assert expected != sorted(expected)
+
+        memory.ask("What happened in sequence?", limit=1, reference_at=at)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.id for hit in grounded] == expected
+    assert "complete for their predicates" in question.text
+    assert "not a complete set" not in question.text
+
+
+def test_sequence_sorting_does_not_restore_stale_index_ids(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = _plan("sequence", {"op": "similar", "query": "what happened?", "k": 3})
+    with _memory(tmp_path, models, recall_planning=True, ambiguity_margin=0) as memory:
+        records = memory.add_many(
+            ("the first red turn 3", "the middle blue turn", "the last green turn"),
+            occurred_at=(DAY, DAY, DAY),
+        )
+        _FakeIndex.instances[-1].dense_hits_override = (
+            IndexHit(id="f" * 64, relevance=1.0, confidence=1.0),
+            *(IndexHit(id=r.id, relevance=0.9, confidence=0.9) for r in reversed(records)),
+        )
+        result = memory.ask("what happened?", limit=3)
+
+    expected = [record.id for record in records]
+    assert [hit.id for hit in models.answer_calls[-1][1]] == expected
+    assert [hit.id for hit in result.hits] == expected
+    assert models.exhaustive_calls == [True]
 
 
 def test_a_window_bound_to_matched_records_reads_the_dates_their_text_states(
@@ -8149,7 +8250,7 @@ def test_a_window_bound_to_matched_records_reads_the_dates_their_text_states(
         "records in the time span between 2022-06-23T00:00:00+00:00 and "
         "2022-06-25T00:00:00+00:00 (2)"
     ) in question.text
-    assert "every record those reads matched, in time order" in question.text
+    assert "complete for their predicates" in question.text
 
 
 def test_a_set_plan_adds_its_matched_rows_to_the_window_the_ranking_earned(
@@ -8177,10 +8278,11 @@ def test_a_set_plan_adds_its_matched_rows_to_the_window_the_ranking_earned(
         "a green crate",
     ]
     assert [hit.content for hit in answered.hits] == [hit.content for hit in grounded]
-    # The reader is holding both, so the note has to separate them: counting a top-ranked record
-    # as one the predicate matched is the same wrong total the completeness line exists to stop.
+    # The red wrench did not match "blue", but still satisfies the question about wrenches.
+    # Read provenance must not exclude it from the semantic answer set.
     assert "records containing blue (1)" in question.text
-    assert "The top-ranked records for the question follow them" in question.text
+    assert "Top-ranked records follow the matched records" in question.text
+    assert "a ranked record may also satisfy the question" in question.text
 
 
 def test_a_set_plan_that_matched_nothing_grounds_exactly_as_the_unplanned_path_does(
@@ -8324,7 +8426,7 @@ def test_a_cut_similarity_row_does_not_make_the_matched_set_incomplete(tmp_path:
         "a blue wrench",
         "a green pallet",
     ]
-    assert "every record those reads matched, in time order" in question.text
+    assert "complete for their predicates" in question.text
     assert "do not state a total" not in question.text
 
 
@@ -8465,7 +8567,7 @@ def test_a_predicate_that_matched_most_of_the_corpus_grounds_like_no_plan_at_all
     assert [hit.content for hit in grounded] == [hit.content for hit in unplanned_hits]
     assert "matched too many records to enumerate (5 of 5)" in question.text
     assert "only the top-ranked records for the question are shown" in question.text
-    assert "every record those reads matched" not in question.text
+    assert "complete for their predicates" not in question.text
     assert "do not state a total" in question.text
     recall = next(
         span for span in exporter.get_finished_spans() if span.name == "mindbridge.recall"
@@ -8493,7 +8595,7 @@ def test_a_selective_predicate_on_the_same_corpus_still_grounds_its_whole_set(
     question, grounded = models.answer_calls[-1]
     assert [hit.content for hit in grounded] == [f"a wrench, mention {index}" for index in range(5)]
     assert "records containing wrench (5)" in question.text
-    assert "every record those reads matched, in time order" in question.text
+    assert "complete for their predicates" in question.text
     assert "too many records to enumerate" not in question.text
 
 
@@ -8568,7 +8670,7 @@ def test_a_read_a_scope_shrank_below_its_bound_is_still_reported_as_truncated(
     question, grounded = models.answer_calls[-1]
     assert grounded == ()
     assert "some matching records were not read" in question.text
-    assert "every record those reads matched" not in question.text
+    assert "complete for their predicates" not in question.text
 
 
 def test_a_sequence_plan_grounds_the_records_around_what_it_found(tmp_path: Path) -> None:
@@ -8584,13 +8686,91 @@ def test_a_sequence_plan_grounds_the_records_around_what_it_found(tmp_path: Path
         memory.ask("what did I say just before the crate?")
 
     question, grounded = models.answer_calls[-1]
-    # The adjacent pair in corpus order, then the one ranked record neither read had already.
+    # The ranked tail participates in the same timeline as the matched adjacent pair.
     assert [hit.content for hit in grounded] == [
+        "a red wrench",
         "a blue wrench",
         "a green crate",
-        "a red wrench",
     ]
     assert "the 1 before and 0 after each of them (1)" in question.text
+
+
+@pytest.mark.parametrize(
+    "texts,member_count",
+    [
+        (
+            (
+                "anchor: blue option card A",
+                "blue option card B",
+                "blue option card C",
+                "blue option card D",
+            ),
+            4,
+        ),
+        (
+            (
+                "anchor: review overview",
+                "blue option card B",
+                "blue option card C",
+                "blue option card D",
+            ),
+            3,
+        ),
+        (
+            (
+                "anchor: blue option card A",
+                "red option card B",
+                "red option card C",
+                "blue option card D",
+            ),
+            2,
+        ),
+    ],
+    ids=("matching-anchor", "context-only-anchor", "context-only-neighbors"),
+)
+def test_a_complete_neighbor_read_does_not_decide_answer_set_membership(
+    tmp_path: Path, texts: tuple[str, ...], member_count: int
+) -> None:
+    class AnchorModels(_FakeModels):
+        def embed(
+            self, inputs: Sequence[ModelInput], task: EmbedTask = EmbedTask.DOCUMENT
+        ) -> tuple[tuple[float, ...], ...]:
+            return tuple(
+                (1.0, 0.0)
+                if task is EmbedTask.QUERY or value.text.startswith("anchor:")
+                else (0.0, 1.0)
+                for value in inputs
+            )
+
+    models = AnchorModels()
+    models.recall_plan = _plan(
+        "set",
+        {"op": "similar", "query": "blue option cards", "k": 1},
+        {"op": "neighbors", "of": "step:0", "before": 0, "after": 3},
+    )
+    at = datetime(2024, 7, 1, tzinfo=timezone.utc)
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        retrieval_mode=RetrievalMode.DENSE,
+        ambiguity_margin=0,
+    ) as memory:
+        records = memory.add_many(texts, occurred_at=(at,) * 4)
+        _FakeIndex.instances[-1].dense_hits_override = (
+            IndexHit(id=records[0].id, relevance=1.0, confidence=1.0),
+        )
+        memory.ask("How many blue option cards were shared?", limit=1, reference_at=at)
+
+    question, grounded = models.answer_calls[-1]
+    assert {hit.id for hit in grounded} == {record.id for record in records}
+    assert sum("blue option card" in hit.content for hit in grounded) == member_count
+    assert "the 0 before and 3 after each of them (3)" in question.text
+    assert "complete for their predicates" in question.text
+    assert "does not automatically make them the question's complete answer set" in question.text
+    assert "Neighbor reads exclude their anchors" in question.text
+    assert "a ranked record may also satisfy the question" in question.text
+    assert "do not state a total" not in question.text
 
 
 def test_an_entity_plan_falls_back_to_the_name_as_text_when_no_identity_carries_it(

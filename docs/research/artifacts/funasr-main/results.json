@@ -1,0 +1,83 @@
+{
+  "source": "FunASR main integration 2026-10-28",
+  "overlap_regression": {
+    "fixture": "0-1000ms sentence; speaker0 0-400ms; speaker1 400-1000ms",
+    "expected_speaker": 1,
+    "baseline_version": "1.4.7",
+    "baseline_wheel_sha256": "7a0a87c0eadef8e83c3c53f0be5f6c23c96a85394b299dec413420a3852364dd",
+    "baseline_actual_speaker": 0,
+    "candidate_actual_speaker": 1
+  },
+  "real_model": {
+    "mixed": {
+      "runtime_commit": "940b0d2463141a2e9ace8a9fd965b4aea93f2db5",
+      "model_id": "FunAudioLLM/Fun-ASR-Nano-2512",
+      "model_revision": "05201c46f1c38592b1567f857c0d56eab3d0d8ef",
+      "fixture_sha256": "f10378336a4e584f3f63799e62f99d5add3c2a401b51d3abe7d3a3a82f255ada",
+      "fixture_bytes": 57441,
+      "placement": {
+        "asr": "cuda",
+        "vad": "cpu",
+        "speaker": "cpu",
+        "ncpu": 2
+      },
+      "cold_seconds": 48.62345767999068,
+      "warm_seconds": 1.4087497619912028,
+      "turns": 1,
+      "speakers": 1,
+      "repeat_equal": true,
+      "text_nonempty": true,
+      "positive_ranges": true,
+      "speaker_coverage": true,
+      "batch_speech_equal": true,
+      "batch_silence_empty": true,
+      "actual_devices": {
+        "asr": "cuda:0",
+        "vad": "cpu",
+        "speaker": "cpu"
+      },
+      "torch_threads": 2,
+      "blas_threads": [
+        2
+      ],
+      "peak_cuda_allocated_bytes": 3552785408,
+      "peak_cuda_reserved_bytes": 3665821696,
+      "passed": true
+    },
+    "default": {
+      "runtime_commit": "940b0d2463141a2e9ace8a9fd965b4aea93f2db5",
+      "model_id": "FunAudioLLM/Fun-ASR-Nano-2512",
+      "model_revision": "05201c46f1c38592b1567f857c0d56eab3d0d8ef",
+      "fixture_sha256": "f10378336a4e584f3f63799e62f99d5add3c2a401b51d3abe7d3a3a82f255ada",
+      "fixture_bytes": 57441,
+      "placement": {
+        "asr": "cuda",
+        "vad": null,
+        "speaker": null,
+        "ncpu": 4
+      },
+      "cold_seconds": 49.62968708318658,
+      "warm_seconds": 1.0363037842325866,
+      "turns": 1,
+      "speakers": 1,
+      "repeat_equal": true,
+      "text_nonempty": true,
+      "positive_ranges": true,
+      "speaker_coverage": true,
+      "batch_speech_equal": true,
+      "batch_silence_empty": true,
+      "actual_devices": {
+        "asr": "cuda:0",
+        "vad": "cuda:0",
+        "speaker": "cuda:0"
+      },
+      "torch_threads": 4,
+      "blas_threads": [
+        4
+      ],
+      "peak_cuda_allocated_bytes": 3582380544,
+      "peak_cuda_reserved_bytes": 3690987520,
+      "passed": true
+    }
+  }
+}

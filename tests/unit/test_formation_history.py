@@ -399,16 +399,11 @@ def test_adapter_does_not_accept_another_targets_private_history() -> None:
     assert _formation_results(response, (first, second)) == ((), ())
 
 
-@pytest.mark.parametrize("different_version", [False, True])
-def test_adapter_assigns_private_aliases_to_each_targets_snapshot_of_one_record(
-    different_version: bool,
-) -> None:
+def test_adapter_assigns_private_aliases_to_each_targets_different_snapshot_of_one_record() -> None:
     first = _history_input()
     old = first.history[0]
     assert old.context is not None
-    changed = (
-        replace(old, context=replace(old.context, confidence=0.5)) if different_version else old
-    )
+    changed = replace(old, context=replace(old.context, confidence=0.5))
     second = replace(first, memory_id="second", history=(changed,))
     payload = _formation_content((first, second))
     assert isinstance(payload, str)
@@ -416,7 +411,7 @@ def test_adapter_assigns_private_aliases_to_each_targets_snapshot_of_one_record(
     aliases = tuple(item["read_only_history"][0]["observation_id"] for item in observations)
     assert aliases[0] != aliases[1]
     details = observations[1]["read_only_history"][0]["context"]
-    assert details["confidence"] == (0.5 if different_version else 1.0)
+    assert details["confidence"] == 0.5
     assert details["recorded_at"] == old.context.recorded_at.isoformat()
     for private in (True, False):
         response = json.dumps(

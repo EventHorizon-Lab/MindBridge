@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager, suppress
 from contextvars import Context, copy_context
 from datetime import datetime
 from time import monotonic, perf_counter_ns
-from typing import Annotated, Any, Literal, Protocol, cast
+from typing import Annotated, Literal, Protocol, TypeVar, cast
 
 from fastapi import APIRouter, FastAPI, Query, Request, Response, status
 from fastapi import Path as PathParameter
@@ -108,6 +108,7 @@ _HTTP_TTFH = "mindbridge.transport.server_time_to_headers_ms"
 _HTTP_TTFB = "mindbridge.transport.server_time_to_first_body_byte_ms"
 _HTTP_TOTAL = "mindbridge.transport.server_total_ms"
 _STREAM_EXHAUSTED = object()
+_FutureResult = TypeVar("_FutureResult")
 
 
 class MemoryCreate(StrictModel):
@@ -1003,7 +1004,7 @@ def _v1_router(  # noqa: C901 - one literal public route registry
         status.HTTP_502_BAD_GATEWAY,
     )
     not_found_errors = error_responses(*standard_statuses, status.HTTP_404_NOT_FOUND)
-    streaming_errors = {
+    streaming_errors: dict[int | str, dict[str, object]] = {
         **model_errors,
         status.HTTP_200_OK: {
             "description": "SSE answer deltas followed by one grounded result event",
@@ -1188,8 +1189,8 @@ def _add_gated_routes(
     identity_operations: bool,
     embodied_operations: bool,
     standard_statuses: tuple[int, ...],
-    standard_errors: dict[int | str, dict[str, Any]],
-    not_found_errors: dict[int | str, dict[str, Any]],
+    standard_errors: dict[int | str, dict[str, object]],
+    not_found_errors: dict[int | str, dict[str, object]],
 ) -> None:
     """Register the opt-in identity and embodied routes, split out to keep `_v1_router` readable."""
     if embodied_operations:
@@ -1213,8 +1214,8 @@ def _add_capture_routes(
     router: APIRouter,
     current_service: Callable[[], _Memory],
     *,
-    model_errors: dict[int | str, dict[str, Any]],
-    standard_errors: dict[int | str, dict[str, Any]],
+    model_errors: dict[int | str, dict[str, object]],
+    standard_errors: dict[int | str, dict[str, object]],
 ) -> None:
     """Register the fast-capture plane: `capture`, `settle`, and `pending_captures`.
 
@@ -1280,7 +1281,7 @@ def _add_embodied_routes(
     router: APIRouter,
     current_service: Callable[[], _Memory],
     *,
-    responses: dict[int | str, dict[str, Any]],
+    responses: dict[int | str, dict[str, object]],
 ) -> None:
     """Register `analyze_speech` and `analyze_faces`, gated by the host's `embodied_operations`."""
 
@@ -1307,8 +1308,8 @@ def _add_identity_routes(
     router: APIRouter,
     current_service: Callable[[], _Memory],
     *,
-    not_found_errors: dict[int | str, dict[str, Any]],
-    standard_errors: dict[int | str, dict[str, Any]],
+    not_found_errors: dict[int | str, dict[str, object]],
+    standard_errors: dict[int | str, dict[str, object]],
 ) -> None:
     """Register naming, reading, unlinking, and erasing identities.
 
@@ -1447,7 +1448,7 @@ async def _first_chunk_or_disconnect(
             await disconnected
 
 
-def _discard_future_result(future: asyncio.Future[Any]) -> None:
+def _discard_future_result(future: asyncio.Future[_FutureResult]) -> None:
     with suppress(BaseException):
         future.result()
 
@@ -1570,7 +1571,7 @@ def _add_context_route(
     router: APIRouter,
     current_service: Callable[[], _Memory],
     *,
-    responses: dict[int | str, dict[str, Any]],
+    responses: dict[int | str, dict[str, object]],
 ) -> None:
     """Register the compiler route, split out only to keep `_v1_router` readable."""
 

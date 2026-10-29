@@ -1022,10 +1022,6 @@ class _MediaFinder:
         return self._index
 
 
-def _find_media(root: Path, *names: str) -> Path:
-    return _MediaFinder(root)(*names)
-
-
 def _grid(end: float, forced: Sequence[float]) -> tuple[float, ...]:
     if end <= 0:
         raise ValueError("selected video horizon must be positive")

@@ -241,6 +241,14 @@ class RecallReader(Protocol):
 
     def entity(self, name: str, *, max_rows: int) -> RecallRows: ...
 
+    def chronological(self, rows: Sequence[SearchHit]) -> tuple[SearchHit, ...]:
+        """Merge selected rows in authoritative event-time and corpus order.
+
+        Event timestamps can tie across several reads. Only the reader's source knows their
+        original order; record IDs and creation timestamps are not sequence numbers.
+        """
+        ...
+
     def time_span(self, rows: Sequence[SearchHit]) -> tuple[datetime, datetime] | None:
         """The half-open span these rows cover: event times and the dates their text states.
 
@@ -358,19 +366,18 @@ def execute(
     return RecallResult(
         plan=plan,
         executed=tuple(executed),
-        exhaustive=tuple(sorted(exhaustive.values(), key=_chronological)),
+        exhaustive=reader.chronological(tuple(exhaustive.values())) if exhaustive else (),
         ranked=tuple(hit for hit in ranked.values() if hit.id not in exhaustive),
         active_records=active_records,
     )
 
 
 def recall_note(result: RecallResult, *, omitted: int = 0) -> str:
-    """State the program and whether its evidence is a complete set.
+    """State read completeness without deciding the question's semantic answer set.
 
-    A count or a list is only licensed by completeness, and the reader cannot see the predicate
-    that produced its evidence. So the reads are named, and either the set is declared complete
-    or the shortfall is: measured, an answerer given an incomplete set with no warning states a
-    total for it anyway.
+    Predicate rows, ranked anchors and neighbors can all supply answer-set members. The read's
+    row count is not their semantic count, and an omitted or bounded read still needs its
+    shortfall stated so a reader cannot silently treat partial evidence as a complete history.
     """
     reads = "; ".join(
         _step_note(step, outcome, result.active_records)
@@ -378,8 +385,10 @@ def recall_note(result: RecallResult, *, omitted: int = 0) -> str:
     )
     if result.complete and not omitted:
         completeness = (
-            "The evidence below is every record those reads matched, in time order, so a count "
-            "or a list over those records is complete."
+            "All records returned by the executed predicate reads are shown below, in corpus "
+            "time order. Those reads are complete for their predicates; this does not "
+            "automatically make them the question's complete answer set. Determine which "
+            "supplied records satisfy the question and the requested counting or listing unit."
         )
     elif not result.exhaustive and any(step.non_selective for step in result.executed):
         # Every predicate matched too much of the corpus to enumerate, so there is no matched set
@@ -399,12 +408,21 @@ def recall_note(result: RecallResult, *, omitted: int = 0) -> str:
             f"{shortfall}, so the matched records are not a complete set: answer from what is "
             "shown and do not state a total."
         )
-    # The matched records never replace the ranking's own window, so the reader is holding both
-    # and has to be told which is which: a top-ranked record is not a record the predicate
-    # matched, and counting one as if it were is the same wrong total by another route.
+    # Read provenance does not decide answer membership. In particular, neighbors exclude their
+    # anchors, so counting only that read can miss a matching anchor retained by the ranking.
+    neighbors = (
+        " Neighbor reads exclude their anchors; supplied anchors may still satisfy the "
+        "question and belong in its answer set."
+        if any(step.op == "neighbors" for step in result.plan.steps)
+        else ""
+    )
+    ranked_position = (
+        "" if result.plan.shape == "sequence" else "Top-ranked records follow the matched records. "
+    )
     return (
-        f"Recall program ({result.plan.shape}): {reads}. {completeness} The top-ranked records "
-        "for the question follow them, and are not part of what those reads matched."
+        f"Recall program ({result.plan.shape}): {reads}. {completeness} {ranked_position}"
+        "Retrieval route does not determine answer-set membership: "
+        f"a ranked record may also satisfy the question.{neighbors}"
     )
 
 
@@ -518,11 +536,6 @@ def _run(
     if step.name is None:
         return RecallRows((), 0)
     return reader.entity(step.name, max_rows=step.max_rows)
-
-
-def _chronological(hit: SearchHit) -> tuple[datetime, str]:
-    """Order exhaustive rows the way a timeline reads, with the ID as the stable tie-break."""
-    return (hit.occurred_at or hit.created_at, hit.id)
 
 
 def _document(payload: str) -> Mapping[str, object] | None:

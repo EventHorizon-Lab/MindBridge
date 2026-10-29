@@ -86,6 +86,7 @@ Memory(
     evidence_budget_chars: int | None = 24_000,
     recall_planning: bool = False,
     recall_query_expansion: bool = False,
+    query_vision: bool = False,
     recall_set_budget_chars: int = 30_000,
     recall_set_max_rows: int = 60,
     recall_rounds: int = 2,
@@ -129,9 +130,14 @@ A plain `TranscriptionBackend` transcribes supported audio/video during `add` re
 evidence expansion follows stored links without another model call. Their budgets and retry-round
 rules are defined in [local memory settings](../configuration.md#local-memory-settings).
 `recall_query_expansion=True` additionally executes planner `similar.query` strings as bounded
-text searches, including point plans. It requires planning, preserves the original grounding,
-and remains experimental and disabled by default. It adds query embedding calls in dense/hybrid
+text searches, including point plans. It requires planning, preserves the original `limit`
+window and matched sets, and packs new evidence before the optional ranked tail. It remains
+experimental and disabled by default. It adds query embedding calls in dense/hybrid
 mode; lexical mode uses full-text search only. No HTTP endpoint or MCP tool schema changes.
+`query_vision=True` uses an already-configured image-capable `vision_describer` to add temporary
+query-image description and OCR routes to `search`, `ask`, and `compile`. Native query media stay
+intact; descriptions are cached only inside the operation and create no durable memory, identity,
+or caption rows. A missing backend or a failed description leaves the original routes in place.
 `memory_budget_records` and the query-failure settings govern control-plane candidates.
 `retention` is inert until `apply_retention()` runs. `independent_evidence` selects an experimental
 store-pinned projection and requires a fresh directory when changing an existing store's policy.
@@ -140,8 +146,9 @@ store-pinned projection and requires a fresh directory when changing an existing
 image-only memory is reachable by the dense route alone. It is selected by the declarative `vision`
 slot, which stays off unless it is configured, or supplied directly through `MemoryPlugins`; see
 [configuration](../configuration.md#visual-descriptions). The bundled `OpenAIModels.describe`
-captions one batch per chat completion, sends a video as four locally decoded stills rather than
-the file, accepts only exactly one non-empty caption per input, and retries one malformed reply
+captions one batch per chat completion, sends a video as locally decoded stills rather than
+the file (`vision_video_frames=4`, configurable from 2 to 64), accepts only exactly one non-empty
+caption per input, and retries one malformed reply
 once. A describer failure never fails the write: the memory is stored without a caption and the
 batch is counted on the vision span as `mindbridge.vision.failed_batches`.
 
@@ -447,10 +454,19 @@ the provider's own deltas, marker included; the terminal `AnswerResult` carries 
 answer, so render a stream on `abstained` rather than on the text.
 
 `ask_stream()` yields the deltas of one answer, never of two. With `recall_planning` on, a
-`"best_effort"` answer the answerer flagged as thin buys a second round, and a round another
-round may replace is held rather than streamed: the concatenated deltas are always the answer the
-terminal `AnswerResult` carries. The cost is that round's time to first token, paid only where a
-replan is possible -- never under `strict`, and never on the last round.
+`"best_effort"` answer the answerer flagged as thin can buy another round within `recall_rounds`.
+With `recall_query_expansion=True`, a `"strict"` abstention can also trigger internal replanning.
+This experimental mode gives the planner a JSON evidence note capped at 6000 characters, with
+local source aliases, source IDs, event dates, record excerpts and explicit untrusted-data and
+omission markers. Each excerpt is at most 1500 characters; records are deduplicated by ID.
+Successful query routes remain eligible in later rounds in discovery order, so a new query can
+retain an earlier bridge fact. They reuse cached results and share the same character/media
+budget and per-query window. The original scope, temporal intent and shared two-query ceiling
+still apply. Ordinary planning
+keeps its count/date summary and best-effort-only retries. A round another round may replace is
+held rather than streamed: the concatenated deltas are always the answer the terminal
+`AnswerResult` carries. The cost is that round's time to first token; the last round streams
+without waiting for a possible replacement.
 
 `ask` may run face recognition on a retrieved photo or video to identify who appears in it before
 answering. With the default `link_identities=True`, a voice-and-face pair corroborated across
@@ -1146,7 +1162,7 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 127 supported names exported by `mindbridge`:
+These are the 128 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
@@ -1157,7 +1173,7 @@ These are the 127 supported names exported by `mindbridge`:
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums and literal aliases | `AnswerPolicy`, `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `ContextSymbolNamespace`, `ContextSymbolCoverage`, `ContextSymbolRole`, `AbstentionReason`, `IndexQuantization`, `RetrievalMode`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
-| Bundled adapters | `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
+| Bundled adapters | `SentenceTransformersEmbedder`, `OpenAIModels`, `OfflineGazetteer`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
 
 ### Public values
@@ -1368,6 +1384,9 @@ reports an incomplete window. History IDs are unique and exclude the primary tar
 formers can ignore the default empty history; enabling it requires a former that can reason over
 the supplied state and cite the actual sources. Retired background may inform interpretation but
 cannot support a new affirmative proposal. Cited history is revalidated atomically at commit.
+If canonical identity reuse makes a proposal cite its own output as evidence, the whole proposal
+is refused and counted; other valid proposals and the committed source are retained. The kernel
+never removes just the self-citation to manufacture a different support clause.
 Jointly cited sources retain place and metadata only when every cited source agrees on the entire
 value, including the whole metadata mapping. Uncited background does not affect inheritance.
 `consolidate` receives the bounded evidence set the kernel chose and may cite only IDs from it;
@@ -1461,6 +1480,9 @@ FunASRTranscriber(
     recipe: FunASRRecipe = DEFAULT_FUNASR_RECIPE,
     *,
     device: str = "auto",
+    ncpu: int = 4,
+    vad_device: str | None = None,
+    speaker_device: str | None = None,
 )
 
 FunASRRecipe(
@@ -1502,6 +1524,11 @@ encoder must expose an immutable `_commit_hash` in its model configuration or re
 that license covers the weights, not MindBridge. `DEFAULT_FUNASR_MODEL_ID` and
 `DEFAULT_FUNASR_RECIPE` publish the default speech recipe.
 `FunASRRecipe.auto_model_arguments() -> dict[str, object]` returns its standard FunASR composition.
+The transcriber uses an immutable FunASR main revision; its transcription space includes that
+revision and the complete recipe. `ncpu` bounds process-wide PyTorch and BLAS threads;
+`vad_device` and `speaker_device` optionally place those submodels separately from ASR.
+Execution placement does not change the transcription space. Stores created with the previous
+runtime require a fresh directory and replay. See [local speech configuration](../configuration.md#local-speech-with-funasr).
 
 For `google/embeddinggemma-2`, the generic loader uses FP32 and supports `128`, `256`, `512`, or
 `768` dimensions without requiring optional Matryoshka metadata. Query and document prompts come
@@ -1542,6 +1569,10 @@ OpenAIModels(
     generation_stream: bool = False,
     generation_media_policy: Literal["all", "on_demand"] = "all",
     generation_media_max_items: int = 2,
+    generation_answer_style: Literal["default", "concise"] = "default",
+    vision_video_frames: int = 4,
+    image_max_pixels: int | None = None,
+    generation_gazetteer: OfflineGazetteer | None = None,
 )
 ```
 
@@ -1555,6 +1586,117 @@ endpoints. Transcription prompt, keywords, and languages form the provider hint.
 `generation_min_video_seconds` converts shorter videos to four ordered stills when image generation
 capability is available; `generation_video_limit` caps retrieved evidence videos but not question
 media. `generation_extra_body` is forwarded to the SDK request.
+`vision_video_frames` selects 2 through 64 ordered stills for visual descriptions, including the
+last frame; declarative configuration calls it `vision.video_frames`. A non-default count changes
+the visual-description recipe and cache identity. It does not change the four-frame
+`generation_min_video_seconds` fallback.
+
+`generation_answer_style="concise"` asks for only the answer's requested entities, relations,
+values or list items, matching the question's output format and omitting explanations, citations
+and introductory phrases. Time expressions are still resolved internally; dates and durations
+are stated only when requested. The default `"default"` preserves the existing reader prompt
+byte for byte. Both styles preserve strict and best-effort abstention semantics. Declarative
+configuration exposes this as `generation.answer_style`; it affects answering only and requires
+task-specific quality evaluation before relying on it.
+
+`image_max_pixels` accepts an integer from 1 through 64,000,000, default `None`, and applies to
+embedding, visual description, and answering on this adapter. Oversized images are converted only
+for the current request to EXIF-oriented RGB JPEG and resized proportionally to fit the pixel and
+inline byte bounds. Ordinary images that fit retain their native request bytes; source assets
+and durable records remain unchanged. The adapter rejects source images above 64 million pixels
+before decoding and checks the actual outbound bytes. Fine detail can be reduced. The setting
+participates in embedding and visual-description identities, including an explicit
+`embedding_space`; use a fresh data directory when enabling or changing it for persisted work.
+See [image transport](../configuration.md#provider-fields) for failure and encoding behavior.
+
+Answering and visual description also read a bounded EXIF allowlist from the original image:
+validated GPS latitude/longitude and capture time, with its explicit UTC offset when present.
+These travel as `untrusted_source_metadata` beside the attachment label, including for query
+images. Capture time without an offset remains local time; it does not replace caller-supplied
+`occurred_at`. Camera identifiers, comments, and other free-form EXIF text are excluded. No
+address is inferred or looked up unless the answer-only offline gazetteer is explicitly enabled.
+Invalid metadata is omitted without rejecting valid pixels;
+metadata-bearing source bytes must still match the asset SHA. Resizing does not remove this
+input because extraction uses the original asset. No fields are written to durable records or
+added to `AssetRef`. Existing stores can use this answer input without re-ingestion. The caption
+recipe identity changes to account for this new input; embedding identity is unchanged.
+
+### Offline gazetteer
+
+```python
+from mindbridge import Modality, OfflineGazetteer, OpenAIModels
+
+gazetteer = OfflineGazetteer(
+    "/absolute/path/named-geometries.sqlite3",
+    index_sha256="<complete lowercase SHA256>",
+    radius_m=500,
+    limit=8,
+    budget_chars=16000,
+)
+answerer = OpenAIModels(
+    generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
+    generation_gazetteer=gazetteer,
+)
+```
+
+Declare the modalities supported by the provider. Pass the answerer through the existing `Memory` constructor or
+`MemoryPlugins`. Declarative configuration exposes the same resource through
+`generation.offline_gazetteer`; see [configuration](../configuration.md#provider-fields).
+Install `mindbridge[openai,gazetteer]`; importing `mindbridge` does not import Shapely or pyproj.
+
+`OfflineGazetteer.nearby(latitude, longitude)` returns a detached dictionary with `status`,
+`candidates`, source/license provenance, `global_complete=False` and
+`photo_identity_confidence="unknown"`. Candidate fields include OSM type/ID, kind, geometry type,
+original names and aliases, explicit address tags, metric distance, coverage/boundary flags and
+spatial relation. Names and map data are untrusted. Proximity refers to the recorded coordinate,
+not an assertion about what a photo depicts. The source snapshot may postdate capture.
+`provenance` returns a detached dictionary; `index_sha256` and `budget_chars` are read-only
+properties. No persistent database connection is held between lookups. Multiple instances may
+share this immutable external index; it is not a MindBridge `data_dir` or an isolation boundary.
+
+The single-region v1 index has SQLite tables `metadata(key,value)`,
+`features(id,osm_type,osm_id,kind,tags_json,geometry_wkb)` and RTree
+`bounds(id,min_lon,max_lon,min_lat,max_lat)`. Metadata values are JSON. Its recipe is exactly
+`offline-osm-named-geometries-v1-aeqd-wgs84-step0005`; source geometry must be densified to at
+most 0.0005 degrees. Source metadata requires an HTTPS URL, source SHA256, ISO snapshot date,
+`extract_bbox_lonlat` and optional header fields. Attribution is
+`© OpenStreetMap contributors; ODbL 1.0`, with license URL
+`https://www.openstreetmap.org/copyright`. The index declares
+`geometry_segment_max_degrees=0.0005` and `complete_world_or_region_map=false`.
+No alternate schema is migrated or guessed, and the SDK does not build an index from raw OSM.
+
+A multi-region index uses the explicit recipe
+`offline-osm-named-geometries-v2-aeqd-wgs84-step0005`. Its `features` table adds
+`source_index` after the six v1 columns; `bounds` is unchanged. Metadata replaces `source`
+with `sources`, an ordered list of at least two complete source mappings with the same
+provenance fields described above. Mixing `source` and `sources`, an invalid source index,
+or duplicate `(osm_type, osm_id)` features rejects the index. Each feature belongs to exactly
+one source; the adapter does not choose between duplicate copies of an OSM feature.
+
+The constructor is unchanged. For v2, `nearby` and `provenance` return the complete `sources`
+list instead of `source`, and each candidate carries its original zero-based `source_index`.
+A lookup first admits sources whose own extract bounds contain the coordinate, then sorts
+their geometry candidates together by distance before applying the same candidate limit.
+The answer context includes `map_sources` in stable source-index order for only the sources
+represented by the candidates actually admitted under the budget. Each entry identifies its
+source index, URL, PBF SHA, snapshot date and replication timestamp; there is no synthesized
+single date or source file. Source headers and candidates share the character budget,
+including every repeated metadata occurrence. V1 retains its existing single-source fields.
+
+Supply a complete, checkpointed main SQLite snapshot and keep it immutable. Only that main file
+is SHA-verified and queried, using SQLite's immutable read-only mode; adjacent WAL/SHM files
+are ignored. Its file identity, size and modification time are subsequently checked, including
+cached lookups.
+Invalid options, missing dependencies, index or provenance raise
+`ValidationError`; changed/unavailable indexes and SQLite read failures raise `StorageError`.
+Coordinates and provider bodies are not logged. A lookup exceeding 10000 prefilter features or
+32 MiB of geometry returns unknown with `lookup_incomplete=True`, rather than claiming that a
+partial scan found the nearest place. Empty/out-of-region results also remain unknown.
+The added map context has a separate whole-candidate character budget; the existing total answer
+byte bound remains in force. Enabling this resource changes the available external knowledge,
+requires task-specific quality evaluation and must be declared in comparisons.
+
+The [multimodal recall guide](../grounded-multimodal-recall.md) documents media fitting and limits.
 
 `generation_response_format="json_schema"` sends strict schemas for structural model operations:
 formation, consolidation, visual descriptions, media diagnosis, and recall planning. The default
@@ -1598,11 +1740,16 @@ transcribe(assets: Sequence[AssetRef]) -> tuple[str, ...]
 close() -> None
 ```
 
-OpenAI requests inline at most 20 MiB of base64 data per media item and 64 MiB in aggregate. Because
-base64 expands input, that is roughly 15 MiB per source file and 48 MiB per call on disk. Grounded
-answer text is capped at 4 MiB. Answer fitting reserves media capacity for the question, keeps
-highest-ranked evidence that fits, and leaves overflow evidence as text when possible; use a
-provider-specific upload adapter for larger media.
+OpenAI requests inline at most 20 MiB per media data URL and 64 MiB of aggregate base64 data.
+Untransformed files therefore fit roughly 15 MiB per item and 48 MiB per call on disk. Embedding
+replaces an oversized video with four locally decoded ordered stills; a video that cannot be
+decoded within the outbound bounds raises `ModelError`. Answering can replace an oversized video
+with sixteen ordered stills when image generation capability is available. Answer requests label
+the sampled video and state that motion, audio, and exact timing are unavailable; stored assets
+remain unchanged. The image pixel setting above also allows large source images to fit by
+conversion. Grounded answer text is capped at 4 MiB. Answer fitting reserves media capacity for
+the question, keeps highest-ranked evidence that fits, and leaves overflow evidence as text when
+possible. Use a provider-specific upload adapter when the original media must be supplied whole.
 
 Named recipes are available through the supported `mindbridge.recipes` submodule, not as a root
 re-export:
