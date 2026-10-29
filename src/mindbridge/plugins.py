@@ -142,6 +142,8 @@ class MemoryConfig:
     # Experimental query execution for similar steps, bounded across all rounds of one ask.
     # Default recall programs reuse the original question's ranking.
     recall_query_expansion: _StrictBool = False
+    # Describe query images transiently for text retrieval, retaining their native image keys.
+    query_vision: _StrictBool = False
     # How many characters of evidence a set, sequence or entity plan may add to the ranked
     # window. A point question keeps `limit` (and `evidence_budget_chars`); a question that asks
     # for every matching record needs more than a window of that width, and this is what bounds
@@ -155,10 +157,10 @@ class MemoryConfig:
     # rather than silently thinned. It bounds the matched set only; the ranked window is outside
     # it. Only read when `recall_planning` is on.
     recall_set_max_rows: _PositiveInt = 60
-    # How many plan-and-answer rounds one `ask` may spend. The second round exists for the case
-    # the first round's own answer diagnoses -- a low-confidence guess under
-    # `answer_policy="best_effort"` -- and it replans against what the first round read. `1`
-    # disables it. Only read when `recall_planning` is on.
+    # How many plan-and-answer rounds one `ask` may spend. A later round replans against the
+    # evidence and answer from the previous one: a low-confidence best-effort answer, or a
+    # strict abstention when query expansion is enabled. `1` disables it. Only read when
+    # `recall_planning` is on.
     recall_rounds: _PositiveInt = 2
     # Whether the grounding window is widened with the records it is structurally linked to: the
     # capture an observation was committed under, a recognized person, a symbolic place, a claim's

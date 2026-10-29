@@ -117,6 +117,7 @@ class OpenAIEmbeddingConfig(_OpenAIConfig):
     # values rather than deferring them to the first `add`.
     modalities: Annotated[frozenset[Modality], Field(min_length=1)] = frozenset({Modality.TEXT})
     request_format: Literal["input", "messages"] = "input"
+    image_max_pixels: Annotated[int, Field(strict=True, ge=1, le=64_000_000)] | None = None
 
 
 class SentenceTransformersEmbeddingConfig(_ConfigModel):
@@ -142,6 +143,8 @@ class _OpenAICompletionConfig(_OpenAIConfig):
 
 
 class OpenAIGenerationConfig(_OpenAICompletionConfig):
+    answer_style: Literal["default", "concise"] = "default"
+    image_max_pixels: Annotated[int, Field(strict=True, ge=1, le=64_000_000)] | None = None
     video_limit: _PositiveInt | None = 8
     # Below this duration a video is answered as four ordered stills instead. The option already
     # existed on `OpenAIModels` and was unreachable from configuration, which left every caller
@@ -159,9 +162,9 @@ class OpenAIFormationConfig(_OpenAICompletionConfig):
     Formation is a separate LLM round-trip on the write path and usually wants its own model,
     token budget, and endpoint, so it is its own slot rather than a reuse of `generation`;
     leaving the slot out keeps that round-trip off, which is the default. It reads the same
-    completion knobs as generation, inherited here — `video_limit` is answer-only, so it is
-    absent, and `formation_model` and `formation_space` on the adapter are derived from exactly
-    these values, so there is nothing formation-specific to add.
+    completion knobs as generation, inherited here. `video_limit` is answer-only;
+    `image_max_pixels` bounds native image transport without changing the observation.
+    `formation_model` and `formation_space` are derived from these values.
 
     Two inherited fields matter more here than they do for answering. `modalities` becomes
     `formation_capabilities`, which gates which observations reach the former at all: an
@@ -170,6 +173,8 @@ class OpenAIFormationConfig(_OpenAICompletionConfig):
     And formation returns JSON, so a `max_tokens` truncation is a hard error rather than a
     partial parse.
     """
+
+    image_max_pixels: Annotated[int, Field(strict=True, ge=1, le=64_000_000)] | None = None
 
 
 class OpenAIVisionConfig(_OpenAICompletionConfig):
@@ -191,6 +196,8 @@ class OpenAIVisionConfig(_OpenAICompletionConfig):
     """
 
     modalities: Annotated[frozenset[Modality], Field(min_length=1)] = frozenset({Modality.IMAGE})
+    video_frames: Annotated[int, Field(strict=True, ge=2, le=64)] = 4
+    image_max_pixels: Annotated[int, Field(strict=True, ge=1, le=64_000_000)] | None = None
 
     @field_validator("modalities")
     @classmethod
@@ -398,6 +405,8 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
         )
         if config.space is not None:
             values["embedding_space"] = config.space
+        if config.image_max_pixels is not None:
+            values["image_max_pixels"] = config.image_max_pixels
         return _openai_factory(values)
     return SentenceTransformersEmbedder(
         model_id=config.model,
@@ -430,6 +439,10 @@ def _completion_values(config: _OpenAICompletionConfig) -> dict[str, object]:
 
 def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
     values = _completion_values(config)
+    if config.answer_style != "default":
+        values["generation_answer_style"] = config.answer_style
+    if config.image_max_pixels is not None:
+        values["image_max_pixels"] = config.image_max_pixels
     if config.video_limit != 8:
         values["generation_video_limit"] = config.video_limit
     if config.min_video_seconds is not None:
@@ -443,12 +456,20 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
 
 def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
     # The bundled adapter reads the generation controls for `form`; `video_limit` is answer-only.
-    return _openai_factory(_completion_values(config))
+    values = _completion_values(config)
+    if config.image_max_pixels is not None:
+        values["image_max_pixels"] = config.image_max_pixels
+    return _openai_factory(values)
 
 
 def _build_vision(config: OpenAIVisionConfig) -> VisionDescriptionBackend:
     # `describe` reads the same generation controls; its capability set is the visual one.
-    return _openai_factory(_completion_values(config))
+    values = _completion_values(config)
+    if config.video_frames != 4:
+        values["vision_video_frames"] = config.video_frames
+    if config.image_max_pixels is not None:
+        values["image_max_pixels"] = config.image_max_pixels
+    return _openai_factory(values)
 
 
 def _build_consolidation(

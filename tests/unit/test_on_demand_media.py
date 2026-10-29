@@ -186,7 +186,9 @@ def test_provider_rejection_does_not_diagnose_again_or_lose_original_omissions(
         else:
             assert "response_format" not in payload
             evidence = json.loads(payload["messages"][1]["content"])["hits"][0]
+            assert evidence["source_modality"] == "image"
             assert evidence["media_omitted"] == {"image": 2}
+            assert "media_modalities" not in evidence
             assert "time order" in payload["messages"][0]["content"]
             content = "answer"
         return httpx.Response(

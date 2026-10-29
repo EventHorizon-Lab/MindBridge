@@ -314,6 +314,26 @@ class RecallReads:
             dropped=dropped,
         )
 
+    def order_memory_ids(self, memory_ids: Sequence[str]) -> tuple[str, ...]:
+        """Order selected active IDs by event time and SQLite insertion position.
+
+        Several bounded recall reads can overlap or discover same-time rows in reverse order.
+        Merge their already-scoped IDs without exposing rowid as a public record field.
+        """
+        candidates = tuple(dict.fromkeys(memory_ids))
+        for memory_id in candidates:
+            require_identifier(memory_id, "memory_id")
+        if not candidates:
+            return ()
+        with self._connections.read_transaction() as connection:
+            return self._ordered_candidates(
+                connection,
+                candidates,
+                place_id=None,
+                identity_clause="",
+                identity_parameters=(),
+            )
+
     def _ordered_candidates(
         self,
         connection: Connection,

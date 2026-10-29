@@ -101,10 +101,10 @@ In this table, connection fields are `base_url`, `api_key`, `timeout`, and `max_
 | Slot and provider | Required | Optional defaults |
 | --- | --- | --- |
 | `embedding: sentence-transformers` | `model` | `revision=None`, `dimension=None`, `device=None`, `batch_size=32` |
-| `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
-| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
-| `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
-| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
+| `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, `image_max_pixels=None`, plus connection fields |
+| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `video_limit=8`, `min_video_seconds=None`, `answer_style=default`, `image_max_pixels=None`, `extra_body=None`, plus connection fields |
+| `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `image_max_pixels=None`, `extra_body=None`, plus connection fields |
+| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `video_frames=4`, `image_max_pixels=None`, `extra_body=None`, plus connection fields |
 | `consolidation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
@@ -551,6 +551,11 @@ consolidator may propose and what the kernel refuses.
 
 ## Local memory settings
 
+The opt-in `settings.query_vision` flag, `generation.answer_style`, per-OpenAI-slot
+`image_max_pixels`, and `vision.video_frames` controls are documented in
+[grounded multimodal recall](grounded-multimodal-recall.md). Their defaults preserve the existing
+query path and reader style; enabling query vision adds model work on image queries.
+
 The `settings` mapping is the value-only `MemoryConfig` policy:
 
 | Field | Default | Meaning |
@@ -562,11 +567,12 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1`, including lexical matches |
 | `evidence_budget_chars` | `24000` | Soft budget for widening `ask` grounding; mandatory `limit` hits survive even when over budget. `None` disables ranked-tail expansion; planning and linked expansion may still add records. No provider token guarantee |
 | `recall_planning` | `False` | Ask the answerer for a recall plan before retrieving, and ground on the set, sequence or entity it names; off means `ask` runs the one search it always has. An answerer without `plan_recall` cannot plan: the store logs one warning when it opens and every question runs that same search |
-| `recall_query_expansion` | `False` | Experimental execution of `similar.query` when planning is on. At most two additional searches per `ask`, shared across steps and replans; each caches up to 100 ranked hits and may append at most `limit` novel hits after existing grounding. See the controls below |
+| `recall_query_expansion` | `False` | Experimental execution of `similar.query` when planning is on. At most two additional searches per `ask`, shared across steps and replans; each caches up to 100 ranked hits and offers at most `limit` novel hits within shared budgets. See the controls below |
+| `query_vision` | `False` | Describe query images transiently through the configured vision backend, adding description and visible-text search routes alongside native image retrieval; text-only queries add no vision work |
 | `recall_set_budget_chars` | `30000` | Soft character allowance used to pack a plan's additions after charging its mandatory window, narrowed by `evidence_budget_chars` when set. Also bounds experimental semantic additions; a point plan without query expansion keeps its normal ranked window. Read only when `recall_planning` is on |
 | `recall_set_max_rows` | `60` | Matched rows a set, sequence or entity plan may add at all, whatever the character budget leaves room for; the rows past it are reported as not shown, so the set is declared incomplete. Bounds the matched set only. Read only when `recall_planning` is on |
-| `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; the second runs only when the first answer was a low-confidence guess under `answer_policy="best_effort"`. `1` disables it. Read only when `recall_planning` is on |
-| `evidence_expansion` | `False` | Widen `ask` grounding with the records the grounded evidence is structurally linked to -- same capture, recognized person, symbolic place, claim lineage, or evidence edge. Costs no model call: the edges are columns the kernel already wrote. Linked rows spend budget the ranking left unspent; experimental semantic additions follow them |
+| `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; a later round requires an abstention. Best-effort answers may replan, and strict answers may replan when `recall_query_expansion` is enabled. `1` disables it. Read only when `recall_planning` is on |
+| `evidence_expansion` | `False` | Widen `ask` grounding with the records the grounded evidence is structurally linked to -- same capture, recognized person, symbolic place, claim lineage, or evidence edge. Costs no model call: the edges are columns the kernel already wrote. Linked rows spend remaining budget after selected semantic routes when query expansion adds evidence |
 | `evidence_expansion_max_rows` | `24` | Linked records one expansion may add, whatever `evidence_budget_chars` leaves room for; the media rows among them stop earlier still, at twice the ask's own `limit`. Read only when `evidence_expansion` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
@@ -599,10 +605,12 @@ The cache and ceiling reset at the next `ask`. Whitespace at the ends is ignored
 
 All searches preserve the caller's scope, memory type, reference time and original inferred
 temporal intent; rewrites cannot widen visibility or replace query media. Semantic additions
-follow existing grounding, deduplicate by record ID and stop at `limit` novel rows per query.
+deduplicate by record ID and stop at `limit` novel rows per query. Successful routes remain
+eligible across rounds and take turns offering rows before the replaceable original ranked tail.
 Their combined character allowance is `min(recall_set_budget_chars, evidence_budget_chars)`
-when the latter is set, otherwise `recall_set_budget_chars`; the existing grounding is charged
-first and is preserved even if already over budget. Added media stop at twice `limit` rows.
+when the latter is set, otherwise `recall_set_budget_chars`; the original mandatory `limit`
+window is charged first and preserved even if already over budget. Predicate rows retain their
+own row/media limits and completeness accounting. Added media stop at twice `limit` rows.
 These are bounded rankings, never complete sets. No new model or service is configured by the
 switch. The [audit and evaluation](research/2026-10-27-semantic-recall.md) records the evidence
 and the real-model checks required before enabling it for a workload.

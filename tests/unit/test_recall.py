@@ -12,6 +12,7 @@ from mindbridge.recall import (
     _MAX_NEIGHBOR_ANCHORS,
     DEFAULT_MAX_ROWS,
     RecallPlan,
+    RecallResult,
     RecallRows,
     RecallStep,
     RecallStepResult,
@@ -101,6 +102,9 @@ class _Reader:
     def entity(self, name: str, *, max_rows: int) -> RecallRows:
         self.calls.append(("entity", (name, max_rows)))
         return self._answer("entity")
+
+    def chronological(self, rows: Sequence[SearchHit]) -> tuple[SearchHit, ...]:
+        return tuple(sorted(rows, key=lambda hit: hit.occurred_at or hit.created_at))
 
     def time_span(self, rows: Sequence[SearchHit]) -> tuple[datetime, datetime] | None:
         self.calls.append(("time_span", tuple(hit.id for hit in rows)))
@@ -373,6 +377,35 @@ def test_a_window_bound_to_an_earlier_step_reads_the_span_of_its_rows() -> None:
     )
 
 
+def test_execute_uses_the_reader_to_merge_same_time_rows_across_reads() -> None:
+    class OrderedReader(_Reader):
+        def chronological(self, rows: Sequence[SearchHit]) -> tuple[SearchHit, ...]:
+            by_id = {hit.id: hit for hit in rows}
+            # The source's order differs from both ID order and first discovery.
+            return tuple(by_id[key] for key in ("z-first", "m-middle", "a-last"))
+
+    reader = OrderedReader(
+        match=(_hit("a-last"), _hit("m-middle")),
+        window=(_hit("z-first"), _hit("a-last")),
+    )
+    plan = RecallPlan(
+        shape="sequence",
+        steps=(
+            RecallStep(op="match", terms=("event",)),
+            RecallStep(op="window", occurred_from=NOW, occurred_until=NOW + timedelta(days=1)),
+        ),
+    )
+
+    result = execute(plan, reader, limit=12, active_records=1_000)
+
+    assert [hit.id for hit in result.exhaustive] == ["z-first", "m-middle", "a-last"]
+    assert result.complete
+    note = recall_note(result)
+    assert "complete for their predicates" in note
+    assert "follow the matched records" not in note
+    assert "a ranked record may also satisfy the question" in note
+
+
 def test_a_match_bound_to_a_step_that_read_no_dated_rows_reads_nothing() -> None:
     """No span to derive means no read, never an unbounded one over the whole corpus."""
     undated = SearchHit(id="u-1", content="record", score=0.5, created_at=NOW)
@@ -512,6 +545,44 @@ def test_neighbors_anchor_on_the_rows_the_named_step_returned() -> None:
     assert [hit.id for hit in result.hits] == ["n-1", "m-1", "m-2"]
 
 
+@pytest.mark.parametrize("omitted,bounded", [(0, False), (1, False), (0, True)])
+def test_recall_note_distinguishes_read_completeness_from_answer_membership(
+    omitted: int, bounded: bool
+) -> None:
+    plan = RecallPlan(
+        shape="set",
+        steps=(RecallStep(op="similar", query="cards"), RecallStep(op="neighbors", of=0)),
+    )
+    result = execute(
+        plan,
+        _Reader(similar=(_hit("anchor"),), neighbors=(_hit("neighbor"),)),
+        limit=12,
+        active_records=1_000,
+    )
+    if bounded:
+        result = RecallResult(
+            plan=plan,
+            executed=(result.executed[0], RecallStepResult(op="neighbors", rows=1, bounded=True)),
+            exhaustive=result.exhaustive,
+            ranked=result.ranked,
+        )
+
+    note = recall_note(result, omitted=omitted)
+
+    assert "Neighbor reads exclude their anchors" in note
+    assert "supplied anchors may still satisfy the question" in note
+    assert "a ranked record may also satisfy the question" in note
+    assert "so a count or a list over those records is complete" not in note
+    if omitted or bounded:
+        assert "do not state a total" in note
+        assert "complete for their predicates" not in note
+    else:
+        assert "complete for their predicates" in note
+        assert "does not automatically make them the question's complete answer set" in note
+        assert "requested counting or listing unit" in note
+        assert "do not state a total" not in note
+
+
 def test_a_step_whose_anchor_read_nothing_reads_nothing_itself() -> None:
     reader = _Reader(neighbors=(_hit("n-1"),))
     plan = parse_recall_plan(
@@ -635,7 +706,7 @@ def test_a_non_selective_step_tells_the_reader_what_it_holds_instead() -> None:
 
     assert "records about Caroline matched too many records to enumerate (300 of 600)" in note
     assert "only the top-ranked records for the question are shown" in note
-    assert "every record those reads matched" not in note
+    assert "complete for their predicates" not in note
 
 
 def test_a_neighbors_step_anchors_on_a_bounded_head_of_what_it_follows() -> None:

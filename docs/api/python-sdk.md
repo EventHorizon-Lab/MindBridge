@@ -86,6 +86,7 @@ Memory(
     evidence_budget_chars: int | None = 24_000,
     recall_planning: bool = False,
     recall_query_expansion: bool = False,
+    query_vision: bool = False,
     recall_set_budget_chars: int = 30_000,
     recall_set_max_rows: int = 60,
     recall_rounds: int = 2,
@@ -129,9 +130,20 @@ A plain `TranscriptionBackend` transcribes supported audio/video during `add` re
 evidence expansion follows stored links without another model call. Their budgets and retry-round
 rules are defined in [local memory settings](../configuration.md#local-memory-settings).
 `recall_query_expansion=True` additionally executes planner `similar.query` strings as bounded
-text searches, including point plans. It requires planning, preserves the original grounding,
+text searches, including point plans. It requires planning, preserves the original limit-sized grounding window,
 and remains experimental and disabled by default. It adds query embedding calls in dense/hybrid
 mode; lexical mode uses full-text search only. No HTTP endpoint or MCP tool schema changes.
+With expansion enabled, strict abstentions may replan within `recall_rounds`, using bounded,
+untrusted excerpts of the evidence already read. Successful semantic routes remain eligible
+across rounds and share the same packing budget. Query-local scores never replace the original
+ranking. Sequence plans present the entire selected union in event-time and SQLite insertion
+order; this does not establish that every relevant event was retrieved.
+
+`query_vision=True` adds transient query-image descriptions and visible-text search routes through
+the configured image-capable vision backend. Native query images remain in retrieval and answering.
+Descriptions are cached only inside the operation and never become stored memories or descriptions.
+Failures preserve native retrieval; text-only queries add no vision request. See
+[grounded multimodal recall](../grounded-multimodal-recall.md) for costs and transport controls.
 `memory_budget_records` and the query-failure settings govern control-plane candidates.
 `retention` is inert until `apply_retention()` runs. `independent_evidence` selects an experimental
 store-pinned projection and requires a fresh directory when changing an existing store's policy.
@@ -140,7 +152,7 @@ store-pinned projection and requires a fresh directory when changing an existing
 image-only memory is reachable by the dense route alone. It is selected by the declarative `vision`
 slot, which stays off unless it is configured, or supplied directly through `MemoryPlugins`; see
 [configuration](../configuration.md#visual-descriptions). The bundled `OpenAIModels.describe`
-captions one batch per chat completion, sends a video as four locally decoded stills rather than
+captions one batch per chat completion, sends a video as `vision_video_frames` locally decoded stills (default four) rather than
 the file, accepts only exactly one non-empty caption per input, and retries one malformed reply
 once. A describer failure never fails the write: the memory is stored without a caption and the
 batch is counted on the vision span as `mindbridge.vision.failed_batches`.
@@ -1542,6 +1554,9 @@ OpenAIModels(
     generation_stream: bool = False,
     generation_media_policy: Literal["all", "on_demand"] = "all",
     generation_media_max_items: int = 2,
+    generation_answer_style: Literal["default", "concise"] = "default",
+    vision_video_frames: int = 4,
+    image_max_pixels: int | None = None,
 )
 ```
 
@@ -1555,6 +1570,13 @@ endpoints. Transcription prompt, keywords, and languages form the provider hint.
 `generation_min_video_seconds` converts shorter videos to four ordered stills when image generation
 capability is available; `generation_video_limit` caps retrieved evidence videos but not question
 media. `generation_extra_body` is forwarded to the SDK request.
+
+`generation_answer_style="concise"` requests only the entities, relations, values or list items
+asked for, preserving the selected answer policy. The default keeps the existing reader prompt.
+`vision_video_frames` accepts integers from 2 through 64. `image_max_pixels` accepts integers from
+1 through 64,000,000 or `None`; it bounds request-local image transport without changing the
+stored original. Explicit image bounds participate in embedding and derived-content identities.
+The [multimodal recall guide](../grounded-multimodal-recall.md) documents media fitting and limits.
 
 `generation_response_format="json_schema"` sends strict schemas for structural model operations:
 formation, consolidation, visual descriptions, media diagnosis, and recall planning. The default

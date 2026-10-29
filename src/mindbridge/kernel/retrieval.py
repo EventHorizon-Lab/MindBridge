@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import logging
 import re
 import unicodedata
 from collections.abc import Iterator, Sequence
@@ -14,6 +15,7 @@ from itertools import chain
 
 from opentelemetry.trace import Tracer
 
+from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local.scoring import max_cosine_part_scores, max_cosine_scores
 from mindbridge.infrastructure.local.zvec_index import IndexHit
 from mindbridge.kernel.content import PreparedContent
@@ -71,11 +73,13 @@ from mindbridge.kernel.validation import (
     validate_limit,
     validated_retrieval_scope,
 )
-from mindbridge.models.base import EmbedTask
+from mindbridge.kernel.vision import Vision
+from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import (
     ContentInput,
     IndexQuantization,
     MemoryType,
+    Modality,
     RetrievalCandidateTrace,
     RetrievalMode,
     RetrievalScope,
@@ -84,6 +88,8 @@ from mindbridge.types import (
 )
 
 RERANK_CANDIDATES = 100
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # Everything a recall query's normalization drops before two of them are called near-equal:
@@ -129,6 +135,7 @@ class Retrieval(Traced):
         hydrator: Hydrator,
         materializer: Materializer,
         speech: Speech,
+        vision: Vision,
         embedding: Embedding,
         projection: Projection,
         execution: Execution,
@@ -143,6 +150,7 @@ class Retrieval(Traced):
         self._hydrator = hydrator
         self._materializer = materializer
         self._speech = speech
+        self._vision = vision
         self._embedding = embedding
         self._projection = projection
         self._execution = execution
@@ -258,6 +266,11 @@ class Retrieval(Traced):
         trace_candidates: builtins.list[RetrievalCandidateTrace] | None = (
             [] if capture_trace else None
         )
+        descriptions = (
+            self._vision.query_descriptions(prepared, operation)
+            if self._settings.query_vision
+            else ()
+        )
         vectors: tuple[tuple[float, ...], ...] = ()
         if self._settings.retrieval_mode is RetrievalMode.LEXICAL:
             text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
@@ -288,11 +301,23 @@ class Retrieval(Traced):
             vectors = tuple(
                 dict.fromkeys(self._embedding.embed(model_inputs, task=EmbedTask.QUERY))
             )
-        lexical_query = focused_text
-        if not lexical_query_terms(lexical_query):
-            lexical_query = ""
+            if descriptions and Modality.TEXT in self._backends.embedding_capabilities:
+                try:
+                    described_vectors = self._embedding.embed(
+                        tuple(ModelInput(text=value) for value in descriptions),
+                        task=EmbedTask.QUERY,
+                    )
+                except ModelError as error:
+                    _LOGGER.warning("query description embedding failed: %s", error.reason)
+                else:
+                    vectors = tuple(dict.fromkeys((*vectors, *described_vectors)))
+        lexical_queries = tuple(
+            dict.fromkeys(
+                value for value in (focused_text, *descriptions) if lexical_query_terms(value)
+            )
+        )
         if self._settings.retrieval_mode is RetrievalMode.DENSE:
-            lexical_query = ""
+            lexical_queries = ()
         # Quantized native order can hide a more relevant parent just below the ordinary
         # route window. Keep a wider, request-limit-independent pool for SQLite FP32 scoring.
         candidate_limit = (
@@ -319,7 +344,7 @@ class Retrieval(Traced):
                 if temporal_range is None:
                     candidates = self._index_candidates(
                         vectors,
-                        lexical_query=lexical_query,
+                        lexical_queries=lexical_queries,
                         limit=candidate_limit,
                         memory_types=memory_types,
                         occurred_from=occurred_from,
@@ -343,7 +368,7 @@ class Retrieval(Traced):
                         if preferred_range is None
                         else self._index_candidates(
                             vectors,
-                            lexical_query=lexical_query,
+                            lexical_queries=lexical_queries,
                             limit=candidate_limit,
                             memory_types=memory_types,
                             occurred_from=preferred_range[0],
@@ -355,7 +380,7 @@ class Retrieval(Traced):
                     )
                     fallback = self._index_candidates(
                         vectors,
-                        lexical_query=lexical_query,
+                        lexical_queries=lexical_queries,
                         limit=candidate_limit,
                         memory_types=memory_types,
                         occurred_from=occurred_from,
@@ -599,11 +624,13 @@ class Retrieval(Traced):
                                 dense_confidence[memory_id] = confidence
                 with translate_storage_errors("score search candidates"):
                     scoring_snapshot.close()
-                lexical_coverage = (
-                    lexical_relevance(lexical_query, memories)
-                    if self._settings.retrieval_mode is RetrievalMode.HYBRID
-                    else {}
-                )
+                lexical_coverage: dict[str, float] = {}
+                if self._settings.retrieval_mode is RetrievalMode.HYBRID:
+                    for query in lexical_queries:
+                        for memory_id, strength in lexical_relevance(query, memories).items():
+                            lexical_coverage[memory_id] = max(
+                                lexical_coverage.get(memory_id, 0.0), strength
+                            )
                 ranked = []
                 ranked_traces: dict[str, partial[RetrievalCandidateTrace]] | None = (
                     {} if trace_candidates is not None else None
@@ -768,7 +795,7 @@ class Retrieval(Traced):
         self,
         vectors: Sequence[Sequence[float]],
         *,
-        lexical_query: str,
+        lexical_queries: Sequence[str],
         limit: int,
         memory_types: frozenset[MemoryType] | None,
         occurred_from: datetime | None = None,
@@ -806,7 +833,7 @@ class Retrieval(Traced):
             tuple(
                 partial(
                     self._index.lexical_search,
-                    lexical_query,
+                    query,
                     limit=limit,
                     space_id=self._backends.space_id,
                     task=DOCUMENT_TASK,
@@ -817,8 +844,9 @@ class Retrieval(Traced):
                     identity_id=identity_id,
                 )
                 for value in type_values
+                for query in lexical_queries
             )
-            if lexical_query and retrieval_mode is not RetrievalMode.DENSE
+            if retrieval_mode is not RetrievalMode.DENSE
             else ()
         )
         calls = (*dense_calls, *lexical_calls)
