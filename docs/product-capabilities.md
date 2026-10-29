@@ -142,9 +142,10 @@ validity interval, spatial frame, and kind-specific fields. The source record is
 Accepted derived records carry their source memory in `evidence_ids`, the model and recipe identity,
 and a stable semantic lineage. Derived records, evidence rows, state versions, formation completion
 marker, embeddings, and index work commit together. Conflicting state proposals from one source are
-rejected. Deleting source evidence retracts unsupported derived facts and replays the remaining
-lineage. Formation is opt-in because it adds inference cost and model-derived claims to the write
-path.
+rejected. A proposal that cites its own derived record is also rejected as a whole; its remaining
+premises are not treated as independent support. Other valid proposals and the original observation
+still commit. Deleting source evidence retracts unsupported derived facts and replays the remaining
+lineage. Formation is opt-in because it adds inference cost and model-derived claims to the write path.
 
 ### 4. Authoritative storage and search projection
 

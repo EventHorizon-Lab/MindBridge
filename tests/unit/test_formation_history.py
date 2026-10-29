@@ -86,6 +86,62 @@ def test_history_is_read_only_and_joint_sources_require_agreed_metadata(
         assert event.metadata == {}
 
 
+@pytest.mark.parametrize("kind", (MemoryKind.ENTITY, MemoryKind.RELATION))
+def test_self_citing_restatement_is_refused_without_failing_source_write(
+    tmp_path: Path, kind: MemoryKind
+) -> None:
+    class RestatingFormer(HistoryFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            self.inputs.extend(inputs)
+            results = []
+            for target in inputs:
+                previous = next(
+                    (row for row in target.history if row.context and row.context.kind is kind),
+                    None,
+                )
+                restatement = FormationProposal(
+                    kind=kind,
+                    content="Rava studies botany.",
+                    subject="Rava",
+                    predicate="interest",
+                    value="botany",
+                    evidence_ids=(target.memory_id,)
+                    if previous is None
+                    else (target.memory_id, previous.id),
+                )
+                results.append(
+                    (restatement,)
+                    if previous is None
+                    else (
+                        restatement,
+                        FormationProposal(
+                            kind=MemoryKind.EVENT,
+                            content="A notebook was received.",
+                            evidence_ids=(target.memory_id,),
+                        ),
+                    )
+                )
+            return tuple(results)
+
+    former = RestatingFormer()
+    with Memory(
+        tmp_path, embedder=TinyEmbedder(), former=former, formation_history_max_rows=16
+    ) as memory:
+        original = memory.add("Rava studies botany.")
+        current = memory.add("The notebook arrived.")
+        records = memory.list(limit=30).items
+        assert {original.id, current.id} <= {row.id for row in records}
+        assert current.content == "The notebook arrived."
+        (standing,) = [row for row in records if row.context and row.context.kind is kind]
+        assert standing.context is not None
+        # Reject the whole conjunction, rather than silently discarding its self premise.
+        assert standing.context.evidence_ids == (original.id,)
+        assert any(row.content == "A notebook was received." for row in records)
+        assert not memory.pending_captures()
+
+
 def test_history_reports_truncation_without_skipping_a_long_recent_correction(
     tmp_path: Path,
 ) -> None:
