@@ -539,6 +539,20 @@ def finalize_scores(task: str, scores: Mapping[str, float]) -> dict[str, float]:
     return result
 
 
+def judge_failure_scores(task: str, scores: Mapping[str, float]) -> dict[str, float]:
+    """Zero unavailable judge verdicts while retaining deterministic answer metrics."""
+    family = _family_or_none(task)
+    result = dict(scores)
+    for metric in _JUDGE_METRICS.get(family or "", ()):
+        result[metric] = 0.0
+    if family == "personamem-v3":
+        result.update((metric, 0.0) for metric in result if metric.startswith("pr_"))
+    primary = sample_primary_metric(task)
+    if family in {"beam", "personamem-v3"} or primary not in result:
+        result[primary] = 0.0
+    return finalize_scores(task, result)
+
+
 def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols auditable
     task: str,
     *,

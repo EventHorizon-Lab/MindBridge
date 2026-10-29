@@ -10,6 +10,11 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Added
 
+- Opt-in query-image description/OCR search routes through `query_vision`, cached only for the
+  current operation without writing new memories.
+- Optional concise answer style, per-adapter image pixel bounds, and configurable video
+  description frame counts. Defaults preserve the existing reader style and query path.
+
 - Public `Memory` and `AsyncMemory` facades for ordered text, image, video, audio, and composite
   observations. Semantic, episodic, and procedural roles share event-time intervals, metadata,
   spatial context, explicit retrieval scopes, and typed results.
@@ -67,6 +72,14 @@ The [documentation index](docs/README.md) describes the current contracts.
   contributor instructions.
 
 ### Fixed
+
+- Preserve semantic bridge evidence across recall rounds, share packing capacity across query
+  routes, and order sequence evidence by event time and original insertion order.
+- Bound actual image/video transport while retaining original assets and distinguishing video
+  samples from independent images in answer evidence.
+- Reject a derived fact's self-dependent support proposal without discarding other valid facts.
+- Preserve complete requested dates, times and ranges in ATM numeric questions. Judge failures
+  retain deterministic answer metrics; evaluation sampling controls are explicit and recorded.
 
 - Evaluation shares model capacity dynamically between ingestion and answers. Bounded idle
   SQLite pools and child-worker admission preserve progress across independent directories;

@@ -1,0 +1,79 @@
+# Replace localhost endpoints and configure credentials outside this committed example.
+# Run: mindbridge-bench eval --config docs/examples/atm-raw-qwen-wemm.yaml --gen-kwargs temperature=0.7
+# Historical recipe; see docs/research/2026-10-29-grounded-recall-quality.md for limits.
+embedding:
+  provider: openai
+  base_url: http://127.0.0.1:8000/v1
+  model: tencent/WeMM-Embedding-9B
+  dimension: 4096
+  modalities:
+  - text
+  - image
+  - video
+  request_format: messages
+  image_max_pixels: 4194304
+  timeout: 180.0
+  max_retries: 2
+generation:
+  provider: openai
+  base_url: http://127.0.0.1:8001/v1
+  model: Qwen3.8-27B
+  modalities:
+  - text
+  - image
+  - video
+  answer_style: concise
+  image_max_pixels: 1048576
+  video_limit: 2
+  max_tokens: 4096
+  media_policy: all
+  timeout: 180.0
+  max_retries: 2
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+    top_p: 0.8
+    top_k: 20
+    presence_penalty: 1.5
+vision:
+  provider: openai
+  base_url: http://127.0.0.1:8001/v1
+  model: Qwen3.8-27B
+  modalities:
+  - image
+  video_frames: 16
+  image_max_pixels: 4194304
+  max_tokens: 4096
+  temperature: 0.7
+  seed: 0
+  timeout: 180.0
+  max_retries: 2
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+    top_p: 0.8
+    top_k: 20
+    presence_penalty: 1.5
+  response_format: json_schema
+settings:
+  retrieval_mode: hybrid
+  index_quantization: none
+  evidence_budget_chars: 64000
+  reinforce_on_answer: false
+  query_vision: true
+  recall_planning: true
+  recall_query_expansion: true
+  recall_rounds: 2
+  recall_set_budget_chars: 64000
+  recall_set_max_rows: 100
+formation: null
+consolidation: null
+speech: null
+face: null
+retention: null
+benchmark:
+  run:
+    tasks: atm-bench-main
+    seed: 0
+    recall_limit: 12
+    answer_policy: strict

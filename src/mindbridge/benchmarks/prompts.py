@@ -161,23 +161,28 @@ OPENEQA_QUERY_PROMPT = PromptSpec(
 ATM_BENCH_QUERY_PROMPT = PromptSpec(
     name="atm_bench_query",
     version="atm_bench_query_v1",
-    purpose="Apply the official ATM-Bench per-type answer instruction.",
-    used_by="mindbridge.benchmarks.atm_bench_runner._question_query",
+    purpose="Apply the MindBridge adapter's ATM-Bench per-type answer instruction.",
+    used_by="mindbridge.benchmarks.eval_adapters._atm_bench",
     text="{question}\n{format_constraint}",
 )
 
 ATM_BENCH_NUMBER_FORMAT_PROMPT = PromptSpec(
     name="atm_bench_number_format",
-    version="atm_bench_number_format_v1",
+    version="atm_bench_number_format_v2",
     purpose=(
-        "Ask an ATM-Bench `number` question for a bare, machine-parseable numeric answer. "
+        "Ask an ATM-Bench `number` question for its complete requested value, including "
+        "dates, times, and ranges. "
         "MindBridge-authored, not transcribed from ATM-Bench: unlike the Mem-Gallery "
         "constraints, no released ATM-Bench prompt file names this wording -- the Oracle "
         "baseline gives every qtype one shared system prompt (`oracle/config.py`'s "
         "ORACLE_SYSTEM) rather than a `number`-specific instruction of its own."
     ),
     used_by="mindbridge.benchmarks.prompts.atm_format_constraint",
-    text="Answer with the number alone, including its unit or currency symbol.",
+    text=(
+        "Answer with the complete value requested by the question: number, date, time, or "
+        "range, with any required unit or currency symbol. Preserve all requested components; "
+        "do not add unrequested components or explanations."
+    ),
 )
 
 ATM_BENCH_LIST_RECALL_FORMAT_PROMPT = PromptSpec(

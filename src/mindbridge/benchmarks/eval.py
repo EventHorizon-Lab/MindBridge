@@ -124,6 +124,7 @@ from mindbridge.benchmarks.eval_config import (
     _description_cache_path,
     _evaluation_config,
     _evaluation_memory_config,
+    _generation_temperature,
     _judge_config,
     _JudgeConfig,
     _load_memory_config,
@@ -228,7 +229,7 @@ from mindbridge.models._jina import (
     DEFAULT_JINA_MODEL_ID,
     DEFAULT_JINA_REVISION,
 )
-from mindbridge.models._openai_protocol import reasoning_model, sampling_supported
+from mindbridge.models._openai_protocol import reasoning_model
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -619,11 +620,6 @@ class _BackendPool:
             from openai import OpenAI
         except ImportError:
             raise RuntimeError("benchmark execution requires mindbridge[openai]") from None
-        self.client = OpenAI(
-            api_key=config.generation_api_key,
-            base_url=config.generation_base_url,
-            timeout=config.timeout_seconds,
-        )
         generation_options = dict(
             item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item
         )
@@ -633,14 +629,20 @@ class _BackendPool:
             if enable_thinking is None
             else {"chat_template_kwargs": {"enable_thinking": enable_thinking == "true"}}
         )
+        temperature = _generation_temperature(
+            config.generation_model, generation_options, extra_body
+        )
+        self.client = OpenAI(
+            api_key=config.generation_api_key,
+            base_url=config.generation_base_url,
+            timeout=config.timeout_seconds,
+        )
         self.models = OpenAIModels(
             generation_client=self.client,
             generation_model=config.generation_model,
             generation_capabilities=config.generation_capabilities,
             generation_seed=None if reasoning_model(config.generation_model) else seed,
-            generation_temperature=(
-                0.0 if sampling_supported(config.generation_model, extra_body) else None
-            ),
+            generation_temperature=temperature,
             generation_max_tokens=(
                 None
                 if "max_tokens" not in generation_options
@@ -3841,11 +3843,15 @@ def _model_result(
     embedding_warmup_count: int | None = None,
 ) -> dict[str, object]:
     generation_seed = None if reasoning_model(config.generation_model) else arguments.seed
-    generation_temperature = 0.0 if sampling_supported(config.generation_model, None) else None
     if memory_config is not None:
         generation = memory_config.generation
         generation_seed = None if generation is None else generation.seed
         generation_temperature = None if generation is None else generation.temperature
+    else:
+        options = dict(
+            item.split("=", 1) for item in arguments.gen_kwargs.split(",") if "=" in item
+        )
+        generation_temperature = _generation_temperature(config.generation_model, options)
     result: dict[str, object] = {
         "adapter": DEFAULT_ARM,
         "embedding_model": DEFAULT_JINA_MODEL_ID,
@@ -3864,6 +3870,11 @@ def _model_result(
         ),
         "generation_seed": generation_seed,
         "generation_temperature": generation_temperature,
+        "generation_answer_style": (
+            memory_config.generation.answer_style
+            if memory_config is not None and memory_config.generation is not None
+            else "default"
+        ),
         "generation_kwargs": arguments.gen_kwargs,
         "generation_min_video_seconds": config.generation_min_video_seconds,
         "transcription_model": DEFAULT_FUNASR_MODEL_ID,

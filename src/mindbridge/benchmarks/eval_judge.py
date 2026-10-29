@@ -28,7 +28,7 @@ from mindbridge._telemetry import (
     mark_model_requests,
     model_span,
 )
-from mindbridge.benchmarks.eval_adapters import LoadedTask
+from mindbridge.benchmarks.eval_adapters import EvalQuestion, LoadedTask
 from mindbridge.benchmarks.eval_arms import _Arm
 from mindbridge.benchmarks.eval_artifacts import _json_bytes
 from mindbridge.benchmarks.eval_cache import (
@@ -61,11 +61,14 @@ from mindbridge.benchmarks.official_scorers import (
     JudgePlan,
     combine_judge_scores,
     finalize_scores,
+    judge_failure_scores,
     judge_model_is_official,
     judge_plan,
+    local_scores,
     parse_judge_response,
     sample_primary_metric,
 )
+from mindbridge.models._openai_protocol import output_limit_parameter, sampling_supported
 from mindbridge.models.openai_sdk import (
     _model_usage,
     _record_openai_provenance,
@@ -76,11 +79,12 @@ from mindbridge.models.openai_sdk import (
 class _JudgeRequestRequired(TypedDict):
     model: str
     messages: list[ChatCompletionMessageParam]
-    temperature: float
 
 
 class _JudgeRequest(_JudgeRequestRequired, total=False):
+    temperature: float
     max_tokens: int
+    max_completion_tokens: int
     extra_body: dict[str, object]
 
 
@@ -109,9 +113,10 @@ async def _apply_judges(
         for question in unit.questions
     }
     planned: dict[str, JudgePlan] = {}
+    prepared_samples: dict[str, SampleResult] = {}
     for sample in samples:
         if (
-            sample.error_code is not None
+            sample.error_code not in (None, "JudgeError")
             or sample.ingest_failure_count
             or not _Arm(sample.arm).generates
             # `--stream-results` already judged this one when its task finished. Re-judging would
@@ -120,6 +125,8 @@ async def _apply_judges(
         ):
             continue
         question = questions[(sample.task, sample.unit_id, sample.question_id)]
+        sample = _restore_local_scores(sample, question)
+        prepared_samples[sample.sample_id] = sample
         plan = judge_plan(
             sample.task,
             question=question.source_question,
@@ -158,7 +165,7 @@ async def _apply_judges(
         nonlocal completed
         plan = planned.get(sample.sample_id)
         result = await _judge_sample(
-            sample,
+            prepared_samples.get(sample.sample_id, sample),
             plan,
             client=client,
             cache=cache,
@@ -185,6 +192,39 @@ async def _apply_judges(
         if cache is not None:
             cache.close()
     return tuple(judged)
+
+
+def _restore_local_scores(sample: SampleResult, question: EvalQuestion) -> SampleResult:
+    if sample.error_code != "JudgeError":
+        return sample
+    # Older artifacts could have overwritten a deterministic headline on judge failure.
+    # Recompute it from the saved prediction; retain the original retrieval diagnostics.
+    local = local_scores(
+        sample.task,
+        score_kind=question.score_kind,
+        prediction=sample.prediction,
+        parsed_choice=sample.parsed_choice,
+        expected_choice=question.expected_choice,
+        references=question.references,
+        question=question.source_question,
+        metadata=question.metadata,
+        evidence_source_ids=sample.ranked_source_ids,
+    )
+    metrics = finalize_scores(
+        sample.task,
+        {
+            **sample.metrics,
+            **{name: value for name, value in local.items() if not name.startswith("retrieval_")},
+        },
+    )
+    return replace(
+        sample,
+        metrics=metrics,
+        score=metrics.get(sample_primary_metric(sample.task)),
+        exact_match=metrics.get("exact_match"),
+        error_code=None,
+        scorer_error=None,
+    )
 
 
 async def _judge_sample(
@@ -229,18 +269,17 @@ async def _judge_sample(
             judge_model=config.model,
             judge_response=(json.dumps(responses, ensure_ascii=False) if log_samples else None),
             judge_cached=all(item[2] for item in outcomes),
+            error_code=None if sample.error_code == "JudgeError" else sample.error_code,
+            scorer_error=None,
         )
     except _JudgeRequestError as failure:
         error = failure.error
         message = " ".join(str(error).split())[:500]
-        # The judge's outage was waited out already; an answer that still has no verdict is
-        # scored as wrong, the same as an answer that was never produced.
-        metrics = finalize_scores(
-            sample.task, {**sample.metrics, sample_primary_metric(sample.task): 0.0}
-        )
+        # An unavailable verdict scores zero only for metrics that depend on the judge.
+        metrics = judge_failure_scores(sample.task, sample.metrics)
         return replace(
             sample,
-            score=0.0,
+            score=metrics.get(sample_primary_metric(sample.task)),
             metrics=metrics,
             error_code=sample.error_code or "JudgeError",
             scorer_error=f"{type(error).__name__}: {message}",
@@ -334,10 +373,12 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
             else {"role": "user", "content": message.content}
             for message in messages
         ],
-        "temperature": 0.0,
     }
     if plan.max_tokens is not None:
-        request["max_tokens"] = plan.max_tokens
+        if output_limit_parameter(config.model) == "max_completion_tokens":
+            request["max_completion_tokens"] = plan.max_tokens
+        else:
+            request["max_tokens"] = plan.max_tokens
     extra_body = dict(plan.extra_body or {})
     model_key = re.sub(r"[^a-z0-9]+", "", config.model.casefold())
     if "qwen3" in model_key and not (
@@ -346,6 +387,8 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
         extra_body.setdefault("chat_template_kwargs", {"enable_thinking": False})
     if extra_body:
         request["extra_body"] = extra_body
+    if sampling_supported(config.model, extra_body):
+        request["temperature"] = 0.0
     use_responses_api = plan.parser == "atm" and judge_model_is_official(sample.task, config.model)
     usages = []
     attempted = 0
@@ -374,6 +417,9 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
                 response = await _retry_transient(call)
                 break
             except _JudgeRequestError as failure:
+                if "temperature" in request and _unsupported_temperature(failure.error):
+                    request.pop("temperature")
+                    continue
                 if "extra_body" in request and _unsupported_extra_body(failure.error):
                     request.pop("extra_body")
                     continue
@@ -460,6 +506,16 @@ def _unsupported_extra_body(error: BaseException) -> bool:
     return field and marker
 
 
+def _unsupported_temperature(error: BaseException) -> bool:
+    if getattr(error, "status_code", None) not in (400, 422):
+        return False
+    message = str(error).casefold()
+    return bool(re.search(r"\btemperature\b", message)) and any(
+        marker in message
+        for marker in ("unsupported", "does not support", "not supported", "not allowed")
+    )
+
+
 def _judge_cache_namespace(config: _JudgeConfig) -> str:
     return hashlib.sha256(
         _json_bytes(
@@ -467,7 +523,7 @@ def _judge_cache_namespace(config: _JudgeConfig) -> str:
                 "version": SCORER_VERSION,
                 "model": config.model,
                 "base_url": config.base_url,
-                "temperature": 0.0,
+                "temperature": 0.0 if sampling_supported(config.model, None) else None,
             }
         )
     ).hexdigest()

@@ -192,9 +192,9 @@ The default generation endpoint is OpenAI-compatible. These environment variable
 | `MINDBRIDGE_TIMEOUT_SECONDS` | Generation timeout; defaults to 300 seconds |
 
 `--model-args` overrides `generation_model`, `base_url`, `timeout_seconds`, and
-`generation_min_video_seconds`. `--gen-kwargs` accepts deterministic generation controls; the
-runner enforces temperature zero, sampling off, and a seed matching `--seed` where the model
-supports them. Known reasoning families omit unsupported default sampling controls and provider
+`generation_min_video_seconds`. `--gen-kwargs` accepts finite temperatures from 0 through 2,
+default 0, and a seed matching `--seed` where supported. `do_sample` must agree with the selected
+temperature. Known reasoning families omit unsupported default sampling controls and provider
 seeds; supported generic models retain both. Reasoning requests use `max_completion_tokens` for
 the configured output limit. Reported `generation_temperature` and `generation_seed` are `null`
 when omitted. The run seed still controls dataset selection and local random baselines; it cannot
@@ -322,6 +322,23 @@ generation:
 
 That is exactly what `--gen-kwargs enable_thinking=false` writes, so a file that declares it does
 not need the flag.
+
+Use `--gen-kwargs temperature=0.7` for a sampled run; its effective temperature, seed and answer
+style are recorded in artifacts and cache identities. Product and baseline arms honor the same
+sampling and optional `generation.answer_style`. Seeds do not guarantee identical remote output.
+
+The [ATM raw example](examples/atm-raw-qwen-wemm.yaml) and
+[Mem-Gallery example](examples/mem-gallery-qwen-wemm.yaml) preserve the verified task-specific
+budgets with replaceable localhost endpoints and no stored credentials. Run them with the
+documented temperature override. Their provenance and limits are in the
+[quality evidence](research/2026-10-29-grounded-recall-quality.md).
+
+ATM `number` questions request the complete value, including requested dates, times, ranges,
+units and currencies. This adapter instruction does not change questions, references or the
+official scorer. Judge requests follow model sampling and output-limit capabilities. A judge
+failure preserves deterministic metrics such as Gallery F1 and is still recorded as an error;
+metrics that require the missing verdict receive their documented failure score. Saved
+`JudgeError` predictions can restore local metrics and be rejudged without generating new answers.
 
 Omitted sections use the same defaults as a run without `--config`: the pinned Jina Omni model
 through the `sentence-transformers` provider and an
@@ -1378,7 +1395,7 @@ Prompts, references, and raw judge responses are retained only with `--log-sampl
 option as sensitive: benchmark artifacts can contain source content, retrieved evidence, and model
 responses.
 
-The runner fixes supported seeds and generation temperature, records model endpoints and scorer protocols,
+The runner records the effective generation temperature and supported seeds, model endpoints and scorer protocols,
 and marks whether each metric used the required official judge. `measurement_protocol` records
 fresh-store state, actual embedding warmups, repeat index, cache exclusions, and uncontrolled
 remote-server state. A provider may still change an unversioned model, so publishable runs should
