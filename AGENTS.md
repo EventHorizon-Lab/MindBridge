@@ -68,6 +68,21 @@ or speculative abstractions. Backward compatibility is not required; remove obso
 formats, and migration paths instead of preserving them. Keep names conventional, public contracts
 explicit, and comments focused on constraints that are not obvious from the code.
 
+- Keep related logic in one function unless extraction enables composition or reuse, isolates a
+  genuinely complex boundary, or gives an operation a clear independent name that improves the
+  caller. Do not preemptively extract single-use helpers; otherwise inline the logic at its call
+  site.
+- Validate unknown values once at the boundary that owns them, then pass typed values inward.
+  Do not repeat runtime type or property-existence checks, such as `isinstance` or `hasattr`, for
+  values already guaranteed by a schema, constructor, or internal type.
+- Before adding complexity for a speculative or vanishingly unlikely race or security edge case,
+  explain the concrete failure mode, likelihood, and complexity cost to the user and get their
+  buy-in. Do not silently expand scope for theoretical robustness.
+- Avoid unnecessary `try`/`except`. Catch specific exceptions only where handling them can recover
+  or translate a failure; preserve required error mapping and resource cleanup.
+- Avoid `typing.Any`. Use concrete types, protocols, generics, or `object` for genuinely unknown
+  inputs, narrowing them at the owning boundary instead of bypassing type checking.
+
 Use `apply_patch` for hand edits. Preserve unrelated work in a dirty tree. Do not run destructive
 Git commands to discard another contributor's changes.
 
