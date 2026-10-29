@@ -153,6 +153,7 @@ class _BaselineGenerator:
         # Sampling controls are sent only where the shared provider policy supports them.
         # Explicit controls in extra_body still reach the adapter's validation.
         stanza = None if generation is None else generation.generation
+        self._generation_store = False if stanza is None else stanza.store
         self._answer_style: Literal["default", "concise"] = (
             "default" if stanza is None else stanza.answer_style
         )
@@ -181,6 +182,7 @@ class _BaselineGenerator:
             generation_video_limit=(8 if stanza is None else stanza.video_limit),
             generation_extra_body=self._extra_body,
             generation_answer_style=self._answer_style,
+            generation_store=self._generation_store,
         )
 
     async def answer(
@@ -221,6 +223,7 @@ class _BaselineGenerator:
         else:
             request = {
                 "model": self._model,
+                "store": self._generation_store,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},

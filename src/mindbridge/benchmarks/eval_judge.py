@@ -77,6 +77,7 @@ from mindbridge.models.openai_sdk import (
 
 
 class _JudgeRequestRequired(TypedDict):
+    store: bool
     model: str
     messages: list[ChatCompletionMessageParam]
 
@@ -367,6 +368,7 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
             return cached
     request: _JudgeRequest = {
         "model": config.model,
+        "store": False,
         "messages": [
             {"role": "system", "content": message.content}
             if message.role == "system"
@@ -402,6 +404,7 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
                 if use_responses_api:
                     return await client.responses.create(
                         model=config.model,
+                        store=False,
                         input="\n".join(message.content for message in messages),
                         max_output_tokens=plan.max_tokens,
                         reasoning={"effort": "minimal"},

@@ -306,6 +306,8 @@ def test_a_former_is_declaratively_reachable_but_never_implicit(
     assert built[-1] == {
         "generation_model": "gpt-5",
         "generation_capabilities": frozenset({Modality.TEXT}),
+        "generation_response_format": "json_schema",
+        "generation_store": False,
         "generation_temperature": 0.0,
     }
     # `video_limit` shapes an answer, not a formation proposal, so it is not part of this slot.
@@ -430,6 +432,7 @@ def test_a_local_openai_compatible_server_fills_the_former_slot(
                     "provider": "openai",
                     "model": "qwen3-8b-local",
                     "base_url": former_url,
+                    "response_format": "json_object",
                     "temperature": 0.0,
                     "max_retries": 0,
                 },
@@ -535,6 +538,8 @@ def test_builtin_openai_generation_config_maps_friendly_names_to_the_sdk_adapter
         "max_retries": 1,
         "generation_model": "gpt-5-mini",
         "generation_capabilities": frozenset({Modality.TEXT, Modality.IMAGE}),
+        "generation_response_format": "json_schema",
+        "generation_store": False,
         "generation_temperature": 0.1,
         "generation_max_tokens": 512,
     }
@@ -713,6 +718,8 @@ def test_builtin_openai_formation_config_maps_friendly_names_to_the_sdk_adapter(
         "base_url": "http://localhost:11434/v1",
         "generation_model": "gpt-5-mini",
         "generation_capabilities": frozenset({Modality.TEXT, Modality.IMAGE}),
+        "generation_response_format": "json_schema",
+        "generation_store": False,
         "generation_temperature": 0.0,
         "generation_seed": 7,
         "generation_max_tokens": 2048,
@@ -1271,6 +1278,8 @@ def test_the_vision_slot_forwards_its_own_transport_controls(
         "max_retries": 5,
         "generation_model": "qwen3.8-27b",
         "generation_capabilities": frozenset({Modality.IMAGE, Modality.VIDEO}),
+        "generation_response_format": "json_schema",
+        "generation_store": False,
         "generation_extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
 

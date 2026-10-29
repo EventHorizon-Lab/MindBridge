@@ -412,11 +412,100 @@ def test_strict_formation_uses_schema_but_still_rejects_invented_witnesses() -> 
 
 
 def test_json_schema_changes_persisted_recipes() -> None:
-    plain = OpenAIModels()
+    plain = OpenAIModels(generation_response_format="json_object")
     strict = OpenAIModels(generation_response_format="json_schema")
     assert strict.formation_space != plain.formation_space
     assert strict.vision_space != plain.vision_space
     assert strict.consolidation_recipe != plain.consolidation_recipe
+
+
+@pytest.mark.parametrize("store", [False, True])
+def test_generation_store_is_explicit_for_answering_and_structural_calls(store: bool) -> None:
+    calls: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body)
+        assert body["store"] is store
+        return _reply('{"shape":"point","steps":[]}' if "response_format" in body else "Blue.")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        adapter = OpenAIModels(_sdk_client(client), generation_store=store)
+        adapter.answer("What color?", (_search_hit(),))
+        adapter.plan_recall("What color?", reference_at=NOW, corpus_digest="1 text record")
+    assert len(calls) == 2
+    assert cast(dict[str, object], calls[-1]["response_format"])["type"] == "json_schema"
+    assert calls[-1]["model"] == "gpt-5-mini-2025-08-07"
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "false"])
+def test_generation_store_rejects_non_boolean_values(value: object) -> None:
+    with pytest.raises(ValidationError, match="generation_store"):
+        OpenAIModels(generation_store=cast(bool, value))
+
+
+def test_extra_body_cannot_override_storage_policy() -> None:
+    with pytest.raises(ValidationError, match="request contract"):
+        OpenAIModels(generation_extra_body={"store": True})
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("content_policy_violation", "Input video is too short."),
+        ("content_filter", "private provider details"),
+        (None, "Input video data may contain inappropriate content."),
+        ("400", "InternalError.Algo.DataInspectionFailed: inappropriate content in video."),
+    ],
+)
+def test_http_safety_refusal_never_retries_by_removing_media(
+    tmp_path: Path, stream: bool, code: str | None, message: str
+) -> None:
+    calls = 0
+    video = _asset(tmp_path, "video", Modality.VIDEO, "video/mp4", b"video")
+    hit = replace(_search_hit(), assets=(video,), modality=Modality.VIDEO)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json={"error": {"code": code, "message": message}})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        adapter = OpenAIModels(
+            _sdk_client(client), generation_capabilities=frozenset({Modality.TEXT, Modality.VIDEO})
+        )
+        with pytest.raises(ModelError) as failed:
+            if stream:
+                list(adapter.stream_answer("What happened?", (hit,)))
+            else:
+                adapter.answer("What happened?", (hit,))
+    assert calls == 1
+    assert failed.value.reason == "model_refused"
+    assert not failed.value.retryable
+    assert message not in str(failed.value)
+
+
+def test_explicit_provider_code_prevents_message_based_media_fallback(tmp_path: Path) -> None:
+    calls = 0
+    video = _asset(tmp_path, "video", Modality.VIDEO, "video/mp4", b"video")
+    hit = replace(_search_hit(), assets=(video,), modality=Modality.VIDEO)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            400, json={"error": {"code": "invalid_parameter", "message": "Input video too short."}}
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        adapter = OpenAIModels(
+            _sdk_client(client), generation_capabilities=frozenset({Modality.TEXT, Modality.VIDEO})
+        )
+        with pytest.raises(ModelError) as failed:
+            adapter.answer("What happened?", (hit,))
+    assert calls == 1
+    assert failed.value.reason == "request_rejected"
 
 
 def test_vision_recipe_uses_effective_sampling_controls() -> None:

@@ -99,17 +99,14 @@ async def _deliberate_periodically(
             # requests this process also serves run in the same loop.
             report = await asyncio.to_thread(memory.deliberate)
         except Exception as error:
-            # The class and its reason code, never the message: a rejected consolidation reply
-            # is quoted back in the `ModelError` it raises, and that quote is model text about
-            # stored memories. Raw memory content stays out of a WARNING the way it stays out of
-            # every other kernel log line; the traceback is one level down for whoever asked.
+            # Exception chains can contain provider bodies even when the outer error is safe.
+            # Keep them out of every log level; model spans carry safe request identifiers.
             reason = error.reason if isinstance(error, MindBridgeError) else None
             _LOGGER.warning(
                 "periodic deliberation failed: %s%s",
                 type(error).__name__,
                 "" if reason is None else f" ({reason})",
             )
-            _LOGGER.debug("periodic deliberation failure detail", exc_info=True)
             continue
         _LOGGER.info(
             "deliberation: rounds=%d weighed=%d applied=%d rejected=%d",

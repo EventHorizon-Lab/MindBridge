@@ -1550,7 +1550,7 @@ OpenAIModels(
     embedding_space: str | None = None,
     embedding_dimension: int = 1536,
     embedding_request_format: Literal["input", "messages"] = "input",
-    generation_model: str = "gpt-5-mini",
+    generation_model: str = "gpt-5-mini-2025-08-07",
     transcription_model: str = "whisper-1",
     transcription_space: str | None = None,
     transcription_prompt: str | None = None,
@@ -1562,7 +1562,8 @@ OpenAIModels(
     generation_seed: int | None = None,
     generation_temperature: float | None = None,
     generation_max_tokens: int | None = None,
-    generation_response_format: Literal["json_object", "json_schema"] = "json_object",
+    generation_response_format: Literal["json_object", "json_schema"] = "json_schema",
+    generation_store: bool = False,
     generation_min_video_seconds: float | None = None,
     generation_video_limit: int | None = 8,
     generation_extra_body: Mapping[str, object] | None = None,
@@ -1698,11 +1699,17 @@ requires task-specific quality evaluation and must be declared in comparisons.
 
 The [multimodal recall guide](../grounded-multimodal-recall.md) documents media fitting and limits.
 
-`generation_response_format="json_schema"` sends strict schemas for structural model operations:
-formation, consolidation, visual descriptions, media diagnosis, and recall planning. The default
-`"json_object"` supports compatible endpoints that implement JSON mode. Both retain local
+The default `generation_response_format="json_schema"` sends strict schemas for structural model
+operations: formation, consolidation, visual descriptions, media diagnosis, and recall planning.
+Explicit `"json_object"` supports compatible endpoints that implement only JSON mode. Both retain local
 validation, and selecting strict output does not change free-text answers. A rejected strict
 schema is reported rather than silently retried with a weaker protocol.
+
+`generation_store=False` explicitly disables provider application-state storage on buffered,
+streamed and structural completion requests. It is a strict boolean and cannot be overridden
+through `generation_extra_body`. This setting is separate from account-level abuse-monitoring
+retention and Zero Data Retention. The default generation snapshot is pinned; explicit moving
+aliases remain the caller's deployment choice and must be re-evaluated when they change.
 
 Known reasoning models omit unsupported automatic sampling controls and reject explicitly configured
 unsupported `generation_temperature` or `generation_seed` before inference. Their

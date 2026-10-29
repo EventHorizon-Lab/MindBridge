@@ -251,7 +251,7 @@ index path.
 mindbridge-bench eval --list-tasks
 mindbridge-bench eval \
   --tasks locomo-refined \
-  --model-args generation_model=gpt-5-mini \
+  --model-args generation_model=gpt-5-mini-2025-08-07 \
   --limit 1 \
   --seed 42 \
   --output-path .benchmarks/results/locomo-one-conversation
