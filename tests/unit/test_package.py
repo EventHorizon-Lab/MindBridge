@@ -300,6 +300,7 @@ def test_dependency_surface_is_exact() -> None:
         "observability": {"opentelemetry-sdk"},
         "openai": {"av", "httpx2", "openai", "pillow"},
         "face": {"opencv-python-headless"},
+        "gazetteer": {"pyproj", "shapely"},
         "local": {
             "cairosvg",
             "funasr",
@@ -328,6 +329,18 @@ def test_dependency_surface_is_exact() -> None:
         "cloud-models",
     )
     assert {name for name in declared if any(word in name for word in forbidden)} == set()
+
+
+def test_funasr_runtime_and_cache_identity_use_the_same_immutable_source() -> None:
+    from mindbridge.models.funasr import _FUNASR_REVISION
+
+    assert len(_FUNASR_REVISION) == 40
+    int(_FUNASR_REVISION, 16)
+    for extra in ("local", "all"):
+        requirement = next(Requirement(item) for item in EXTRAS[extra] if _name(item) == "funasr")
+        assert requirement.url == (
+            f"git+https://github.com/modelscope/FunASR.git@{_FUNASR_REVISION}"
+        )
 
 
 def _name(requirement: str) -> str:

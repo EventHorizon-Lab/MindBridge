@@ -3462,6 +3462,32 @@ def test_neighbor_memories_merges_anchors_without_repeating_them(tmp_path: Path)
         assert [memory.memory_id for memory in bounded] == ["turn-2"]
 
 
+def test_recall_orders_selected_ids_by_event_time_and_insertion_across_sql_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("mindbridge.infrastructure.local.store.recall.SQLITE_PARAMETER_BATCH", 2)
+    start = datetime(2024, 9, 10, 9, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        store.records.write_memories(
+            (
+                _turn("z-first", "first", occurred_at=start),
+                _turn("m-middle", "middle", occurred_at=start),
+                _turn("a-last", "last", occurred_at=start),
+                _turn("later", "later", occurred_at=start + timedelta(days=1)),
+                _turn("earlier", "earlier", occurred_at=start - timedelta(days=1)),
+                _turn("forgotten", "forgotten", occurred_at=start),
+            )
+        )
+        store.records.set_forgotten(("forgotten",), forgotten_at=start)
+
+        ordered = store.recall.order_memory_ids(
+            ("later", "a-last", "missing", "m-middle", "z-first", "earlier", "a-last", "forgotten")
+        )
+
+        assert ordered == ("earlier", "z-first", "m-middle", "a-last", "later")
+        assert store.recall.order_memory_ids(()) == ()
+
+
 @pytest.mark.parametrize(
     ("arguments", "error"),
     [

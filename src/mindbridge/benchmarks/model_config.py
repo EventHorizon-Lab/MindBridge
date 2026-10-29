@@ -171,6 +171,7 @@ class RunOverrides(_HarnessModel):
     batch_size: str | None = None
     max_batch_size: Annotated[int, Field(strict=True, gt=0)] | None = None
     unit_concurrency: Annotated[int, Field(strict=True, gt=0)] | None = None
+    ingest_concurrency: Annotated[int, Field(strict=True, gt=0)] | None = None
     request_concurrency: Annotated[int, Field(strict=True, gt=0)] | None = None
     judge_concurrency: Annotated[int, Field(strict=True, gt=0)] | None = None
     recall_limit: Annotated[int, Field(strict=True, gt=0, le=100)] | None = None

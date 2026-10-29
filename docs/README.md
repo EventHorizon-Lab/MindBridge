@@ -72,6 +72,8 @@ contract.
 
 ## Evaluate
 
+- [FunASR main adoption](research/2026-10-28-funasr-main.md) — pinned runtime, speaker attribution,
+  thread and device controls, and bounded real-model validation.
 - [Negation retrieval research](research/2026-10-27-negation-retrieval-research.md) — original
   papers, open implementations, Chinese scope extraction, and evaluation priorities.
 - [Controlled semantic recall](research/2026-10-27-semantic-recall.md) — R01 audit, bounded

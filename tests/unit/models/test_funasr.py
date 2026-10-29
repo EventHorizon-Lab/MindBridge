@@ -6,11 +6,12 @@ from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 import mindbridge.models.funasr as funasr_module
-from mindbridge.exceptions import ModelError
+from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.models.base import SpeechBackend, SpeechTurn
 from mindbridge.models.funasr import (
     DEFAULT_FUNASR_MODEL_ID,
@@ -89,8 +90,9 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
     assert arguments["vad_model"] == DEFAULT_FUNASR_VAD_MODEL_ID
     assert arguments["spk_model"] == DEFAULT_FUNASR_SPEAKER_MODEL_ID
     assert arguments["spk_mode"] == "vad_segment"
+    assert arguments["ncpu"] == 4
     assert "punc_model" not in arguments
-    expected_space = f"{DEFAULT_FUNASR_MODEL_ID}:speech:b47a175e755dea61"
+    expected_space = f"{DEFAULT_FUNASR_MODEL_ID}:speech:2f09571780abadb7"
     assert transcriber.transcription_space == expected_space
     assert "device" not in arguments
     assert "trust_remote_code" not in arguments
@@ -103,6 +105,94 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
     transcriber.close()
     with pytest.raises(ModelError, match="closed"):
         transcriber.analyze((asset,))
+
+
+def test_funasr_preserves_vad_settings_with_explicit_submodel_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments: dict[str, object] = {}
+
+    def auto_model(**kwargs: object) -> object:
+        arguments.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        funasr_module, "import_module", lambda _name: SimpleNamespace(AutoModel=auto_model)
+    )
+    transcriber = FunASRTranscriber(
+        device=" CUDA:1 ", ncpu=2, vad_device=" CPU ", speaker_device="cuda:0"
+    )
+    assert transcriber._load() is transcriber._load()
+    assert arguments["device"] == "cuda:1"
+    assert arguments["ncpu"] == 2
+    assert arguments["vad_kwargs"] == {"max_single_segment_time": 30_000, "device": "cpu"}
+    assert arguments["spk_kwargs"] == {"device": "cuda:0"}
+    assert DEFAULT_FUNASR_RECIPE.auto_model_arguments()["vad_kwargs"] == {
+        "max_single_segment_time": 30_000
+    }
+    transcriber.close()
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5, "2", None])
+def test_funasr_rejects_invalid_cpu_budgets(value: object) -> None:
+    with pytest.raises(ValidationError, match="ncpu"):
+        FunASRTranscriber(ncpu=cast(int, value))
+
+
+@pytest.mark.parametrize("value", ["auto", "", "cuda:-1", "cpu:0", "gpu", True])
+def test_funasr_rejects_invalid_submodel_devices(value: object) -> None:
+    with pytest.raises(ValidationError, match="device"):
+        FunASRTranscriber(vad_device=cast(str, value))
+    with pytest.raises(ValidationError, match="device"):
+        FunASRTranscriber(speaker_device=cast(str, value))
+
+
+def test_funasr_space_tracks_the_runtime_but_not_execution_placement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = FunASRTranscriber().transcription_space
+    assert original != f"{DEFAULT_FUNASR_MODEL_ID}:speech:b47a175e755dea61"
+    assert (
+        FunASRTranscriber(
+            device="cpu", ncpu=1, vad_device="cpu", speaker_device="cpu"
+        ).transcription_space
+        == original
+    )
+    monkeypatch.setattr(funasr_module, "_FUNASR_REVISION", "another-runtime")
+    assert FunASRTranscriber().transcription_space != original
+
+
+@pytest.mark.parametrize(
+    "timestamps",
+    [
+        [[0, 100], [100, 100], [400, 600]],
+        [
+            {"start_time": 0, "end_time": 0.1},
+            {"start_time": 0.1, "end_time": 0.1},
+            {"start_time": 0.4, "end_time": 0.6},
+        ],
+    ],
+)
+def test_funasr_accepts_zero_width_punctuation_timestamps(timestamps: object) -> None:
+    result = funasr_module._analysis(
+        {"text": "hello, world", "timestamp": timestamps}, speaker_analysis=False
+    )
+    assert result.turns == (SpeechTurn(0, 600, "hello, world"),)
+
+
+def test_funasr_still_rejects_zero_width_speech_turns() -> None:
+    with pytest.raises(ModelError, match="range"):
+        funasr_module._analysis(
+            {"text": "hello", "timestamp": [[100, 100]]}, speaker_analysis=False
+        )
+
+
+@pytest.mark.parametrize("start,end", [(float("nan"), 100), (0, float("inf")), (100, 0)])
+def test_funasr_rejects_invalid_sentence_time_ranges(start: float, end: float) -> None:
+    with pytest.raises(ModelError, match="turn"):
+        funasr_module._analysis(
+            {"text": "hello", "sentence_info": [{"text": "hello", "start": start, "end": end}]}
+        )
 
 
 def test_funasr_usage_counts_full_media_duration_for_batch_retry(

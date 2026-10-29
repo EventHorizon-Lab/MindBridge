@@ -157,6 +157,10 @@ def test_jina_is_selected_through_the_sentence_transformers_provider() -> None:
             "embedding": {"provider": "openai"},
             "settings": {"recall_query_expansion": "false"},
         },
+        {
+            "embedding": {"provider": "openai"},
+            "settings": {"query_vision": "false"},
+        },
     ),
 )
 def test_declarative_config_does_not_coerce_boolean_or_numeric_fields(
@@ -1000,6 +1004,10 @@ def test_declarative_generation_slot_carries_every_control_through_the_real_fact
                     ]
                 },
             )
+        assert (
+            "Give only the answer to the question"
+            in json.loads(request.content)["messages"][0]["content"]
+        )
         if not json.loads(request.content).get("stream"):
             return httpx.Response(
                 200,
@@ -1047,6 +1055,7 @@ def test_declarative_generation_slot_carries_every_control_through_the_real_fact
                     "max_tokens": 64,
                     "video_limit": 4,
                     "min_video_seconds": 2.0,
+                    "answer_style": "concise",
                     "extra_body": {"top_k": 20},
                 },
             }

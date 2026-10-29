@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import cast
 
 from mindbridge.evidence import answer_constraint_payloads, answer_evidence_payloads
 from mindbridge.models import openai_sdk as openai_backend
-from mindbridge.types import EvidenceBasis, MemoryContext, MemoryKind, SearchHit
+from mindbridge.types import AssetRef, EvidenceBasis, MemoryContext, MemoryKind, Modality, SearchHit
 
 NOW = datetime(2026, 9, 7, tzinfo=timezone.utc)
 
@@ -204,7 +206,7 @@ def test_origin_and_correction_do_not_increase_support_count() -> None:
     assert context["supersedes_label"] == "S3"
 
 
-def test_raw_payload_keeps_the_frozen_unqualified_shape() -> None:
+def test_raw_payload_identifies_the_record_modality_without_qualifying_provenance() -> None:
     hit = SearchHit(
         id="raw",
         content="unchanged raw memory",
@@ -214,9 +216,51 @@ def test_raw_payload_keeps_the_frozen_unqualified_shape() -> None:
     )
 
     assert json.dumps(answer_evidence_payloads((hit,)), separators=(",", ":")) == (
-        '[{"content":"unchanged raw memory","memory_type":"semantic",'
+        '[{"content":"unchanged raw memory","memory_type":"semantic","source_modality":"text",'
         f'"created_at":"{NOW.isoformat()}","metadata":{{"capture":"sdk"}}}}]'
     )
+
+
+def test_source_modality_is_the_record_kind_not_derived_text_or_supporting_source(
+    tmp_path: Path,
+) -> None:
+    assets = []
+    for kind, media_type in (
+        (Modality.IMAGE, "image/png"),
+        (Modality.VIDEO, "video/mp4"),
+        (Modality.AUDIO, "audio/wav"),
+    ):
+        path = tmp_path / kind.value
+        path.write_bytes(kind.value.encode())
+        assets.append(
+            AssetRef(
+                kind.value,
+                modality=kind,
+                media_type=media_type,
+                size_bytes=path.stat().st_size,
+                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                path=path,
+            )
+        )
+    hits = (
+        *(
+            SearchHit(asset.id, "derived description", 0.8, NOW, assets=(asset,), modality=kind)
+            for asset, kind in zip(
+                assets, (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO), strict=True
+            )
+        ),
+        SearchHit(
+            "mixed", "mixed description", 0.8, NOW, assets=tuple(assets), modality=Modality.OMNI
+        ),
+        _hit("derived-text", source_id="video", evidence_ids=("image", "video")),
+    )
+    assert [payload["source_modality"] for payload in answer_evidence_payloads(hits)] == [
+        "image",
+        "video",
+        "audio",
+        "omni",
+        "text",
+    ]
 
 
 def _large_payload(source_count: int) -> tuple[tuple[SearchHit, ...], list[dict[str, object]]]:

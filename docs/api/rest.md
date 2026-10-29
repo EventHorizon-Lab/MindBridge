@@ -533,8 +533,7 @@ Answer requests are not retried after silently trimming evidence. This reason is
 the adapter's byte-based `payload_too_large` and the output limit's `output_truncated`.
 `quota_exhausted` includes exhausted credits and provider project or organization spend/usage
 limits. `provider_unavailable` covers temporary upstream server failures after the SDK's own retry
-budget; callers still need a bounded retry policy. See OpenAI's
-[error guidance](https://developers.openai.com/api/docs/guides/error-codes) for provider recovery steps.
+budget; callers still need a bounded retry policy.
 
 The status is a function of `reason` alone, read from one table in `mindbridge.api.errors`. Which
 exception class carried the failure, and which raise site produced it, do not change the answer:

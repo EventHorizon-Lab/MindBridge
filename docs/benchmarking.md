@@ -192,17 +192,23 @@ The default generation endpoint is OpenAI-compatible. These environment variable
 | `MINDBRIDGE_TIMEOUT_SECONDS` | Generation timeout; defaults to 300 seconds |
 
 `--model-args` overrides `generation_model`, `base_url`, `timeout_seconds`, and
-`generation_min_video_seconds`. `--gen-kwargs` accepts deterministic generation controls; the
-runner enforces temperature zero, sampling off, and a seed matching `--seed` where the model
-supports them. Known reasoning families omit unsupported default sampling controls and provider
-seeds; supported generic models retain both. Reasoning requests use `max_completion_tokens` for
+`generation_min_video_seconds`. `--gen-kwargs` accepts generation controls. Temperature defaults
+to zero and accepts finite values from `0` through `2`; for example,
+`--gen-kwargs temperature=0.7,max_tokens=512,enable_thinking=false` enables sampling.
+The normalized `do_sample` value is `true` exactly when temperature is above zero; an explicit
+contradictory value is rejected. A supplied seed must still match `--seed`. The product and
+answer-generating baseline arms use the same resolved temperature and seed, which are recorded in the
+effective configuration and response-cache identity. Known reasoning families omit unsupported
+default sampling controls and provider seeds; explicitly requesting an unsupported nonzero
+temperature fails. Supported generic models retain both controls. Reasoning requests use `max_completion_tokens` for
 the configured output limit. Reported `generation_temperature` and `generation_seed` are `null`
 when omitted. The run seed still controls dataset selection and local random baselines; it cannot
 guarantee deterministic output from a provider that does not accept a seed. Explicit unsupported
 controls in `generation.extra_body` fail validation.
 
 Open-ended tasks use a judge. Without separate judge settings, the judge reuses the generation
-endpoint. Configure an official or deliberately chosen judge independently:
+endpoint. Judge requests follow the same model-capability rules for sampling controls and omit
+unsupported automatic settings. Configure an official or deliberately chosen judge independently:
 
 ```bash
 export MINDBRIDGE_JUDGE_MODEL="Qwen/Qwen3-14B"
@@ -279,7 +285,7 @@ annotated [example configuration](examples/eval.example.yaml) for every field an
 `benchmark.run` mirrors these flags: `tasks`, `arms`, `full_context_chars`, `compile_max_items`,
 `compile_max_chars`, `ingest`, `limit`, `offset`, `seed`, `bootstrap_samples`, `batch_size`,
 `compile_allow_partial_sources`,
-`repeat_index`, `max_batch_size`, `unit_concurrency`,
+`repeat_index`, `max_batch_size`, `unit_concurrency`, `ingest_concurrency`,
 `request_concurrency`, `judge_concurrency`, `recall_limit`, `device`, `device_lock`, `use_cache`,
 `answer_policy`,
 `run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `stream_results`,
@@ -308,9 +314,17 @@ they are not accepted keys in `benchmark.run`. The product CLI `mindbridge ask` 
 `--answer-policy` flag: this override belongs to the evaluator, while product REST and SDK
 requests carry their own policy. Keep the command used for an experiment with its artifacts.
 
-A run owns supported generation temperature and seed settings, so
-`generation.temperature` and `generation.seed` are rejected. Disable model thinking through the
-generation block instead:
+A run owns supported generation temperature and seed settings, so `generation.temperature` and
+`generation.seed` are rejected in YAML or JSON configuration. Select sampling through
+`--gen-kwargs temperature=0.7` and the seed through `--seed` or `benchmark.run.seed`.
+`generation.extra_body` cannot override temperature, sampling, seed or output-token controls.
+Other completion slots, including `vision.temperature`, retain their separate configured values.
+`generation.answer_style: concise` selects the optional answer-only reader style for both the
+product and answer-generating baseline arms. Its default preserves the previous prompt; the
+resolved configuration and response-cache identity include the choice. Dataset query templates
+and official output constraints remain unchanged. Evaluate this presentation policy with the
+chosen model rather than assuming it improves task scores.
+Model thinking can be configured through the generation block:
 
 ```yaml
 generation:
@@ -525,6 +539,23 @@ below, come from a real run instead of reading `0` in every task's `performance`
 still answers against the same fully settled store either way; `--ingest` changes how the store got
 there, not what an arm can see once ingest finishes.
 
+`--ingest-concurrency` (or `benchmark.run.ingest_concurrency`) defaults to `1`, preserving
+sequential chunks. Values such as `4` or `8` run bounded waves of `add_many` chunks through the
+public SDK, sharing the existing 28-slot process budget. Each wave settles before chunk receipts
+advance in input order; cancelling waits for its in-flight writes before closing the store.
+Chunks with overlapping start or end times wait for earlier chunks to finish before calling the
+SDK; a failed predecessor prevents its dependent writes. Unknown times form a serial barrier.
+Only independent time groups can commit concurrently, so the requested ceiling does not promise
+that every chunk runs at once. The value is recorded in run metadata and cache identities, so
+compare it using an independent run directory.
+
+This opt-in requires `--ingest add`, no `--deliberate`, and an explicit configuration without
+`formation`, `speech`, or `face` backends. Every selected question must have no causal cutoff;
+tasks with cutoffs retain sequential ingestion. This prevents a resumed store from exposing a
+later write to an earlier question. ATM raw main and Mem-Gallery support this static-corpus mode.
+The description cache serializes requests sharing an asset digest while independent assets can
+still be described concurrently.
+
 ## Supported benchmark categories and primary metrics
 
 The executable catalog currently contains 16 benchmark families expanded to 30 concrete tasks.
@@ -573,6 +604,12 @@ adapter version, so response caches from the earlier source-ID scheme are not re
 | --- | --- | --- | --- |
 | ATM-Bench (`atm-bench`: main/hard, raw/SGM) | Email, image, and video memory; needle-in-a-haystack, number/list, open-ended answers, and exact evidence-ID retrieval; use for personal archives | `accuracy`; `open_end` uses judge `gpt-5-mini`, number/list rows are deterministic | Pinned Hugging Face QA, email, media, and SGM artifacts; automatic; SGM variants use processed text instead of runtime media; raw variants need a `vision:` slot so image and video memories carry a text document, otherwise their only indexed text is the source ID |
 | Mem-Gallery (`mem-gallery`) | Multi-session persona dialogue, image-grounded QA, temporal/knowledge/recall points, and exact clue-round retrieval; use for conversational image memory | `f1`; deterministic; optional official `llm_judge` uses `qwen2.5-72b-instruct` | Pinned Hugging Face dialogue JSON and images; automatic |
+
+ATM-Bench's `number` label includes dates, times, and ranges. Its MindBridge-authored
+`atm_bench_number_format_v2` hint asks for the complete value requested by the original question,
+with required units and no unrequested components or explanation. It replaces the narrower
+"number alone" hint; the released questions, references, and scorer stay unchanged. Report the
+hint version when comparing runs.
 
 ### Embodied, video, and spatial memory
 
@@ -884,7 +921,7 @@ number would measure the generator's prior knowledge of the scripts rather than 
 
 ## Reported performance and resource metrics
 
-Evaluation artifacts use schema version `21` and runner recipe `mindbridge_eval_official_v18`.
+Evaluation artifacts use schema version `22` and runner recipe `mindbridge_eval_official_v18`.
 Results include five-layer quality diagnostics, observed answerer evidence, original trace/span
 identifiers, and `grounding_request` for each sample. `--log-samples` retains the original
 `source_question`. Baselines, rejudging inputs, and response caches require the current format.
@@ -1244,8 +1281,12 @@ between attempts) for up to ten minutes. Such a failure describes the network at
 the answer, write, or verdict it interrupted, and one fourteen-hour run lost its `longmemeval-s`
 score to eight connection resets during judging. Only the attempt that succeeded is timed. An
 outage longer than the budget follows the failure policy for that stage. Generation and judge
-request failures remain per-question errors: they score zero, stay in the mean, and increment
-`error_count`. Embedding failures retain the write and retrieval validity rules above.
+request failures remain per-question errors, stay in the mean, and increment `error_count`.
+Generation failures score zero. A `JudgeError` zeros only metrics requiring that judge and keeps
+deterministic answer metrics, including Mem-Gallery F1 and BLEU. Saved `JudgeError` predictions can
+be sent through the judging stage again without rerunning the reader; local metrics overwritten
+by an older artifact are restored from the saved prediction before rejudging. Embedding failures
+retain the write and retrieval validity rules above.
 
 Only provider SDK and transport failures raised by a judge request enter that zero-score policy.
 Local response parsing, score combination, cache access, and usage accounting errors stop the
@@ -1369,7 +1410,7 @@ Before reporting a number, check these task fields:
 | --- | --- |
 | `primary_metric` and `score.mean` | Name and value of the headline result |
 | `official_metric` | Must be true for an official-protocol claim |
-| `score_valid` | Must be true; ingest failures, failed retrieval diagnostics, and unavailable units make it false. An answer or judge failure scores zero, stays in the mean, and is counted in `error_count` |
+| `score_valid` | Must be true; ingest failures, failed retrieval diagnostics, and unavailable units make it false. An answer failure scores zero; a judge failure zeros judge-dependent metrics. Both stay in the mean and are counted in `error_count` |
 | `question_count` and `score.cluster_count` | Report both sample size and independent memory units |
 | `score.confidence_interval_95` | Present as `null` with fewer than two independent clusters |
 | `dataset_sha256`, `evaluation_sha256`, `scorer_protocol`, and `judge_model` | Establish whether two runs are comparable |
@@ -1378,7 +1419,7 @@ Prompts, references, and raw judge responses are retained only with `--log-sampl
 option as sensitive: benchmark artifacts can contain source content, retrieved evidence, and model
 responses.
 
-The runner fixes supported seeds and generation temperature, records model endpoints and scorer protocols,
+The runner fixes supported seeds, records the resolved generation temperature, model endpoints and scorer protocols,
 and marks whether each metric used the required official judge. `measurement_protocol` records
 fresh-store state, actual embedding warmups, repeat index, cache exclusions, and uncontrolled
 remote-server state. A provider may still change an unversioned model, so publishable runs should

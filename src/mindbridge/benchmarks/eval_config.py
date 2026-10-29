@@ -155,6 +155,7 @@ class _Arguments:
     resume: bool
     quiet: bool
     fallback_reference_at: datetime | None = None
+    ingest_concurrency: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,11 +311,17 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--gen-kwargs",
         default="",
-        help="deterministic generation settings; supports max_tokens and enable_thinking",
+        help="generation settings; supports temperature, max_tokens and enable_thinking",
     )
     parser.add_argument("--batch-size", "-b", default=None)
     parser.add_argument("--max-batch-size", type=_positive_int, default=None)
     parser.add_argument("--unit-concurrency", type=_positive_int, default=None)
+    parser.add_argument(
+        "--ingest-concurrency",
+        type=_positive_int,
+        default=None,
+        help="concurrent add_many chunks per unit; requires add without history-dependent backends",
+    )
     parser.add_argument("--request-concurrency", type=_positive_int, default=None)
     parser.add_argument("--judge-concurrency", type=_positive_int, default=None)
     parser.add_argument("--recall-limit", type=_positive_int, default=None)
@@ -450,6 +457,7 @@ def _arguments(
     batch_size = _picked(parsed.batch_size, run.batch_size, "auto")
     max_batch_size = _picked(parsed.max_batch_size, run.max_batch_size, 64)
     unit_concurrency = _picked(parsed.unit_concurrency, run.unit_concurrency, 1)
+    ingest_concurrency = _picked(parsed.ingest_concurrency, run.ingest_concurrency, 1)
     request_concurrency = _picked(parsed.request_concurrency, run.request_concurrency, 4)
     judge_concurrency = _picked(parsed.judge_concurrency, run.judge_concurrency, 8)
     recall_limit = _picked(parsed.recall_limit, run.recall_limit, 20)
@@ -469,6 +477,8 @@ def _arguments(
         False,
     )
     ingest = _picked(parsed.ingest, run.ingest, DEFAULT_INGEST_MODE)
+    if ingest_concurrency > 1 and (ingest != "add" or parsed.deliberate):
+        parser.error("--ingest-concurrency above 1 requires --ingest add without --deliberate")
     bootstrap_samples = _picked(
         parsed.bootstrap_samples, run.bootstrap_samples, DEFAULT_BOOTSTRAP_SAMPLES
     )
@@ -541,6 +551,7 @@ def _arguments(
         batch_size=batch_size,
         max_batch_size=max_batch_size,
         unit_concurrency=unit_concurrency,
+        ingest_concurrency=ingest_concurrency,
         request_concurrency=request_concurrency,
         recall_limit=recall_limit,
         answer_policy=answer_policy,
@@ -722,23 +733,21 @@ def _load_memory_config(
     if generation is None:
         raise ValueError("benchmark config generation cannot be null")
     conflicts = sorted(
-        {"max_tokens", "seed", "temperature"}.intersection(generation.extra_body or {})
+        {"max_tokens", "seed", "temperature", "do_sample"}.intersection(generation.extra_body or {})
     )
     if conflicts:
         raise ValueError(
             "benchmark config generation.extra_body cannot set benchmark controls: "
             + ", ".join(conflicts)
         )
-    # A reproducible sweep pins sampling: the harness always sends temperature 0 and the seed
-    # `--seed` names. Declaring either here used to be accepted and then silently discarded, so
-    # the file said one thing and the run did another; say so instead.
+    # CLI generation controls own sampling; accepting these fields here would introduce a second
+    # precedence rule and let the saved product stanza disagree with the run.
     pinned = sorted(name for name in ("temperature", "seed") if name in generation.model_fields_set)
     if pinned:
         raise ValueError(
             "benchmark config generation cannot set "
             + ", ".join(pinned)
-            + ": reproducible evaluation pins temperature to 0 and takes the seed from --seed "
-            "or benchmark.run.seed"
+            + ": set temperature through --gen-kwargs and seed through --seed or benchmark.run.seed"
         )
     return config, overrides
 
@@ -901,9 +910,7 @@ def _evaluation_memory_config(
             ),
             "model": model.generation_model,
             "timeout": model.timeout_seconds,
-            "temperature": (
-                0.0 if sampling_supported(model.generation_model, extra_body) else None
-            ),
+            "temperature": _generation_temperature(model.generation_model, options, extra_body),
             "seed": None if reasoning_model(model.generation_model) else arguments.seed,
             "modalities": model.generation_capabilities,
             "max_tokens": (
@@ -1092,13 +1099,22 @@ def _generation_kwargs(  # noqa: C901 - ordered trust-boundary validation is lin
     }
     if unsupported:
         raise ValueError(
-            "MindBridge eval supports deterministic --gen-kwargs only: temperature, do_sample, "
+            "MindBridge eval supports --gen-kwargs controls: temperature, do_sample, "
             "seed, max_tokens, enable_thinking"
         )
-    if "temperature" in supplied and float(supplied["temperature"]) != 0:
-        raise ValueError("reproducible evaluation requires temperature=0")
-    if "do_sample" in supplied and supplied["do_sample"].casefold() not in {"false", "0"}:
-        raise ValueError("reproducible evaluation requires do_sample=false")
+    try:
+        temperature = float(supplied.get("temperature", "0"))
+    except ValueError:
+        raise ValueError("--gen-kwargs temperature must be finite and between 0 and 2") from None
+    if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+        raise ValueError("--gen-kwargs temperature must be finite and between 0 and 2")
+    temperature = temperature or 0.0
+    if "do_sample" in supplied:
+        sampled = supplied["do_sample"].casefold()
+        if sampled not in {"true", "false", "1", "0"}:
+            raise ValueError("--gen-kwargs do_sample must be true or false")
+        if (sampled in {"true", "1"}) != (temperature > 0):
+            raise ValueError("--gen-kwargs do_sample must match whether temperature is above zero")
     if "seed" in supplied and int(supplied["seed"]) != seed:
         raise ValueError("--gen-kwargs seed must match the first --seed value")
     if "max_tokens" in supplied:
@@ -1115,13 +1131,28 @@ def _generation_kwargs(  # noqa: C901 - ordered trust-boundary validation is lin
         "0",
     }:
         raise ValueError("--gen-kwargs enable_thinking must be true or false")
-    normalized = ["temperature=0", "do_sample=false", f"seed={seed}"]
+    normalized = [
+        f"temperature={str(temperature).removesuffix('.0')}",
+        f"do_sample={'true' if temperature > 0 else 'false'}",
+        f"seed={seed}",
+    ]
     if "max_tokens" in supplied:
         normalized.append(f"max_tokens={max_tokens}")
     if "enable_thinking" in supplied:
         enabled = supplied["enable_thinking"].casefold() in {"true", "1"}
         normalized.append(f"enable_thinking={'true' if enabled else 'false'}")
     return ",".join(normalized)
+
+
+def _generation_temperature(
+    model: str, options: Mapping[str, str], extra_body: Mapping[str, object] | None = None
+) -> float | None:
+    temperature = float(options.get("temperature", "0"))
+    if sampling_supported(model, extra_body):
+        return temperature
+    if temperature != 0:
+        raise ValueError(f"{model} does not support the configured temperature")
+    return None
 
 
 def _positive_int(value: str) -> int:

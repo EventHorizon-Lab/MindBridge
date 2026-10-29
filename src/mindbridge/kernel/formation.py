@@ -341,10 +341,15 @@ def _grounded_formation_pairs(
     states: dict[tuple[str | None, str], builtins.list[MemoryContext]] = {}
     for pair in pairs:
         prepared, source_id, _confidence = pair
+        context = prepared.context
+        if isinstance(context, MemoryContext) and prepared.memory_id in context.evidence_ids:
+            # Canonical facts may reuse a historical ID. Reject the entire self-dependent
+            # assessment; removing one member would turn its conjunction into other evidence.
+            refused += 1
+            continue
         if seen.setdefault((prepared.memory_id, source_id), prepared) != prepared:
             refused += 1
             continue
-        context = prepared.context
         if isinstance(context, MemoryContext) and context.kind is MemoryKind.STATE:
             lineage = states.setdefault(
                 (source_id, context.lineage_id or prepared.memory_id),

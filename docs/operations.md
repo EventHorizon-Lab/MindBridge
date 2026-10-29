@@ -439,8 +439,7 @@ Provider request IDs are recorded as `gen_ai.request.id` for a single request an
 `mindbridge.model.request_ids` when one model span covers multiple requests. They are taken from
 the SDK response or provider error, including failure paths; an absent ID is left absent rather
 than invented. A local trace ID identifies the MindBridge operation, while the provider request
-ID identifies the upstream call for support. Keep both in protected operator telemetry. This
-follows OpenAI's [request debugging guidance](https://developers.openai.com/api/reference/overview#debugging-requests).
+ID identifies the upstream call for support. Keep both in protected operator telemetry.
 
 The first-output clocks deliberately use different scopes and units:
 

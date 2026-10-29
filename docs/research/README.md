@@ -13,6 +13,9 @@ the repository. An archived command may require those artifacts or an older chec
 
 | Record | Scope |
 | --- | --- |
+| [ATM raw main 与 Mem-Gallery：最佳配置与能力突破方向 — 2026-10-29](2026-10-29-atm-gallery-baseline.md) | Task-specific parameters, verified full-run limits, memory formation failures, and genuine grounding/perception improvements |
+| [FunASR main adoption — 2026-10-28](2026-10-28-funasr-main.md) | Pinned upstream runtime, speaker-overlap regression, thread/placement controls, timestamp compatibility and model-check boundaries |
+| [ATM raw main 与 Mem-Gallery：能力修复与真实模型运行 — 2026-10-28](2026-10-28-atm-gallery-capability-run.md) | Bounded multimodal retrieval, cross-round evidence retention, reader controls, verified media transport and ongoing full runs |
 | [Eval concurrency and resource reuse — 2026-10-27](2026-10-27-eval-concurrency.md) | Dynamic model admission, idle connection reclamation, child-worker fairness, cancellation, and deterministic paired SDK evaluation |
 | [Local runtime performance — 2026-10-27](2026-10-27-local-runtime-performance.md) | FP32 buffer scoring, scoped SQLite hydration, exact-result checks, and frozen SDK latency comparisons |
 | [否定敏感检索的论文与开源方案评估 — 2026-10-27](2026-10-27-negation-retrieval-research.md) | Cross-encoder evidence, Chinese subject/scope extraction, exclusion-query methods, implementation status, and MindBridge evaluation priorities |

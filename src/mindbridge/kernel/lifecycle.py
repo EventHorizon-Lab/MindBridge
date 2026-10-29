@@ -38,6 +38,7 @@ class OperationAssets:
     speech_rollbacks: builtins.list[SpeechRollback]
     face_observations: dict[str, tuple[FaceObservation, ...]]
     descriptions: dict[str, str]
+    query_descriptions: dict[str, str]
     # Identity ID -> the name a caption's facts stated for that diarised speaker. Staged rather
     # than applied on the spot: the naming assertion reindexes every memory that mentions the
     # person, and this write's own memory does not exist until it commits.
@@ -210,6 +211,7 @@ class Lifecycle:
             speech_rollbacks=[],
             face_observations={},
             descriptions={},
+            query_descriptions={},
             speaker_names={},
         )
         try:

@@ -32,12 +32,6 @@ that wider context always improves quality. No new retrieval-quality result is c
 
 Sources checked on 2026-10-27:
 
-- OpenAI's [token counting guide](https://developers.openai.com/api/docs/guides/token-counting)
-  recommends counting the actual structured input, including framing and media. Its endpoint
-  accepts Responses input. This project emits Chat Completions and supports arbitrary compatible
-  servers, so counting a translated Responses request would not establish an exact count for
-  the actual request. Adding a generic tokenizer or dividing characters by four would not
-  establish that guarantee either.
 - Anthropic's [token counting guide](https://platform.claude.com/docs/en/build-with-claude/token-counting)
   includes system prompts, tools, images, and PDFs, with endpoint-specific restrictions, and
   describes counting as an estimate. A counter's capability must be explicit for the chosen
