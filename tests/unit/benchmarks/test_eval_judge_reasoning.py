@@ -98,6 +98,7 @@ async def test_known_reasoning_judge_omits_sampling_and_uses_completion_limit(mo
     assert result.error_code is None
     assert result.metrics["llm_judge"] == 1.0
     assert requests[0]["model"] == model
+    assert requests[0]["store"] is False
     assert "temperature" not in requests[0]
     assert "max_tokens" not in requests[0]
     assert requests[0]["max_completion_tokens"] == 512

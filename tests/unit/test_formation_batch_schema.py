@@ -137,7 +137,7 @@ def test_only_strict_formation_recipe_changes_for_dynamic_batch_strategy() -> No
         )
         return ":json-schema-v1:" + hashlib.sha256(payload.encode()).hexdigest()[:16]
 
-    plain, strict = OpenAIModels(), OpenAIModels(generation_response_format="json_schema")
+    plain, strict = OpenAIModels(generation_response_format="json_object"), OpenAIModels()
     assert strict.formation_space == plain.formation_space + backend._schema_recipe("formation")
     assert backend._schema_recipe("formation") != legacy_recipe("formation")
     names: tuple[SchemaName, ...] = ("vision", "consolidation", "recall_plan", "media_selection")

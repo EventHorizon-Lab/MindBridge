@@ -53,7 +53,7 @@ config = {
     },
     "generation": {
         "provider": "openai",
-        "model": "gpt-5-mini",
+        "model": "gpt-5-mini-2025-08-07",
         "response_format": "json_schema",
     },
     "settings": {
@@ -102,10 +102,10 @@ In this table, connection fields are `base_url`, `api_key`, `timeout`, and `max_
 | --- | --- | --- |
 | `embedding: sentence-transformers` | `model` | `revision=None`, `dimension=None`, `device=None`, `batch_size=32` |
 | `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, `image_max_pixels=None`, plus connection fields |
-| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `answer_style=default`, `video_limit=8`, `min_video_seconds=None`, `image_max_pixels=None`, `offline_gazetteer=None`, `extra_body=None`, plus connection fields |
-| `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `image_max_pixels=None`, `extra_body=None`, plus connection fields |
-| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `video_frames=4` (2–64), `image_max_pixels=None`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
-| `consolidation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_object`, `stream=False`, `extra_body=None`, plus connection fields |
+| `generation: openai` | — | `model=gpt-5-mini-2025-08-07`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_schema`, `store=False`, `stream=False`, `answer_style=default`, `video_limit=8`, `min_video_seconds=None`, `image_max_pixels=None`, `offline_gazetteer=None`, `extra_body=None`, plus connection fields |
+| `formation: openai` | — | `model=gpt-5-mini-2025-08-07`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_schema`, `store=False`, `stream=False`, `image_max_pixels=None`, `extra_body=None`, plus connection fields |
+| `vision: openai` | — | `model=gpt-5-mini-2025-08-07`, `modalities=[image]` (image and/or video only), `video_frames=4` (2–64), `image_max_pixels=None`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_schema`, `store=False`, `stream=False`, `extra_body=None`, plus connection fields |
+| `consolidation: openai` | — | `model=gpt-5-mini-2025-08-07`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `response_format=json_schema`, `store=False`, `stream=False`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto`, `ncpu=4`, `vad_device=None`, `speaker_device=None` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
 | `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
@@ -119,12 +119,26 @@ Every `base_url` must be an absolute `http://` or `https://` URL; a bare host na
 during configuration validation rather than at the first model request.
 
 Use an SDK base URL ending in `/v1`, not the complete `/chat/completions` URL: the SDK appends the
-operation path. For an endpoint supporting strict structured output, select
-`response_format="json_schema"`. The adapter then sends a strict JSON Schema for formation,
+operation path. The default `response_format="json_schema"` sends a strict JSON Schema for formation,
 consolidation, visual descriptions, media diagnosis, and recall planning. Free-text answers remain
-text. The compatible-server default is `json_object`; it guarantees JSON syntax, not the shape or
-meaning of a response. Both modes retain local validation, and a configured strict schema is never
-silently downgraded.
+text. A compatible endpoint that supports only JSON mode must explicitly select
+`response_format="json_object"`; this guarantees JSON syntax, not response shape or meaning.
+Both modes retain local validation, and a strict schema is never silently downgraded.
+
+Every chat-completion request, including streaming and structural calls, explicitly sends the
+configured storage policy, defaulting to `store=False`. Set the slot's strict boolean `store`
+field to `True` only when provider-side
+application-state storage is intended. Direct callers use `generation_store`. This setting does
+not disable provider abuse-monitoring retention or establish Zero Data Retention; review the
+provider's account-level [data controls](https://developers.openai.com/api/docs/guides/your-data).
+Local deletion and retention cannot erase copies already held by a model provider.
+
+The bundled generation default pins the previously evaluated snapshot rather than a moving alias.
+Explicit model names remain caller-owned: pin a compatible model's deployment revision and
+re-evaluate it before changing that deployment. Returned model identity and request IDs remain
+available on traces. Changing the default model or output protocol changes formation, vision and
+consolidation recipe identities; replay source data into a fresh directory when those stored
+representations were built with the previous defaults.
 
 Sampling controls are model-dependent. Known reasoning models do not receive incompatible automatic
 `temperature` or `seed` settings; explicitly configuring unsupported controls raises
@@ -222,7 +236,8 @@ Later reasoning models that support non-reasoning requests may use temperature w
 cannot use this combination. GPT-5.1 and GPT-5.2 aliases and dated snapshots default to `none`, so
 temperature also works without explicitly setting effort on those models. Seeds are rejected for
 known reasoning models. `extra_body` cannot
-override the model, messages, response format, or streaming controls; configure their named options.
+override the model, messages, response format, streaming controls, or storage policy; configure
+their named options.
 
 Atomic capability declarations contain only `text`, `image`, `video`, and `audio`. OpenAI
 embedding requires at least one modality. Jina dimensions are `32`, `64`, `128`, `256`, `512`, or
@@ -232,11 +247,13 @@ from 0 through 2; seed is from 0 through `2**63 - 1`; face thresholds are from 0
 `generation.video_limit` caps retrieved evidence videos in one answer request; question media has
 priority, and `None` disables that count. `generation.min_video_seconds` sends a shorter video as
 four ordered stills and requires image support. When the provider rejects an answer request by
-declaring a constraint on its media -- a video "too short", or input data that "may contain
-inappropriate content" -- the same request is sent once more with that modality's evidence
-media omitted and the omission declared in the prompt, because the memories' text still answers
-and the provider names the modality, never the clip. Formation and consolidation have neither
-field because they shape answer evidence, not proposals.
+declaring a technical duration constraint such as a video "too short", without a different
+semantic error code, the request is sent once more with that modality's evidence media omitted
+and the omission declared in the prompt. Content-safety refusals, including recognized safety
+codes and compatible gateways' "inappropriate content" inspection errors, instead raise
+`ModelError(reason="model_refused")` without removing media or retrying. Explicit semantic error
+codes take precedence over message matching. Formation and consolidation have neither field
+because they shape answer evidence, not proposals.
 
 Answer evidence declares each record's original `source_modality`: `text`, `image`, `video`,
 `audio`, or `omni` for a record containing multiple media kinds. Derived text records remain
@@ -533,7 +550,7 @@ config = {
     },
     "vision": {
         "provider": "openai",
-        "model": "gpt-5-mini",
+        "model": "gpt-5-mini-2025-08-07",
         "modalities": ["image"],
     },
 }
@@ -647,7 +664,7 @@ with Memory.from_config(
         },
         "consolidation": {
             "provider": "openai",
-            "model": "gpt-5-mini",
+            "model": "gpt-5-mini-2025-08-07",
             "modalities": ["text", "image"],
             "response_format": "json_schema",
             "max_tokens": 4096,
@@ -1063,7 +1080,7 @@ from mindbridge import SentenceTransformersEmbedder, Memory, OpenAIModels
 with OpenAI(timeout=30.0, max_retries=3) as client:
     models = OpenAIModels(
         generation_client=client,
-        generation_model="gpt-5-mini",
+        generation_model="gpt-5-mini-2025-08-07",
     )
     with Memory(
         "./data/assistant",
@@ -1092,7 +1109,7 @@ supplied a description, so speculative retrieval has a query before finality.
 fill `answerer=`, `former=`, and `consolidator=`:
 
 ```python
-models = OpenAIModels(generation_model="gpt-5-mini")
+models = OpenAIModels(generation_model="gpt-5-mini-2025-08-07")
 memory = Memory(
     "./data/assistant",
     embedder=SentenceTransformersEmbedder(

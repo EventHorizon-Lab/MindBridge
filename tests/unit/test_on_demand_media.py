@@ -152,8 +152,10 @@ def test_diagnosis_text_ceiling_includes_system_prompt_before_http(
     assert failure.value.stage == "generate"
 
 
+@pytest.mark.parametrize("safety_rejection", [False, True])
 def test_provider_rejection_does_not_diagnose_again_or_lose_original_omissions(
     tmp_path: Path,
+    safety_rejection: bool,
 ) -> None:
     assets = tuple(
         _asset(tmp_path, f"picture-{i}", Modality.IMAGE, "image/png", b"image") for i in range(2)
@@ -180,9 +182,12 @@ def test_provider_rejection_does_not_diagnose_again_or_lose_original_omissions(
         if len(sent) == 1:
             content = '{"requests":[{"media_index":0,"reason":"detail_missing"}]}'
         elif len(sent) == 2:
-            return httpx.Response(
-                400, json={"error": {"message": "image input may contain inappropriate content"}}
+            message = (
+                "image input may contain inappropriate content"
+                if safety_rejection
+                else "image input is too short"
             )
+            return httpx.Response(400, json={"error": {"message": message}})
         else:
             assert "response_format" not in payload
             evidence = json.loads(payload["messages"][1]["content"])["hits"][0]
@@ -204,8 +209,13 @@ def test_provider_rejection_does_not_diagnose_again_or_lose_original_omissions(
             generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
             generation_media_policy="on_demand",
         )
-        model.answer("question", (hit,), exhaustive=True)
-    assert len(sent) == 3
+        if safety_rejection:
+            with pytest.raises(ModelError) as failure:
+                model.answer("question", (hit,), exhaustive=True)
+            assert failure.value.reason == "model_refused"
+        else:
+            model.answer("question", (hit,), exhaustive=True)
+    assert len(sent) == (2 if safety_rejection else 3)
 
 
 @pytest.mark.parametrize(

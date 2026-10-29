@@ -691,6 +691,37 @@ def retire_evidence_clauses_for_source(
     return changed
 
 
+def response_policy_dependencies(connection: sqlite3.Connection) -> frozenset[str]:
+    """Read standing host policies and their complete active support graph in this transaction.
+
+    Follow the flat evidence projection that ordinary compilation requires. UNION terminates
+    even on a cyclic graph; omitting an ancestor would grant mutation authority over it.
+    """
+    return frozenset(
+        row_text(row, "memory_id")
+        for row in connection.execute(
+            """
+            WITH RECURSIVE protected(memory_id) AS (
+                SELECT s.memory_id
+                FROM memory_semantics AS s
+                JOIN memory_records AS r ON r.memory_id = s.memory_id
+                WHERE s.kind = 'response_policy' AND r.forgotten_at IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM memory_versions AS v
+                    WHERE v.memory_id = s.memory_id AND v.retired_at IS NULL AND v.visible = 1
+                  )
+                UNION
+                SELECT e.source_memory_id
+                FROM memory_evidence AS e
+                JOIN protected AS p ON p.memory_id = e.memory_id
+                WHERE e.retired_at IS NULL
+            )
+            SELECT memory_id FROM protected
+            """
+        ).fetchall()
+    )
+
+
 def active_evidence_dependent_closure(
     connection: sqlite3.Connection,
     source_memory_id: str,

@@ -15,6 +15,7 @@ from mindbridge._telemetry import mark_model_requests
 from mindbridge.control import dump_operation, load_operation, operation_key
 from mindbridge.exceptions import MemoryNotFoundError, MindBridgeError, ModelError, ValidationError
 from mindbridge.infrastructure.local.store import (
+    ProtectedMemoryError,
     StaleOperationError,
     StoredEmbedding,
     StoredMemory,
@@ -54,6 +55,7 @@ from mindbridge.types import (
     EvidenceBasis,
     IdentityChange,
     MemoryIntent,
+    MemoryKind,
     MemoryOperation,
     MemoryOperationRecord,
     MemoryOutcome,
@@ -68,6 +70,21 @@ _LOGGER = logging.getLogger(__name__)
 # configured window is a gap. Not configurable: below two there is no repetition to speak of, and
 # a host that wants a stricter threshold narrows the window instead.
 _REPEATED_FAILURES = 2
+
+
+def _target_refusal(
+    targets: Mapping[str, StoredMemory], target_ids: Sequence[str], *, host_authored: bool
+) -> str | None:
+    if any(is_bound_naming_assertion(targets, target) for target in target_ids):
+        return "naming_assertion"
+    if any(is_consent_assertion(targets, target) for target in target_ids):
+        return "consent_assertion"
+    if not host_authored and any(
+        target.context is not None and target.context.kind is MemoryKind.RESPONSE_POLICY
+        for target in targets.values()
+    ):
+        return "unauthorized"
+    return None
 
 
 class ControlPlane(Traced):
@@ -453,6 +470,7 @@ class ControlPlane(Traced):
                     shown=None,
                     window=None,
                     assets=assets,
+                    host_authored=True,
                 )
             except RejectedOperation as rejection:
                 if rejection.reason == "unknown_target":
@@ -724,10 +742,9 @@ class ControlPlane(Traced):
         # person permitted; only `record_consent()` supersedes it and only `rollback()` retracts.
         # Checked here for the same reason as the rule above.
         targets = self._control_records(operation.target_ids)
-        if any(is_bound_naming_assertion(targets, target) for target in operation.target_ids):
-            raise RejectedOperation("naming_assertion")
-        if any(is_consent_assertion(targets, target) for target in operation.target_ids):
-            raise RejectedOperation("consent_assertion")
+        refusal = _target_refusal(targets, operation.target_ids, host_authored=host_authored)
+        if refusal is not None:
+            raise RejectedOperation(refusal)
         pending = StoredOperation(
             operation_key=key,
             intent=operation.intent.value,
@@ -750,7 +767,9 @@ class ControlPlane(Traced):
                 )
             if operation.intent is MemoryIntent.IDENTIFY:
                 return operation_record(
-                    self._apply_identification(operation, pending, shown=shown, assets=assets)
+                    self._apply_identification(
+                        operation, pending, shown=shown, assets=assets, host_authored=host_authored
+                    )
                 )
             return operation_record(
                 self._apply_operation_effects(
@@ -760,8 +779,11 @@ class ControlPlane(Traced):
                     shown=shown,
                     window=window,
                     assets=assets,
+                    host_authored=host_authored,
                 )
             )
+        except ProtectedMemoryError:
+            raise RejectedOperation("unauthorized") from None
         except StaleOperationError:
             # The proposal was built on records the apply transaction found had moved. Nothing
             # was written; the in-transaction re-check is the whole guarantee, so there is no
@@ -777,6 +799,7 @@ class ControlPlane(Traced):
         shown: Mapping[str, MemoryRecord] | None,
         window: frozenset[str] | None,
         assets: OperationAssets,
+        host_authored: bool,
     ) -> StoredOperation:
         """Validate a REINFORCE, CORRECT, or FORGET proposal and commit its effect.
 
@@ -824,6 +847,7 @@ class ControlPlane(Traced):
                     require_visible=(
                         operation.evidence_ids if operation.intent is MemoryIntent.REINFORCE else ()
                     ),
+                    preserve_response_policies=not host_authored,
                     naming_projection_factory=self._formation.naming_projection_factory(assets),
                 )
             if logged is None:
@@ -944,6 +968,7 @@ class ControlPlane(Traced):
             # a different complete set as another clause; REINFORCE remains the explicit way to
             # add independent singleton support.
             joint_evidence_clauses=True,
+            preserve_response_policies=not host_authored,
         )
         if logged is None:
             raise RejectedOperation("duplicate")
@@ -956,6 +981,7 @@ class ControlPlane(Traced):
         *,
         shown: Mapping[str, MemoryRecord] | None,
         assets: OperationAssets,
+        host_authored: bool,
     ) -> StoredOperation:
         """Validate one agent-proposed naming and commit it as a bound ENTITY assertion.
 
@@ -1057,6 +1083,7 @@ class ControlPlane(Traced):
                 # before it opened: forgotten, hidden or retired evidence makes the naming
                 # stale, and the dispatch turns that into a `stale` rejection.
                 require_visible=operation.evidence_ids,
+                preserve_response_policies=not host_authored,
                 projection_identity_id=identity_id,
                 projection_factory=projection,
             )

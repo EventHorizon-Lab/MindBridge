@@ -1177,10 +1177,9 @@ def _request_telemetry(tracer: Tracer) -> ServerMiddleware[Any]:
                 raise
             finally:
                 span.set_attribute(_MCP_TOTAL, (perf_counter_ns() - started) / 1_000_000)
-            if (
-                isinstance(result, Mapping)
-                and (result.get("isError") is True or result.get("is_error") is True)
-            ) or getattr(result, "is_error", False) is True:
+            if (isinstance(result, Mapping) and result.get("isError") is True) or (
+                isinstance(result, CallToolResult) and result.is_error
+            ):
                 span.set_status(StatusCode.ERROR)
             return result
 

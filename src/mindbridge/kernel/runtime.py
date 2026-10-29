@@ -18,6 +18,7 @@ from mindbridge.infrastructure.local.store import (
     IndexDocument,
     LocalStore,
     LocalStoreCapacityError,
+    ProtectedMemoryError,
     StaleOperationError,
     UnsupportedSchemaError,
 )
@@ -110,9 +111,8 @@ def open_store(data_dir: Path) -> LocalStore:
 def translate_storage_errors(action: str) -> Iterator[None]:
     try:
         yield
-    # A stale control-plane precondition is kernel policy, not an IO failure: the two apply call
-    # sites turn it into a `"stale"` rejection, and no other store method raises it.
-    except (MindBridgeError, StaleOperationError):
+    # Preserve policy refusals for the kernel to classify instead of reporting an IO failure.
+    except (MindBridgeError, ProtectedMemoryError, StaleOperationError):
         raise
     except LocalStoreCapacityError as error:
         raise StorageError(

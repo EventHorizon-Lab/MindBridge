@@ -681,7 +681,8 @@ def test_description_numbers_every_visual_in_one_request_and_sends_video_as_stil
     assert len(seen) == 1
     payload = seen[0]
     assert payload["model"] == "caption-model"
-    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"]["name"] == "vision"
     parts = payload["messages"][1]["content"]
     # Ordinals, not identifiers: the reply is matched to inputs by position, and the caption is
     # stored in a searchable document, so nothing naming the asset may enter the prompt.
@@ -3278,11 +3279,6 @@ def test_answer_converts_only_videos_below_the_configured_provider_minimum(
     "rejection",
     [
         "The video file is too short.",
-        # A content-inspection refusal names the modality, not the clip; measured live on one
-        # gateway for two of thirteen questions over the same clips, so it is a fact about this
-        # request and the memories' text still answers.
-        "<400> InternalError.Algo.DataInspectionFailed: Input video data may contain "
-        "inappropriate content.",
     ],
 )
 @pytest.mark.parametrize("streaming", [False, True])
@@ -4534,6 +4530,7 @@ def _model(
         generation_video_limit=generation_video_limit,
         generation_extra_body=generation_extra_body,
         generation_stream=generation_stream,
+        generation_response_format="json_object",
     )
 
 

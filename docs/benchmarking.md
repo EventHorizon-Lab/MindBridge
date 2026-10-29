@@ -220,7 +220,7 @@ export MINDBRIDGE_GENERATION_API_KEY="..."
 
 uv run --frozen mindbridge-bench eval \
   --tasks locomo-refined \
-  --model-args generation_model=gpt-5-mini \
+  --model-args generation_model=gpt-5-mini-2025-08-07 \
   --limit 1 \
   --seed 42 \
   --output-path .benchmarks/results/locomo-one-conversation
@@ -236,7 +236,7 @@ The default generation endpoint is OpenAI-compatible. These environment variable
 | --- | --- |
 | `MINDBRIDGE_GENERATION_API_KEY` | API key; falls back to `OPENAI_API_KEY` |
 | `MINDBRIDGE_GENERATION_BASE_URL` | Base URL; falls back to `OPENAI_BASE_URL` |
-| `MINDBRIDGE_GENERATION_MODEL` | Generation model; defaults to `gpt-5-mini` |
+| `MINDBRIDGE_GENERATION_MODEL` | Generation model; defaults to `gpt-5-mini-2025-08-07` |
 | `MINDBRIDGE_GENERATION_MODALITIES` | Comma-separated atomic modalities, or `omni` |
 | `MINDBRIDGE_TIMEOUT_SECONDS` | Generation timeout; defaults to 300 seconds |
 

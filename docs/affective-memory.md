@@ -171,6 +171,14 @@ applies itself through `apply()` writes one, and the stored record carries `resp
 authorization is stamped on that record and not on the proposal, which the operation log keeps
 exactly as it was handed over so a logged row replays to the same derived record.
 
+Model-originated formation and control-plane operations also cannot modify a standing policy or
+its transitive active evidence graph. SQLite checks this in the same transaction as the write:
+reinforcement, correction, forgetting, source replacement and implicit lineage supersession are
+refused as `unauthorized`. This includes partially superseding an ancestor's validity interval.
+Automatic formation drops a refused derivation while preserving its observation and unrelated
+sibling proposals. Explicit host `apply()`, `forget()`, rollback, deletion and retention retain
+their authority to update or withdraw policy and supporting evidence.
+
 **Arousal-weighted consolidation priority stays capped.** High arousal may raise the priority of
 deliberation, bounded, so that a single intense episode cannot dominate the slow loop. If such a
 weight ever reaches ranking, it must be a `MemoryConfig` flag that defaults off, because a benchmark

@@ -6,6 +6,10 @@ from pydantic import ValidationError
 from mindbridge.benchmarks.model_config import HarnessOverrides, ModelConfig
 
 
+def test_benchmark_default_pins_the_generation_snapshot() -> None:
+    assert ModelConfig.from_environment({}).generation_model == "gpt-5-mini-2025-08-07"
+
+
 @pytest.mark.parametrize(
     "url",
     (

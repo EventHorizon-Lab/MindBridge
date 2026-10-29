@@ -121,7 +121,7 @@ Append this to `quickstart.py`:
 # Reuse the local embedding space and add only a generation backend.
 answer_config = {
     **config,
-    "generation": {"provider": "openai", "model": "gpt-5-mini"},
+    "generation": {"provider": "openai", "model": "gpt-5-mini-2025-08-07"},
 }
 
 with Memory.from_config(answer_config) as memory:

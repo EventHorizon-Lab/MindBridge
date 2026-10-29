@@ -138,7 +138,8 @@ class _OpenAICompletionConfig(_OpenAIConfig):
     temperature: _Temperature | None = None
     seed: _Seed | None = None
     max_tokens: _PositiveInt | None = None
-    response_format: Literal["json_object", "json_schema"] = "json_object"
+    response_format: Literal["json_object", "json_schema"] = "json_schema"
+    store: Annotated[bool, Field(strict=True)] = False
     extra_body: Mapping[str, object] | None = None
     stream: bool = False
 
@@ -437,6 +438,8 @@ def _completion_values(config: _OpenAICompletionConfig) -> dict[str, object]:
     values.update(
         generation_model=config.model,
         generation_capabilities=config.modalities,
+        generation_response_format=config.response_format,
+        generation_store=config.store,
     )
     optional = {
         "generation_temperature": config.temperature,
@@ -444,9 +447,6 @@ def _completion_values(config: _OpenAICompletionConfig) -> dict[str, object]:
         "generation_max_tokens": config.max_tokens,
         "generation_extra_body": config.extra_body,
         "generation_stream": True if config.stream else None,
-        "generation_response_format": (
-            config.response_format if config.response_format != "json_object" else None
-        ),
     }
     values.update((key, value) for key, value in optional.items() if value is not None)
     return values

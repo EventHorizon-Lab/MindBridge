@@ -13,10 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from mindbridge.benchmarks.eval_regression import PERFORMANCE_BUDGET_NAMES
 from mindbridge.configuration import _absolute_http_url
+from mindbridge.models.openai_sdk import DEFAULT_GENERATION_MODEL
 from mindbridge.types import AnswerPolicy, Modality
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_GENERATION_MODEL = "gpt-5-mini"
 # An hour bounds nothing a benchmark run cares about: a request the server never answers
 # holds its task for the whole hour while the remaining workers idle, and the run reports
 # the stall as elapsed time rather than as a failure. The slowest mean model call measured

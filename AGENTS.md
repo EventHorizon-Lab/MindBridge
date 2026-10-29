@@ -39,9 +39,16 @@ uv lock --check --default-index https://pypi.org/simple
 uv run --frozen ruff format --check .
 uv run --frozen ruff check .
 uv run --frozen mypy
-uv run --frozen pytest -W error
 git diff --check
 ```
+
+Follow OpenAI's [testing and review guidance](https://learn.chatgpt.com/guides/best-practices#improve-reliability-with-testing-and-review)
+by selecting checks relevant to the change. Run the smallest affected test cases or modules with
+`uv run --frozen pytest -W error <test-path>`, including direct callers and contract tests when
+their behavior changes. Once those checks pass, stop testing unless another change, failure or
+unresolved concern justifies expanding coverage. Do not run the full test suite unless the user
+explicitly requests it. Report the checks actually run and any relevant checks not run; CI's
+configured checks remain independent of this local workflow.
 
 Documentation changes must also pass the pinned Markdown and link commands in
 `CONTRIBUTING.md`. Ruff formats Python code blocks in Markdown, so documentation examples are part

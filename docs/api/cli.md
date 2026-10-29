@@ -184,6 +184,27 @@ the public replay path: reproducing a logged sequence against a fresh store conf
 recipe that produced it reproduces the same derived IDs. A refused operation exits
 `validation_error` naming the kernel's rejection reason.
 
+`--operation` requires the complete current log payload, including explicit nulls and empty
+arrays; it does not fill missing fields from older or abbreviated formats. For example, a
+forget operation has this shape (replace the target ID with a real memory ID):
+
+```json
+{
+  "intent": "forget",
+  "evidence_ids": [],
+  "target_ids": ["memory-id"],
+  "proposal": null,
+  "claim": null,
+  "consent": null,
+  "identity": null,
+  "rationale": null
+}
+```
+
+Proposal, claim, consent and identity objects also require their current logged fields. A row
+copied from `operations` supplies them. An incomplete payload raises `storage_error` during log
+decoding before the kernel applies it.
+
 `record-consent` takes `granted`, `withheld`, or `withdrawn`, and prints the logged operation, or
 `null` when that statement already stands. `consent` reads back the standing state, where `null`
 means nobody has recorded one. What the two restrained states change is listed under

@@ -5664,6 +5664,8 @@ def _streaming_arguments(output_path: Path, **overrides: object) -> eval_config_
         "device": None,
         "media_manifest": None,
         "media_overrides": {},
+        "offset": 0,
+        "limit": None,
         "output_path": output_path,
         "predict_only": True,
         "quiet": False,

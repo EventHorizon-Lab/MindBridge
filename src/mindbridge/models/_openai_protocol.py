@@ -52,7 +52,14 @@ def validate_sampling(
         raise ValidationError(f"{model} does not support the configured sampling controls")
     if reasoning_model(model) and (seed is not None or body.get("seed") is not None):
         raise ValidationError(f"{model} does not support generation_seed")
-    reserved = {"model", "messages", "response_format", "stream", "stream_options"} & body.keys()
+    reserved = {
+        "model",
+        "messages",
+        "response_format",
+        "stream",
+        "stream_options",
+        "store",
+    } & body.keys()
     if reserved:
         raise ValidationError("generation_extra_body must not override the model request contract")
 

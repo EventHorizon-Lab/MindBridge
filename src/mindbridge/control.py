@@ -77,20 +77,20 @@ def load_operation(payload: str) -> MemoryOperation:
         value = json.loads(payload)
         if not isinstance(value, dict):
             raise ValueError
-        proposal = value.get("proposal")
-        claim = value.get("claim")
-        consent = value.get("consent")
-        identity = value.get("identity")
+        proposal = value["proposal"]
+        claim = value["claim"]
+        consent = value["consent"]
+        identity = value["identity"]
         # Constructors own value validation; these casts do not coerce untrusted JSON.
         return MemoryOperation(
             intent=cast(MemoryIntent, value["intent"]),
-            evidence_ids=tuple(value.get("evidence_ids") or ()),
-            target_ids=tuple(value.get("target_ids") or ()),
+            evidence_ids=tuple(value["evidence_ids"]),
+            target_ids=tuple(value["target_ids"]),
             proposal=None if proposal is None else _proposal(proposal),
             claim=None if claim is None else _claim(claim),
             consent=None if consent is None else _consent(consent),
             identity=None if identity is None else _identity_change(identity),
-            rationale=cast(str | None, value.get("rationale")),
+            rationale=cast(str | None, value["rationale"]),
         )
     except (
         KeyError,
@@ -150,7 +150,7 @@ def _identity_change(value: object) -> IdentityChange:
         raise ValueError
     return IdentityChange(
         identity_id=cast(str, value["identity_id"]),
-        moved_ids=tuple(value.get("moved_ids") or ()),
+        moved_ids=tuple(value["moved_ids"]),
     )
 
 
@@ -160,7 +160,7 @@ def _consent(value: object) -> ConsentClaim:
     return ConsentClaim(
         identity_id=cast(str, value["identity_id"]),
         state=cast(ConsentState, value["state"]),
-        note=cast(str | None, value.get("note")),
+        note=cast(str | None, value["note"]),
     )
 
 
@@ -170,7 +170,7 @@ def _claim(value: object) -> IdentityClaim:
     return IdentityClaim(
         identity_id=cast(str, value["identity_id"]),
         name=cast(str, value["name"]),
-        relationship=cast(str | None, value.get("relationship")),
+        relationship=cast(str | None, value["relationship"]),
     )
 
 
@@ -214,41 +214,42 @@ def _spatial_payload(spatial: SpatialContext) -> dict[str, object]:
 def _proposal(value: object) -> FormationProposal:
     if not isinstance(value, dict):
         raise ValueError
-    spatial = value.get("spatial")
+    spatial = value["spatial"]
+    evidence_ids = value["evidence_ids"]
     return FormationProposal(
         kind=cast(MemoryKind, value["kind"]),
         content=cast(str, value["content"]),
         basis=cast(EvidenceBasis, value["basis"]),
-        subject=cast(str | None, value.get("subject")),
-        predicate=cast(str | None, value.get("predicate")),
-        value=cast(str | None, value.get("value")),
+        subject=cast(str | None, value["subject"]),
+        predicate=cast(str | None, value["predicate"]),
+        value=cast(str | None, value["value"]),
         confidence=cast(float, value["confidence"]),
-        valid_from=_time(value.get("valid_from")),
-        valid_until=_time(value.get("valid_until")),
+        valid_from=_time(value["valid_from"]),
+        valid_until=_time(value["valid_until"]),
         spatial=None if spatial is None else _spatial(spatial),
-        cue_modality=cast(Modality | None, value.get("cue_modality")),
-        valence=cast(float | None, value.get("valence")),
-        arousal=cast(float | None, value.get("arousal")),
-        evidence_ids=(None if value.get("evidence_ids") is None else tuple(value["evidence_ids"])),
+        cue_modality=cast(Modality | None, value["cue_modality"]),
+        valence=cast(float | None, value["valence"]),
+        arousal=cast(float | None, value["arousal"]),
+        evidence_ids=None if evidence_ids is None else tuple(evidence_ids),
     )
 
 
 def _spatial(value: object) -> SpatialContext:
     if not isinstance(value, dict):
         raise ValueError
-    orientation = value.get("orientation_xyzw")
+    orientation = value["orientation_xyzw"]
     return SpatialContext(
         frame_id=cast(str, value["frame_id"]),
         anchor=cast(SpatialAnchor, value["anchor"]),
         x=cast(float, value["x"]),
         y=cast(float, value["y"]),
-        z=cast(float, value.get("z", 0.0)),
+        z=cast(float, value["z"]),
         orientation_xyzw=(
             None
             if orientation is None
             else cast(tuple[float, float, float, float], tuple(orientation))
         ),
-        position_uncertainty_m=cast(float | None, value.get("position_uncertainty_m")),
+        position_uncertainty_m=cast(float | None, value["position_uncertainty_m"]),
     )
 
 

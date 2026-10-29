@@ -188,14 +188,9 @@ def _metrics(
         max(sample.ingest_failure_count for sample in samples if sample.unit_id == unit_id)
         for unit_id in {sample.unit_id for sample in samples}
     )
-    unavailable_units = dict(getattr(task, "unavailable_units", {}))
-    evaluated_units = getattr(task, "units", ())
-    evaluated_unit_count = (
-        len(evaluated_units) if evaluated_units else len({sample.unit_id for sample in samples})
-    )
-    full_dataset_selected = getattr(arguments, "offset", 0) == 0 and getattr(
-        arguments, "limit", None
-    ) in (None, -1)
+    unavailable_units = dict(task.unavailable_units)
+    evaluated_unit_count = len(task.units)
+    full_dataset_selected = arguments.offset == 0 and arguments.limit in (None, -1)
     result: dict[str, object] = {
         "arm": arm,
         "primary_metric": primary_name,

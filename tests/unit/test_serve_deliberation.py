@@ -177,18 +177,15 @@ def test_shutdown_lets_the_round_it_interrupts_finish_and_report(
 async def test_a_failed_round_names_its_failure_without_quoting_the_model(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The warning carries the failure class and its reason code, and nothing the model wrote.
-
-    An invalid consolidation reply is rejected whole, and the `ModelError` quotes 400 characters
-    of it back so the operator can see which key was wrong. That quote is model text about
-    stored memories, so `exc_info=True` on the warning put remembered content into every
-    operator's log at default level. The traceback moved to DEBUG, where it is asked for.
-    """
+    """Even DEBUG must not expose model text or a chained provider exception."""
     quoted = f"consolidation response was invalid (model returned: {_ANSWER})"
 
     class _Failing:
         def deliberate(self) -> DeliberationReport:
-            raise ModelError(quoted, reason="response_invalid")
+            try:
+                raise RuntimeError("private provider response body")
+            except RuntimeError as error:
+                raise ModelError(quoted, reason="response_invalid") from error
 
     stop = asyncio.Event()
     with caplog.at_level(logging.DEBUG, logger=_LOOP_LOGGER):
@@ -206,7 +203,9 @@ async def test_a_failed_round_names_its_failure_without_quoting_the_model(
     assert "response_invalid" in warnings[0].getMessage()
     assert _ANSWER not in warnings[0].getMessage()
     assert warnings[0].exc_info is None, "the warning still carries the quoted reply"
-    assert any(record.levelno == logging.DEBUG and record.exc_info for record in caplog.records)
+    assert _ANSWER not in caplog.text
+    assert "private provider response body" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_the_mcp_loop_is_refused_without_a_consolidation_backend(tmp_path: Path) -> None:

@@ -504,8 +504,14 @@ every repeat; an upstream error fails the gate rather than disappearing from its
 Grounded fixtures require a single answer word, allowing case, punctuation, and Markdown
 decoration. Negated, conflicting, or additional injected text fails. The report identifies this
 as an answering-only gate: the output-protocol option configures structural calls, but these
-answering fixtures do not establish that an endpoint accepts strict schemas. Verify formation,
-planning, vision, and consolidation separately when changing a provider or its protocol.
+answering fixtures do not establish that an endpoint accepts strict schemas. The companion
+`mindbridge-workflow-quality-v1` gate exercises those stages through the public SDK: relative-date
+formation with and without a timestamp injection, exact collection counting with a non-fallback
+recall plan, a red-rectangle image carrying an injected instruction, preservation of a
+host-authorized policy during adversarial consolidation, and a Chinese grounded answer. A case
+passes only when its behavioral criterion and expected model stage both hold. Workflow requests
+use an 8192-token output ceiling, a 120-second timeout, and no SDK retries. Each case/repeat
+allocates a fresh physical directory; every repeat must pass.
 
 Set `OPENAI_API_KEY` through a secret manager or the process environment. For a compatible server,
 set `OPENAI_BASE_URL` to the SDK base URL ending in `/v1`, without `/chat/completions`. Select an
@@ -517,6 +523,12 @@ uv run --frozen python -m mindbridge.benchmarks.model_quality \
   --response-format json_schema \
   --repeats 3 \
   --output .benchmarks/model-quality/report.json
+
+uv run --frozen python -m mindbridge.benchmarks.workflow_quality \
+  --model "$MODEL_QUALITY_MODEL" \
+  --response-format json_schema \
+  --repeats 3 \
+  --output .benchmarks/model-quality/workflow.json
 ```
 
 `MODEL_QUALITY_MODEL` names the model snapshot to evaluate. Use `--response-format json_object`
@@ -527,13 +539,20 @@ fixtures do not authorize testing with private production content or establish f
 quality. Use the [dataset harness](benchmarking.md) for broader comparisons, and calibrate quality
 criteria against reviewed failures before expanding this suite.
 
-The [model-quality workflow](../.github/workflows/model-quality.yml) runs manually with explicit
-model, response-format, and repeat inputs. Scheduled runs are opt-in: configure the repository
-secret `MODEL_QUALITY_API_KEY`, set `MODEL_QUALITY_ENABLED=true`, and provide the
-`MODEL_QUALITY_MODEL` snapshot variable. `MODEL_QUALITY_BASE_URL` and
-`MODEL_QUALITY_RESPONSE_FORMAT` optionally select a compatible endpoint and protocol. Review the
-aggregate artifact before approving prompt, model, or retrieval-policy changes. Keep the ordinary
-credential-free CI gate enabled even when real-service evaluation is unavailable.
+The [model-quality workflow](../.github/workflows/model-quality.yml) runs both gates for pull
+requests changing product code, dependencies, integration fixtures or the gates themselves.
+Configure the repository secret `MODEL_QUALITY_API_KEY` and the
+`MODEL_QUALITY_MODEL` snapshot variable before requiring this check in branch protection.
+`MODEL_QUALITY_BASE_URL` and `MODEL_QUALITY_RESPONSE_FORMAT` optionally select a compatible
+endpoint and protocol. Missing credentials or a model pin fail the check rather than marking
+untested quality as passing. Fork pull requests do not receive repository secrets; a maintainer
+must run the trusted evaluation path before approval. The workflow uses `pull_request`, never
+`pull_request_target`, and never exposes secrets to a fork checkout.
+
+Manual runs accept explicit model, response-format and repeat inputs. Weekly scheduled runs
+remain opt-in through `MODEL_QUALITY_ENABLED=true`. Both aggregate reports are retained in the
+artifact even when answering fails. Review those reports and keep ordinary credential-free CI
+enabled; provider/protocol changes also require comparison with an equivalent baseline.
 
 Recorded validation on 2026-10-26 used `gpt-5-mini-2025-08-07` as both the configured and returned
 model with fixture `mindbridge-reader-quality-v2`: all four cases passed each of three repeats
@@ -562,6 +581,22 @@ formation fixture and an equivalent real-model baseline comparison were not run 
 service credentials were configured. Transport fixtures establish no model-quality improvement;
 run the credentialed checks before making that claim.
 
+On 2026-10-29 (UTC), the configured and returned model was `gpt-5-mini-2025-08-07` on the
+caller-supplied compatible endpoint. `mindbridge-reader-quality-v2` passed 12/12 with strict
+schemas configured. `mindbridge-workflow-quality-v1` passed 18/18 with the final formation prompt,
+strict schemas, an 8192-token ceiling and a 120-second timeout; every case ran three times. The
+JSON-mode baseline on the same fixtures and snapshot passed 18/18 with the preceding prompt,
+the same token ceiling and a 60-second timeout. These different prompts and timeouts do not
+establish an isolated protocol-quality improvement. The independent
+`mindbridge-formation-time-v1` integration fixtures passed 12/12 with the final prompt and their
+original 4096-token, 60-second bounds.
+
+Earlier strict workflow runs scored 16/18: the 4096-token run failed a collection count and
+truncated consolidation; the 8192-token run timed out during consolidation and failed timestamp
+injection. Those failures remain in the local reports beside the final results under
+`.benchmarks/openai-practices-fixes/`. Passing this small synthetic suite does not establish
+general prompt-injection resistance or full model quality.
+
 ## Changing the runtime or stored representations
 
 Before changing MindBridge, model revisions, vector dimensions, transcription or face recipes, or
@@ -581,6 +616,11 @@ predicate provenance before admitting the store. It never upgrades an older sche
 stored content. A nonempty store must contain all required identity and evidence-policy markers.
 The optional face backend can be enabled for the first time when no face analysis or face-space
 markers exist; startup records its two space identities together.
+
+Operation logs use the complete current JSON payload, including explicit nulls and empty arrays.
+Readers do not supply missing fields from older payloads, including proposal evidence and spatial
+coordinates. An incomplete payload raises `StorageError`; there is no legacy decoder or automatic
+migration. Replay source observations into a fresh directory when adopting a different format.
 
 `memory_semantics.predicate` retains the original model wording; `predicate_key`,
 `predicate_registry`, and `predicate_match` record the stable identifier, registry revision, and

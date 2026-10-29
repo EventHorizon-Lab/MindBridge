@@ -1,6 +1,16 @@
 name: Model quality
 
 on:
+  pull_request:
+    paths:
+      - 'src/mindbridge/**'
+      - '!src/mindbridge/benchmarks/**'
+      - 'src/mindbridge/benchmarks/model_quality.py'
+      - 'src/mindbridge/benchmarks/workflow_quality.py'
+      - 'tests/integration/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/model-quality.yml'
   workflow_dispatch:
     inputs:
       model:
@@ -66,6 +76,7 @@ jobs:
         run: uv sync --locked --default-index https://pypi.org/simple --extra openai --extra benchmarks
 
       - name: Evaluate public SDK behavior
+        id: reader
         run: >-
           uv run --no-sync --frozen python -m mindbridge.benchmarks.model_quality
           --model "$QUALITY_MODEL"
@@ -73,11 +84,22 @@ jobs:
           --repeats "$QUALITY_REPEATS"
           --output model-quality.json
 
+      - name: Evaluate formation, planning, vision, and policy boundaries
+        if: success() || steps.reader.outcome == 'failure'
+        run: >-
+          uv run --no-sync --frozen python -m mindbridge.benchmarks.workflow_quality
+          --model "$QUALITY_MODEL"
+          --response-format "$QUALITY_FORMAT"
+          --repeats "$QUALITY_REPEATS"
+          --output workflow-quality.json
+
       - name: Preserve scores and model identities
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: model-quality
-          path: model-quality.json
+          path: |
+            model-quality.json
+            workflow-quality.json
           if-no-files-found: ignore
           retention-days: 30

@@ -53,7 +53,7 @@ contract.
   model boundaries.
 - [Deployment](deployment.md) — embedded, REST, MCP, and edge process shapes.
 - [Operations](operations.md) — health, capture backlog, backup, recovery, retention, index
-  maintenance, and telemetry.
+  maintenance, telemetry, and the answering/workflow model quality gates.
 - [Troubleshooting](troubleshooting.md) — diagnose startup, retrieval, content, and provider
   failures.
 - [Security](../SECURITY.md) — trust boundaries, data exposure, and deployment hardening.
