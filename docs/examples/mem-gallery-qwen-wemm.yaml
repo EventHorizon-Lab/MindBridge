@@ -1,0 +1,106 @@
+# Replace localhost endpoints and configure credentials outside this committed example.
+# Run: mindbridge-bench eval --config docs/examples/mem-gallery-qwen-wemm.yaml --gen-kwargs temperature=0.7
+# Historical recipe; see docs/research/2026-10-29-grounded-recall-quality.md for limits.
+consolidation: null
+embedding:
+  base_url: http://127.0.0.1:8000/v1
+  dimension: 4096
+  image_max_pixels: 4194304
+  max_retries: 2
+  modalities:
+  - text
+  - image
+  - video
+  model: tencent/WeMM-Embedding-9B
+  provider: openai
+  request_format: messages
+  space: null
+  timeout: 180.0
+face: null
+formation: null
+generation:
+  answer_style: concise
+  base_url: http://127.0.0.1:8001/v1
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+    top_p: 0.8
+    top_k: 20
+    presence_penalty: 1.5
+  image_max_pixels: 1048576
+  max_retries: 2
+  max_tokens: 4096
+  media_max_items: 2
+  media_policy: all
+  min_video_seconds: null
+  modalities:
+  - text
+  - image
+  - video
+  model: Qwen3.8-27B
+  provider: openai
+  response_format: json_object
+  stream: false
+  timeout: 180.0
+  video_limit: 2
+retention: null
+settings:
+  ambiguity_margin: 0.01
+  decay_half_life_days: null
+  evidence_budget_chars: 32000
+  evidence_expansion: false
+  evidence_expansion_max_rows: 24
+  face_margin: 0.05
+  face_similarity: 0.363
+  formation_history_budget_chars: 6000
+  formation_history_max_rows: 0
+  identity_link_min_assets: 2
+  independent_evidence: false
+  index_quantization: none
+  index_speech: true
+  memory_budget_records: null
+  minimum_relevance: 0.1
+  query_failure_history: 512
+  query_failure_window_seconds: 3600.0
+  query_vision: true
+  recall_planning: true
+  recall_query_expansion: true
+  recall_rounds: 2
+  recall_set_budget_chars: 32000
+  recall_set_max_rows: 60
+  reinforce_on_answer: false
+  retention:
+    capture_failure_days: null
+    forgotten_days: null
+    media_days: null
+  retrieval_mode: hybrid
+  speaker_margin: 0.05
+  speaker_similarity: 0.78
+speech: null
+vision:
+  base_url: http://127.0.0.1:8001/v1
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+    top_p: 0.8
+    top_k: 20
+    presence_penalty: 1.5
+  image_max_pixels: 4194304
+  max_retries: 2
+  max_tokens: 4096
+  modalities:
+  - image
+  model: Qwen3.8-27B
+  provider: openai
+  response_format: json_schema
+  seed: 0
+  stream: false
+  temperature: 0.7
+  timeout: 180.0
+  video_frames: 16
+benchmark:
+  run:
+    tasks: mem-gallery
+    seed: 0
+    recall_limit: 12
+    answer_policy: strict

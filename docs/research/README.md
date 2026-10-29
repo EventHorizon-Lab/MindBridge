@@ -1,5 +1,8 @@
 # Research archive
 
+- [Grounded recall quality evidence](2026-10-29-grounded-recall-quality.md) — evidence and limits
+  for the promoted retrieval, media, answer-style, and evaluation changes.
+
 These reports and specifications preserve dated evidence, protocols, and design decisions.
 They are not current API instructions or a fresh competitor survey. “Current”, paths, commands,
 schemas, and model names inside a record refer to its own frozen snapshot. Use the

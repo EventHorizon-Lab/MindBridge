@@ -704,6 +704,11 @@ consolidator may propose and what the kernel refuses.
 
 ## Local memory settings
 
+The opt-in `settings.query_vision` flag, `generation.answer_style`, per-OpenAI-slot
+`image_max_pixels`, and `vision.video_frames` controls are documented in
+[grounded multimodal recall](grounded-multimodal-recall.md). Their defaults preserve the existing
+query path and reader style; enabling query vision adds model work on image queries.
+
 The `settings` mapping is the value-only `MemoryConfig` policy:
 
 | Field | Default | Meaning |

@@ -206,7 +206,7 @@ def test_origin_and_correction_do_not_increase_support_count() -> None:
     assert context["supersedes_label"] == "S3"
 
 
-def test_raw_payload_identifies_the_record_modality_without_qualifying_provenance() -> None:
+def test_plain_text_payload_preserves_the_existing_wire_without_qualifying_provenance() -> None:
     hit = SearchHit(
         id="raw",
         content="unchanged raw memory",
@@ -216,7 +216,7 @@ def test_raw_payload_identifies_the_record_modality_without_qualifying_provenanc
     )
 
     assert json.dumps(answer_evidence_payloads((hit,)), separators=(",", ":")) == (
-        '[{"content":"unchanged raw memory","memory_type":"semantic","source_modality":"text",'
+        '[{"content":"unchanged raw memory","memory_type":"semantic",'
         f'"created_at":"{NOW.isoformat()}","metadata":{{"capture":"sdk"}}}}]'
     )
 
@@ -254,13 +254,14 @@ def test_source_modality_is_the_record_kind_not_derived_text_or_supporting_sourc
         ),
         _hit("derived-text", source_id="video", evidence_ids=("image", "video")),
     )
-    assert [payload["source_modality"] for payload in answer_evidence_payloads(hits)] == [
+    payloads = answer_evidence_payloads(hits)
+    assert [payload["source_modality"] for payload in payloads[:-1]] == [
         "image",
         "video",
         "audio",
         "omni",
-        "text",
     ]
+    assert "source_modality" not in payloads[-1]
 
 
 def _large_payload(source_count: int) -> tuple[tuple[SearchHit, ...], list[dict[str, object]]]:

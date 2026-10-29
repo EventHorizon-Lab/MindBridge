@@ -1647,7 +1647,8 @@ class OpenAIModels:
         # Fitting or provider fallback can leave only text from an original media record.
         source_modalities = {hit.id: hit.modality.value for hit in source_hits}
         for hit, payload in zip(grounded, evidence_payloads, strict=True):
-            payload["source_modality"] = source_modalities[hit.id]
+            if source_modalities[hit.id] != "text":
+                payload["source_modality"] = source_modalities[hit.id]
         constraints = answer_constraint_payloads(grounded, evidence_payloads)
         text_parts = (
             _answer_text_parts(

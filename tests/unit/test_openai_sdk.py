@@ -2424,7 +2424,6 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
         assert hit == {
             "content": "The red parcel arrived.",
             "memory_type": "semantic",
-            "source_modality": "text",
             "occurred_at": occurred_at.isoformat(),
             "occurred_end": occurred_end.isoformat(),
             "metadata": {"dialog": "delivery", "turn": 7},

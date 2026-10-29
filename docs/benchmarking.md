@@ -337,6 +337,23 @@ generation:
 That is exactly what `--gen-kwargs enable_thinking=false` writes, so a file that declares it does
 not need the flag.
 
+Use `--gen-kwargs temperature=0.7` for a sampled run; its effective temperature, seed and answer
+style are recorded in artifacts and cache identities. Product and baseline arms honor the same
+sampling and optional `generation.answer_style`. Seeds do not guarantee identical remote output.
+
+The [ATM raw example](examples/atm-raw-qwen-wemm.yaml) and
+[Mem-Gallery example](examples/mem-gallery-qwen-wemm.yaml) preserve the verified task-specific
+budgets with replaceable localhost endpoints and no stored credentials. Run them with the
+documented temperature override. Their provenance and limits are in the
+[quality evidence](research/2026-10-29-grounded-recall-quality.md).
+
+ATM `number` questions request the complete value, including requested dates, times, ranges,
+units and currencies. This adapter instruction does not change questions, references or the
+official scorer. Judge requests follow model sampling and output-limit capabilities. A judge
+failure preserves deterministic metrics such as Gallery F1 and is still recorded as an error;
+metrics that require the missing verdict receive their documented failure score. Saved
+`JudgeError` predictions can restore local metrics and be rejudged without generating new answers.
+
 Omitted sections use the same defaults as a run without `--config`: the pinned Jina Omni model
 through the `sentence-transformers` provider and an
 `openai` generation endpoint. The runner always replaces `data_dir` with isolated per-unit

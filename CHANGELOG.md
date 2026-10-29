@@ -94,6 +94,8 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Fixed
 
+- Sequence answers order selected evidence by event time and insertion order. ATM numeric
+  instructions preserve complete dates, times and ranges.
 - Judge requests omit unsupported automatic sampling controls. Judge failures retain local
   answer metrics, and saved `JudgeError` predictions can restore those metrics and be rejudged
   without repeating generation.
