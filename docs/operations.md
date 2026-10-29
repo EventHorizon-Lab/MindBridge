@@ -551,13 +551,6 @@ remain opt-in through `MODEL_QUALITY_ENABLED=true`. Both aggregate reports are r
 artifact even when answering fails. Review those reports and keep ordinary credential-free CI
 enabled; provider/protocol changes also require comparison with an equivalent baseline.
 
-Recorded validation on 2026-10-26 used `gpt-5-mini-2025-08-07` as both the configured and returned
-model with fixture `mindbridge-reader-quality-v2`: all four cases passed each of three repeats
-(12/12). Separate strict-schema probes passed formation, consolidation, recall planning, vision,
-and media selection. The local aggregate reports remain under `.benchmarks/openai-practices/`.
-These synthetic checks do not establish benchmark gains or parity with other model deployments;
-live EmbeddingGemma 2 through vLLM was not verified.
-
 The formation-time fixture `mindbridge-formation-time-v1` independently tests the snapshot
 `gpt-5-mini-2025-08-07` with strict JSON Schema and a 4096-token output budget. Its synthetic
 source says “I moved to Paris yesterday” with observation time `2026-03-02T12:00:00Z`, no typed
@@ -572,27 +565,9 @@ MINDBRIDGE_FORMATION_TIME_EVAL=1 uv run --frozen pytest -W error -rP \
 ```
 
 Only fixture IDs, case IDs, repeat numbers, and configured/returned model identifiers are printed.
-On 2026-10-27 the credential-free regression reproduced the prior March 2 fallback and verified
-timestamp propagation and persistence of the resolved March 1 date after the fix. The real-model
-formation fixture and an equivalent real-model baseline comparison were not run because no
-service credentials were configured. Transport fixtures establish no model-quality improvement;
-run the credentialed checks before making that claim.
-
-On 2026-10-29 (UTC), the configured and returned model was `gpt-5-mini-2025-08-07` on the
-caller-supplied compatible endpoint. `mindbridge-reader-quality-v2` passed 12/12 with strict
-schemas configured. `mindbridge-workflow-quality-v1` passed 18/18 with the final formation prompt,
-strict schemas, an 8192-token ceiling and a 120-second timeout; every case ran three times. The
-JSON-mode baseline on the same fixtures and snapshot passed 18/18 with the preceding prompt,
-the same token ceiling and a 60-second timeout. These different prompts and timeouts do not
-establish an isolated protocol-quality improvement. The independent
-`mindbridge-formation-time-v1` integration fixtures passed 12/12 with the final prompt and their
-original 4096-token, 60-second bounds.
-
-Earlier strict workflow runs scored 16/18: the 4096-token run failed a collection count and
-truncated consolidation; the 8192-token run timed out during consolidation and failed timestamp
-injection. Those failures remain in the local reports beside the final results under
-`.benchmarks/openai-practices-fixes/`. Passing this small synthetic suite does not establish
-general prompt-injection resistance or full model quality.
+Run credentialed checks against equivalent fixtures, model snapshots, prompts and budgets before
+claiming a quality improvement. Keep dated measurements and their limitations in local research
+records; transport fixtures alone do not establish model quality.
 
 ## Changing the runtime or stored representations
 

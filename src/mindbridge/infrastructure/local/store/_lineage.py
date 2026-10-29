@@ -38,6 +38,7 @@ from mindbridge.infrastructure.local.store.rows import (
 )
 from mindbridge.kernel.corroboration import Assessment
 from mindbridge.kernel.predicates import PREDICATE_REGISTRY_VERSION
+from mindbridge.kernel.temporal import intervals_overlap
 from mindbridge.types import EvidenceBasis, MemoryContext, MemoryKind
 
 
@@ -289,7 +290,7 @@ def _retire_displaced_lineage(
         if (
             transaction_memory_ids is not None
             and row_text(old, "memory_id") in transaction_memory_ids
-        ) or not _intervals_overlap(valid_from, valid_until, old_from, old_until):
+        ) or not intervals_overlap(valid_from, valid_until, old_from, old_until):
             continue
         if kind == MemoryKind.STATE.value and not _state_can_supersede(
             basis,
@@ -351,18 +352,6 @@ def _state_can_supersede(
     # prevent an equally supported later assertion from revising it.
     return confidence >= previous_confidence or math.isclose(
         confidence, previous_confidence, rel_tol=1e-15, abs_tol=0.0
-    )
-
-
-def _intervals_overlap(
-    left_from: datetime | None,
-    left_until: datetime | None,
-    right_from: datetime | None,
-    right_until: datetime | None,
-) -> bool:
-    return not (
-        (left_until is not None and right_from is not None and left_until <= right_from)
-        or (right_until is not None and left_from is not None and right_until <= left_from)
     )
 
 
@@ -1640,7 +1629,7 @@ def semantic_visibility(
             for row in rows
         )
     return not any(
-        _intervals_overlap(valid_from, valid_until, explicit_from, explicit_until)
+        intervals_overlap(valid_from, valid_until, explicit_from, explicit_until)
         for explicit_from, explicit_until in explicit_intervals
     )
 
@@ -1848,7 +1837,7 @@ def rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contra
                 continue
             remaining: list[tuple[sqlite3.Row, datetime | None, datetime | None]] = []
             for owner, valid_from, valid_until in segments:
-                if not _intervals_overlap(valid_from, valid_until, cut_from, cut_until) or (
+                if not intervals_overlap(valid_from, valid_until, cut_from, cut_until) or (
                     kind == MemoryKind.STATE.value
                     and not _state_can_supersede(
                         row_text(cut_owner, "basis"),

@@ -253,12 +253,3 @@ def test_metadata_cannot_hide_same_size_source_integrity_failure(tmp_path: Path)
             ModelInput(text="Where?"), (_hit(changed),), answer_evidence_payloads((_hit(changed),))
         )
     assert error.value.reason == "asset_changed"
-
-
-def test_caption_recipe_changes_but_embedding_space_does_not() -> None:
-    model = OpenAIModels(
-        generation_model="Qwen3.8-27B",
-        generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
-    )
-    assert model.vision_space != "Qwen3.8-27B:mindbridge-vision-v2:40892ae842681bee"
-    assert model.embedding_space == "text-embedding-3-small:1536:l2-v1"

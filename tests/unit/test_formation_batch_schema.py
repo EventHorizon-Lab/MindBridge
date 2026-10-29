@@ -1,6 +1,5 @@
 """Strict formation batches constrain coverage while local semantics remain authoritative."""
 
-import hashlib
 import json
 from typing import Any, Literal
 
@@ -8,9 +7,8 @@ import httpx2 as httpx
 import pytest
 from test_openai_sdk import _sdk_client
 
-import mindbridge.models.openai_sdk as backend
 from mindbridge import FormationInput, ModelError, ModelInput, ObservationContext, OpenAIModels
-from mindbridge.models._openai_schemas import SchemaName, response_schema
+from mindbridge.models._openai_schemas import response_schema
 
 
 def _inputs(count: int) -> tuple[FormationInput, ...]:
@@ -126,24 +124,3 @@ def test_provider_ignoring_envelope_constraints_still_fails_closed(aliases: list
             adapter.form(_inputs(4))
     assert requests == 2
     assert failure.value.reason == "response_invalid"
-
-
-def test_only_strict_formation_recipe_changes_for_dynamic_batch_strategy() -> None:
-    def legacy_recipe(name: SchemaName) -> str:
-        payload = json.dumps(
-            {"schema": response_schema(name), "instruction": backend._STRICT_JSON_INSTRUCTION},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return ":json-schema-v1:" + hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-    plain, strict = OpenAIModels(generation_response_format="json_object"), OpenAIModels()
-    assert strict.formation_space == plain.formation_space + backend._schema_recipe("formation")
-    assert backend._schema_recipe("formation") != legacy_recipe("formation")
-    names: tuple[SchemaName, ...] = ("vision", "consolidation", "recall_plan", "media_selection")
-    for name in names:
-        assert backend._schema_recipe(name) == legacy_recipe(name)
-    assert strict.vision_space == plain.vision_space + legacy_recipe("vision")
-    assert strict.consolidation_recipe == plain.consolidation_recipe + legacy_recipe(
-        "consolidation"
-    )

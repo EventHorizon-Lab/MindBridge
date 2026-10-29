@@ -50,6 +50,7 @@ from mindbridge.kernel.predicates import claim_lineage_id, resolve_predicate
 from mindbridge.kernel.projection import Projection
 from mindbridge.kernel.runtime import Storage, translate_storage_errors
 from mindbridge.kernel.settings import Settings
+from mindbridge.kernel.temporal import intervals_overlap
 from mindbridge.kernel.tracing import Traced
 from mindbridge.models.base import EmbedTask, FormationInput, ModelInput
 from mindbridge.types import (
@@ -358,7 +359,7 @@ def _grounded_formation_pairs(
             )
             if any(
                 standing.value != context.value
-                and _valid_intervals_overlap(
+                and intervals_overlap(
                     standing.valid_from,
                     standing.valid_until,
                     context.valid_from,
@@ -371,18 +372,6 @@ def _grounded_formation_pairs(
             lineage.append(context)
         kept.append(pair)
     return tuple(kept), refused
-
-
-def _valid_intervals_overlap(
-    left_from: datetime | None,
-    left_until: datetime | None,
-    right_from: datetime | None,
-    right_until: datetime | None,
-) -> bool:
-    return not (
-        (left_until is not None and right_from is not None and left_until <= right_from)
-        or (right_until is not None and left_from is not None and right_until <= left_from)
-    )
 
 
 def agreed_inheritance(

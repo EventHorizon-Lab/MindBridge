@@ -124,6 +124,19 @@ _MONTHS = {
 }
 
 
+def intervals_overlap(
+    left_from: datetime | None,
+    left_until: datetime | None,
+    right_from: datetime | None,
+    right_until: datetime | None,
+) -> bool:
+    """Compare half-open validity intervals; a missing bound is unbounded."""
+    return not (
+        (left_until is not None and right_from is not None and left_until <= right_from)
+        or (right_until is not None and left_from is not None and right_until <= left_from)
+    )
+
+
 def validated_occurred_at(value: datetime | None) -> datetime | None:
     if value is None:
         return None

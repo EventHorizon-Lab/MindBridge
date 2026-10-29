@@ -903,67 +903,15 @@ transcript every record is about both speakers, so the identity edge selects the
 nothing about the question, while the capture edge beside it stays selective. Gating the edges
 together would let the first discard the second.
 
-The ordering is a measured decision, and the measurement went against the interesting version.
-Admitting linked rows *ahead* of the budget's ranked tail asks whether a structurally linked
-record is worth more than the next-best record by cosine; on 120 LongMemEval-S questions at a
-24 000-character budget it is not -- complete gold support in the window fell from 0.8917 to
-0.8583, three questions gained it and seven lost it, and 11.13 linked rows per question displaced
-the tail that had been finding the rest of the support. Linked rows therefore go last, and
-the same 120 questions then tie exactly -- 120 of 120, with the grounded rows and characters
-identical to baseline -- because a rerank pool a hundred candidates deep fills any budget before
-expansion is reached. So the setting changes a window only where `evidence_budget_chars` is `None`
-and the window is `limit` rows that linked rows can follow; with a budget set it does nothing.
+Structural expansion is off by default. If the ranked tail fills the character budget, no linked
+rows can be added; exact query-media context still has its earlier admission priority. With
+`evidence_budget_chars=None`, linked rows can follow the mandatory window within the row and
+supplemental media caps.
 
-What it is worth enabling for is prompt size, not answer quality. Measured against a comparable
-budget of ranked tail on two corpora, a paired sign test cannot distinguish the answers: 6 won and
-4 lost on LongMemEval-S, 10 and 7 on ATM-Bench raw media. What differs is the price of reaching
-them. Priced the way `evidence_cost` prices a window -- characters plus a flat charge per media
-part -- LongMemEval-S is a corpus where a capture is a dialogue session the tail already reaches,
-so linked rows duplicate it and cost 39,500 against the tail's 24,400, 1.62x. On ATM-Bench, where a
-capture is a day of photographs no query can name, the same window is assembled for 48,200 against
-the tail's 63,800, 0.76x, carrying almost the same media rows in 36 rows rather than 58. Both
-widenings raise complete gold support by about the same few questions on either corpus, so neither
-edge reaches evidence the other cannot.
-
-What it is *not* is a route to evidence the ranking cannot reach. Everything it recovered on
-ATM-Bench sat between ranks 13 and 36 -- inside the candidate pool, outside the window -- which is
-why the ranked tail recovers the same questions by walking there on cosine instead. Discarding the
-linked rows the ranking had also proposed was measured and removed the whole benefit: complete gold
-support fell to the narrow window's own figure and 117 of 117 questions tied. So expansion reaches
-further down one ranking by a different selector, and the only question is which selector is
-cheaper.
-
-Enable it where captures group evidence a query has no way to name -- a day of photographs, a room,
-one recorded session of a robot's work -- and the window costs about three quarters as much to
-fill. Leave it off where the ranking already spans the capture.
-
-How much any of this can matter is bounded by how often a window is missing evidence at all. On the
-120 ATM-Bench questions measured here, 98 windows already held every gold record, 22 were missing
-one, and some edge could supply it on 3 -- all three through the capture edge. The identity edge
-contributed one row across the whole set, because that corpus holds few recognisable faces. On
-Mem-Gallery, whose questions are about recurring personas, the same measurement reads very
-differently: of 1,527 questions, 493 windows were missing gold and 132 were completable, 125
-through the capture edge and 29 through identity.
-A store whose ranking already completes its windows has nothing for an edge to add, whichever edge
-it is, and `benchmarks/edge_power.py` reports that ceiling for a corpus without running a reader
-over it. It is off by default because a caller who
-has not measured their own corpus should not pay for it.
-
-Mem-Gallery is also the only corpus measured here whose windows had that headroom, and running the
-three arms over 224 of its questions shows what the headroom buys. Both widenings recover complete
-gold support with no question losing it -- 0.4777 on the window alone, 0.6741 with linked rows
-(44 won, 0 lost), 0.8080 with the ranked tail (74 won, 0 lost) -- so even where an edge has room,
-the tail reaches more. The two official metrics then disagree about that tail: judged correctness
-rises from 0.6004 to 0.6674 (37 won, 16 lost) while token overlap with the short gold string falls
-from 0.1708 to 0.1395 (55 won, 100 lost), which is what a longer, better-grounded answer does to an
-F1 scored against a phrase. Linked rows hold that overlap where the tail does not, 0.224 against
-0.161 on the questions whose window was already complete.
-
-Splitting those questions by where their gold sat is what decides the setting. Where the window
-held part of the support, linked rows help: judged 0.549 to 0.659 on 82 questions. Where the gold
-was ranked but below the window they *hurt* -- 0.191 to 0.088, against the tail's 0.338, on 34
-questions -- because that is evidence cosine can reach on its own, and the linked rows crowd it out
-of the prompt. The edge is worth its window only for evidence the ranking has no way to name.
+Evaluate expansion on your own corpus before enabling it. Compare complete support, answer
+quality and evidence cost against both the narrow window and a budget of ranked rows. Existing
+links can reach records below the window without establishing a complete answer set or improving
+quality. `benchmarks/edge_power.py` measures potential support coverage without running a reader.
 
 What expansion adds is reported to the reader as records linked to the evidence rather than records
 a predicate matched, so nothing it adds licenses a count, and the count is the number of rows
