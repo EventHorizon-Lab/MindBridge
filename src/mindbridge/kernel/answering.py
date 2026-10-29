@@ -525,21 +525,23 @@ def _budgeted_recall(
     ranked = {hit.id: hit for hit in (*program.ranked, *required) if hit.id not in exhaustive_ids}
     required_ids = {hit.id for hit in required}
     selected: builtins.list[SearchHit] = []
-    spent = 0
+    # Required rows may come after optional matches in chronological order. Reserve their cost
+    # before admitting any additions, then count an overlapping required row only once.
+    spent = sum(evidence_cost(hit) for hit in required)
     media = 0
     omitted = 0
     for index, hit in enumerate((*program.exhaustive, *ranked.values())):
         exhaustive_row = index < len(program.exhaustive)
         cost = evidence_cost(hit)
         if hit.id not in required_ids and (
-            (selected and spent + cost > budget_chars)
+            (spent + cost > budget_chars)
             or (exhaustive_row and hit.assets and media >= media_limit)
             or (exhaustive_row and index >= max_rows)
         ):
             omitted += 1 if exhaustive_row else 0
             continue
         selected.append(hit)
-        spent += cost
+        spent += cost if hit.id not in required_ids else 0
         media += 1 if exhaustive_row and hit.assets and hit.id not in required_ids else 0
     return tuple(selected), omitted
 

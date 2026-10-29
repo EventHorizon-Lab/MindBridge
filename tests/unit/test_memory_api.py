@@ -8328,6 +8328,40 @@ def test_a_cut_similarity_row_does_not_make_the_matched_set_incomplete(tmp_path:
     assert "do not state a total" not in question.text
 
 
+@pytest.mark.parametrize(
+    ("budget", "optional_size", "expected_extra"),
+    [(80, 50, False), (80, 20, True), (40, 20, False)],
+    ids=("reserve-the-window", "charge-overlap-once", "over-budget-window"),
+)
+def test_set_packing_charges_the_mandatory_window_before_optional_matches(
+    tmp_path: Path, budget: int, optional_size: int, expected_extra: bool
+) -> None:
+    """An earlier matched row cannot spend the budget owed to the guaranteed ranked window."""
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_set_budget_chars=budget,
+        evidence_budget_chars=budget,
+    ) as memory:
+        optional = memory.add("red wrench " + "r" * (optional_size - 11), occurred_at=DAY)
+        mandatory = memory.add("green wrench " + "m" * 47, occurred_at=DAY + timedelta(days=1))
+        _FakeIndex.instances[-1].hits_override = (
+            IndexHit(id=mandatory.id, relevance=1.0, confidence=1.0),
+        )
+        assert [hit.id for hit in memory.search("how many tools?", limit=1)] == [mandatory.id]
+
+        memory.ask("how many tools?", limit=1)
+
+    question, grounded = models.answer_calls[-1]
+    expected = [optional.id, mandatory.id] if expected_extra else [mandatory.id]
+    assert [hit.id for hit in grounded] == expected
+    assert sum(len(hit.content) for hit in grounded) <= max(budget, 60)
+    assert ("1 further matched records are not shown" in question.text) is not expected_extra
+
+
 def test_a_set_plan_grounds_within_the_callers_own_evidence_budget(tmp_path: Path) -> None:
     """A caller who bounded the prompt bounded it for every question shape, not just ranked ones."""
     models = _FakeModels()
