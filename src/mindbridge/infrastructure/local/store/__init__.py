@@ -17,6 +17,7 @@ from mindbridge.infrastructure.local.store._schema import SCHEMA_VERSION
 from mindbridge.infrastructure.local.store.errors import (
     LocalStoreCapacityError,
     LocalStoreClosedError,
+    ProtectedMemoryError,
     StaleOperationError,
     UnsupportedSchemaError,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "LocalStoreCapacityError",
     "LocalStoreClosedError",
     "NamingProjectionFactory",
+    "ProtectedMemoryError",
     "RecallDigest",
     "RecallRead",
     "RelatedRead",

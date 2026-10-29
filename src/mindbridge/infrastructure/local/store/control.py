@@ -30,6 +30,7 @@ from mindbridge.infrastructure.local.store._lineage import (
     require_every,
     require_unretired_memories,
     require_visible_memories,
+    response_policy_dependencies,
     restore_memory_versions,
     retire_memory_evidence,
     retire_memory_versions,
@@ -48,7 +49,7 @@ from mindbridge.infrastructure.local.store._operations import (
     later_operation_depends_on,
     operation_from_row,
 )
-from mindbridge.infrastructure.local.store.errors import StaleOperationError
+from mindbridge.infrastructure.local.store.errors import ProtectedMemoryError, StaleOperationError
 from mindbridge.infrastructure.local.store.identities import (
     identity_link_plan,
     merge_identity_rows,
@@ -272,6 +273,7 @@ class OperationLog:
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
         require_visible: Sequence[str] = (),
+        preserve_response_policies: bool = False,
         naming_projection_factory: NamingProjectionFactory | None = None,
     ) -> StoredOperation | None:
         """Apply one already-validated operation and its log row in one transaction.
@@ -301,6 +303,12 @@ class OperationLog:
             require_active_memories(connection, require_active)
             require_unretired_memories(connection, require_unretired)
             require_visible_memories(connection, require_visible)
+            if preserve_response_policies:
+                blocked = response_policy_dependencies(connection).intersection(
+                    (*correct_ids, *forget_ids, *(memory_id for memory_id, _source in reinforce))
+                )
+                if blocked:
+                    raise ProtectedMemoryError(blocked)
             naming_before = naming_snapshot(
                 connection,
                 (*(memory_id for memory_id, _source in reinforce), *correct_ids, *forget_ids),

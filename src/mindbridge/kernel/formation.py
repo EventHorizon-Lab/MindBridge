@@ -26,6 +26,7 @@ from mindbridge.exceptions import MindBridgeError, ModelError
 from mindbridge.infrastructure.local.store import (
     CONSENT_PREDICATE,
     NamingProjectionFactory,
+    ProtectedMemoryError,
     StaleOperationError,
     StoredEmbedding,
     StoredMemory,
@@ -831,16 +832,32 @@ class Formation(Traced):
         operation: OperationAssets,
         completed_at: datetime,
     ) -> None:
+        remaining = tuple(grounded)
         try:
-            self.commit(
-                grounded,
-                targets,
-                assets=operation,
-                completed_at=completed_at,
-                joint_evidence_clauses=True,
-                require_active=tuple(source.id for source in targets),
-                require_visible=_cited_sources(grounded),
-            )
+            while True:
+                try:
+                    self.commit(
+                        remaining,
+                        targets,
+                        assets=operation,
+                        completed_at=completed_at,
+                        joint_evidence_clauses=True,
+                        require_active=tuple(source.id for source in targets),
+                        require_visible=_cited_sources(remaining),
+                        preserve_response_policies=True,
+                    )
+                except ProtectedMemoryError as error:
+                    # The failed transaction committed nothing. Keep valid siblings together
+                    # so independent assertions retain their original batch lineage boundary.
+                    accepted = tuple(
+                        pair for pair in remaining if pair[0].memory_id not in error.memory_ids
+                    )
+                    assert len(accepted) < len(remaining)
+                    record_formation_refusals(len(remaining) - len(accepted))
+                    _LOGGER.warning("formation proposal refused: unauthorized")
+                    remaining = accepted
+                else:
+                    return
         except StaleOperationError as error:
             raise ModelError(
                 "formation evidence changed before commit; the observation remains stored",
@@ -861,6 +878,7 @@ class Formation(Traced):
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
         require_visible: Sequence[str] = (),
+        preserve_response_policies: bool = False,
         projection_identity_id: str | None = None,
         joint_evidence_clauses: bool = False,
         projection_factory: Callable[
@@ -1001,6 +1019,7 @@ class Formation(Traced):
                     require_active=require_active,
                     require_unretired=require_unretired,
                     require_visible=require_visible,
+                    preserve_response_policies=preserve_response_policies,
                     projection_identity_id=projection_identity_id,
                     projection_memories=projection_memories,
                     projection_embeddings=projection_embeddings,

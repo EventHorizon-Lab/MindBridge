@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 
 class LocalStoreClosedError(RuntimeError):
     """Raised when a closed local store is used."""
@@ -13,6 +15,14 @@ class LocalStoreCapacityError(RuntimeError):
 
 class UnsupportedSchemaError(RuntimeError):
     """Raised when the data directory has an unknown or incomplete schema."""
+
+
+class ProtectedMemoryError(RuntimeError):
+    """Raised when a proposed mutation touches a host policy or its supporting records."""
+
+    def __init__(self, memory_ids: Iterable[str]) -> None:
+        super().__init__("model mutation would change a host response policy")
+        self.memory_ids = frozenset(memory_ids)
 
 
 class StaleOperationError(RuntimeError):

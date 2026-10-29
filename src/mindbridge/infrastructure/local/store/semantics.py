@@ -30,6 +30,7 @@ from mindbridge.infrastructure.local.store._lineage import (
     require_active_memories,
     require_unretired_memories,
     require_visible_memories,
+    response_policy_dependencies,
     set_forgotten,
     validate_formation_links,
     version_retired,
@@ -40,7 +41,7 @@ from mindbridge.infrastructure.local.store._naming_projection import (
     refresh_naming_documents,
 )
 from mindbridge.infrastructure.local.store._operations import active_operation_id, insert_operation
-from mindbridge.infrastructure.local.store.errors import StaleOperationError
+from mindbridge.infrastructure.local.store.errors import ProtectedMemoryError, StaleOperationError
 from mindbridge.infrastructure.local.store.records import (
     MemoryRecords,
     read_memories,
@@ -113,6 +114,7 @@ class Semantics:
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
         require_visible: Sequence[str] = (),
+        preserve_response_policies: bool = False,
         projection_identity_id: str | None = None,
         projection_memories: Iterable[StoredMemory] = (),
         projection_embeddings: Iterable[StoredEmbedding] = (),
@@ -177,6 +179,22 @@ class Semantics:
             require_active_memories(connection, require_active)
             require_unretired_memories(connection, require_unretired)
             require_visible_memories(connection, require_visible)
+            protected = (
+                response_policy_dependencies(connection)
+                if preserve_response_policies
+                else frozenset()
+            )
+            blocked = protected.intersection(
+                (
+                    *(memory.memory_id for memory in supplied_memories),
+                    *(memory_id for memory_id, _source, _confidence in evidence),
+                    *(memory_id for memory_id, _members, _confidence in evidence_clauses),
+                    *(memory_id for memory_id, _place, _metadata in narrowed),
+                    *forget_ids,
+                )
+            )
+            if blocked:
+                raise ProtectedMemoryError(blocked)
             naming_before = naming_snapshot(
                 connection,
                 (
@@ -229,6 +247,7 @@ class Semantics:
             clause_memory_ids = {memory_id for memory_id, _members, _confidence in evidence_clauses}
             for memory in supplied_memories:
                 has_explicit_clause = memory.memory_id in clause_memory_ids
+                superseded_before = len(superseded)
                 write_memory(
                     connection,
                     memory,
@@ -239,6 +258,12 @@ class Semantics:
                     context_recorded_at=completed_at if has_explicit_clause else None,
                 )
                 transaction_memory_ids.add(memory.memory_id)
+                # Attribute implicit retirement to the incoming proposal, so automatic
+                # formation can discard it and retry its valid siblings as one batch.
+                if protected.intersection(
+                    memory_id for memory_id, _version in superseded[superseded_before:]
+                ):
+                    raise ProtectedMemoryError((memory.memory_id,))
             connection.executemany(
                 """
                 UPDATE memory_records
