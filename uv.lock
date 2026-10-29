@@ -1758,6 +1758,7 @@ all = [
     { name = "pillow" },
     { name = "pyarrow" },
     { name = "pyyaml" },
+    { name = "regex" },
     { name = "sentence-transformers", extra = ["image", "video"] },
     { name = "soundfile" },
     { name = "starlette" },
@@ -1778,6 +1779,7 @@ benchmarks = [
     { name = "opentelemetry-sdk" },
     { name = "pyarrow" },
     { name = "pyyaml" },
+    { name = "regex" },
     { name = "tqdm" },
 ]
 face = [
@@ -1867,6 +1869,8 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "pyyaml", marker = "extra == 'all'", specifier = ">=6,<7" },
     { name = "pyyaml", marker = "extra == 'benchmarks'", specifier = ">=6,<7" },
+    { name = "regex", marker = "extra == 'all'", specifier = ">=2024.11.6" },
+    { name = "regex", marker = "extra == 'benchmarks'", specifier = ">=2024.11.6" },
     { name = "sentence-transformers", extras = ["image", "video"], marker = "extra == 'all'", specifier = ">=6.1,<7" },
     { name = "sentence-transformers", extras = ["image", "video"], marker = "extra == 'local'", specifier = ">=6.1,<7" },
     { name = "soundfile", marker = "extra == 'all'", specifier = ">=0.13,<1" },

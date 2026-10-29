@@ -95,10 +95,14 @@ jobs:
           wheel = next(pathlib.Path("dist").glob("*.whl"))
           sdist = next(pathlib.Path("dist").glob("*.tar.gz"))
           built = set(zipfile.ZipFile(wheel).namelist())
-          if any(pathlib.PurePosixPath(name).name == "AGENTS.md" for name in built):
-              raise SystemExit("built wheel contains contributor instructions")
           with tarfile.open(sdist) as archive:
               packed = set(archive.getnames())
+          for artifact, names in ((wheel, built), (sdist, packed)):
+              if any(
+                  pathlib.PurePosixPath(name).name in {"AGENTS.md", "CLAUDE.md"}
+                  for name in names
+              ):
+                  raise SystemExit(f"{artifact.name} contains contributor instructions")
           prefix = sdist.name[: -len(".tar.gz")] + "/src/"
           missing = [f"{wheel.name}:{name}" for name in WANTED if name not in built]
           missing += [f"{sdist.name}:{name}" for name in WANTED if prefix + name not in packed]

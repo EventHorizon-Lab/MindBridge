@@ -41,6 +41,7 @@ all = [
     "pillow>=10,<13",
     "pyarrow>=18,<26",
     "pyyaml>=6,<7",
+    "regex>=2024.11.6",
     "sentence-transformers[image,video]>=6.1,<7",
     "soundfile>=0.13,<1",
     "starlette>=0.46,<2",
@@ -60,6 +61,8 @@ benchmarks = [
     "pyarrow>=18,<26",
     # eval.py reads its harness configuration file as YAML or JSON.
     "pyyaml>=6,<7",
+    # Mem-Gallery's published normalizer uses regex Unicode word boundaries.
+    "regex>=2024.11.6",
     # eval.py draws the per-task progress bar with it, and formats the non-interactive progress
     # line with `tqdm.format_meter` so both modes report the same counts and ETA.
     "tqdm>=4.66,<5",
@@ -148,9 +151,11 @@ dev = [
     "types-tqdm>=4.66,<5",
 ]
 
+[tool.hatch.build]
+exclude = ["**/AGENTS.md", "**/CLAUDE.md"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/mindbridge"]
-exclude = ["**/AGENTS.md"]
 
 [tool.ruff]
 target-version = "py310"

@@ -1081,17 +1081,19 @@ def test_worldmemarena_qa_labels_and_empty_answer_match_upstream() -> None:
         # Published by the pinned scorers.
         ("atm-bench-hard", "accuracy", True),
         ("mem-gallery", "f1", True),
+        ("mem-gallery", "exact_match", True),
+        ("mem-gallery", "retrieval_precision@10", True),
+        ("mem-gallery", "retrieval_recall@10", True),
+        ("mem-gallery", "retrieval_hit@10", True),
         ("mm-lifelong", "ref_at_300", True),
         ("personamem-v3", "ndcg_at_5", True),
         ("personamem-v3", "pr_combined_personalization_score", True),
         ("openeqa-hm3d", "llm_match_score_1_5", True),
         # Invented here. `_official/atm_score.py` has only `deterministic_accuracy` and
-        # `list_jaccard_score`; Mem-Gallery publishes no retrieval or exact-match number.
+        # `list_jaccard_score`; its retrieval and joint metrics are harness diagnostics.
         ("atm-bench-hard", "retrieval_recall@10", False),
         ("atm-bench-hard", "retrieval_recall@gt", False),
         ("atm-bench-hard", "joint_partial@10", False),
-        ("mem-gallery", "retrieval_precision@10", False),
-        ("mem-gallery", "exact_match", False),
         ("personamem-v3", "negative_in_top1", False),
         ("worldmemarena", "answer_f1", True),
         # No family at all.

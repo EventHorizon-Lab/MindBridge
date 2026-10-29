@@ -9,9 +9,12 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 build/
 dist/
+*.log
 .env
 .env.local
 # Local model checkout used by the WeMM deployment guide.

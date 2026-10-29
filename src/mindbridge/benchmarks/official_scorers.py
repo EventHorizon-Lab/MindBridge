@@ -125,7 +125,7 @@ _PROTOCOLS = {
     "mm-lifelong": "mm_lifelong_judge_248aa82039a5",
     "supermemory-vqa": "supermemory_vqa_metrics_1d228e0f1004",
     "atm-bench": "atm_bench_scorer_ef4e5dff1a47_minimal_v2",
-    "mem-gallery": "mem_gallery_scorer_a93959e1e978",
+    "mem-gallery": "mem_gallery_scorer_a93959e1e978_v2",
     "longmemeval": "longmemeval_anscheck_2ec2a557f339",
     "clbench": "clbench_binary_rubric_b28a5832a09b",
     "beam": "beam_unified_rubric_3e12035532eb",
@@ -183,7 +183,19 @@ _OFFICIAL_METRICS: dict[str, frozenset[str]] = {
     # reported here as `accuracy`, plus the open-ended judge. Its retrieval and joint metrics are
     # MindBridge diagnostics and are deliberately absent.
     "atm-bench": frozenset({"accuracy"}),
-    "mem-gallery": frozenset({"llm_judge", "f1", "bleu", "bleu_1", "bleu_2"}),
+    "mem-gallery": frozenset(
+        {
+            "llm_judge",
+            "f1",
+            "bleu",
+            "bleu_1",
+            "bleu_2",
+            "exact_match",
+            "retrieval_precision@10",
+            "retrieval_recall@10",
+            "retrieval_hit@10",
+        }
+    ),
     "longmemeval": frozenset({"accuracy"}),
     "clbench": frozenset({"solving_rate", "requirement_ratio"}),
     "beam": frozenset({"llm_judge_score", "precision", "recall", "f1", "tau_norm", "final_score"}),
@@ -514,11 +526,19 @@ def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer f
     if family == "mem-gallery":
         reference = references[0]
         scores = {
-            "f1": _gallery_f1(prediction, reference),
-            "bleu": _gallery_bleu(prediction, reference, (0.25, 0.25, 0.25, 0.25)),
-            "bleu_1": _gallery_bleu(prediction, reference, (1.0, 0.0, 0.0, 0.0)),
-            "bleu_2": _gallery_bleu(prediction, reference, (0.5, 0.5, 0.0, 0.0)),
-            "exact_match": float(_gallery_normalize(prediction) == _gallery_normalize(reference)),
+            "f1": _gallery_f1(prediction, reference, tokenizer=_mem_gallery_tokens),
+            "bleu": _gallery_bleu(
+                prediction, reference, (0.25, 0.25, 0.25, 0.25), tokenizer=_mem_gallery_tokens
+            ),
+            "bleu_1": _gallery_bleu(
+                prediction, reference, (1.0, 0.0, 0.0, 0.0), tokenizer=_mem_gallery_tokens
+            ),
+            "bleu_2": _gallery_bleu(
+                prediction, reference, (0.5, 0.5, 0.0, 0.0), tokenizer=_mem_gallery_tokens
+            ),
+            "exact_match": float(
+                _mem_gallery_normalize(prediction) == _mem_gallery_normalize(reference)
+            ),
         }
         scores.update(_gallery_retrieval(metadata, evidence_source_ids))
         return scores
@@ -1297,9 +1317,35 @@ def _gallery_tokens(value: str) -> list[str]:
     return _gallery_normalize(value).split()
 
 
-def _gallery_f1(prediction: str, reference: str) -> float:
-    predicted = [_porter().stem(word) for word in _gallery_tokens(prediction)]
-    expected = [_porter().stem(word) for word in _gallery_tokens(reference)]
+def _mem_gallery_normalize(value: str) -> str:
+    # a93959e1e978/evaluation.py uses regex, whose word boundaries include combining marks.
+    # Keep WorldMemArena's existing stdlib-re normalizer separate.
+    import regex  # type: ignore[import-untyped]
+
+    normalized = str(value).lower()
+    normalized = regex.sub(r"(?<=\d)\.(?=\d)", "DOTPLACEHOLDER", normalized)
+    normalized = normalized.replace("_", "UNDERSCOREPLACEHOLDER")
+    normalized = regex.sub(r"\b(a|an|the|and)\b", " ", normalized)
+    normalized = "".join(
+        character if character not in string.punctuation else " " for character in normalized
+    )
+    return " ".join(
+        normalized.replace("DOTPLACEHOLDER", ".").replace("UNDERSCOREPLACEHOLDER", "_").split()
+    )
+
+
+def _mem_gallery_tokens(value: str) -> list[str]:
+    return _mem_gallery_normalize(value).split()
+
+
+def _gallery_f1(
+    prediction: str,
+    reference: str,
+    *,
+    tokenizer: Callable[[str], list[str]] = _gallery_tokens,
+) -> float:
+    predicted = [_porter().stem(word) for word in tokenizer(prediction)]
+    expected = [_porter().stem(word) for word in tokenizer(reference)]
     if not predicted or not expected:
         return 0.0
     overlap = sum((Counter(predicted) & Counter(expected)).values())
@@ -1368,13 +1414,13 @@ def _gallery_retrieval(
     metadata: Mapping[str, object], evidence_source_ids: Sequence[str]
 ) -> dict[str, float]:
     expected = set(_metadata_values(metadata, "clue_ids"))
-    if not expected:
-        return {}
-    retrieved = _deduplicated_sources(evidence_source_ids)[:10]
+    # The evaluator truncates the raw ranking before deduplication, and empty clues still
+    # contribute zeros to its overall means (not an omitted row).
+    retrieved = tuple(dict.fromkeys(evidence_source_ids[:10]))
     hits = sum(source in expected for source in retrieved)
     return {
         "retrieval_precision@10": hits / max(1, len(retrieved)),
-        "retrieval_recall@10": hits / len(expected),
+        "retrieval_recall@10": hits / len(expected) if expected else 0.0,
         "retrieval_hit@10": float(hits > 0),
     }
 

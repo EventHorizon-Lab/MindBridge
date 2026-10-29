@@ -72,6 +72,8 @@ contract.
 
 ## Evaluate
 
+- [Mem-Gallery evaluation audit](research/2026-10-27-mem-gallery-evaluation-audit.md) — official
+  scorer parity, protocol differences, and limits on attributing quality losses.
 - [Negation retrieval research](research/2026-10-27-negation-retrieval-research.md) — original
   papers, open implementations, Chinese scope extraction, and evaluation priorities.
 - [Controlled semantic recall](research/2026-10-27-semantic-recall.md) — R01 audit, bounded

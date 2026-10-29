@@ -86,6 +86,8 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Removed
 
+- Unused generic token-F1 scoring helpers and the withdrawn raw-video experiment proposal.
+  Dataset-specific official scorers and the historical measurement records remain available.
 - PostgreSQL/pgvector, Celery, Redis, S3, service workers, and the service-specific APIs and
   benchmark runners from the superseded design.
 - Tenant, user, run, and other implicit isolation identifiers; metadata remains application data.

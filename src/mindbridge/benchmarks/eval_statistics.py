@@ -6,7 +6,6 @@ import math
 import random
 import re
 import unicodedata
-from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import cast
@@ -59,14 +58,6 @@ def parse_choice(response: str, choices: Sequence[str] = ()) -> str | None:
         if answer == normalize_text(choice):
             return label
     return None
-
-
-def token_f1(prediction: str, references: Sequence[str]) -> float:
-    """Return the best deterministic bag-of-token F1 across accepted references."""
-    predicted = normalize_text(prediction).split()
-    if not references:
-        raise ValueError("token F1 needs at least one reference")
-    return max(_token_f1(predicted, normalize_text(reference).split()) for reference in references)
 
 
 def exact_match(prediction: str, references: Sequence[str]) -> float:
@@ -181,24 +172,6 @@ def paired_comparison(
             sum(draw > 0 for draw in draws) / len(draws) if draws else None
         ),
     }
-
-
-def _token_f1(predicted: Sequence[str], reference: Sequence[str]) -> float:
-    if not predicted and not reference:
-        return 1.0
-    if not predicted or not reference:
-        return 0.0
-    remaining: dict[str, int] = defaultdict(int)
-    for token in reference:
-        remaining[token] += 1
-    overlap = 0
-    for token in predicted:
-        if remaining[token] > 0:
-            remaining[token] -= 1
-            overlap += 1
-    precision = overlap / len(predicted)
-    recall = overlap / len(reference)
-    return 2 * precision * recall / (precision + recall) if overlap else 0.0
 
 
 def _clusters(values: Iterable[ScoredValue]) -> tuple[tuple[float, ...], ...]:

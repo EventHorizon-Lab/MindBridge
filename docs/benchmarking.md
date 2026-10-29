@@ -1336,9 +1336,12 @@ default.
 Several result fields carry a caveat that decides whether they can be quoted:
 
 - **`official_metric` means the pinned upstream protocol publishes that metric and, for a judged
-  one, that the required judge produced it.** The retrieval and joint diagnostics -- `retrieval_*`
-  and `joint_*` -- are MindBridge's own and are never official, however faithful the rest of the
-  run was. `official_scorers.py` holds the per-family registry that decides this.
+  one, that the required judge produced it.** This flag alone does not establish that the reader,
+  prompts, evidence budget, or answer serialization match the official runner. Mem-Gallery
+  publishes EM and optional retrieval precision, recall, and hit at K; the harness implements the
+  K=10 formulas, including zero-valued empty-clue rows. Its generic labelled-source coverage
+  diagnostics use a different denominator. ATM-Bench's retrieval and joint metrics remain harness
+  diagnostics. `official_scorers.py` holds the per-family registry that decides this.
 - **`abstentions` undercounts.** It counts two things: the opaque marker the answer backend emits
   when it declines, and -- for a task whose own prompt mandates a refusal wording -- an answer
   equal to that wording. A model that refuses in its own free wording, on a task that mandates

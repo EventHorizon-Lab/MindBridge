@@ -13,6 +13,7 @@ the repository. An archived command may require those artifacts or an older chec
 
 | Record | Scope |
 | --- | --- |
+| [Mem-Gallery 评估一致性与失分归因 — 2026-10-27](2026-10-27-mem-gallery-evaluation-audit.md) | Complete fixed-answer parity against upstream, scoring corrections, protocol mismatches, causal attribution limits, and reward-hacking boundaries |
 | [Local runtime performance — 2026-10-27](2026-10-27-local-runtime-performance.md) | FP32 buffer scoring, scoped SQLite hydration, exact-result checks, and frozen SDK latency comparisons |
 | [否定敏感检索的论文与开源方案评估 — 2026-10-27](2026-10-27-negation-retrieval-research.md) | Cross-encoder evidence, Chinese subject/scope extraction, exclusion-query methods, implementation status, and MindBridge evaluation priorities |
 | [质量损失分层审查 — 2026-10-27](2026-10-27-quality-diagnostics.md) | Five observed question boundaries, trace correlation, source coverage limits and stratified human annotation |
@@ -61,7 +62,6 @@ the repository. An archived command may require those artifacts or an older chec
 | [Memory competitor source ledger (2026-09-07)](memory-backend-sources-2026-09-07.md) | Dated analysis or results; retain the stated evidence limits |
 | [Memory optimization: design and validation record](memory-optimization-2026-09-07.md) | Dated analysis or results; retain the stated evidence limits |
 | [Timeline neighbor-window risk review](timeline-neighbor-window-risk-review-2026-09-08.md) | Dated analysis or results; retain the stated evidence limits |
-| [Next experiment for raw-video memory](video-memory-next-experiment-2026-09-08.md) | Dated analysis or results; retain the stated evidence limits |
 
 ## Current implementation and experiment boundaries
 

@@ -295,6 +295,7 @@ def test_dependency_surface_is_exact() -> None:
             "opentelemetry-sdk",
             "pyarrow",
             "pyyaml",
+            "regex",
             "tqdm",
         },
         "observability": {"opentelemetry-sdk"},

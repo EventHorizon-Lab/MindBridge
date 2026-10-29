@@ -1,0 +1,72 @@
+{
+  "scope": "Fixed predictions; eight deterministic metrics; no judge or model calls",
+  "upstream_commit": "a93959e1e978a6a7d77798ae92c2ffe41c538c62",
+  "official_evaluator_sha256": "8ed8fb242ba0a9bf7b0029a138864ebd4f0d520528e6ffdc5492543221f5ba00",
+  "samples_sha256": "017a231bad8e5e3c8784bf33104f6a868cff75a4b74838a7dfb0bbcba7795f2c",
+  "scorer_protocol": "mem_gallery_scorer_a93959e1e978_v2",
+  "dataset_sha256": [
+    "fcd47af2b493cd9a7856cb77a622291b5aa9c6dad12b1f3553d8f569e2c5f6b8"
+  ],
+  "evaluation_sha256": [
+    "9ac83cc5643c607e781049d7d898b3dfc02d5c705236089414ca19715a53bd33"
+  ],
+  "questions": 1711,
+  "topics": 20,
+  "answer_errors": 5,
+  "current_mismatches": {},
+  "stored_mismatches": {},
+  "stored_missing": {
+    "retrieval_precision@10": 184,
+    "retrieval_recall@10": 184,
+    "retrieval_hit@10": 184
+  },
+  "official_means": {
+    "f1": 0.6874292835630688,
+    "bleu": 0.28474821539098166,
+    "bleu_1": 0.6448465261118297,
+    "bleu_2": 0.5167057043893273,
+    "exact_match": 0.5236703682057277,
+    "retrieval_precision@10": 0.20800701344243136,
+    "retrieval_recall@10": 0.8065596800108781,
+    "retrieval_hit@10": 0.8632378725891292
+  },
+  "categories": {
+    "AR": {
+      "questions": 184,
+      "f1": 0.3277836208814099
+    },
+    "CD": {
+      "questions": 81,
+      "f1": 0.9135802469135802
+    },
+    "FR": {
+      "questions": 219,
+      "f1": 0.6828570025697778
+    },
+    "KR": {
+      "questions": 81,
+      "f1": 0.39043746581803696
+    },
+    "MR": {
+      "questions": 206,
+      "f1": 0.5249530357948752
+    },
+    "TR": {
+      "questions": 123,
+      "f1": 0.5443331633199437
+    },
+    "TTL": {
+      "questions": 337,
+      "f1": 0.7671850898853866
+    },
+    "VR": {
+      "questions": 174,
+      "f1": 0.7954964197101925
+    },
+    "VS": {
+      "questions": 306,
+      "f1": 0.9433239962651727
+    }
+  },
+  "passed": true
+}
