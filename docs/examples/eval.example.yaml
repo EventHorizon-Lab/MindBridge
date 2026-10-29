@@ -232,6 +232,9 @@ benchmark:
     # Static corpora only; values above 1 require add, no deliberate, formation, speech, or face.
     ingest_concurrency: 1
     request_concurrency: 4
+    # SDK surface, separate from generation.stream and stream_results. False uses buffered ask,
+    # allowing request_concurrency: 16 against one store within the 28-operation admission budget.
+    stream_answers: true
     judge_concurrency: 8
     batch_size: auto
     max_batch_size: 64

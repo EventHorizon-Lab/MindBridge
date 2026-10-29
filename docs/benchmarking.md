@@ -177,6 +177,31 @@ Parity fixtures cover unchanged ID-list references, scalar/list dispatch, the ex
 judge prompt, boolean and numeric judge outputs, and the shared query/refusal instruction.
 These checks establish protocol parity, not answer quality.
 
+The judge request requires a boolean `accuracy` through a strict JSON schema. This preserves the
+official verdict parser: a string such as `"true"` is still invalid and receives no credit. A
+provider-format repair must rejudge sealed predictions and must not be reported as a quality gain.
+
+To evaluate raw ATM media together with the release's caption, OCR, location, and tags, build an
+explicit source manifest from a complete local release:
+
+```bash
+uv run --frozen python benchmarks/atm_source_manifest.py \
+  --inputs .benchmarks/data \
+  --output .benchmarks/atm-source-annotations.json
+uv run --frozen mindbridge-bench eval \
+  --config atm-config.yaml \
+  --tasks atm-bench-main \
+  --media-manifest .benchmarks/atm-source-annotations.json \
+  --data-root .benchmarks/atm-source-run \
+  --no-download
+```
+
+Use your multimodal model configuration as `atm-config.yaml` and a fresh `data-root`. The builder
+requires an exact source-ID match, retains every raw asset, labels annotations as fallible source
+text, and writes input and manifest hashes beside the manifest. It reads no QA or evidence labels.
+Report this input condition as raw media plus released source annotations. It differs from both
+raw-only evaluation and the text-only SGM task, so its score cannot establish a raw-only algorithm gain.
+
 A bounded local reader check uses six synthetic text fixtures: a pickup date/time, a photo date,
 a currency value, photo IDs, missing private information, and an instruction embedded in stored
 evidence. It compares the legacy type-specific query with the current official shared instruction,
@@ -328,7 +353,7 @@ annotated [example configuration](examples/eval.example.yaml) for every field an
 `repeat_index`, `max_batch_size`, `unit_concurrency`, `ingest_concurrency`,
 `request_concurrency`, `judge_concurrency`, `recall_limit`, `device`, `device_lock`, `use_cache`,
 `answer_policy`,
-`run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `stream_results`,
+`run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `stream_results`, `stream_answers`,
 `download`,
 `allow_unverified_data`, `verbosity`, `quiet`, `compare`, `fail_on_regression`,
 `regression_threshold`, `media_manifest`, `task_data`, and `media_root`. Omitted
@@ -432,6 +457,14 @@ then stops further retries. Requested concurrency is a ceiling;
 values above these budgets wait in the harness. Waiting for admission is included in caller latency
 and TTFT. See
 [runtime limits](operations.md#concurrency-and-overload).
+
+Answers use `AsyncMemory.ask_stream()` by default. Set `--no-stream-answers` (or
+`benchmark.run.stream_answers: false`) to use the public buffered `AsyncMemory.ask()` surface.
+This allows `request_concurrency: 16` to admit sixteen answers against one physical store,
+within the same 28-operation runtime budget. The question, retrieval limit, reference time,
+and answer policy are identical. Artifacts record the delivery mode and effective ask concurrency.
+Buffered calls have no caller-observed first-token latency. This option is separate from
+`stream_results`, which controls reporting, and `generation.stream`, which controls provider transport.
 
 Unless `--quiet` is set, `eval` reports ingest, sample, and judge progress to stderr. On a
 terminal those are live progress bars with an ETA. While a sample is still rebuilding, ingesting,

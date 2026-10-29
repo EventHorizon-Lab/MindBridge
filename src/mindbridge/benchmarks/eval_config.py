@@ -156,6 +156,7 @@ class _Arguments:
     quiet: bool
     fallback_reference_at: datetime | None = None
     ingest_concurrency: int = 1
+    stream_answers: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +395,12 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--allow-unverified-data", action="store_true", default=None)
     parser.add_argument(
+        "--stream-answers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="use SDK answer streams (8 per instance); disable for buffered ask (28 per instance)",
+    )
+    parser.add_argument(
         "--download",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -492,6 +499,7 @@ def _arguments(
     predict_only = _picked(parsed.predict_only, run.predict_only, False)
     log_samples = _picked(parsed.log_samples, run.log_samples, False)
     stream_results = _picked(parsed.stream_results, run.stream_results, True)
+    stream_answers = _picked(parsed.stream_answers, run.stream_answers, True)
     allow_unverified = _picked(parsed.allow_unverified_data, run.allow_unverified_data, False)
     download_inputs = _picked(parsed.download, run.download, True)
     overwrite = _picked(parsed.overwrite, run.overwrite, False)
@@ -587,6 +595,7 @@ def _arguments(
         predict_only=predict_only,
         log_samples=log_samples,
         stream_results=stream_results,
+        stream_answers=stream_answers,
         allow_unverified_data=allow_unverified,
         download=download_inputs,
         overwrite=overwrite,

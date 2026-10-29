@@ -149,7 +149,7 @@ from mindbridge.benchmarks.eval_environment import (
     source_metadata,
     unavailable_server_resources,
 )
-from mindbridge.benchmarks.eval_judge import _apply_judges
+from mindbridge.benchmarks.eval_judge import JUDGE_REQUEST_VERSION, _apply_judges
 from mindbridge.benchmarks.eval_metrics import (
     _abstentions,
     _answer_retrieval_candidate_limit,
@@ -245,7 +245,7 @@ from mindbridge.models.base import (
 )
 from mindbridge.models.openai_sdk import _answer_result
 
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v18"
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v23"
 _BENCHMARK_SEARCH_REPLAY_SETUP_SPAN = "mindbridge.benchmark.search_replay_setup"
 # Mirror the fixed per-instance SDK admission contract documented in docs/operations.md.
 _SDK_STREAM_LIMIT = 8
@@ -1616,6 +1616,7 @@ async def _run_arms(
                 batch_size=batch_sizes[task.spec.name],
                 unit_concurrency=arguments.unit_concurrency,
                 ingest_concurrency=arguments.ingest_concurrency,
+                stream_answers=arguments.stream_answers,
                 request_concurrency=arguments.request_concurrency,
                 recall_limit=arguments.recall_limit,
                 predict_only=arguments.predict_only,
@@ -1673,6 +1674,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     ingest_digest: str | None = None,
     deliberate: bool = False,
     ingest_concurrency: int = 1,
+    stream_answers: bool = True,
     tracer: Tracer | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     on_ingest_progress: Callable[[int, int], None] | None = None,
@@ -1784,6 +1786,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 ingest_mode=ingest_mode,
                 ingest_concurrency=ingest_concurrency,
                 checkpoint=checkpoint,
+                stream_answers=stream_answers,
                 deliberate=deliberate,
                 tracer=tracer,
                 on_sample_completed=sample_completed,
@@ -2080,6 +2083,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     answer_policy: AnswerPolicy | None = None,
     ingest_mode: str = DEFAULT_INGEST_MODE,
     ingest_concurrency: int = 1,
+    stream_answers: bool = True,
     checkpoint: _IngestCheckpoint | None = None,
     deliberate: bool = False,
     tracer: Tracer | None = None,
@@ -2212,6 +2216,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                     answer_policy=answer_policy,
                     tracer=tracer,
                     on_sample_completed=on_sample_completed,
+                    stream_answers=stream_answers,
                 )
                 results.update(cutoff_results)
                 if any(
@@ -2267,6 +2272,7 @@ async def _answer_arms(
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
     model_semaphore: asyncio.Semaphore | None = None,
+    stream_answers: bool = True,
 ) -> dict[tuple[str, str], SampleResult]:
     """Answer one cutoff's pending questions once per arm, against one ingested store."""
     results: dict[tuple[str, str], SampleResult] = {}
@@ -2290,6 +2296,7 @@ async def _answer_arms(
             answer_policy=answer_policy,
             tracer=tracer,
             on_complete=on_sample_completed,
+            stream_answers=stream_answers,
         )
         for question, outcome in zip(questions, answered, strict=True):
             _cache_outcome(
@@ -2773,6 +2780,7 @@ async def _guarded_answer(
     tracer: Tracer | None,
     on_answer: Callable[[EvalQuestion, _AnswerOutcome], None] | None,
     on_complete: Callable[[], None] | None,
+    stream_answers: bool = True,
 ) -> _AnswerOutcome:
     identity = f"{task_name}/{unit_id}/{question.question_id}"
     sample_id = identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
@@ -2794,6 +2802,7 @@ async def _guarded_answer(
             answer_span=answer_span,
             model_semaphore=model_semaphore,
             systemic_stop=systemic_stop,
+            stream_answers=stream_answers,
         )
 
     try:
@@ -2844,6 +2853,7 @@ async def _answer_many(
     answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
     model_semaphore: asyncio.Semaphore | None = None,
+    stream_answers: bool = True,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
     model_semaphore = model_semaphore or asyncio.Semaphore(_SDK_OPERATION_LIMIT)
@@ -2851,7 +2861,7 @@ async def _answer_many(
     # shared across units. Queue excess callers here before they can occupy global slots or
     # become immediate admission errors. Each unit owns its store and runs its arms in order.
     instance_limit = _SDK_OPERATION_LIMIT if arm.reads_memory else request_concurrency
-    if _answers_through_ask(arm, task_name):
+    if stream_answers and _answers_through_ask(arm, task_name):
         instance_limit = _SDK_STREAM_LIMIT
     instance_semaphore = asyncio.Semaphore(min(request_concurrency, instance_limit))
     systemic_stop = asyncio.Event()
@@ -2877,6 +2887,7 @@ async def _answer_many(
                         tracer=tracer,
                         on_answer=on_answer,
                         on_complete=on_complete,
+                        stream_answers=stream_answers,
                     )
                     for question in questions
                 ),
@@ -3000,6 +3011,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
     tracer: Tracer | None = None,
     model_semaphore: asyncio.Semaphore | None = None,
     systemic_stop: asyncio.Event | None = None,
+    stream_answers: bool = True,
 ) -> _AnswerOutcome:
     latency_started = time.perf_counter()
     content = _content(question.content)
@@ -3166,6 +3178,13 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
         # for "unknown", so the request asks for a committed answer there. `task_answer_policy`
         # owns the mapping -- `{m3-bench-robot}` -- and its rationale.
         async def answered() -> AnswerResult:
+            if not stream_answers:
+                return await memory.ask(
+                    content,
+                    limit=recall_limit,
+                    reference_at=question.reference_at,
+                    answer_policy=requested_policy,
+                )
             first_token_seen = False
             streamed: AnswerResult | None = None
             async for chunk in memory.ask_stream(
@@ -3767,6 +3786,7 @@ def _results(
         "ingest_concurrency": arguments.ingest_concurrency,
         "effective_ingest_concurrency": min(arguments.ingest_concurrency, _SDK_OPERATION_LIMIT),
         "request_concurrency": arguments.request_concurrency,
+        "stream_answers": arguments.stream_answers,
         "recall_limit": arguments.recall_limit,
         "answer_policy_override": arguments.answer_policy,
         # P5/P6: without this the configured consolidator was constructed, registered for close,
@@ -3788,6 +3808,7 @@ def _results(
             embedding_warmup_count=embedding_warmup_count,
         ),
         "judge": {
+            "request_version": JUDGE_REQUEST_VERSION,
             "model": judge_config.model,
             "base_url": judge_config.base_url,
             "sampling": "benchmark_protocol",
@@ -3969,6 +3990,11 @@ def _arm_provenance(
             "Memory.ask in-answer ranked list; none on a task answered through Memory.compile"
         ),
         "search_e2e_limit": arguments.recall_limit,
+        "answer_delivery": "streamed" if arguments.stream_answers else "buffered",
+        "effective_ask_concurrency": min(
+            arguments.request_concurrency,
+            _SDK_STREAM_LIMIT if arguments.stream_answers else _SDK_OPERATION_LIMIT,
+        ),
         "search_e2e_source": "post-answer public Memory.search replay",
         "evidence_budget_chars": evidence_budget_chars,
         "ingest": arguments.ingest,
@@ -4301,6 +4327,7 @@ def _cache_namespace(
         "batch_sizes": dict(sorted(batch_sizes.items())),
         "ingest": arguments.ingest,
         "ingest_concurrency": arguments.ingest_concurrency,
+        "stream_answers": arguments.stream_answers,
         "deliberate": arguments.deliberate,
         "compile_max_items": arguments.compile_max_items,
         "compile_max_chars": arguments.compile_max_chars,

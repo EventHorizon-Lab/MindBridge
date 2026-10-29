@@ -374,6 +374,12 @@ async def test_atm_official_judge_uses_minimal_reasoning() -> None:
     assert calls[0]["reasoning"] == {"effort": "minimal"}
     assert calls[0]["store"] is False
     assert calls[0]["max_output_tokens"] == 600
+    text_config = cast(dict[str, object], calls[0]["text"])
+    format_config = cast(dict[str, object], text_config["format"])
+    assert format_config["strict"] is True
+    schema = cast(dict[str, object], format_config["schema"])
+    properties = cast(dict[str, object], schema["properties"])
+    assert properties["accuracy"] == {"type": "boolean"}
 
 
 @pytest.mark.asyncio

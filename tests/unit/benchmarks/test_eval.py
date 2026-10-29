@@ -869,6 +869,7 @@ def _namespace_arguments() -> eval_config_module._Arguments:
             blind=False,
             ingest="add",
             ingest_concurrency=1,
+            stream_answers=True,
             deliberate=False,
             compile_max_items=24,
             compile_max_chars=16000,
@@ -937,9 +938,15 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert eval_results_module.EVAL_SCHEMA_VERSION == 22
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v18"
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v23"
     arguments = _namespace_arguments()
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
+
+    buffered_arguments = cast(
+        eval_config_module._Arguments,
+        SimpleNamespace(**{**vars(arguments), "stream_answers": False}),
+    )
+    assert _cache_namespace(buffered_arguments, ModelConfig(), {"text": 1}) != before
 
     monkeypatch.setattr(eval_module, "EVAL_RUNNER_VERSION", "next-runner-recipe")
 
@@ -1274,6 +1281,7 @@ def test_eval_config_reuses_the_declarative_memory_schema(
             blind=False,
             ingest="add",
             ingest_concurrency=1,
+            stream_answers=True,
             deliberate=False,
             compile_max_items=24,
             compile_max_chars=16000,
@@ -3468,6 +3476,7 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             run_id="run",
             unit_concurrency=1,
             ingest_concurrency=1,
+            stream_answers=True,
             request_concurrency=1,
             recall_limit=3,
             answer_policy=None,
@@ -5676,6 +5685,7 @@ def _streaming_arguments(output_path: Path, **overrides: object) -> eval_config_
         "run_id": "run",
         "seed": 7,
         "stream_results": False,
+        "stream_answers": True,
         "use_cache": None,
     }
     values.update(overrides)

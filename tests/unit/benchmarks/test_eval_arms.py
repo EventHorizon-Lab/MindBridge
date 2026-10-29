@@ -1440,6 +1440,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
             fallback_reference_at=None,
             repeat_index=0,
             stream_results=False,
+            stream_answers=False,
             seed=7,
             seeds=(7, 7, 7, 7),
             bootstrap_samples=20,
@@ -1503,6 +1504,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
         },
     )
     rows = cast(list[dict[str, object]], results["tasks"])
+    assert results["stream_answers"] is False
     arms = cast(dict[str, object], results["arms"])
     table = eval_console_module._table(results)
 
@@ -1545,7 +1547,10 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     assert "atm-bench-main [blind]" in table
 
 
-def test_product_budget_provenance_distinguishes_ask_and_compile_tasks() -> None:
+@pytest.mark.parametrize(("stream_answers", "expected_concurrency"), [(True, 8), (False, 16)])
+def test_product_budget_provenance_distinguishes_ask_and_compile_tasks(
+    stream_answers: bool, expected_concurrency: int
+) -> None:
     arguments = cast(
         eval_config_module._Arguments,
         SimpleNamespace(
@@ -1560,6 +1565,8 @@ def test_product_budget_provenance_distinguishes_ask_and_compile_tasks() -> None
             seed=7,
             ingest="add",
             ingest_concurrency=1,
+            stream_answers=stream_answers,
+            request_concurrency=16,
         ),
     )
     provenance = eval_module._arm_provenance(arguments)
@@ -1568,6 +1575,8 @@ def test_product_budget_provenance_distinguishes_ask_and_compile_tasks() -> None
 
     assert budgets["personamem-v3"] == {"surface": "compile", "max_chars": 128, "max_items": 3}
     assert budgets["longmemeval-s"]["surface"] == "ask"
+    assert provenance["answer_delivery"] == ("streamed" if stream_answers else "buffered")
+    assert provenance["effective_ask_concurrency"] == expected_concurrency
 
 
 def test_answer_retrieval_candidate_limit_matches_budget_policy() -> None:

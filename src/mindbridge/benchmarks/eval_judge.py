@@ -20,7 +20,7 @@ from opentelemetry.trace import Tracer
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
     from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
-    from openai.types.responses import Response
+    from openai.types.responses import Response, ResponseTextConfigParam
 from mindbridge import Modality
 from mindbridge._telemetry import (
     MODEL_MODULE,
@@ -74,6 +74,28 @@ from mindbridge.models.openai_sdk import (
     _record_openai_provenance,
     _record_usage_batch,
 )
+
+JUDGE_REQUEST_VERSION = "mindbridge_judge_request_v2"
+
+
+def _atm_judge_text_format() -> ResponseTextConfigParam:
+    """Require the official boolean verdict type without constraining its value."""
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": "atm_judge",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "explanation": {"type": "string"},
+                    "accuracy": {"type": "boolean"},
+                },
+                "required": ["explanation", "accuracy"],
+                "additionalProperties": False,
+            },
+        }
+    }
 
 
 class _JudgeRequestRequired(TypedDict):
@@ -408,6 +430,7 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
                         input="\n".join(message.content for message in messages),
                         max_output_tokens=plan.max_tokens,
                         reasoning={"effort": "minimal"},
+                        text=_atm_judge_text_format(),
                     )
                 completion: ChatCompletion = await client.chat.completions.create(**request)
                 return completion
@@ -459,6 +482,7 @@ def _judge_cache_coordinates(
         _json_bytes(
             {
                 "version": SCORER_VERSION,
+                "request_version": JUDGE_REQUEST_VERSION,
                 "model": config.model,
                 "protocol": plan.protocol,
                 "call": call_index,

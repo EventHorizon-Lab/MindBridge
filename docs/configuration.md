@@ -1127,6 +1127,12 @@ collects the provider's SSE response before parsing it, requires the terminal us
 off by default. This transport setting does not change `ask_stream()`, which already delivers
 answer deltas to the caller.
 
+The benchmark's `benchmark.run.stream_answers` separately chooses the public SDK answer surface:
+`true` (the default) uses `AsyncMemory.ask_stream()`, and `false` uses buffered `AsyncMemory.ask()`.
+For sixteen concurrent answers against one store, set it to `false` and set
+`benchmark.run.request_concurrency: 16`. See [benchmark concurrency](benchmarking.md) for admission
+limits and timing semantics.
+
 Use `MemoryPlugins` with `Memory.from_plugins()` when constructed adapters should travel as one
 value. `resolve_memory_config()` is for hosts that need a `MemoryComposition` before opening
 storage; close it unless its plugins are transferred to a `Memory`. Ordinary applications should
