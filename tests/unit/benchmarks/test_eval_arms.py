@@ -1258,7 +1258,9 @@ def test_invented_metrics_are_never_stamped_official(metric: str, expected: bool
     # `recall_limit` to 1..100, so 10 is a value the real parser would accept.
     arguments = cast(
         eval_config_module._Arguments,
-        SimpleNamespace(seed=7, bootstrap_samples=20, recall_limit=10, blind=False),
+        SimpleNamespace(
+            seed=7, bootstrap_samples=20, recall_limit=10, blind=False, offset=0, limit=None
+        ),
     )
     sample = _sample_with({metric: 1.0})
 
@@ -1276,7 +1278,9 @@ def test_a_baseline_arm_never_reports_an_official_metric() -> None:
     # `recall_limit` to 1..100, so 10 is a value the real parser would accept.
     arguments = cast(
         eval_config_module._Arguments,
-        SimpleNamespace(seed=7, bootstrap_samples=20, recall_limit=10, blind=False),
+        SimpleNamespace(
+            seed=7, bootstrap_samples=20, recall_limit=10, blind=False, offset=0, limit=None
+        ),
     )
     sample = _sample_with({"accuracy": 1.0}, arm="full-context")
 
@@ -1681,7 +1685,8 @@ def test_baseline_generator_uses_the_configured_generation_model(
     assert blind == stuffed == stuffed_with_text_hit == "Ada"
     for request in requests[1:]:
         assert request["model"] == model
-        assert set(request) == {"model", "messages", "extra_body"} | controls.keys()
+        assert set(request) == {"model", "messages", "extra_body", "store"} | controls.keys()
+        assert request["store"] is False
         assert {name: request[name] for name in controls} == controls
         assert request["extra_body"] == {
             "chat_template_kwargs": {"enable_thinking": False},

@@ -372,6 +372,7 @@ async def test_atm_official_judge_uses_minimal_reasoning() -> None:
 
     assert scores == {"accuracy": 1.0}
     assert calls[0]["reasoning"] == {"effort": "minimal"}
+    assert calls[0]["store"] is False
     assert calls[0]["max_output_tokens"] == 600
 
 
@@ -498,7 +499,9 @@ def test_results_mark_proxy_judge_metrics_nonofficial(tmp_path: Path) -> None:
     )
     arguments = cast(
         eval_config_module._Arguments,
-        SimpleNamespace(seed=7, bootstrap_samples=20, recall_limit=20, blind=False),
+        SimpleNamespace(
+            seed=7, bootstrap_samples=20, recall_limit=20, blind=False, offset=0, limit=None
+        ),
     )
 
     result = _metrics(task, (sample,), arguments)

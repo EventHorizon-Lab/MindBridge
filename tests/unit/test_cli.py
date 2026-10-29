@@ -34,7 +34,7 @@ from mindbridge.api import app as rest
 from mindbridge.api import content as rest_content
 from mindbridge.api.errors import ErrorEnvelope
 from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, _parser, main
-from mindbridge.control import load_operation
+from mindbridge.control import dump_operation, load_operation
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.kernel.contracts import declared_capabilities
 from mindbridge.models._jina import DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION
@@ -1382,7 +1382,7 @@ def test_the_control_plane_loop_commands_only_translate(
     }
 
     # `apply` reads the same operation JSON the log stores, so a log row replays verbatim.
-    operation = json.dumps({"intent": "forget", "target_ids": [memory_id]})
+    operation = dump_operation(MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(memory_id,)))
     status, applied, _ = _run(capsys, "--app", app, "-q", "apply", "--operation", operation)
     assert status == 0
     record = cast(dict[str, object], cast(dict[str, object], applied)["operation"])
@@ -1419,11 +1419,29 @@ def test_the_control_plane_loop_commands_only_translate(
         "-q",
         "apply",
         "--operation",
-        json.dumps({"intent": "correct", "target_ids": [memory_id]}),
+        dump_operation(MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(memory_id,))),
     )
     assert status == EXIT_CODES["validation_error"] == 3
     assert stdout is None
     assert cast(dict[str, object], stderr[0])["reason"] == "not_derived"
+
+
+def test_apply_rejects_an_abbreviated_operation_before_kernel_validation(
+    app: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, stdout, stderr = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "apply",
+        "--operation",
+        '{"intent":"forget","target_ids":["missing-memory"]}',
+    )
+
+    assert status == EXIT_CODES["storage_error"]
+    assert stdout is None
+    assert cast(dict[str, object], stderr[0])["code"] == "storage_error"
 
 
 def test_an_operation_row_names_the_people_a_merge_moved() -> None:

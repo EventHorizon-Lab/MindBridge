@@ -2132,7 +2132,7 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         "--operation",
         required=True,
         metavar="JSON",
-        help="one operation object as `operations` logs it, @PATH, or -",
+        help="one complete current operation object as `operations` logs it, @PATH, or -",
     )
     outcome = commands.add_parser(
         "record-outcome",

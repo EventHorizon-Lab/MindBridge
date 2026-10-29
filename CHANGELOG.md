@@ -50,6 +50,22 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Changed
 
+- Operation-log decoding requires the complete current payload. Removed missing-field defaults,
+  outdated benchmark object-shape fallbacks and non-protocol MCP error-field handling; older
+  incomplete payloads must be replaced by re-ingesting source observations. CLI `apply --operation`
+  uses the same complete payload, including explicit nulls and empty arrays.
+- OpenAI completion defaults pin `gpt-5-mini-2025-08-07`, use strict JSON Schema, and explicitly
+  disable provider application-state storage with `generation_store=False` (`store` in config).
+  JSON-only compatible endpoints must select `json_object` explicitly. Stored formation, vision
+  and consolidation recipes change; use a fresh directory and replay when adopting these defaults.
+- Model operations cannot mutate host response policies or their transitive active evidence,
+  including through implicit lineage replacement. Content-safety refusals keep `model_refused`
+  semantics without media-removal retries, and deliberation logs never include exception chains.
+- Formation explicitly separates factual source content from embedded instructions that impersonate
+  runtime authority, replace observation clocks or dictate output fields.
+- Relevant pull requests run answering and workflow quality gates covering formation timestamps,
+  recall planning, image prompt injection, policy preservation and Chinese answering. See the
+  [model quality gate](docs/operations.md#model-quality-gate) for required CI secrets and model pins.
 - Answer requests identify original record and attachment modalities, including video sources
   shown as ordered stills or retained only as text after media omission.
 - Local speech uses a pinned FunASR main revision with corrected speaker attribution and bounded

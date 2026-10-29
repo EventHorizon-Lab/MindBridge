@@ -63,6 +63,7 @@ from mindbridge.benchmarks.eval_telemetry import (
     ResourceSampler,
     storage_bytes,
 )
+from mindbridge.benchmarks.task_catalog import TaskSpec
 from mindbridge.context import compile_context
 
 
@@ -147,9 +148,23 @@ def _arguments(**overrides: object) -> eval_config_module._Arguments:
         "bootstrap_samples": 32,
         "recall_limit": 20,
         "blind": False,
+        "offset": 0,
+        "limit": None,
     }
     values.update(overrides)
     return cast(eval_config_module._Arguments, SimpleNamespace(**values))
+
+
+def _metric_task(
+    name: str = "fixture", *, unavailable_units: Mapping[str, str] | None = None
+) -> LoadedTask:
+    return LoadedTask(
+        TaskSpec(name, "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        Path("fixture.json"),
+        "d" * 64,
+        (EvalUnit("unit", (), (EvalQuestion("q1", ("What happened?",), ("an event",)),)),),
+        unavailable_units={} if unavailable_units is None else unavailable_units,
+    )
 
 
 # --- family 1: ingestion latency to durable, searchable memory, plus throughput -------------
@@ -285,7 +300,7 @@ def test_answer_latency_names_the_quantity_it_measures() -> None:
         replace(sample, latency_ms=latency)
         for sample, latency in zip(samples, (10.0, 20.0, 30.0, 40.0), strict=True)
     )
-    task = cast(Any, SimpleNamespace(spec=SimpleNamespace(name="fixture")))
+    task = _metric_task()
 
     metrics = eval_metrics_module._metrics(task, samples, _arguments())
     latency = cast(Mapping[str, object], metrics["answer_latency_ms"])
@@ -307,14 +322,7 @@ def test_a_failed_answer_counts_as_wrong_without_invalidating_the_task_score() -
         error_reason="request_rejected",
         error_message="Input video data may contain inappropriate content.",
     )
-    task = cast(
-        Any,
-        SimpleNamespace(
-            spec=SimpleNamespace(name="fixture"),
-            units=(SimpleNamespace(unit_id="unit"),),
-            unavailable_units={},
-        ),
-    )
+    task = _metric_task()
 
     metrics = eval_metrics_module._metrics(task, (answered, failed), _arguments())
     score = cast(Mapping[str, object], metrics["score"])
@@ -327,14 +335,7 @@ def test_a_failed_answer_counts_as_wrong_without_invalidating_the_task_score() -
 
 def test_metrics_mark_an_unavailable_dataset_unit_as_incomplete() -> None:
     sample = _sample("q1", sources=(), gold=(), candidate_count=0)
-    task = cast(
-        Any,
-        SimpleNamespace(
-            spec=SimpleNamespace(name="fixture"),
-            units=(SimpleNamespace(unit_id="unit"),),
-            unavailable_units={"private-video": "ERROR: Private video"},
-        ),
-    )
+    task = _metric_task(unavailable_units={"private-video": "ERROR: Private video"})
 
     metrics = eval_metrics_module._metrics(task, (sample,), _arguments())
     coverage = cast(Mapping[str, object], metrics["dataset_coverage"])
@@ -351,14 +352,7 @@ def test_metrics_mark_an_unavailable_dataset_unit_as_incomplete() -> None:
 
 def test_metrics_do_not_compare_a_selected_slice_to_the_full_dataset() -> None:
     sample = _sample("q1", sources=(), gold=(), candidate_count=0)
-    task = cast(
-        Any,
-        SimpleNamespace(
-            spec=SimpleNamespace(name="fixture"),
-            units=(SimpleNamespace(unit_id="unit"),),
-            unavailable_units={},
-        ),
-    )
+    task = _metric_task()
 
     metrics = eval_metrics_module._metrics(task, (sample,), _arguments(limit=1, offset=0))
     coverage = cast(Mapping[str, object], metrics["dataset_coverage"])
@@ -376,14 +370,7 @@ def test_openeqa_aggregate_keeps_the_official_zero_to_one_hundred_scale() -> Non
         metrics={"llm_match": 75.0, "llm_match_score_1_5": 4.0},
         judge_model="gpt-4-1106-preview",
     )
-    task = cast(
-        Any,
-        SimpleNamespace(
-            spec=SimpleNamespace(name="openeqa-hm3d"),
-            units=(SimpleNamespace(unit_id="unit"),),
-            unavailable_units={},
-        ),
-    )
+    task = _metric_task("openeqa-hm3d")
 
     result = eval_metrics_module._metrics(task, (sample,), _arguments())
 
@@ -408,14 +395,7 @@ def test_personamem_does_not_publish_a_biased_partial_micro_score() -> None:
         metrics={},
         judge_model=None,
     )
-    task = cast(
-        Any,
-        SimpleNamespace(
-            spec=SimpleNamespace(name="personamem-v3"),
-            units=(SimpleNamespace(unit_id="unit"),),
-            unavailable_units={},
-        ),
-    )
+    task = _metric_task("personamem-v3")
 
     result = eval_metrics_module._metrics(task, (supported, unsupported), _arguments())
     score = cast(Mapping[str, object], result["score"])
@@ -961,7 +941,7 @@ def test_controls_are_complete_only_with_all_three_baselines() -> None:
 
 
 def test_metrics_attach_the_controls_and_never_hide_a_missing_one() -> None:
-    task = cast(Any, SimpleNamespace(spec=SimpleNamespace(name="fixture")))
+    task = _metric_task()
     samples = (_sample("q1", sources=("s1",), gold=(), candidate_count=4),)
 
     metrics = eval_metrics_module._metrics(task, samples, _arguments())
@@ -1185,7 +1165,7 @@ def test_blind_baseline_rejects_a_different_answer_policy(tmp_path: Path) -> Non
 
 
 def test_noise_floor_reports_the_smallest_resolvable_difference() -> None:
-    task = cast(Any, SimpleNamespace(spec=SimpleNamespace(name="fixture")))
+    task = _metric_task()
     samples = tuple(
         _sample(f"q{index}", sources=(), gold=(), candidate_count=0, score=float(index % 2))
         for index in range(8)
