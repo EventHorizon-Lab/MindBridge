@@ -506,6 +506,17 @@ def _semantic_hits(
     return tuple(offered)
 
 
+def _recall_ranked_tail(
+    program: RecallResult, ranked: tuple[SearchHit, ...], *, budgeted: bool
+) -> tuple[SearchHit, ...]:
+    """Fill an explicit evidence budget; otherwise retain the plan's ranked depth."""
+    if not budgeted:
+        depth = max((step.k for step in program.plan.steps if step.op == "similar"), default=0)
+        ranked = ranked[:depth]
+    matched = {hit.id for hit in program.exhaustive}
+    return tuple(hit for hit in ranked if hit.id not in matched)
+
+
 def expansion_note(added: int, expansion: _Expansion, *, chronological: bool = False) -> str:
     """Say what the linked rows are, and refuse to let them be read as a set.
 
@@ -915,6 +926,7 @@ class Answering(Traced):
                     scope=scope,
                     require_unambiguous=limit == 1,
                     capture_trace=False,
+                    capture_visual_matches=True,
                 )
                 speech_assets = self._speech.answer_speech_assets(prepared.assets)
                 if speech_assets and all(
@@ -924,14 +936,18 @@ class Answering(Traced):
                     with self._execution.overlap_speech(
                         self._speech.recognize, speech_assets, assets
                     ) as identities:
-                        hits = prepared_search().hits
+                        outcome = prepared_search()
+                        hits = outcome.hits
                         _record_retrieval_results(hits)
                         identities.result()
                 else:
                     if speech_assets:
                         self._speech.recognize(speech_assets, assets)
-                    hits = prepared_search().hits
+                    outcome = prepared_search()
+                    hits = outcome.hits
                     _record_retrieval_results(hits)
+            routed = self._route_generation(prepared, assets)
+            image_ids = {asset.id for asset in routed.assets if asset.modality is Modality.IMAGE}
             round_context = _RecallContext(
                 answerer=answerer,
                 prepared=prepared,
@@ -943,7 +959,14 @@ class Answering(Traced):
                 # spoken question becomes text there -- and because routing appends speech
                 # identities and transcripts, which would otherwise land after the line
                 # documented as final.
-                routed=self._route_generation(prepared, assets),
+                routed=replace(
+                    routed,
+                    image_retrieval_matches=tuple(
+                        match
+                        for match in outcome.image_retrieval_matches
+                        if match.query_asset_id in image_ids
+                    ),
+                ),
                 assets=assets,
                 ranked=hits,
                 ranked_depth=ranked_depth,
@@ -1212,6 +1235,16 @@ class Answering(Traced):
             if hits
             else ()
         )
+        if question.image_retrieval_matches:
+            delivered = {(hit.id, asset.id) for hit in routed_hits for asset in hit.assets}
+            question = replace(
+                question,
+                image_retrieval_matches=tuple(
+                    match
+                    for match in question.image_retrieval_matches
+                    if (match.memory_id, match.source_asset_id) in delivered
+                ),
+            )
         self._speech.persist_transcripts(context.assets)
         with closing(
             self._answer_chunks(
@@ -1383,8 +1416,9 @@ class Answering(Traced):
             note = f"{note} {semantic_note}" if note else semantic_note
         tail = context.ranked
         if program is not None and exhaustive:
-            depth = max((step.k for step in program.plan.steps if step.op == "similar"), default=0)
-            tail = tuple(hit for hit in tail[:depth] if hit.id not in matched)
+            tail = _recall_ranked_tail(
+                program, tail, budgeted=self._settings.evidence_budget is not None
+            )
         if budget is not None and (self._settings.evidence_budget is not None or exhaustive):
             hits = (*hits, *_budgeted_hits(tail, hits, budget))
         remaining = self._settings.evidence_expansion_max_rows - native_added
@@ -1471,8 +1505,9 @@ class Answering(Traced):
         note = f"{note} {semantic_note}" if note else semantic_note
         tail = context.ranked
         if program.plan.exhaustive:
-            depth = max((step.k for step in program.plan.steps if step.op == "similar"), default=0)
-            tail = tuple(hit for hit in tail[:depth] if hit.id not in matched)
+            tail = _recall_ranked_tail(
+                program, tail, budgeted=self._settings.evidence_budget is not None
+            )
         if program.plan.exhaustive or self._settings.evidence_budget is not None:
             hits = (*hits, *_budgeted_hits(tail, hits, budget))
         if self._settings.evidence_expansion:
@@ -1507,17 +1542,19 @@ class Answering(Traced):
         down to a refusal the unplanned path had answered. A plan says what else is relevant; it
         never says the ranking was wrong.
         """
-        if program is not None and self._settings.recall_query_expansion:
-            # Preserve the default program's ranked contribution. Query-local rows must pass
-            # the semantic row/media caps even when a plan also contains exhaustive reads.
-            depth = max((step.k for step in program.plan.steps if step.op == "similar"), default=0)
-            matched = {hit.id for hit in program.exhaustive}
+        if program is not None:
+            # A selective predicate must not strand spare budget or hide ranked follow-ups
+            # that omit its literal terms. Query-local rows still pass semantic row/media caps.
             program = replace(
                 program,
                 ranked=(
                     ()
                     if defer_tail
-                    else tuple(hit for hit in context.ranked[:depth] if hit.id not in matched)
+                    else _recall_ranked_tail(
+                        program,
+                        context.ranked,
+                        budgeted=self._settings.evidence_budget is not None,
+                    )
                 ),
             )
         if program is None or not program.plan.exhaustive:
@@ -1557,8 +1594,7 @@ class Answering(Traced):
             budget,
             media_limit=_RECALL_MEDIA_FACTOR * context.limit,
             max_rows=self._settings.recall_set_max_rows,
-            # Exactly what the unplanned path grounds, this question's modality floor included,
-            # so no plan can cost a question the evidence it already had.
+            # Reserve the limit-sized window, including its modality floor, before additions.
             required=grounding_hits(context.ranked, context.limit),
         )
         note = recall_note(program, omitted=omitted)

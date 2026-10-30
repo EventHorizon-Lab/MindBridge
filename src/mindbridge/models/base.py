@@ -21,6 +21,7 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     SearchHit,
+    VisualRetrievalMatch,
     _require_aware,
     _require_interval,
 )
@@ -39,6 +40,7 @@ class ModelInput:
 
     text: str = ""
     assets: tuple[AssetRef, ...] = ()
+    image_retrieval_matches: tuple[VisualRetrievalMatch, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str):
@@ -48,8 +50,17 @@ class ModelInput:
             raise ValidationError("model input must contain text or media")
         if any(not isinstance(asset, AssetRef) or not asset.is_resolved for asset in assets):
             raise ValidationError("model input assets must be resolved")
+        matches = tuple(self.image_retrieval_matches)
+        if any(not isinstance(match, VisualRetrievalMatch) for match in matches):
+            raise ValidationError(
+                "image retrieval matches must contain VisualRetrievalMatch values"
+            )
+        images = {asset.id for asset in assets if asset.modality is Modality.IMAGE}
+        if any(match.query_asset_id not in images for match in matches):
+            raise ValidationError("image retrieval matches must refer to a query image")
         object.__setattr__(self, "text", self.text.strip())
         object.__setattr__(self, "assets", assets)
+        object.__setattr__(self, "image_retrieval_matches", matches)
 
     @property
     def modality(self) -> Modality:

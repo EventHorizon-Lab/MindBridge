@@ -1656,6 +1656,53 @@ def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None
         assert memory.search("What happened at BMVC 2024?", limit=3)[0].id == april.id
 
 
+@pytest.mark.parametrize(
+    "question",
+    (
+        "It's 2018 now. Where did I spend last summer?",
+        "It is June 2020 now. What did I buy last month?",
+        "It\u2019s 2030 now. Which places did I visit last year?",
+    ),
+)
+def test_a_coarse_current_clock_does_not_become_the_requested_event_period(
+    question: str,
+) -> None:
+    reference = datetime(2026, 8, 21, tzinfo=timezone.utc)
+
+    assert parse_temporal_range(question, reference) is None
+    # Ordinary event periods still receive their existing soft preference.
+    assert parse_temporal_range("What happened in June 2020?", reference) == (
+        datetime(2020, 6, 1, tzinfo=timezone.utc),
+        datetime(2020, 7, 1, tzinfo=timezone.utc),
+    )
+
+
+def test_coarse_current_clock_keeps_sources_and_explicit_occurrence_bounds(tmp_path: Path) -> None:
+    question = "It is June 2020 now. Where did I leave the red camera last month?"
+    reference = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    with _memory(tmp_path, _FakeModels()) as memory:
+        earlier = memory.add(
+            "red camera beside the wardrobe",
+            occurred_at=datetime(2020, 5, 10, tzinfo=timezone.utc),
+        )
+        later = memory.add(
+            "red camera beside the window",
+            occurred_at=datetime(2020, 6, 10, tzinfo=timezone.utc),
+        )
+        result = memory.search_with_trace(question, limit=2, reference_at=reference)
+        bounded = memory.search(
+            question,
+            limit=2,
+            reference_at=reference,
+            occurred_from=datetime(2020, 5, 1, tzinfo=timezone.utc),
+            occurred_until=datetime(2020, 6, 1, tzinfo=timezone.utc),
+        )
+
+    assert {hit.id for hit in result.hits} == {earlier.id, later.id}
+    assert all(candidate.temporal_factor is None for candidate in result.trace.candidates)
+    assert [hit.id for hit in bounded] == [earlier.id]
+
+
 def test_rolling_spans_resolve_in_every_calendar_unit() -> None:
     """ "Past two years" is a window that ends at the clock, in either language and any unit."""
     reference = datetime(2026, 8, 31, 12, tzinfo=timezone.utc)
@@ -7576,6 +7623,37 @@ def test_the_corpus_digest_is_recomputed_after_a_write_and_not_before(tmp_path: 
 
         assert unchanged == "empty"
         assert memory._answering._corpus_digest().startswith("1 records; ")
+
+
+@pytest.mark.parametrize("query_expansion", [False, True])
+@pytest.mark.parametrize("budget", [None, 4_000])
+def test_selective_recall_fills_unused_budget_from_the_original_ranking(
+    tmp_path: Path, query_expansion: bool, budget: int | None
+) -> None:
+    models = _FakeModels()
+    models.recall_plan = json.dumps(
+        {"shape": "set", "steps": [{"op": "match", "terms": ["bicycle"], "max_rows": 10}]}
+    )
+    with _memory(
+        tmp_path,
+        models,
+        recall_planning=True,
+        recall_query_expansion=query_expansion,
+        ambiguity_margin=0,
+        evidence_budget_chars=budget,
+        recall_set_budget_chars=4_000,
+    ) as memory:
+        records = (
+            memory.add("red bicycle repair has started"),
+            memory.add("red front brake still rubs against the wheel"),
+            memory.add("red gears still slip during the test ride"),
+        )
+
+        result = memory.ask("List the repair issues", limit=1)
+
+    expected = records if budget is not None else records[:1]
+    assert {record.id for record in expected} == {hit.id for hit in result.hits}
+    assert "records containing bicycle (1)" in models.answer_calls[-1][0].text
 
 
 def test_a_backend_that_cannot_plan_keeps_todays_single_search(tmp_path: Path) -> None:

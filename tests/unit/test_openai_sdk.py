@@ -1,6 +1,7 @@
 """Focused checks for the official-SDK model adapter."""
 
 import base64
+import hashlib
 import json
 import math
 import re
@@ -87,6 +88,7 @@ from mindbridge.types import (
     SearchHit,
     SpatialAnchor,
     SpatialContext,
+    VisualRetrievalMatch,
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
@@ -525,6 +527,64 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
     assert result.answer == "The cat is on the sofa."
     assert result.hits == (hit,)
     assert len(requests) == 1
+
+
+def test_answer_renders_only_delivered_visual_matches_with_attachment_labels(
+    tmp_path: Path,
+) -> None:
+    query = _asset(tmp_path, "query", Modality.IMAGE, "image/png", b"query")
+    image = _asset(tmp_path, "source", Modality.IMAGE, "image/png", b"source")
+    query = replace(query, sha256=hashlib.sha256(b"query").hexdigest())
+    image = replace(image, sha256=hashlib.sha256(b"source").hexdigest())
+    hit = SearchHit(
+        id="memory",
+        content="The caller taught this label.",
+        score=0.8,
+        created_at=NOW,
+        assets=(image,),
+        modality=Modality.IMAGE,
+    )
+    question = ModelInput(
+        text="Which taught label?",
+        assets=(query,),
+        image_retrieval_matches=(
+            VisualRetrievalMatch(query.id, "not-delivered", image.id, 1, 0.9),
+            VisualRetrievalMatch(query.id, hit.id, image.id, 2, 0.8),
+            VisualRetrievalMatch(query.id, hit.id, "omitted-image", 3, 0.7),
+        ),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        parts = payload["messages"][1]["content"]
+        memory = json.loads(parts[3]["text"])["memory"]
+        assert memory["content"] == hit.content
+        assert memory["image_retrieval_matches"] == [
+            {
+                "query_media": "attachment 1",
+                "source_media": "attachment 2",
+                "basis": "image_embedding_cosine",
+                "rank": 2,
+                "cosine_similarity": 0.8,
+            }
+        ]
+        assert parts[1]["text"] == "attachment 1" and parts[4]["text"] == "attachment 2"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "The taught label."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client)).answer(question, (hit,))
+    assert result.answer == "The taught label."
 
 
 def test_formation_batches_grounded_observations_and_validates_typed_output(
