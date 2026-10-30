@@ -113,6 +113,10 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Fixed
 
+- Mem-Gallery queries keep the question inside the official template instead of leaving its
+  question heading followed only by a format constraint. Adapter v3 invalidates old answer caches.
+- ATM judge verdicts follow the official pre-summary conversion, accepting boolean and string
+  `true`. Scorer v3 separates those verdicts from numeric deterministic-list scores.
 - Coarse current-clock declarations such as "It's June 2020 now" leave natural-language time
   preferences unset, preserving relevant earlier memories and explicit occurrence filters.
 - Selective recall reads use spare explicit evidence budgets for the original ranked tail,

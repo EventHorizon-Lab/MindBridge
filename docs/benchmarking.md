@@ -157,6 +157,13 @@ precedence over an explicit `Today is ...` date in the original question, which 
 over the latest memory timestamp. An omitted year uses the corpus year. The execution clock and
 dates in adapter instructions do not override the original question.
 
+Mem-Gallery uses `mem_gallery_official_v3` and `mem_gallery_query_v2`. The complete query template
+is rendered in order, keeping the original question after its question heading and before the
+official category constraint. Earlier adapters moved the question before the template, leaving
+that heading followed only by a constraint. Old predictions keep their original protocol and
+need regeneration for a comparison using the repaired input; rescoring cannot repair them.
+References, clues, query images and the answer scorer are unchanged.
+
 ATM adapters use `atm_bench_official_v4` and one shared answer-only/list-ID query instruction
 (`atm_bench_query_v3`) for every question. The shared instruction reproduces the pinned official
 Oracle wording, including the `Unknown` refusal. `qtype`, reference answers, and annotated evidence
@@ -167,19 +174,23 @@ before comparison with v4; changing their scores does not repair their original 
 ATM answer scoring follows `JingbiaoMei/ATM-Bench@ef4e5dff1a47` without repairing or normalizing
 the released reference answers. This includes the upstream whitespace-separated ID-list edge
 case; no alternative normalized-ID answer score is emitted. The judge prompt and response
-interpretation follow the same revision, including numeric scores clamped to 0--1. The scorer
-identity is `atm_bench_scorer_ef4e5dff1a47_minimal_v2`; earlier judge responses need rejudging
-under this identity. The configured judge model remains selectable and is recorded independently;
+interpretation follow the same revision. The judge's boolean or string `true` verdict scores one;
+other structured verdicts score zero. Numeric partial credit belongs to deterministic list scores,
+which the official summary clamps to 0--1 after the judge verdict has been converted to a boolean.
+The scorer identity is `atm_bench_scorer_ef4e5dff1a47_minimal_v3`; v2 confused these two stages
+and scored string `true` verdicts zero. Saved responses can be reparsed under v3; runs that did
+not retain responses need both comparison arms rejudged. The configured judge model remains selectable and is recorded independently;
 using another model is still marked non-official. Retrieval and joint metrics remain separate
 MindBridge diagnostics and do not replace the official answer score.
 
 Parity fixtures cover unchanged ID-list references, scalar/list dispatch, the exact upstream
-judge prompt, boolean and numeric judge outputs, and the shared query/refusal instruction.
-These checks establish protocol parity, not answer quality.
+judge prompt, boolean/string verdicts before summary coercion, and the shared query/refusal
+instruction. These checks establish protocol parity, not answer quality.
 
 The judge request requires a boolean `accuracy` through a strict JSON schema. This preserves the
-official verdict parser: a string such as `"true"` is still invalid and receives no credit. A
-provider-format repair must rejudge sealed predictions and must not be reported as a quality gain.
+official response contract; saved responses still use the official conversion described above,
+including string `"true"`. A provider-format repair must rejudge sealed predictions and must not
+be reported as a quality gain.
 
 To evaluate raw ATM media together with the release's caption, OCR, location, and tags, build an
 explicit source manifest from a complete local release:

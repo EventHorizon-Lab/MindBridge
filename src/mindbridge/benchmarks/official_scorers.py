@@ -69,7 +69,7 @@ from mindbridge.benchmarks._official.worldmemarena_qa import (
 )
 from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
-SCORER_VERSION = "official_scorers_v5"
+SCORER_VERSION = "official_scorers_v6"
 
 
 class _Stemmer(Protocol):
@@ -124,7 +124,7 @@ _PROTOCOLS = {
     "memlens": "memlens_judge_77f3ab9a52fa",
     "mm-lifelong": "mm_lifelong_judge_248aa82039a5",
     "supermemory-vqa": "supermemory_vqa_metrics_1d228e0f1004",
-    "atm-bench": "atm_bench_scorer_ef4e5dff1a47_minimal_v2",
+    "atm-bench": "atm_bench_scorer_ef4e5dff1a47_minimal_v3",
     "mem-gallery": "mem_gallery_scorer_a93959e1e978_v2",
     "longmemeval": "longmemeval_anscheck_2ec2a557f339",
     "clbench": "clbench_binary_rubric_b28a5832a09b",
@@ -1473,20 +1473,9 @@ def _atm_judge_accuracy(value: str) -> float:
     except (ValueError, json.JSONDecodeError):
         payload = {}
     if "accuracy" in payload:
-        # Match upstream's `_coerce_accuracy` after its JSON parser. In particular,
-        # numeric scores retain partial credit; string "true" is not a JSON boolean.
-        accuracy = payload["accuracy"]
-        if isinstance(accuracy, bool):
-            return float(accuracy)
-        try:
-            score = float(cast(str | int | float, accuracy))
-        except (TypeError, ValueError):
-            return 0.0
-        if score < 0.0:
-            return 0.0
-        if score > 1.0:
-            return 1.0
-        return score
+        # run_llm_judge converts the verdict before summarize_atm coerces scores.
+        # Numeric partial credit belongs to deterministic list scores, not judge verdicts.
+        return float(str(payload["accuracy"]).lower() == "true")
     lowered = value.lower()
     if '"accuracy": true' in lowered or '"accuracy":true' in lowered:
         return 1.0
