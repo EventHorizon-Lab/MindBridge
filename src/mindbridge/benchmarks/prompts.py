@@ -178,9 +178,9 @@ ATM_BENCH_QUERY_PROMPT = PromptSpec(
 
 MEM_GALLERY_QUERY_PROMPT = PromptSpec(
     name="mem_gallery_query",
-    version="mem_gallery_query_v1",
+    version="mem_gallery_query_v2",
     purpose="Apply the official Mem-Gallery concise-answer instruction.",
-    used_by="mindbridge.benchmarks.mem_gallery_runner._question_query",
+    used_by="mindbridge.benchmarks.eval_adapters._gallery_question",
     text=(
         "Your task is to answer the question about the conversation between {speaker_a} "
         "and {speaker_b} in a concise manner with the help of memory content.\n"

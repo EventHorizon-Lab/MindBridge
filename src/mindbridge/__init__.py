@@ -133,6 +133,7 @@ from mindbridge.types import (
     VisionFrame,
     VisionPartial,
     VisionStreamPacket,
+    VisualRetrievalMatch,
 )
 
 __all__ = [
@@ -263,5 +264,6 @@ __all__ = [
     "VisionFrame",
     "VisionPartial",
     "VisionStreamPacket",
+    "VisualRetrievalMatch",
     "resolve_memory_config",
 ]

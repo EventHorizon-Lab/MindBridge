@@ -180,19 +180,23 @@ def test_atm_list_score_keeps_non_id_items() -> None:
     [
         (True, 1.0),
         (False, 0.0),
-        (1, 1.0),
+        (1, 0.0),
         (0, 0.0),
-        (0.5, 0.5),
-        ("0.5", 0.5),
-        (2, 1.0),
+        (0.5, 0.0),
+        ("0.5", 0.0),
+        (2, 0.0),
         (-1, 0.0),
         (None, 0.0),
-        ("true", 0.0),
+        ("true", 1.0),
+        ("TRUE", 1.0),
+        (" true ", 0.0),
         ("false", 0.0),
         ([], 0.0),
     ],
 )
-def test_atm_judge_scores_match_upstream_numeric_coercion(value: object, expected: float) -> None:
+def test_atm_judge_verdicts_match_upstream_before_summary_coercion(
+    value: object, expected: float
+) -> None:
     import json
 
     plan = JudgePlan("p", "atm", ((JudgeMessage("user", "prompt"),),))

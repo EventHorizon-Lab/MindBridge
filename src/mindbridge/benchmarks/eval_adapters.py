@@ -1230,12 +1230,13 @@ def _gallery_question(
     format_constraint: str,
     refusal: str | None,
 ) -> EvalQuestion:
-    parts = _query_parts(
-        prompt_template,
-        question.question,
-        speaker_a=profile_name,
-        speaker_b="the assistant",
-        format_constraint=format_constraint,
+    parts = _split_parts(
+        prompt_template.format(
+            question=question.question,
+            speaker_a=profile_name,
+            speaker_b="the assistant",
+            format_constraint=format_constraint,
+        ).strip()
     )
     image: Path | None = None
     if question.question_image_path:

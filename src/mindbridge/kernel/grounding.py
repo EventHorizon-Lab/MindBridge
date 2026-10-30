@@ -110,6 +110,17 @@ def semantic_hits(
     return tuple(offered)
 
 
+def recall_ranked_tail(
+    program: RecallResult, ranked: tuple[SearchHit, ...], *, budgeted: bool
+) -> tuple[SearchHit, ...]:
+    """Fill an explicit evidence budget; otherwise retain the plan's ranked depth."""
+    if not budgeted:
+        depth = max((step.k for step in program.plan.steps if step.op == "similar"), default=0)
+        ranked = ranked[:depth]
+    matched = {hit.id for hit in program.exhaustive}
+    return tuple(hit for hit in ranked if hit.id not in matched)
+
+
 def expansion_note(added: int, expansion: EvidenceExpansion, *, chronological: bool = False) -> str:
     """Say what the linked rows are, and refuse to let them be read as a set.
 

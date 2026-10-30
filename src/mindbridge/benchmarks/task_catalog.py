@@ -433,7 +433,7 @@ TASKS: dict[str, TaskSpec] = {
             "mem-gallery",
             "Mem-Gallery",
             "mem-gallery/data/dialog",
-            "mem_gallery_official_v2",
+            "mem_gallery_official_v3",
             _GALLERY,
             digest="fcd47af2b493cd9a7856cb77a622291b5aa9c6dad12b1f3553d8f569e2c5f6b8",
             media="mem-gallery/data/image",

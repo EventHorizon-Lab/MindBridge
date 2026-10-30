@@ -80,6 +80,7 @@ from mindbridge.benchmarks.eval_adapters import (
     _choice_prompt,
     _free_text_parts,
     _gallery_memory,
+    _gallery_question,
     _query_parts,
     load_task,
     parse_media_manifest,
@@ -106,7 +107,11 @@ from mindbridge.benchmarks.eval_statistics import (
 )
 from mindbridge.benchmarks.eval_telemetry import EvaluationTelemetry
 from mindbridge.benchmarks.isolation import BenchmarkRun
-from mindbridge.benchmarks.mem_gallery import MemGalleryRound, MemGallerySession
+from mindbridge.benchmarks.mem_gallery import (
+    MemGalleryQuestion,
+    MemGalleryRound,
+    MemGallerySession,
+)
 from mindbridge.benchmarks.model_config import (
     DEFAULT_HF_ENDPOINT,
     DownloadOverrides,
@@ -201,6 +206,51 @@ def test_query_parts_and_gallery_image_id_preserve_retrieval_evidence(tmp_path: 
         "Select the best answer using only the memories. Reply with one letter (A, B).\n"
         "Question: Where is it?\nA. Desk\nB. Shelf\nAnswer:"
     )
+
+
+@pytest.mark.parametrize("point", ["FR", "AR", "CD", "VS"])
+def test_gallery_keeps_the_question_in_its_official_template_position(
+    tmp_path: Path, point: str
+) -> None:
+    from mindbridge.benchmarks.prompts import (
+        MEM_GALLERY_QUERY_PROMPT,
+        mem_gallery_format_constraint,
+        mem_gallery_refusal,
+    )
+
+    image = tmp_path / "query.jpg"
+    image.write_bytes(b"image")
+    question = MemGalleryQuestion.model_validate(
+        {
+            "question_id": "topic:1",
+            "point": point,
+            "question": "Which image shows the repaired cabinet?",
+            "reference_answer": "D1:IMG_001",
+            "session_ids": ["D1"],
+            "question_image_path": image.name,
+        }
+    )
+    constraint = mem_gallery_format_constraint(point)
+
+    result = _gallery_question(
+        "Mira",
+        question,
+        MediaResolver("mem-gallery", tmp_path, None, None),
+        MEM_GALLERY_QUERY_PROMPT.text,
+        constraint,
+        mem_gallery_refusal(point),
+    )
+
+    expected = MEM_GALLERY_QUERY_PROMPT.text.format(
+        speaker_a="Mira",
+        speaker_b="the assistant",
+        question=question.question,
+        format_constraint=constraint,
+    ).strip()
+    assert result.content == (expected, image)
+    assert f"The current question is as follows:\n{question.question}" in expected
+    assert result.source_question == question.question
+    assert TASKS["mem-gallery"].adapter_version == "mem_gallery_official_v3"
 
 
 def test_catalog_covers_requested_benchmarks_and_groups() -> None:

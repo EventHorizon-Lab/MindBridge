@@ -17,6 +17,7 @@ from opentelemetry.trace import Tracer
 
 from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local.scoring import max_cosine_part_scores, max_cosine_scores
+from mindbridge.infrastructure.local.store import StoredEmbedding, StoredMemory
 from mindbridge.infrastructure.local.zvec_index import IndexHit
 from mindbridge.kernel.content import PreparedContent
 from mindbridge.kernel.contracts import Backends
@@ -85,6 +86,7 @@ from mindbridge.types import (
     RetrievalScope,
     SearchHit,
     TracedSearchResult,
+    VisualRetrievalMatch,
 )
 
 RERANK_CANDIDATES = 100
@@ -262,6 +264,7 @@ class Retrieval(Traced):
         scope: RetrievalScope | None,
         require_unambiguous: bool,
         capture_trace: bool,
+        capture_visual_matches: bool = False,
     ) -> SearchOutcome:
         trace_candidates: builtins.list[RetrievalCandidateTrace] | None = (
             [] if capture_trace else None
@@ -272,6 +275,7 @@ class Retrieval(Traced):
             else ()
         )
         vectors: tuple[tuple[float, ...], ...] = ()
+        image_queries: tuple[tuple[str, tuple[float, ...]], ...] = ()
         if self._settings.retrieval_mode is RetrievalMode.LEXICAL:
             text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
             focused_text = text_parts[0] if len(text_parts) > 1 else prepared.text
@@ -298,9 +302,16 @@ class Retrieval(Traced):
                     )
                 )
             )
-            vectors = tuple(
-                dict.fromkeys(self._embedding.embed(model_inputs, task=EmbedTask.QUERY))
-            )
+            encoded = self._embedding.embed(model_inputs, task=EmbedTask.QUERY)
+            vectors = tuple(dict.fromkeys(encoded))
+            if capture_visual_matches:
+                image_queries = tuple(
+                    (value.assets[0].id, vector)
+                    for value, vector in zip(model_inputs, encoded, strict=True)
+                    if not value.text
+                    and len(value.assets) == 1
+                    and value.assets[0].modality is Modality.IMAGE
+                )
             if descriptions and Modality.TEXT in self._backends.embedding_capabilities:
                 try:
                     described_vectors = self._embedding.embed(
@@ -521,6 +532,9 @@ class Retrieval(Traced):
                 )
                 eligible_memories = tuple(
                     memory for memory in memories if kept is None or memory.memory_type in kept
+                )
+                image_matches = (
+                    self._image_matches(image_queries, eligible_memories) if image_queries else ()
                 )
                 # Deletion must not separate authoritative hydration from media protection.
                 # Candidates keep short leases; only winners retain them through the operation.
@@ -775,7 +789,58 @@ class Retrieval(Traced):
                 for hit in hits
                 if hit.id in matched_dense_index_ids
             },
+            image_retrieval_matches=image_matches,
         )
+
+    def _image_matches(
+        self,
+        queries: Sequence[tuple[str, tuple[float, ...]]],
+        memories: Sequence[StoredMemory],
+    ) -> tuple[VisualRetrievalMatch, ...]:
+        """Preserve image-only provenance within the authoritative, scoped candidate pool."""
+        visual = tuple(
+            memory
+            for memory in memories
+            if any(asset.modality == "image" for asset in memory.assets)
+        )
+        if not visual:
+            return ()
+        with translate_storage_errors("read image retrieval keys"):
+            documents = self._store.index.read_memory_index_documents(
+                tuple(memory.memory_id for memory in visual)
+            )
+        by_memory: builtins.dict[str, builtins.list[StoredEmbedding]] = {}
+        for document in documents:
+            embedding = document.embedding
+            if embedding.space_id == self._backends.space_id and embedding.task == DOCUMENT_TASK:
+                by_memory.setdefault(embedding.memory_id, []).append(embedding)
+        parts = tuple(
+            (memory.memory_id, asset_id, embedding)
+            for memory in visual
+            for asset_id, embedding in self._embedding.image_parts(
+                memory, by_memory.get(memory.memory_id, ())
+            )
+        )
+        result: builtins.list[VisualRetrievalMatch] = []
+        for query_id, query in queries:
+            scores = max_cosine_scores(
+                (query,), ((embedding.embedding_id, embedding.values) for _, _, embedding in parts)
+            )
+            ordered = sorted(
+                parts,
+                key=lambda part: (-scores[part[2].embedding_id][1], part[0], part[1]),
+            )[:3]
+            result.extend(
+                VisualRetrievalMatch(
+                    query_asset_id=query_id,
+                    memory_id=memory_id,
+                    source_asset_id=asset_id,
+                    rank=rank,
+                    cosine_similarity=2.0 * scores[embedding.embedding_id][1] - 1.0,
+                )
+                for rank, (memory_id, asset_id, embedding) in enumerate(ordered, 1)
+            )
+        return tuple(result)
 
     def _pushed_identity(self, scope: RetrievalScope | None) -> str | None:
         """Resolve a scoped identity to the ID the index projection stores, or `None`.

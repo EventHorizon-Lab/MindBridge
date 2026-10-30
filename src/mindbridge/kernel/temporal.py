@@ -42,6 +42,12 @@ _TODAY_NAMED_DATE = re.compile(
 _NAMED_MONTH_YEAR = re.compile(rf"\b({_MONTH_NAME})\s+((?:19|20|21)\d{{2}})\b", re.IGNORECASE)
 
 
+_COARSE_CURRENT_CLOCK = re.compile(
+    rf"\bit(?:['\u2019]s|\s+is)\s+(?:(?:{_MONTH_NAME})\s+)?(?:19|20|21)\d{{2}}\s+now\b",
+    re.IGNORECASE,
+)
+
+
 _NUMBER_WORDS = {
     "one": 1,
     "two": 2,
@@ -268,6 +274,10 @@ def parse_temporal_range(  # noqa: C901 - ordered phrases are clearer as one par
     reference_at: datetime,
 ) -> tuple[datetime, datetime] | None:
     if not text:
+        return None
+    # A current month/year supplies neither an event window nor a precise reference day.
+    # Leave retrieval unbounded rather than treating that clock as the event being sought.
+    if _COARSE_CURRENT_CLOCK.search(text):
         return None
     dates = stated_iso_days(text)
     if dates:

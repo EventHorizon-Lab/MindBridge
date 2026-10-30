@@ -1559,6 +1559,31 @@ class MemoryRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class VisualRetrievalMatch:
+    """An image-only retrieval association, not a verified identity or factual claim."""
+
+    query_asset_id: str
+    memory_id: str
+    source_asset_id: str
+    rank: int
+    cosine_similarity: float
+
+    def __post_init__(self) -> None:
+        _text(self.query_asset_id, "query asset id")
+        _text(self.memory_id, "memory id")
+        _text(self.source_asset_id, "source asset id")
+        _positive_int(self.rank, "visual retrieval rank")
+        value = self.cosine_similarity
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+            or not -1.0 <= value <= 1.0
+        ):
+            raise ValidationError("visual retrieval cosine must be between minus one and one")
+
+
+@dataclass(frozen=True, slots=True)
 class SearchHit:
     """One ranked memory, flattened for direct use."""
 

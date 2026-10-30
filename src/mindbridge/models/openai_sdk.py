@@ -3666,6 +3666,21 @@ def _answer_text_parts(
         return {"untrusted_source_metadata": values} if values else {}
 
     constraints = answer_constraint_payloads(hits, evidence_payloads)
+    image_matches: dict[str, list[dict[str, object]]] = {}
+    by_id = {hit.id: hit for hit in hits}
+    for match in question.image_retrieval_matches:
+        hit = by_id.get(match.memory_id)
+        if hit is None or not any(asset.id == match.source_asset_id for asset in hit.assets):
+            continue
+        image_matches.setdefault(hit.id, []).append(
+            {
+                "query_media": media_labels[match.query_asset_id],
+                "source_media": media_labels[match.source_asset_id],
+                "basis": "image_embedding_cosine",
+                "rank": match.rank,
+                "cosine_similarity": match.cosine_similarity,
+            }
+        )
     return (
         _json_text(
             {
@@ -3690,6 +3705,11 @@ def _answer_text_parts(
                             for asset in hit.assets
                         },
                         **source_metadata(hit.assets),
+                        **(
+                            {"image_retrieval_matches": image_matches[hit.id]}
+                            if hit.id in image_matches
+                            else {}
+                        ),
                     }
                 }
             )

@@ -33,6 +33,7 @@ from mindbridge.kernel.derived import (
     has_indexed_speech,
     has_stream_description,
     has_stream_transcript,
+    prepared_from_stored,
     retrieval_content,
     speech_identity_text,
     stored_canonical_parts,
@@ -313,6 +314,28 @@ class Embedding(Traced):
                 for index in range(maximum_keys)
             )
         return (aggregate, *unique)
+
+    def image_parts(
+        self,
+        memory: StoredMemory,
+        embeddings: Sequence[StoredEmbedding],
+    ) -> tuple[tuple[str, StoredEmbedding], ...]:
+        """Resolve bare-image keys only when the complete stored layout is reconstructable.
+
+        Oversized inputs can elide and renumber keys. A shortened layout cannot establish
+        which original asset a surviving position encoded, so it supplies no association.
+        """
+        inputs = self.inputs(prepared_from_stored(memory).content)
+        by_part = {embedding.object_part: embedding for embedding in embeddings}
+        if len(by_part) != len(inputs) or set(by_part) != set(range(len(inputs))):
+            return ()
+        return tuple(
+            (value.assets[0].id, by_part[index])
+            for index, value in enumerate(inputs)
+            if not value.text
+            and len(value.assets) == 1
+            and value.assets[0].modality is Modality.IMAGE
+        )
 
     def prepare(
         self,

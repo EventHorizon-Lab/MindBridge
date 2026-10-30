@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge import IndexQuantization, PrefetchResult, StreamInput
+from mindbridge import (
+    IndexQuantization,
+    ModelInput,
+    PrefetchResult,
+    StreamInput,
+    VisualRetrievalMatch,
+)
 from mindbridge.exceptions import (
     RETRYABLE_REASONS,
     IndexUnavailableError,
@@ -44,6 +50,34 @@ from mindbridge.types import (
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
+
+
+def test_visual_retrieval_match_is_validated_and_bound_to_a_query_image(tmp_path: Path) -> None:
+    match = VisualRetrievalMatch("query", "memory", "source-image", 2, 0.8)
+    assert pickle.loads(pickle.dumps(match)) == match
+    assert asdict(match)["rank"] == 2
+    with pytest.raises(FrozenInstanceError):
+        match.rank = 1  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="rank"):
+        VisualRetrievalMatch("query", "memory", "source-image", 0, 0.8)
+    with pytest.raises(ValidationError, match="query image"):
+        ModelInput(text="A text question", image_retrieval_matches=(match,))
+    image = AssetRef(
+        "query",
+        modality=Modality.IMAGE,
+        media_type="image/png",
+        size_bytes=1,
+        sha256="a" * 64,
+        path=tmp_path / "image.png",
+    )
+    value = ModelInput(assets=(image,), image_retrieval_matches=(match,))
+    assert value.image_retrieval_matches == (match,)
+
+
+@pytest.mark.parametrize("cosine", [float("nan"), float("inf"), -1.01, 1.01, True])
+def test_visual_retrieval_match_rejects_invalid_cosines(cosine: float) -> None:
+    with pytest.raises(ValidationError, match="cosine"):
+        VisualRetrievalMatch("query", "memory", "source-image", 1, cosine)
 
 
 def test_index_quantization_is_a_stable_string_enum() -> None:

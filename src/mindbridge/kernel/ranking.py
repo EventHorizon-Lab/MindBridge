@@ -27,6 +27,7 @@ from mindbridge.types import (
     RetrievalRejection,
     RetrievalTrace,
     SearchHit,
+    VisualRetrievalMatch,
 )
 
 RANK_FLOOR = 0.3
@@ -171,6 +172,7 @@ class SearchOutcome:
     hits: tuple[SearchHit, ...]
     trace: RetrievalTrace | None = None
     matched_dense_index_ids: tuple[tuple[str, str], ...] = ()
+    image_retrieval_matches: tuple[VisualRetrievalMatch, ...] = ()
 
 
 def merge_lexical_routes(routes: Sequence[Sequence[IndexHit]]) -> tuple[IndexHit, ...]:
@@ -257,6 +259,7 @@ def search_outcome(
     exhaustive: bool,
     ambiguous: bool = False,
     matched_dense_index_ids: Mapping[str, str] | None = None,
+    image_retrieval_matches: tuple[VisualRetrievalMatch, ...] = (),
 ) -> SearchOutcome:
     trace = (
         None
@@ -272,6 +275,7 @@ def search_outcome(
         hits=tuple(hits),
         trace=trace,
         matched_dense_index_ids=tuple((matched_dense_index_ids or {}).items()),
+        image_retrieval_matches=image_retrieval_matches,
     )
 
 

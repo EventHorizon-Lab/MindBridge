@@ -354,8 +354,11 @@ dedup and no recomputed score -- exhaustive rows in time order, then the ranked 
 and the answer prompt states which reads produced it and whether the set is complete, because
 completeness is what licenses a count or a list. The ranked window is the one the unplanned path
 would have grounded, `limit` hits and their modality floor, and a plan can only add to it: the
-budget trims exhaustive rows beyond that window and never the window itself, so no plan grounds
-less evidence than no plan. Completeness stays a statement about the exhaustive reads alone, and
+budget trims exhaustive rows beyond that window and never the window itself. With an explicit
+`evidence_budget_chars`, remaining budget after matched rows admits the original ranked tail even
+without a `similar` step. Without that setting, the plan's ranked depth remains unchanged.
+The window is guaranteed; optional tails can differ when additions consume the budget.
+Completeness stays a statement about the exhaustive reads alone, and
 the note says so, because a top-ranked record is not a record the predicate matched. Two bounds
 decide when a predicate's set is worth holding at all: a read whose predicate selected more than
 a fifth of the active corpus (or more than four times `limit` rows, whichever is larger)
@@ -364,6 +367,14 @@ information about the question; and the rows a selective read did return stop at
 `recall_set_max_rows`, chronologically, with the remainder reported as not shown. Any missing
 capability, planner failure, or plan the kernel will not run falls back to the single ranked
 search, which is the default.
+
+For image-bearing `ask` inputs, retrieval preserves the first three image-only neighbors per
+query image within its scoped candidate pool. It reuses the query's bare-image vector and
+reconstructable image keys already stored in SQLite. Elided key layouts produce no association.
+`ModelInput.image_retrieval_matches` carries these temporary values through answering; the
+adapter labels only source assets present in the final media grounding. This does not change
+search ranking, write facts, infer an identity, or add model calls. Only image-bearing `ask`
+requests perform this additional document-vector read.
 
 By default, `similar(query, k)` reuses the original ranking and ignores a rewritten query.
 `recall_query_expansion` is a separate, disabled experiment: a per-ask reader caches query

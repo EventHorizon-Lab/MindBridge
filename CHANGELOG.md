@@ -10,6 +10,9 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Added
 
+- Image-bearing `ask` inputs carry temporary `VisualRetrievalMatch` values from existing
+  image-only embedding keys. Answer transport labels only associations whose source media
+  actually reached the reader; similarities do not become durable facts or verified identities.
 - Optional `OfflineGazetteer` and `generation.offline_gazetteer` add bounded, explicitly untrusted
   external map candidates from a pinned read-only local OSM index to answer evidence. The default
   remains disabled; no coordinates leave the machine for lookup and no memory facts are written.
@@ -117,6 +120,14 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Fixed
 
+- Mem-Gallery queries keep the question inside the official template instead of leaving its
+  question heading followed only by a format constraint. Adapter v3 invalidates old answer caches.
+- ATM judge verdicts follow the official pre-summary conversion, accepting boolean and string
+  `true`. Scorer v3 separates those verdicts from numeric deterministic-list scores.
+- Coarse current-clock declarations such as "It's June 2020 now" leave natural-language time
+  preferences unset, preserving relevant earlier memories and explicit occurrence filters.
+- Selective recall reads use spare explicit evidence budgets for the original ranked tail,
+  retaining contextual follow-ups while preserving unbudgeted depth and predicate row caps.
 - Sequence answers order selected evidence by event time and insertion order. ATM numeric
   instructions preserve complete dates, times and ranges.
 - Judge requests omit unsupported automatic sampling controls. Judge failures retain local

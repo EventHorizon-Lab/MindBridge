@@ -421,6 +421,10 @@ being asked. `occurred_from` and `occurred_until` are optional timezone-aware,
 half-open event-overlap filters; either may be omitted, and two bounds require
 `occurred_until > occurred_from`. Records without `occurred_at` do not match a bounded search.
 
+Natural-language dates add a soft retrieval preference. Coarse current-clock declarations such
+as "It's June 2020 now" leave this preference unset because the parser cannot resolve their
+relative dates precisely. Explicit occurrence bounds still apply.
+
 `scope` adds the bitemporal and spatial filters. `valid_at` selects world validity, `known_at`
 selects the transaction version known then, and `near` with a non-negative `radius_m` restricts
 results to one matching coordinate frame and anchor. SQLite reapplies every scope filter after
@@ -1163,7 +1167,7 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 128 supported names exported by `mindbridge`:
+These are the 129 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
@@ -1173,7 +1177,7 @@ These are the 128 supported names exported by `mindbridge`:
 | Delivery certificates | `ContextProof`, `ContextProofNode` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums and literal aliases | `AnswerPolicy`, `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `ContextSymbolNamespace`, `ContextSymbolCoverage`, `ContextSymbolRole`, `AbstentionReason`, `IndexQuantization`, `RetrievalMode`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
-| Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
+| Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `VisualRetrievalMatch`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
 | Bundled adapters | `SentenceTransformersEmbedder`, `OpenAIModels`, `OfflineGazetteer`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
 
@@ -1431,7 +1435,18 @@ and propagates source ID, place, metadata, and spatial context. Relative-time or
 resolution that needs fields absent from the model payload therefore remains a formation limit;
 the runtime propagation does not mean the former reasoned over those fields.
 
-`ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
+`ModelInput` contains normalized `text`, resolved `assets`, and optional
+`image_retrieval_matches`. For image-bearing `ask` calls, these temporary associations retain
+up to three image-only neighbors per query image within the scoped retrieval candidates.
+They reuse stored image keys and query vectors without additional model calls. Incomplete
+stored key layouts supply no association. Each match names the query asset, source memory,
+source asset, original rank and cosine; similarity establishes neither identity nor a learned
+class label. Custom answerers may use or ignore this evidence. The kernel removes associations
+to records or assets not provided to the answerer. The OpenAI adapter emits attachment labels
+only for source media actually delivered, preserving rank gaps after omission.
+The associations do not alter stored content, metadata or public search ranking.
+
+Speech adapters return
 `SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return
 `FaceAnalysis(faces)` using `FaceEmbedding`.
 
@@ -1444,7 +1459,8 @@ routed with no text at all looks like.
 
 | Backend value | Fields |
 | --- | --- |
-| `ModelInput` | `text`, `assets`; derived `modality` and `modalities` properties |
+| `ModelInput` | `text`, `assets`, `image_retrieval_matches=()`; derived `modality` and `modalities` properties |
+| `VisualRetrievalMatch` | `query_asset_id`, `memory_id`, `source_asset_id`, positive `rank`, `cosine_similarity` in `[-1, 1]` |
 | `SpeechTurn` | `start_ms`, `end_ms`, `text`, `speaker_label` |
 | `SpeakerEmbedding` | `speaker_label`, `values` |
 | `SpeechAnalysis` | `turns`, `speakers` |
