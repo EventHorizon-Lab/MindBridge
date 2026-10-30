@@ -1,6 +1,6 @@
 # Benchmarking
 
-MindBridge provides one evaluation runner and three focused utilities. Use the evaluation runner for
+MindBridge provides one evaluation runner and focused utilities. Use the evaluation runner for
 quality claims; use the utilities only for their narrower artifact or storage purpose.
 
 | Command | Use it for | Do not infer |
@@ -9,6 +9,7 @@ quality claims; use the utilities only for their narrower artifact or storage pu
 | `mindbridge-bench locomo-refined` | Raw LoCoMo-Refined predictions for another evaluator | An integrated benchmark score |
 | `mindbridge-bench local-index` | SQLite-to-Zvec ingestion, recall, latency, throughput, and disk use | Embedding or answer quality |
 | `mindbridge-bench control-plane` | Slow-loop quality on a seeded synthetic scenario: consolidation precision, contradiction recovery, false retirement, and rollback success | Retrieval or answer quality; the scenario is sized so one deliberation window covers it |
+| `python -m mindbridge.benchmarks.sdk_concurrency` | Local SDK concurrency, successful throughput, latency, and overload rejection with synthetic embeddings | Real model-service capacity or retrieval quality |
 
 Never point a benchmark at an application's live `data_dir`. One physical directory has one live
 MindBridge owner, and each independent benchmark unit needs its own new directory.
@@ -215,20 +216,9 @@ text, and writes input and manifest hashes beside the manifest. It reads no QA o
 Report this input condition as raw media plus released source annotations. It differs from both
 raw-only evaluation and the text-only SGM task, so its score cannot establish a raw-only algorithm gain.
 
-A bounded local reader check uses six synthetic text fixtures: a pickup date/time, a photo date,
-a currency value, photo IDs, missing private information, and an instruction embedded in stored
-evidence. It compares the legacy type-specific query with the current official shared instruction,
-using product evidence serialization and three requests per prompt and fixture. Passing requires
-complete grounded values, the exact requested ID set, refusal for missing information, and a
-grounded answer that ignores the stored instruction. Every current-prompt repetition must pass.
-
-```bash
-uv run --frozen python benchmarks/atm_adapter_quality.py \
-  --repeats 3 --output /tmp/mindbridge-atm-adapter-quality.json
-```
-
-These checks do not measure retrieval, native visual understanding, the deployed DeepSeek reader,
-or a new full ATM score.
+Use the [model quality gate](operations.md#model-quality-gate) for credentialed reader checks
+through the public SDK. ATM adapter contract tests pin the shared official query instruction,
+including numeric and temporal questions; they do not establish real-model answer quality.
 
 ES-MemEval's QA task is selected through its family name; `--limit 1` means one seeker and all of
 that seeker's questions:
@@ -1708,6 +1698,41 @@ itself with `scope: storage_microbenchmark` and an `excludes` list. Its `ingest_
 synthetic-vector storage number and is not the product ingest figure: it never embeds, routes a
 modality, prepares media, grounds an answer, or touches `Memory`. The product ingest latency and
 throughput come from the `ingest` block of an `eval` run, which drives the public SDK.
+
+## Measure local SDK concurrency
+
+The credential-free SDK load test calls public `Memory` methods with deterministic synthetic
+embeddings. Each workload, concurrency level, and repetition uses a fresh temporary directory,
+seeds the same corpus, optimizes the index, and warms reads before timing:
+
+```bash
+uv run --frozen python -m mindbridge.benchmarks.sdk_concurrency \
+  --workloads get search mixed \
+  --concurrency 1 4 8 16 28 32 64 128 \
+  --requests 512 --rows 1000 --dimension 128 --repeats 3 \
+  --output .benchmarks/sdk-concurrency.jsonl
+```
+
+`mixed` attempts 70% searches, 20% ID reads, and 10% single-record writes; `add` measures writes
+alone. Workers start together and issue their next operation after the previous one finishes,
+without retries. JSONL records successful throughput, successful p50/p95/p99 latency, separate
+rejection counts and latency, CPU time, and final record counts. Every search checks its top hit;
+every acknowledged write is read back after contention ends. Unexpected failures stop the run.
+The output path must be new.
+
+Corpus seeding uses SDK batches of at most 1,024 inputs, so `--rows 8000` can measure a working
+set larger than the local read caches. Compare that separately from a small repeated working set;
+cache warm-up, writes, and corpus size can materially change the result.
+
+Defaults use hybrid retrieval and unquantized vectors. Compare `--quantization int8` or
+`--retrieval-mode dense` separately. `--model-latency-ms 20` simulates embedding wait without
+contacting a service. `--profile-dir .benchmarks/sdk-profiles` profiles one representative caller
+per case; profiling affects timing and excludes work performed on child index threads.
+
+Compare repeated measurements with identical shapes, including rejection rates. High producer
+concurrency can exhaust the [runtime admission limits](operations.md#concurrency-and-overload);
+fast rejections do not count as successful throughput. These results measure the local SDK with
+synthetic embeddings, and establish neither real model-service capacity nor retrieval quality.
 
 ## Preserve isolation and artifacts
 

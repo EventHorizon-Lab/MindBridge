@@ -43,9 +43,7 @@ dist/
 receipts/
 review-receipts/
 
-# Agent scratch: implementation-plan workspaces (ledgers, task briefs, reports, review diffs).
-# The subagent-driven-development skill assumes this directory is ignored; it holds working
-# notes for one plan and nothing another checkout needs.
+# Local implementation plans and review notes.
 .superpowers/
 # Keep completed agent plans and superseded specifications out of product documentation.
 /docs/superpowers/

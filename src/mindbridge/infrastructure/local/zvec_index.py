@@ -5,7 +5,7 @@ from __future__ import annotations
 import errno
 import math
 import re
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,7 +15,7 @@ from shutil import rmtree
 from tempfile import TemporaryDirectory
 from threading import Condition, get_ident
 from types import ModuleType
-from typing import Any, NoReturn, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 from mindbridge.infrastructure.local._capacity import FILE_DESCRIPTOR_LOCK
 from mindbridge.infrastructure.local._capacity import (
@@ -23,6 +23,19 @@ from mindbridge.infrastructure.local._capacity import (
 )
 from mindbridge.infrastructure.local.store import IndexDocument
 from mindbridge.types import IndexQuantization
+
+if TYPE_CHECKING:
+    from zvec import (
+        Collection,
+        CollectionSchema,
+        CollectionStats,
+        Doc,
+        FtsIndexParam,
+        HnswIndexParam,
+        HnswRabitqIndexParam,
+        InvertIndexParam,
+        Status,
+    )
 
 _COLLECTION_NAME = "mindbridge_memory_index"
 _CONTENT_FIELD = "content"
@@ -286,7 +299,7 @@ class ZvecIndex:
         self.ef_search = ef_search
         self.quantization = quantization
         self._gate = _CollectionGate()
-        self._zvec: Any = _load_zvec()
+        self._zvec = _load_zvec()
         self._schema = self._build_schema()
         # A compaction that was killed leaves behind a complete second copy of the collection.
         # Removing it rests on the storage invariant that one physical `data_dir` has one live
@@ -308,10 +321,8 @@ class ZvecIndex:
                     option=option,
                 )
         try:
-            self._validate_schema(cast(Any, self._collection).schema)
-            self._optimization_watermark = _indexed_document_count(
-                cast(Any, self._collection).stats
-            )
+            self._validate_schema(self._require_collection().schema)
+            self._optimization_watermark = _indexed_document_count(self._require_collection().stats)
             persisted_segments = _persisted_segment_count(self.path)
             self._flushes_since_optimization = persisted_segments
             self._flushes_since_compaction = persisted_segments
@@ -330,7 +341,7 @@ class ZvecIndex:
     def doc_count(self) -> int:
         """Return the number of documents currently visible to Zvec."""
         with self._gate.read():
-            collection = cast(Any, self._require_collection())
+            collection = self._require_collection()
             return int(collection.stats.doc_count)
 
     def upsert(self, documents: Sequence[IndexDocument]) -> None:
@@ -380,7 +391,7 @@ class ZvecIndex:
         written = []
         with _INDEX_MAINTENANCE_LOCK, self._gate.read():
             _require_file_descriptor_headroom()
-            collection = cast(Any, self._require_collection())
+            collection = self._require_collection()
             for start in range(0, len(docs), _MAX_WRITE_BATCH):
                 end = start + _MAX_WRITE_BATCH
                 written.append(
@@ -399,7 +410,7 @@ class ZvecIndex:
         deleted = []
         with _INDEX_MAINTENANCE_LOCK, self._gate.read():
             _require_file_descriptor_headroom()
-            collection = cast(Any, self._require_collection())
+            collection = self._require_collection()
             for start in range(0, len(ids), _MAX_WRITE_BATCH):
                 batch = list(ids[start : start + _MAX_WRITE_BATCH])
                 deleted.append((batch, cast(Sequence[object], collection.delete(batch))))
@@ -509,7 +520,7 @@ class ZvecIndex:
         with _INDEX_MAINTENANCE_LOCK:
             with self._gate.read():
                 _require_file_descriptor_headroom()
-                collection = cast(Any, self._require_collection())
+                collection = self._require_collection()
                 collection.flush()
                 self._flushes_since_optimization += 1
                 self._flushes_since_compaction += 1
@@ -520,7 +531,7 @@ class ZvecIndex:
         if isinstance(concurrency, bool) or concurrency < 0:
             raise ValueError("concurrency must be a non-negative integer")
         with _INDEX_MAINTENANCE_LOCK, self._gate.write():
-            collection = cast(Any, self._require_collection())
+            collection = self._require_collection()
             collection.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
             self._optimization_watermark = self.doc_count
             self._flushes_since_optimization = 0
@@ -555,7 +566,7 @@ class ZvecIndex:
                 return True
 
             with self._gate.read():
-                collection = cast(Any, self._require_collection())
+                collection = self._require_collection()
                 stats = collection.stats
                 document_count = int(stats.doc_count)
                 self._optimization_watermark = min(self._optimization_watermark, document_count)
@@ -597,7 +608,7 @@ class ZvecIndex:
         ) as workspace:
             temporary = Path(workspace) / "new"
             backup = Path(workspace) / "old"
-            target: Any | None = None
+            target: Collection | None = None
             try:
                 target = self._zvec.create_and_open(
                     str(temporary),
@@ -606,7 +617,7 @@ class ZvecIndex:
                 )
                 copied = 0
                 with self._gate.read():
-                    source = cast(Any, self._require_collection())
+                    source = self._require_collection()
                     batch = []
                     with source.iter_docs() as documents:
                         for document in documents:
@@ -645,7 +656,7 @@ class ZvecIndex:
         with self._gate.write():
             if self._collection is not source:
                 raise RuntimeError("Zvec collection changed during compaction")
-            cast(Any, source).close()
+            cast("Collection", source).close()
             self._collection = None
             # If the process stops between renames, the missing canonical path makes the
             # authoritative SQLite store rebuild this disposable index on the next open.
@@ -666,7 +677,7 @@ class ZvecIndex:
                     option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
                 )
                 raise
-            replacement: Any | None = None
+            replacement: Collection | None = None
             try:
                 replacement = self._zvec.open(
                     str(self.path),
@@ -691,7 +702,7 @@ class ZvecIndex:
             self._flushes_since_compaction = 0
 
     def _upsert_native(
-        self, collection: object, documents: Sequence[object], *, action: str
+        self, collection: Collection, documents: Sequence[Doc], *, action: str
     ) -> None:
         """Copy already-native documents, in batches the writer will accept.
 
@@ -701,8 +712,8 @@ class ZvecIndex:
         """
         for start in range(0, len(documents), _MAX_WRITE_BATCH):
             batch = list(documents[start : start + _MAX_WRITE_BATCH])
-            ids = [str(cast(Any, document).id) for document in batch]
-            statuses = cast(Sequence[object], cast(Any, collection).upsert(batch))
+            ids = [str(document.id) for document in batch]
+            statuses = collection.upsert(batch)
             self._check_statuses(action, ids, statuses)
 
     def rebuild(
@@ -732,7 +743,7 @@ class ZvecIndex:
         optimize_concurrency: int,
     ) -> int:
         with _INDEX_MAINTENANCE_LOCK:
-            collection = cast(Any, self._require_collection())
+            collection = self._require_collection()
             collection.destroy()
             self._collection = None
             self._collection = self._zvec.create_and_open(
@@ -765,7 +776,7 @@ class ZvecIndex:
         with _INDEX_MAINTENANCE_LOCK, self._gate.write():
             if self._collection is None:
                 return
-            collection = cast(Any, self._collection)
+            collection = self._require_collection()
             self._collection = None
             collection.close()
 
@@ -783,12 +794,12 @@ class ZvecIndex:
         identity_id: str | None,
         ef: int | None,
         exact: bool,
-    ) -> list[object]:
+    ) -> list[Doc]:
         self._validate_vector(values)
         _require_positive(limit, "limit")
         selected_ef = self.ef_search if ef is None else ef
         _require_positive(selected_ef, "ef")
-        collection = cast(Any, self._require_collection())
+        collection = self._require_collection()
         query = self._zvec.Query(
             field_name=_VECTOR_FIELD,
             vector=list(values),
@@ -826,15 +837,12 @@ class ZvecIndex:
         topk = max(_GROUP_FALLBACK_MINIMUM, limit * 4)
         ceiling = max(topk, limit * _MAX_EMBEDDINGS_PER_MEMORY)
         while len(by_memory) < limit:
-            docs = cast(
-                list[object],
-                collection.query(
-                    queries=query,
-                    topk=topk,
-                    filter=filter_expression,
-                    include_vector=False,
-                    output_fields=[_MEMORY_ID_FIELD],
-                ),
+            docs = collection.query(
+                queries=query,
+                topk=topk,
+                filter=filter_expression,
+                include_vector=False,
+                output_fields=[_MEMORY_ID_FIELD],
             )
             for doc in docs:
                 memory_id = _required_field(doc, _MEMORY_ID_FIELD)
@@ -858,7 +866,7 @@ class ZvecIndex:
         occurred_until: datetime | None,
         place_id: str | None,
         identity_id: str | None,
-    ) -> list[object]:
+    ) -> list[Doc]:
         ngram_text = _ngram_text(text)
         queries = [
             self._zvec.Query(field_name=name, fts=self._zvec.Fts(match_string=match))
@@ -868,28 +876,25 @@ class ZvecIndex:
             )
             if match
         ]
-        return cast(
-            list[object],
-            cast(Any, self._require_collection()).query(
-                queries=queries,
-                topk=limit,
-                reranker=(
-                    self._zvec.RrfReRanker(rank_constant=_LEXICAL_RANK_CONSTANT)
-                    if len(queries) > 1
-                    else None
-                ),
-                filter=_filter_expression(
-                    space_id=space_id,
-                    task=task,
-                    memory_type=memory_type,
-                    occurred_from=occurred_from,
-                    occurred_until=occurred_until,
-                    place_id=place_id,
-                    identity_id=identity_id,
-                ),
-                include_vector=False,
-                output_fields=[],
+        return self._require_collection().query(
+            queries=queries,
+            topk=limit,
+            reranker=(
+                self._zvec.RrfReRanker(rank_constant=_LEXICAL_RANK_CONSTANT)
+                if len(queries) > 1
+                else None
             ),
+            filter=_filter_expression(
+                space_id=space_id,
+                task=task,
+                memory_type=memory_type,
+                occurred_from=occurred_from,
+                occurred_until=occurred_until,
+                place_id=place_id,
+                identity_id=identity_id,
+            ),
+            include_vector=False,
+            output_fields=[],
         )
 
     def _build_schema(self) -> object:
@@ -972,7 +977,7 @@ class ZvecIndex:
         return schema
 
     def _validate_schema(self, schema: object) -> None:  # noqa: C901 - one persisted schema
-        native_schema = cast(Any, schema)
+        native_schema = cast("CollectionSchema", schema)
         if native_schema.name != _COLLECTION_NAME:
             _schema_mismatch(f"collection name is {native_schema.name!r}")
         fields = {field.name: field for field in native_schema.fields}
@@ -980,14 +985,15 @@ class ZvecIndex:
             _schema_mismatch("scalar fields differ")
         for name, tokenizer, filters, extra_params in _FTS_FIELDS:
             content = fields[name]
+            content_index = cast("FtsIndexParam | None", content.index_param)
             if (
                 content.data_type != self._zvec.DataType.STRING
                 or content.nullable
-                or content.index_param is None
-                or content.index_param.type != self._zvec.IndexType.FTS
-                or content.index_param.tokenizer_name != tokenizer
-                or tuple(content.index_param.filters) != filters
-                or content.index_param.extra_params != extra_params
+                or content_index is None
+                or content_index.type != self._zvec.IndexType.FTS
+                or content_index.tokenizer_name != tokenizer
+                or tuple(content_index.filters) != filters
+                or content_index.extra_params != extra_params
             ):
                 _schema_mismatch(f"{name} FTS field differs")
         identity = fields[_IDENTITY_FIELD]
@@ -1021,12 +1027,13 @@ class ZvecIndex:
                 _schema_mismatch(f"{name} scalar field differs")
         for name in (_OCCURRED_AT_FIELD, _OCCURRED_END_FIELD):
             field = fields[name]
+            range_index = cast("InvertIndexParam | None", field.index_param)
             if (
                 field.data_type != self._zvec.DataType.INT64
                 or field.nullable
-                or field.index_param is None
-                or field.index_param.type != self._zvec.IndexType.INVERT
-                or not field.index_param.enable_range_optimization
+                or range_index is None
+                or range_index.type != self._zvec.IndexType.INVERT
+                or not range_index.enable_range_optimization
             ):
                 _schema_mismatch(f"{name} filter field differs")
 
@@ -1034,7 +1041,8 @@ class ZvecIndex:
         if vectors.keys() != {_VECTOR_FIELD}:
             _schema_mismatch("vector fields differ")
         vector = vectors[_VECTOR_FIELD]
-        index = vector.index_param
+        index = cast("HnswIndexParam | HnswRabitqIndexParam", vector.index_param)
+        rabitq = cast("HnswRabitqIndexParam", index)
         expected_type = (
             self._zvec.IndexType.HNSW_RABITQ
             if self.quantization is IndexQuantization.RABITQ
@@ -1058,9 +1066,9 @@ class ZvecIndex:
             or (
                 self.quantization is IndexQuantization.RABITQ
                 and (
-                    index.total_bits != _RABITQ_TOTAL_BITS
-                    or index.num_clusters != _RABITQ_NUM_CLUSTERS
-                    or index.sample_count != 0
+                    rabitq.total_bits != _RABITQ_TOTAL_BITS
+                    or rabitq.num_clusters != _RABITQ_NUM_CLUSTERS
+                    or rabitq.sample_count != 0
                 )
             )
         ):
@@ -1117,7 +1125,7 @@ class ZvecIndex:
             )
         failures = []
         for document_id, status in zip(ids, statuses, strict=True):
-            native_status = cast(Any, status)
+            native_status = cast("Status", status)
             if native_status.ok() or (
                 allow_not_found and native_status.code() == self._zvec.StatusCode.NOT_FOUND
             ):
@@ -1133,10 +1141,10 @@ class ZvecIndex:
         if failures:
             raise ZvecWriteError(f"Zvec {action} failed: {'; '.join(failures)}")
 
-    def _require_collection(self) -> object:
+    def _require_collection(self) -> Collection:
         if self._collection is None:
             raise RuntimeError("Zvec index is closed")
-        return self._collection
+        return cast("Collection", self._collection)
 
 
 def _load_zvec() -> ModuleType:
@@ -1308,7 +1316,7 @@ def _end_timestamp(start: datetime | None, end: datetime | None) -> int:
 
 
 def _required_score(doc: object) -> float:
-    native_doc = cast(Any, doc)
+    native_doc = cast("Doc", doc)
     if native_doc.score is None:
         raise RuntimeError(f"Zvec query result {native_doc.id!r} has no score")
     score = float(native_doc.score)
@@ -1318,25 +1326,25 @@ def _required_score(doc: object) -> float:
 
 
 def _required_id(doc: object) -> str:
-    document_id = cast(Any, doc).id
+    document_id = cast("Doc", doc).id
     if not isinstance(document_id, str) or not document_id:
         raise RuntimeError("Zvec query result has no document ID")
     return document_id
 
 
 def _required_field(doc: object, name: str) -> str:
-    value = cast(Any, doc).field(name)
+    value = cast(Callable[[str], object], cast("Doc", doc).field)(name)
     if not isinstance(value, str) or not value:
         raise RuntimeError(f"Zvec query result {_required_id(doc)!r} has no {name}")
     return value
 
 
-def _best_documents(documents: Iterable[object], limit: int) -> list[object]:
+def _best_documents(documents: Iterable[Doc], limit: int) -> list[Doc]:
     return sorted(documents, key=lambda doc: (_required_score(doc), _required_id(doc)))[:limit]
 
 
 def _indexed_document_count(stats: object) -> int:
-    native_stats = cast(Any, stats)
+    native_stats = cast("CollectionStats", stats)
     document_count = int(native_stats.doc_count)
     completeness = float(native_stats.index_completeness[_VECTOR_FIELD])
     if not math.isfinite(completeness) or not 0.0 <= completeness <= 1.0:

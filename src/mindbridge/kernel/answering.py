@@ -10,7 +10,6 @@ from __future__ import annotations
 import builtins
 from collections.abc import Generator, Sequence
 from contextlib import closing, suppress
-from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
@@ -55,7 +54,7 @@ from mindbridge.kernel import grounding
 from mindbridge.kernel.content import PreparedContent, memory_modality
 from mindbridge.kernel.contracts import Backends, fallback_unsupported, require_audio_transcription
 from mindbridge.kernel.derived import derived_text, has_stream_description, has_stream_transcript
-from mindbridge.kernel.execution import Execution
+from mindbridge.kernel.execution import ASYNC_QUEUE_TIME_MS, Execution
 from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.lifecycle import Lifecycle, OperationAssets
 from mindbridge.kernel.materialization import Materializer
@@ -113,12 +112,6 @@ _RECALL_MEDIA_FACTOR = 2
 
 # A per-ask ceiling, shared by all steps and replans, including a deeper original-query read.
 _RECALL_QUERY_LIMIT = 2
-
-
-ASYNC_QUEUE_TIME_MS: ContextVar[float | None] = ContextVar(
-    "mindbridge_async_queue_time_ms",
-    default=None,
-)
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,7 +6,7 @@ import asyncio
 import sqlite3
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from contextlib import closing
 from pathlib import Path
 from typing import cast
@@ -30,6 +30,7 @@ from mindbridge import (
     ModelInput,
     ObservationContext,
     RetrievalScope,
+    StreamInput,
     ValidationError,
 )
 from mindbridge._telemetry import CAPTURE_FAILED, CAPTURE_SETTLED, CAPTURE_TIME_TO_SEARCHABLE
@@ -441,6 +442,32 @@ def test_async_capture_settle_and_pending_mirror_the_synchronous_surface(tmp_pat
             assert [hit.id for hit in await memory.search("ladder")] == [record.id]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("capture", (False, True))
+async def test_async_stream_commits_lazily_and_preserves_capture_policy(
+    tmp_path: Path, capture: bool
+) -> None:
+    pulled: list[str] = []
+
+    async def contents() -> AsyncIterator[str | StreamInput]:
+        pulled.append("structured")
+        yield StreamInput("the ladder is in the garage", metadata={"source": "camera"})
+        pulled.append("plain")
+        yield "the fuse box is behind the coats"
+
+    embedder = CountingEmbedder()
+    async with AsyncMemory(Memory(tmp_path, embedder=embedder)) as memory:
+        stream = memory.add_stream(contents(), capture=capture)
+        first = await anext(stream)
+        assert pulled == ["structured"]
+        assert (await memory.get(first.id)).metadata == {"source": "camera"}
+        records = [first, *[record async for record in stream]]
+        assert pulled == ["structured", "plain"]
+        for record in records:
+            assert await memory.get(record.id) == record
+        assert len(await memory.pending_captures()) == (2 if capture else 0)
+        assert embedder.calls == (0 if capture else 2)
 
 
 def test_the_capture_operations_reach_the_command_line(tmp_path: Path) -> None:

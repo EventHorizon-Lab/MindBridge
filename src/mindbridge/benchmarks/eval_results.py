@@ -11,10 +11,8 @@ from collections.abc import (
     Mapping,
 )
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar
+from typing import TypeVar
 
-if TYPE_CHECKING:
-    pass
 from mindbridge import (
     AnswerPolicy,
     MindBridgeError,

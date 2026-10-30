@@ -13,9 +13,9 @@ How deep that probe reaches depends on what each backend publishes; ``probe()`` 
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from importlib import import_module
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
@@ -167,10 +167,8 @@ class _OwnedClientModels(OpenAIModels):
 
     __slots__ = ("_owned_client", "_owned_client_closed")
 
-    def __init__(self, client: OpenAI, **controls: object) -> None:
-        super().__init__(client, **cast("Any", controls))
-        self._owned_client = client
-        self._owned_client_closed = False
+    _owned_client: OpenAI
+    _owned_client_closed: bool
 
     def close(self) -> None:
         """Close the backend, then the SDK client the recipe created to build it."""
@@ -188,10 +186,8 @@ _CONNECTION = ("base_url", "api_key", "timeout", "max_retries")
 def _owned_openai_models(**controls: object) -> OpenAIModels:
     """Build the SDK adapter and own the client created for declarative composition.
 
-    Every adapter control passes through unnamed, so a control `OpenAIModels` gains is reachable
-    declaratively at once instead of after this signature is remembered too -- which is how the
-    documented `min_video_seconds` once shipped unreachable. An unknown name still fails loudly:
-    the adapter raises `TypeError` for it on the first `from_config`.
+    Forward adapter controls without duplicating its constructor signature. The adapter
+    validates values and rejects unknown keywords.
     """
     connection = {}
     for name in _CONNECTION:
@@ -200,10 +196,16 @@ def _owned_openai_models(**controls: object) -> OpenAIModels:
             connection[name] = value
     client = _openai_client(**connection)
     try:
-        return _OwnedClientModels(client, **controls)
+        # Declarative controls cross this dynamic boundary once; the adapter owns validation
+        # and rejects unknown keywords with its inherited constructor signature.
+        build = cast(Callable[..., _OwnedClientModels], _OwnedClientModels)
+        backend = build(client, **controls)
     except BaseException:
         client.close()
         raise
+    backend._owned_client = client
+    backend._owned_client_closed = False
+    return backend
 
 
 def _build(name: str, *, slot: Slot, load: bool) -> object:
@@ -218,23 +220,21 @@ def _build(name: str, *, slot: Slot, load: bool) -> object:
     # Constructing the SDK client is the load: it is where the official SDK resolves its own
     # credentials and fails when none are present.
     selected = _OPENAI_MODELS[slot] if model is None else model
-    client = _openai_client()
     if slot == "embedder":
-        return _OwnedClientModels(client, embedding_model=selected)
+        return _owned_openai_models(embedding_model=selected)
     if slot in ("answerer", "former", "consolidator"):
         # One adapter serves all three: `formation_model` and `consolidation_model` are the
         # generation model it was given.
-        return _OwnedClientModels(client, generation_model=selected)
+        return _owned_openai_models(generation_model=selected)
     if slot == "vision":
         # `vision_capabilities` are the generation ones, and `Memory` rejects a describer that
         # declares anything but image or video. Image alone is the declarative default too:
         # video is captioned from four decoded stills, so it costs four image parts per memory.
-        return _OwnedClientModels(
-            client,
+        return _owned_openai_models(
             generation_model=selected,
             generation_capabilities=frozenset({Modality.IMAGE}),
         )
-    return _OwnedClientModels(client, transcription_model=selected)
+    return _owned_openai_models(transcription_model=selected)
 
 
 def _openai_client(**config: object) -> OpenAI:

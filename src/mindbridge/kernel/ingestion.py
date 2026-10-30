@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -37,6 +37,7 @@ from mindbridge.kernel.derived import (
     with_stream_transcript,
 )
 from mindbridge.kernel.embedding import DOCUMENT_TASK, Embedding
+from mindbridge.kernel.execution import Execution
 from mindbridge.kernel.formation import Formation
 from mindbridge.kernel.hydration import Hydrator
 from mindbridge.kernel.identity import Identities
@@ -110,6 +111,7 @@ class Ingestion(Traced):
         backends: Backends,
         settings: Settings,
         lifecycle: Lifecycle,
+        execution: Execution,
         hydrator: Hydrator,
         materializer: Materializer,
         speech: Speech,
@@ -126,6 +128,7 @@ class Ingestion(Traced):
         self._backends = backends
         self._settings = settings
         self._lifecycle = lifecycle
+        self._execution = execution
         self._hydrator = hydrator
         self._materializer = materializer
         self._speech = speech
@@ -513,6 +516,31 @@ class Ingestion(Traced):
             index += 1
         if grouped:
             self._flush_stream_group()
+
+    async def add_async_stream(
+        self,
+        contents: AsyncIterable[ContentInput | StreamInput],
+        *,
+        capture: bool = False,
+    ) -> AsyncIterator[MemoryRecord]:
+        if not isinstance(contents, AsyncIterable):
+            raise ValidationError("contents must be an async iterable of memory inputs")
+        capture = strict_bool(capture, "capture")
+        iterator = aiter(contents)
+        index = 0
+        while True:
+            try:
+                content = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            yield await self._execution.run(
+                self._add_stream_item, content, index=index, capture=capture
+            )
+            index += 1
 
     def _add_stream_item(
         self,

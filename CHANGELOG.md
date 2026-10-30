@@ -39,7 +39,7 @@ The [documentation index](docs/README.md) describes the current contracts.
   unrelated dates, explanations or citations. The default reader prompt and both evidence-policy
   refusal rules are preserved; benchmark baseline arms honor the same configured style.
 - Explicit backend composition through `MemoryPlugins`, `MemoryConfig`, declarative
-  configuration, and named recipes. Local Sentence Transformers/Jina, FunASR, OpenCV face, and
+  configuration, and named recipes. Local Sentence Transformers, FunASR, OpenCV face, and
   caller-supplied OpenAI SDK adapters load their optional dependencies lazily.
 - REST under `/v1`, fifteen typed MCP tools, and the `mindbridge` product CLI over the shared SDK.
   Capability documents describe the operations and modalities available on each surface.
@@ -160,10 +160,6 @@ The [documentation index](docs/README.md) describes the current contracts.
 
 ### Removed
 
-- Unused generic token-F1 scoring helpers and the withdrawn raw-video experiment proposal.
-  Dataset-specific official scorers and the historical measurement records remain available.
-- Unused single-item storage wrappers and the unused media-size query; internal callers use
-  the existing batch operations.
 - PostgreSQL/pgvector, Celery, Redis, S3, service workers, and the service-specific APIs and
   benchmark runners from the superseded design.
 - Tenant, user, run, and other implicit isolation identifiers; metadata remains application data.
@@ -177,9 +173,6 @@ The [documentation index](docs/README.md) describes the current contracts.
 - Video-MME, EgoLifeQA, EgoMemReason, and MemEye tasks, their unused adapters and submission
   artifacts, duplicate scoring runners, the unused evaluation journal, and unused registries.
   Video-MME-v2 remains supported.
-- Completed implementation audits and intermediate development notes duplicated by current
-  guides and regression tests. Research protocols, measurements, and source pins stay local-only;
-  third-party scorer notices remain in the benchmark package.
 
 ### Limits
 

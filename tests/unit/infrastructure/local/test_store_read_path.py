@@ -1,16 +1,5 @@
-"""What the search read path is allowed to cost, and what it must still guarantee.
-
-Hydrating a search candidate used to rebuild and re-validate its FP32 vector even though no
-retrieval code reads it: `memory.py` touches only `embedding_id`, `memory_id` and `object_part` on
-a hydrated document, and the vector is consumed solely by `ZvecIndex.upsert`. The two O(dimension)
-Python loops in `StoredEmbedding.__post_init__` therefore ran once per candidate per search and
-paid for nobody. They now run where a vector enters SQLite instead.
-
-These tests pin both halves of that trade: hydration does not re-check stored vector content, and
-the write boundary still refuses a vector it would be wrong to store. They also pin the two
-storage invariants the change is closest to breaking -- stale index IDs are dropped by SQLite
-hydration, and a missing index rebuilds from stored vectors without asking the embedder again.
-"""
+"""Authoritative read projections must reject invalid writes, drop stale index IDs, preserve
+SQLite snapshots, and rebuild a missing index without embedding stored content again."""
 
 from __future__ import annotations
 
@@ -27,13 +16,12 @@ from threading import Event
 
 import pytest
 
-from mindbridge import Memory
+from mindbridge import EmbedTask, Memory, ModelInput
 from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local import LocalStore, StoredEmbedding, StoredMemory
 from mindbridge.infrastructure.local.store import index as index_module
 from mindbridge.infrastructure.local.store._codec import optional_datetime_from_row
 from mindbridge.infrastructure.local.store.records import MemoryRecords
-from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import Modality
 
 _NOW = datetime(2026, 9, 2, 12, 0, 0, tzinfo=timezone.utc)

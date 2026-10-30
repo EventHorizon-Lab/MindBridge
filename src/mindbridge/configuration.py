@@ -41,7 +41,6 @@ from mindbridge.models.openai_sdk import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_GENERATION_MODEL,
     DEFAULT_TRANSCRIPTION_MODEL,
-    OpenAIModels,
 )
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
@@ -393,10 +392,6 @@ def _validated_config(value: MindBridgeConfig | Mapping[str, object]) -> MindBri
         raise ValidationError("; ".join(issues)) from None
 
 
-def _openai_factory(values: dict[str, object]) -> OpenAIModels:
-    return recipes._owned_openai_models(**values)
-
-
 def _openai_values(config: _OpenAIConfig) -> dict[str, object]:
     return {
         key: value
@@ -423,7 +418,7 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
             values["embedding_space"] = config.space
         if config.image_max_pixels is not None:
             values["image_max_pixels"] = config.image_max_pixels
-        return _openai_factory(values)
+        return recipes._owned_openai_models(**values)
     return SentenceTransformersEmbedder(
         model_id=config.model,
         revision=config.revision,
@@ -468,7 +463,7 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
         values["generation_media_max_items"] = config.media_max_items
     if config.offline_gazetteer is not None:
         values["generation_gazetteer"] = OfflineGazetteer(**config.offline_gazetteer.model_dump())
-    return _openai_factory(values)
+    return recipes._owned_openai_models(**values)
 
 
 def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
@@ -476,7 +471,7 @@ def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
     values = _completion_values(config)
     if config.image_max_pixels is not None:
         values["image_max_pixels"] = config.image_max_pixels
-    return _openai_factory(values)
+    return recipes._owned_openai_models(**values)
 
 
 def _build_vision(config: OpenAIVisionConfig) -> VisionDescriptionBackend:
@@ -486,7 +481,7 @@ def _build_vision(config: OpenAIVisionConfig) -> VisionDescriptionBackend:
         values["vision_video_frames"] = config.video_frames
     if config.image_max_pixels is not None:
         values["image_max_pixels"] = config.image_max_pixels
-    return _openai_factory(values)
+    return recipes._owned_openai_models(**values)
 
 
 def _build_consolidation(
@@ -510,7 +505,7 @@ def _build_consolidation(
             # `OpenAIModels`, which implements every reasoning protocol, but it is typed here
             # as the slot it was built for.
             return cast(ConsolidationBackend, built)
-    return _openai_factory(values)
+    return recipes._owned_openai_models(**values)
 
 
 def _build_speech(config: SpeechProviderConfig) -> SpeechBackend | TranscriptionBackend:
@@ -525,7 +520,7 @@ def _build_speech(config: SpeechProviderConfig) -> SpeechBackend | Transcription
     values["transcription_model"] = config.model
     if config.space is not None:
         values["transcription_space"] = config.space
-    return _openai_factory(values)
+    return recipes._owned_openai_models(**values)
 
 
 def _build_face(config: OpenCVFaceConfig) -> FaceBackend:

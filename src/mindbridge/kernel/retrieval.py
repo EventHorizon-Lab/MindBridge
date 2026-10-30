@@ -432,12 +432,7 @@ class Retrieval(Traced):
                         occurred_until,
                     )
                 )
-            # The survivor count exists only to decide whether to widen, so neither it nor the
-            # slate it counts is built where it can no longer change that decision. Every other
-            # reason to stop is already known here, and asking first made a second scope pass
-            # over the whole candidate window part of the price of every search that was never
-            # going to widen -- which is every search whose routes came back short, and every
-            # one that had already reached the ceiling.
+            # Count scoped survivors only when the result can still widen the candidate window.
             if candidates.exhausted or candidate_limit >= candidate_ceiling:
                 break
             current_index_ids = set(index_ids)
@@ -456,13 +451,6 @@ class Retrieval(Traced):
                     known_at=None if scope is None else scope.known_at,
                     near=None if scope is None else scope.near,
                     radius_m=None if scope is None else scope.radius_m,
-                    # Passed here for consistency with every other scope axis, which all
-                    # reach both reads. This one is the survivor count that drives candidate
-                    # widening; no constructed corpus (30 or 120 memories) could make its
-                    # absence change a result, so it is unproven rather than proven needed.
-                    # Kept because omitting one axis at one of two sites is the anomaly a
-                    # reader would have to explain, and because narrowing a count can only
-                    # widen the search. The hydration site below is mutation-covered.
                     place_id=None if scope is None else scope.place_id,
                     identity_id=None if scope is None else scope.identity_id,
                     active_only=True,

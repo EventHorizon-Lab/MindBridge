@@ -8,7 +8,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
 from time import perf_counter_ns
-from typing import Annotated, Any, Literal, ParamSpec, TypeVar, cast
+from typing import Annotated, Literal, ParamSpec, TypeVar, cast
 from uuid import uuid4
 
 from mcp.server import MCPServer
@@ -498,7 +498,7 @@ def build_mcp_server(
         middleware=[
             transport_telemetry,
             _request_admission(memory),
-            cast(ServerMiddleware[Any], _strict_tool_arguments),
+            cast(ServerMiddleware[None], _strict_tool_arguments),
         ],
     )
     # MCP 2 installs its generic OpenTelemetry middleware outside every user middleware. Keep the
@@ -1059,10 +1059,12 @@ def _register_identity_tools(
         return ForgetResult(erasure=memory.forget_identity(identity_id))
 
 
-def _request_admission(memory: Memory) -> ServerMiddleware[Any]:
+def _request_admission(memory: Memory) -> ServerMiddleware[None]:
     slots = memory._execution.requests if isinstance(memory, Memory) else Capacity(32)
 
-    async def admit(context: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
+    async def admit(
+        context: ServerRequestContext[None, object], call_next: CallNext
+    ) -> HandlerResult:
         if context.method != "tools/call":
             return await call_next(context)
         if not slots.acquire():
@@ -1080,7 +1082,7 @@ def _request_admission(memory: Memory) -> ServerMiddleware[Any]:
         finally:
             slots.release()
 
-    return cast(ServerMiddleware[Any], admit)
+    return cast(ServerMiddleware[None], admit)
 
 
 def _stable_errors(
@@ -1101,7 +1103,7 @@ def _stable_errors(
 
 
 async def _strict_tool_arguments(
-    context: ServerRequestContext[Any, Any],
+    context: ServerRequestContext[None, object],
     call_next: CallNext,
 ) -> HandlerResult:
     params = context.params or {}
@@ -1145,9 +1147,9 @@ async def _strict_tool_arguments(
     return result
 
 
-def _request_telemetry(tracer: Tracer) -> ServerMiddleware[Any]:
+def _request_telemetry(tracer: Tracer) -> ServerMiddleware[None]:
     async def observe(
-        context: ServerRequestContext[Any, Any],
+        context: ServerRequestContext[None, object],
         call_next: CallNext,
     ) -> HandlerResult:
         params = context.params or {}
@@ -1183,7 +1185,7 @@ def _request_telemetry(tracer: Tracer) -> ServerMiddleware[Any]:
                 span.set_status(StatusCode.ERROR)
             return result
 
-    return cast(ServerMiddleware[Any], observe)
+    return cast(ServerMiddleware[None], observe)
 
 
 # Which of `MemoryCapabilities.operations` one of the fifteen tools can actually reach, mirroring

@@ -42,21 +42,8 @@ _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
 
 
-# Covering every distinctive query term is evidence in a way that placing well in the full-text
-# index is not, so a complete match ranks as near-certain and a memory quoting the whole question
-# cannot be buried by an unrelated dense neighbour. Nothing short of complete coverage enters the
-# ranking score through this branch. A general floor under every full-text hit used to, at 0.24,
-# but that compared an index-side quantity against a cosine, and how often it decided anything
-# turned entirely on where the configured embedder puts its cosines: replaying 841 dev queries,
-# the share of dense candidates it could outrank was 0.92% on LoCoMo-Refined, 8.48% on
-# Mem-Gallery and 50.26% on MemLens. Deleting it left R@1, R@5, R@10, R@20, R@100 and MRR
-# unchanged to four decimals on all three and the top ten identical on 99.87% of queries.
-# The threshold leaves slack for summation order; the coverage ratio is otherwise exactly one.
-# Across both replayed corpora two candidates in more than twenty thousand reached full coverage,
-# so this rescues the exact-phrase case without moving the measurement at all. The value sits
-# between the two behaviours the search tests pin: after the coverage lift it must clear a
-# mediocre dense neighbour and must still lose to strong semantic evidence, because a memory that
-# merely echoes the question back is a complete term match and is not the answer.
+# Only complete distinctive-term coverage contributes lexical rank relevance. Allow rounding
+# slack in the coverage ratio, and keep an exact echo below strong semantic evidence.
 LEXICAL_FULL_COVERAGE = 0.999
 
 

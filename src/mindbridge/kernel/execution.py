@@ -4,22 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import AsyncGenerator, Callable, Generator, Iterator, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from functools import partial
 from threading import BoundedSemaphore, Condition, Lock
-from typing import ParamSpec, TypeVar
+from time import perf_counter
+from typing import ParamSpec, TypeVar, cast
 
 from mindbridge.exceptions import StorageError
 from mindbridge.infrastructure.local._capacity import Capacity
 from mindbridge.kernel.lifecycle import Lifecycle
+from mindbridge.types import AnswerChunk, AnswerResult
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _PROCESS_SUBMISSIONS = Capacity(128)
 _PROCESS_REQUESTS = Capacity(128)
+_STREAM_EXHAUSTED = object()
+ASYNC_QUEUE_TIME_MS: ContextVar[float | None] = ContextVar(
+    "mindbridge_async_queue_time_ms", default=None
+)
 
 
 class _Workers:
@@ -143,6 +149,15 @@ class Execution:
         self._closed = False
 
     async def run(self, fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        queued_at = perf_counter()
+
+        def invoke() -> _T:
+            token = ASYNC_QUEUE_TIME_MS.set((perf_counter() - queued_at) * 1_000.0)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                ASYNC_QUEUE_TIME_MS.reset(token)
+
         # In a forked child, an inherited executor may have idle tokens but no live workers.
         # Check ownership before even acquiring one of its inherited locks.
         self._lifecycle.require_open()
@@ -152,13 +167,84 @@ class Execution:
             if not self._async_slots.acquire():
                 raise _overloaded()
             try:
-                future = self._async.submit(copy_context().run, partial(fn, *args, **kwargs))
+                future = self._async.submit(copy_context().run, invoke)
                 self._pending += 1
             except BaseException:
                 self._async_slots.release()
                 raise
         future.add_done_callback(self._completed)
         return await asyncio.wrap_future(future)
+
+    async def pump(
+        self,
+        stream: Generator[AnswerChunk, None, AnswerResult],
+    ) -> AsyncGenerator[AnswerChunk, None]:
+        """Advance an answer on one pinned worker and release it after terminal cleanup."""
+        loop = asyncio.get_running_loop()
+        context = copy_context()
+        # One worker, not `asyncio.to_thread`: every step has to run on the same thread so the
+        # span and operation contextvars the generator attaches on its first step are the ones
+        # it detaches on its last. `to_thread` runs each call in a fresh context copy, which
+        # would strand both. `next` is given a sentinel because a `StopIteration` crossing a
+        # future becomes `RuntimeError` rather than ending the loop.
+        #
+        # Admission happens before a worker is created, and every wrapper and transport borrows
+        # from this instance's same bounded pool.
+        worker = self.streams.borrow()
+        first_advance = True
+        closed = False
+
+        def advance(queued_at: float, record_queue: bool) -> object:
+            token = None
+            if record_queue:
+                token = ASYNC_QUEUE_TIME_MS.set((perf_counter() - queued_at) * 1_000.0)
+            try:
+                return next(stream, _STREAM_EXHAUSTED)
+            finally:
+                if token is not None:
+                    ASYNC_QUEUE_TIME_MS.reset(token)
+
+        async def close_stream() -> None:
+            nonlocal closed
+            if closed:
+                return
+            closed = True
+            try:
+                closing = loop.run_in_executor(worker, context.run, stream.close)
+                closing.add_done_callback(
+                    lambda done: None if done.cancelled() else done.exception()
+                )
+                await asyncio.shield(closing)
+            finally:
+                released = asyncio.wrap_future(worker.release())
+                await asyncio.shield(released)
+
+        try:
+            while True:
+                queued_at = perf_counter()
+                record_queue = first_advance
+                first_advance = False
+                chunk = await loop.run_in_executor(
+                    worker,
+                    context.run,
+                    advance,
+                    queued_at,
+                    record_queue,
+                )
+                if chunk is _STREAM_EXHAUSTED:
+                    return
+                answer_chunk = cast(AnswerChunk, chunk)
+                if answer_chunk.result is not None:
+                    # Reading the terminal result is a complete consumption: callers need not
+                    # advance once more or explicitly close it to return worker capacity.
+                    await close_stream()
+                    yield answer_chunk
+                    return
+                yield answer_chunk
+        finally:
+            # A running executor call cannot be cancelled, so the close always completes even
+            # when the awaiting task is gone; `wait=False` keeps that off the event loop.
+            await close_stream()
 
     def _completed(self, future: Future[_T]) -> None:
         with self._lock:

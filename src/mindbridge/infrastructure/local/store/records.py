@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 
+from mindbridge.infrastructure.local.store._cache import ReadCache
 from mindbridge.infrastructure.local.store._codec import (
     SQLITE_PARAMETER_BATCH,
     asset_from_row,
@@ -567,6 +568,7 @@ class MemoryRecords:
         connections: Connections,
     ) -> None:
         self._connections = connections
+        self._read_cache: ReadCache[StoredMemory] = ReadCache(1_024)
 
     def write_memory(
         self,
@@ -689,8 +691,17 @@ class MemoryRecords:
         `identity_id` scopes it to one person, accepting a merged alias, and is a hard filter for
         the same reason: it is the authoritative answer the search index only approximates.
         """
+        cacheable = active_only and all(
+            value is None for value in (valid_at, known_at, near, radius_m, place_id, identity_id)
+        )
+        generation = self._connections.read_generation if cacheable else None
+        if generation is not None:
+            self._connections.require_open()
+            cached = self._read_cache.get(memory_ids, generation=generation)
+            if cached is not None:
+                return cached
         with self._connections.read_transaction() as connection:
-            return read_memories(
+            memories = read_memories(
                 connection,
                 memory_ids,
                 valid_at=valid_at,
@@ -701,6 +712,22 @@ class MemoryRecords:
                 identity_id=identity_id,
                 active_only=active_only,
             )
+        if generation is not None and generation == self._connections.read_generation:
+            # Context validity can change with time alone; media needs fresh lease coordination.
+            # Only plain text without semantic context is reusable (at most 8 MiB of UTF-8
+            # content/metadata per directory, plus object overhead). A concurrent commit stops
+            # this snapshot from populating the cache.
+            self._read_cache.put(
+                (
+                    (memory.memory_id, memory)
+                    for memory in memories
+                    if not memory.assets
+                    and memory.context is None
+                    and len(memory.content) + len(memory.metadata_json) <= 2_048
+                ),
+                generation=generation,
+            )
+        return memories
 
     def count_memories(
         self,

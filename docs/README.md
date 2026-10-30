@@ -72,9 +72,7 @@ contract.
 
 ## Evaluate
 
-- [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
-- [Grounded multimodal recall](grounded-multimodal-recall.md) — bounded semantic routes,
-  transient query vision, optional concise answers, and native-media transport.
+- [Benchmarking](benchmarking.md) — behavior evaluation, local-index measurement, and SDK load tests.
 - [Offline semantic support audit](semantic-support-audit.md) — atomic-claim review, evidence
   localization, withdrawal residue and verification costs before changing formation admission.
 - [Model quality gate](operations.md#model-quality-gate) — synthetic real-model regression cases,

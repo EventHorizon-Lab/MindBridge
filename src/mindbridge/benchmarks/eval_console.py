@@ -15,12 +15,10 @@ from collections.abc import (
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from threading import Event, RLock, Thread
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast
 
 from tqdm import tqdm
 
-if TYPE_CHECKING:
-    pass
 from mindbridge.benchmarks.eval_results import DEFAULT_ARM
 
 # The harness writes from threads in one process. tqdm's default multiprocessing RLock

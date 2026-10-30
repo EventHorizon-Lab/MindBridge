@@ -179,12 +179,11 @@ async def test_stream_capacity_is_shared_and_reusable(tmp_path: Path) -> None:
         return AnswerResult(answer="answer")
 
     with Memory(tmp_path, embedder=TinyEmbedder()) as memory:
-        first, second = AsyncMemory(memory), AsyncMemory(memory)
-        streams = [first._pump(chunks()) for _ in range(8)]
+        streams = [memory._execution.pump(chunks()) for _ in range(8)]
         try:
             for stream in streams:
                 assert (await anext(stream)).text == "answer"
-            excess = second._pump(chunks())
+            excess = memory._execution.pump(chunks())
             try:
                 with pytest.raises(StorageError) as failure:
                     await anext(excess)
@@ -194,7 +193,7 @@ async def test_stream_capacity_is_shared_and_reusable(tmp_path: Path) -> None:
         finally:
             for stream in streams:
                 await stream.aclose()
-        recovered = second._pump(chunks())
+        recovered = memory._execution.pump(chunks())
         assert (await anext(recovered)).text == "answer"
         await recovered.aclose()
 
@@ -254,9 +253,8 @@ async def test_stream_cleanup_failure_does_not_leak_capacity(tmp_path: Path) -> 
             raise ValueError("cleanup failed")
 
     with Memory(tmp_path, embedder=TinyEmbedder()) as memory:
-        facade = AsyncMemory(memory)
         for _ in range(9):
-            stream = facade._pump(broken_cleanup())
+            stream = memory._execution.pump(broken_cleanup())
             assert (await anext(stream)).text == "answer"
             with pytest.raises(ValueError, match="cleanup failed"):
                 await stream.aclose()
@@ -292,8 +290,7 @@ async def test_terminal_chunk_releases_worker_before_the_caller_stops(tmp_path: 
             closed.append(True)
 
     with Memory(tmp_path, embedder=TinyEmbedder()) as memory:
-        facade = AsyncMemory(memory)
-        streams = [facade._pump(chunks()) for _ in range(9)]
+        streams = [memory._execution.pump(chunks()) for _ in range(9)]
         try:
             for index, stream in enumerate(streams):
                 assert (await anext(stream)).result is not None
@@ -317,7 +314,7 @@ async def test_cancellation_during_terminal_cleanup_remains_cancellation(tmp_pat
             assert release.wait(5)
 
     with Memory(tmp_path, embedder=TinyEmbedder()) as memory:
-        stream = AsyncMemory(memory)._pump(chunks())
+        stream = memory._execution.pump(chunks())
         pending = asyncio.create_task(anext(stream))
         try:
             assert await asyncio.to_thread(closing.wait, 2)

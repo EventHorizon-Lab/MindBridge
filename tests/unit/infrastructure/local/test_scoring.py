@@ -131,7 +131,7 @@ def test_multikey_batches_reject_invalid_vectors(invalid: tuple[float, ...]) -> 
         max_cosine_scores(queries, iter(documents))
 
 
-def test_python_310_fallback_preserves_the_public_scoring_contract(
+def test_python_311_fallback_preserves_the_public_scoring_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(scoring, "_dot_product", scoring._fallback_dot_product)

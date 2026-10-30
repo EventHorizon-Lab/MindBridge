@@ -17,6 +17,7 @@ from PIL.TiffImagePlugin import IFDRational
 from test_openai_sdk import _sdk_client
 
 import mindbridge.configuration as configuration
+import mindbridge.recipes as recipes
 from mindbridge import (
     AssetRef,
     Memory,
@@ -232,11 +233,11 @@ def test_config_factory_injects_only_the_generation_adapter(
     captured: dict[str, object] = {}
     marker = cast(GenerationBackend, object())
 
-    def build(values: dict[str, object]) -> GenerationBackend:
+    def build(**values: object) -> GenerationBackend:
         captured.update(values)
         return marker
 
-    monkeypatch.setattr(configuration, "_openai_factory", build)
+    monkeypatch.setattr(recipes, "_owned_openai_models", build)
     value = configuration.OpenAIGenerationConfig.model_validate(
         {
             "provider": "openai",

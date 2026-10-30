@@ -966,15 +966,7 @@ def _caption_response(*captions: str) -> httpx.Response:
 def test_declarative_generation_slot_carries_every_control_through_the_real_factory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A control is only wired if it survives the recipe factory, which no adapter test sees.
-
-    `_owned_openai_models` forwards every adapter control it is given, so a control added to
-    `_build_generation` cannot be forgotten there, and an unknown name still raises `TypeError`
-    from the adapter on the first `from_config`. Every other configuration test monkeypatches
-    that factory away, which is how the documented `min_video_seconds` shipped unreachable when
-    the factory still restated the signature by hand. Only the SDK client is faked here, so the
-    real factory runs and the built adapter has to answer.
-    """
+    """Exercise declarative controls through the real factory with only HTTP transport replaced."""
 
     def respond(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/embeddings"):

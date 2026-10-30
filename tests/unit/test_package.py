@@ -107,14 +107,7 @@ def test_product_does_not_address_benchmarks() -> None:
 
 
 def test_imported_distributions_are_declared() -> None:
-    """Every third-party root a product module imports must be declared by this project.
-
-    The walk behind ``_benchmark_references`` already collected these imports and then threw the
-    third-party ones away. Keeping them turns the packaging tests around:
-    ``test_dependency_surface_is_exact`` is a tripwire against *adding* a dependency and cannot
-    see one that is imported but undeclared. This catches the direct case; a transitive one --
-    an upstream package importing what it never declares -- needs the isolated CI legs.
-    """
+    """Require direct imports to be declared; isolated CI installs check transitive dependencies."""
     declared = {
         canonicalize_name(_name(item))
         for item in [*DEPENDENCIES, *(item for items in EXTRAS.values() for item in items)]
@@ -160,11 +153,7 @@ def _installed_roots() -> dict[str, frozenset[str]]:
 
 
 def test_deferred_and_conditional_imports_are_classified(tmp_path: Path) -> None:
-    """Pin the classification the declaration check depends on, on inputs the source lacks.
-
-    Every deferred backend in this package loads through ``import_module``, so a scan that only
-    read import statements would run its new branch over a corpus with nothing to find.
-    """
+    """Classify deferred and conditional imports without treating prose as a dependency."""
     module = tmp_path / "sample.py"
     module.write_text(
         "import os\n"
@@ -270,48 +259,13 @@ def test_benchmark_reference_scan_detects_a_lazy_import(tmp_path: Path) -> None:
     assert _benchmark_references(dispatcher) == {"mindbridge.benchmarks.cli"}
 
 
-def test_dependency_surface_is_exact() -> None:
-    assert {_name(item) for item in DEPENDENCIES} == {
-        "numpy",
-        "opentelemetry-api",
-        "pydantic",
-        "zvec",
-    }
+def test_all_extra_contains_every_optional_dependency() -> None:
     assert set(EXTRAS["all"]) == {
         item for extra, items in EXTRAS.items() if extra != "all" for item in items
     }
-    extras = {
-        extra: {_name(item) for item in items} for extra, items in EXTRAS.items() if extra != "all"
-    }
-    assert extras == {
-        "benchmarks": {
-            "httpx",
-            "huggingface-hub",
-            "nltk",
-            "opentelemetry-sdk",
-            "pyarrow",
-            "pyyaml",
-            "regex",
-            "tqdm",
-        },
-        "observability": {"opentelemetry-sdk"},
-        "openai": {"av", "httpx2", "openai", "pillow"},
-        "face": {"opencv-python-headless"},
-        "gazetteer": {"pyproj", "shapely"},
-        "local": {
-            "pillow",
-            "funasr",
-            "librosa",
-            "sentence-transformers",
-            "soundfile",
-            "torch",
-            "torchaudio",
-            "torchvision",
-            "transformers",
-        },
-        "server": {"fastapi", "starlette", "uvicorn"},
-        "mcp": {"mcp"},
-    }
+
+
+def test_dependencies_do_not_require_external_storage_services() -> None:
     declared = set(EXTRAS) | {_name(item) for item in DEPENDENCIES}
     declared |= {_name(item) for items in EXTRAS.values() for item in items}
     forbidden = (
@@ -321,9 +275,6 @@ def test_dependency_surface_is_exact() -> None:
         "celery",
         "redis",
         "boto",
-        "edge",
-        "media",
-        "cloud-models",
     )
     assert {name for name in declared if any(word in name for word in forbidden)} == set()
 

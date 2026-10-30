@@ -21,26 +21,13 @@ from mindbridge.kernel.runtime import (
 )
 from mindbridge.kernel.tracing import Traced
 
-# One drain hydrates and applies this many outbox rows per read. A flush is a fixed ~50 ms
-# fsync-class operation whatever it carries -- one document costs the same as a thousand -- and it
-# also creates one durable segment, which every later search pays for until an optimize merges it
-# away. Both costs are therefore per *flush*, so a bulk write applies rows in the largest batch
-# the index writes in a single call, 1024 documents, and flushes once per batch. `ZvecIndex.upsert`
-# chunks anything larger, so this is a memory-for-flushes choice and not a safety bound. Raising
-# it from 256 quartered both the flush count and the segment count of a bulk `add_many` (8 000
-# memories: 32 flushes and 32 segments became 8 and 8) for about 32 MiB of transient hydration at
-# 1024 dimensions.
+# Bound each outbox read to the native index's upsert batch size.
 OUTBOX_BATCH_SIZE = 1_024
 
 
-# Applied-but-unflushed outbox rows that trigger the Zvec flush. Zvec answers dense and full-text
-# queries from unflushed writes (and hides unflushed deletes), so a public write only has to
-# *apply* its rows to be visible; the ~50 ms flush is taken once per this many rows, when a drain
-# applied a deletion, and at `optimize()`, `reindex()` and `close()`. Rows are acknowledged in
-# SQLite only after that flush, exactly as before, and a single `add` no longer pays a flush or
-# leaves one segment behind.
-# ponytail: 256 caps the replay after a crash at 256 idempotent upserts; raise it if segment count
-# ever matters more than that.
+# Flush once applied rows reach this threshold, on deletion, or at explicit maintenance/close.
+# Unflushed mutations are searchable, but their outbox rows remain durable in SQLite until the
+# native flush succeeds. A batch can exceed this threshold; it is not a crash-replay size cap.
 INDEX_FLUSH_OPERATIONS = 256
 
 

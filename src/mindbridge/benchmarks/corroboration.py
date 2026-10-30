@@ -15,13 +15,13 @@ import random
 import statistics
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
-from typing import Any
+from typing import NotRequired, TypedDict
 
 from mindbridge import (
     Blob,
@@ -44,6 +44,36 @@ from mindbridge import (
 _REFERENCE = datetime(2026, 9, 1, tzinfo=timezone.utc)
 _BUDGET = ContextBudget(max_items=64, max_chars=256_000)
 _ROUTES = ("text", "image", "audio", "video", "omni")
+
+
+class VisibilityResult(TypedDict):
+    expected_visible: bool
+    visible: bool
+    compiled: bool
+    withdrawal_ok: NotRequired[bool]
+
+
+class CorroborationResult(VisibilityResult):
+    family: str
+    split: str
+    route: str
+    seed: int
+    arm: str
+    confidence: float
+    compile_chars: int
+    budget_chars: int
+    budget_items: int
+    budget_ok: bool
+    consolidation_calls: int
+    input_records: int
+    input_chars: int
+    embedding_items: int
+    write_seconds: float
+    compile_ms: float
+    target_evidence_count: int
+    post_visible: NotRequired[bool]
+    total_seconds: NotRequired[float]
+    store_bytes: NotRequired[int]
 
 
 @dataclass(frozen=True)
@@ -268,7 +298,9 @@ def _content(label: str, route: str) -> ContentInput:
     return Blob(payload, media_type=media_type)
 
 
-def run_case(scenario: Scenario, route: str, seed: int, arm: str, data_dir: Path) -> dict[str, Any]:
+def run_case(
+    scenario: Scenario, route: str, seed: int, arm: str, data_dir: Path
+) -> CorroborationResult:
     """Run identical captures/proposals under one policy in an exclusive physical store."""
     rng = random.Random(seed)
     actor = f"person-{rng.getrandbits(48):012x}"
@@ -326,7 +358,7 @@ def run_case(scenario: Scenario, route: str, seed: int, arm: str, data_dir: Path
             reference_at=_REFERENCE + timedelta(days=1),
         )
         selected = {hit.id for hit in compiled.hits}
-        result_row: dict[str, Any] = {
+        result_row: CorroborationResult = {
             "family": scenario.family,
             "split": scenario.split,
             "route": route,
@@ -366,7 +398,7 @@ def run_case(scenario: Scenario, route: str, seed: int, arm: str, data_dir: Path
     return result_row
 
 
-def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def summarize(rows: Sequence[VisibilityResult]) -> dict[str, int | float | None]:
     positive = [row for row in rows if row["expected_visible"]]
     negative = [row for row in rows if not row["expected_visible"]]
     withdrawals = [row for row in rows if "withdrawal_ok" in row]
@@ -412,8 +444,8 @@ def _ablation(scenario: Scenario, *, union_alternatives: bool) -> bool:
     return any(not first & second for i, first in enumerate(target) for second in target[i + 1 :])
 
 
-def _paired(rows: Sequence[Mapping[str, Any]], arm: str) -> dict[str, Any]:
-    def key(row: Mapping[str, Any]) -> tuple[str, str, int]:
+def _paired(rows: Sequence[CorroborationResult], arm: str) -> dict[str, int | float | None]:
+    def key(row: CorroborationResult) -> tuple[str, str, int]:
         return row["family"], row["route"], row["seed"]
 
     baseline = {key(row): row for row in rows if row["arm"] == "A"}
@@ -480,7 +512,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "limitations": "Fixed proposals, constant embeddings, synthetic media bytes; no perception or natural-distribution quality claims.",
     }
     (args.output / "manifest.json").write_text(json.dumps(meta, indent=2) + "\n")
-    rows: list[dict[str, Any]] = []
+    rows: list[CorroborationResult] = []
     with (
         TemporaryDirectory(prefix="mindbridge-corroboration-") as temporary,
         (args.output / "samples.jsonl").open("w") as output,
@@ -498,7 +530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         output.write(json.dumps(row, sort_keys=True) + "\n")
                         output.flush()
             print(f"completed {case.split}/{case.family}", flush=True)
-    report: dict[str, Any] = {
+    report: dict[str, object] = {
         "arms": {
             arm: summarize([row for row in rows if row["arm"] == arm]) for arm in ("A", "A2", "B")
         },

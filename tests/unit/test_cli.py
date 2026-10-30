@@ -747,7 +747,7 @@ def test_the_vision_recipe_declares_a_visual_capability_memory_accepts(
 
 
 def test_every_recipe_slot_has_a_command_line_flag() -> None:
-    """The four literals this used to need are now one list; keep the flag set derived from it."""
+    """Expose a construction flag for every supported model slot."""
     from mindbridge import cli
 
     flags = {action.dest for action in cli._parser()._actions}
@@ -776,7 +776,9 @@ class _SdkClient:
         self.close_calls += 1
 
 
-@pytest.mark.parametrize("slot", ("embedder", "answerer", "former", "transcriber", "vision"))
+@pytest.mark.parametrize(
+    "slot", ("embedder", "answerer", "former", "consolidator", "transcriber", "vision")
+)
 def test_a_recipe_closes_the_sdk_client_it_constructed(
     slot: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -797,6 +799,22 @@ def test_a_recipe_closes_the_sdk_client_it_constructed(
     # recipe's, so the connection pool goes when the returned backend does.
     assert [client.closed for client in clients] == [True]
     assert [client.close_calls for client in clients] == [1]
+
+
+@pytest.mark.parametrize("entry", ("recipe", "config"))
+def test_failed_backend_construction_closes_the_created_client(
+    entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _SdkClient()
+    monkeypatch.setattr(recipes, "_openai_client", lambda **_values: client)
+    with pytest.raises(ValidationError, match="embedding_model"):
+        if entry == "recipe":
+            monkeypatch.setattr(recipes, "_OPENAI_MODELS", {"embedder": ""})
+            recipes.embedder("openai")
+        else:
+            recipes._owned_openai_models(embedding_model="")
+
+    assert client.close_calls == 1
 
 
 @pytest.mark.parametrize(

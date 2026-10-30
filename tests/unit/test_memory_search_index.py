@@ -1,15 +1,4 @@
-"""`Memory` driven against the real Zvec index rather than a stand-in.
-
-The API tests install a fake index so they can steer retrieval, which means they cannot see any
-behaviour the real index actually implements. One such rule cost a release: a memory's full-text
-document is written on its ``object_part == 0`` row alone, so a memory stored without that row is
-reachable by the dense route only. A test asserting the memory was "still searchable" passed
-against the fake while the real index could not match it at all.
-
-These tests therefore construct `Memory` with no index substitution. Only the models are faked;
-the store, the outbox, and the index are the real ones. `zvec` is a base dependency, so this runs
-wherever the suite runs.
-"""
+"""Public-SDK retrieval with real SQLite, outbox, and Zvec; only model backends are replaced."""
 
 from __future__ import annotations
 

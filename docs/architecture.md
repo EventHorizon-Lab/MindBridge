@@ -440,6 +440,16 @@ an already hydrated search may finish while that search returns its snapshot; le
 available until the operation ends, when pending orphan cleanup can remove it. A returned asset
 path does not extend that lease beyond the operation.
 
+The local store can reuse immutable candidate identity projections and complete plain-text
+record slates within one write generation. Active write transactions bypass reuse; completion,
+including rollback or a commit error, invalidates the generation.
+Admission waits for repeated reads without a commit, and a working set that exceeds the cache
+bound disables reuse until the next generation. A partial miss reads the complete slate again;
+it never combines cached records with records from a newer SQLite snapshot. Scoped reads, media,
+and semantic contexts retain their existing record-read path, including time-dependent validity
+selection and media leases. Missing IDs are not cached. Candidate discovery, scoring, and ranking
+remain unchanged.
+
 `reindex()` reads authoritative SQLite pages, replaces the Zvec collection, then replays the
 outbox so writes committed during the scan are retained. `close()` rejects new work, waits for
 active operations, releases asset leases, flushes and acknowledges the applied index work, and

@@ -7,6 +7,7 @@ import sqlite3
 import struct
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
+from functools import lru_cache
 from operator import mul
 from typing import Literal
 
@@ -50,6 +51,30 @@ def prepare_write_batch(
 
 
 def memory_from_row(
+    row: sqlite3.Row,
+    *,
+    assets: tuple[StoredAsset, ...] = (),
+    context: MemoryContext | None = None,
+) -> StoredMemory:
+    # Ranking repeatedly hydrates the same small text records. Key by the complete SQLite
+    # row, including access/forgetting state, so any changed column misses immediately.
+    # Media leases and scoped semantic contexts remain on the uncached path. Bound retained
+    # text to 1024 x 2048 characters (at most 8 MiB of UTF-8 payload, plus row/object overhead).
+    if (
+        not assets
+        and context is None
+        and len(row_text(row, "content")) + len(row_text(row, "metadata_json")) <= 2_048
+    ):
+        return _text_memory_from_row(row)
+    return _memory_from_row(row, assets=assets, context=context)
+
+
+@lru_cache(maxsize=1_024)
+def _text_memory_from_row(row: sqlite3.Row) -> StoredMemory:
+    return _memory_from_row(row)
+
+
+def _memory_from_row(
     row: sqlite3.Row,
     *,
     assets: tuple[StoredAsset, ...] = (),

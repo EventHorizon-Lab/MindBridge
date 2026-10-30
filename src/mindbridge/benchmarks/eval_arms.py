@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from opentelemetry import trace
 from opentelemetry.trace import Tracer
 
-if TYPE_CHECKING:
-    pass
 from mindbridge import (
     AbstentionReason,
     AnswerPolicy,
@@ -47,6 +45,9 @@ from mindbridge.models.openai_sdk import (
     _record_usage_batch,
     _styled_answer_prompt,
 )
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletion
 
 # Baseline transport belongs to the harness. Evidence readers reuse the product's policy;
 # blind changes only the permitted source to the model's prior. Version the changed protocol.
@@ -140,7 +141,7 @@ class _BaselineGenerator:
             None if "max_tokens" not in options else int(options["max_tokens"]) or None
         )
         thinking = options.get("enable_thinking")
-        extra_body: dict[str, Any] = (
+        extra_body: dict[str, object] = (
             {}
             if thinking is None
             else {"chat_template_kwargs": {"enable_thinking": thinking == "true"}}
@@ -172,7 +173,6 @@ class _BaselineGenerator:
         self._generation_capabilities = config.generation_capabilities
         self._query_asset_cache: dict[Path, AssetRef] = {}
         self._native_media = OpenAIModels(
-            generation_client=cast(Any, self._client),
             generation_model=self._model,
             generation_capabilities=self._generation_capabilities,
             generation_seed=self._seed,
@@ -255,7 +255,11 @@ class _BaselineGenerator:
             usages = []
             try:
                 mark_model_requests(1)
-                response = await self._client.chat.completions.create(**request)
+                create = cast(
+                    "Callable[..., Awaitable[ChatCompletion]]",
+                    self._client.chat.completions.create,
+                )
+                response = await create(**request)
                 _record_openai_provenance(response)
                 usages.append(
                     _model_usage(
@@ -287,7 +291,7 @@ class _BaselineGenerator:
         system: str,
         question_assets: tuple[AssetRef, ...],
         evidence_hits: Sequence[SearchHit],
-    ) -> tuple[dict[str, Any], frozenset[Modality]]:
+    ) -> tuple[dict[str, object], frozenset[Modality]]:
         # Reuse the product adapter's capability checks, integrity checks, media-size fitting,
         # video limits, and native part preparation. The benchmark then restores its existing
         # context prompt; no benchmark labels or reference answers participate in this request.
@@ -334,7 +338,7 @@ class _BaselineGenerator:
                 for part in content
                 if isinstance((kind := part.get("type")), str) and kind in kind_to_modality
             )
-        return cast(dict[str, Any], request), frozenset(modalities)
+        return request, frozenset(modalities)
 
     @classmethod
     def _bound_native_content(

@@ -46,13 +46,9 @@ from functools import partial
 from pathlib import Path
 from typing import cast
 
+import httpx2 as httpx
 from corpora import Unit, gallery_units, write_unit
 from openai import APIError, OpenAI
-
-# The installed OpenAI SDK is built on `httpx2`, not `httpx`, and only the former is in the
-# dependency closure. Taking the module the client itself uses keeps the hook attachable whichever
-# one a future pin brings, instead of importing a name that is not installed.
-from openai._base_client import httpx2 as httpx
 
 from mindbridge import (
     AnswerPolicy,
@@ -63,6 +59,7 @@ from mindbridge import (
     Modality,
     ModelInput,
     ObservationContext,
+    OpenAIModels,
     SearchHit,
 )
 from mindbridge.benchmarks._official.longmemeval_prompts import (
@@ -80,7 +77,6 @@ from mindbridge.benchmarks.official_scorers import judge_plan, local_scores, par
 from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT
 from mindbridge.context import evidence_cost
 from mindbridge.exceptions import ModelError
-from mindbridge.models.openai_sdk import OpenAIModels
 
 RECALL_LIMIT = 12
 EMBEDDING_DIMENSION = 2048

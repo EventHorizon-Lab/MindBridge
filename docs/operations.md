@@ -40,6 +40,8 @@ across directories. The fixed runtime bounds are:
 | SQLite connections, including borrowed and idle handles | 32 per directory; 128 per process |
 | REST `/v1` requests and MCP tool calls sharing one directory | 32 per directory; 128 per process |
 | Open local stores | 16 per process |
+| Cached candidate identity projections | 1,024 per directory |
+| Cached hydrated plain-text records | 1,024 per directory; at most 2,048 content and metadata characters each |
 | Materialized input text and media retained by active operations | 512 MiB per operation and per process |
 | Inputs in one SDK `add_many()` | 1,024 |
 | Captures awaiting enrichment or formation | 10,000 per directory |
@@ -89,6 +91,12 @@ Directory closure waits for both its borrowers and any eviction already closing 
 handles. The active limits remain 32 per directory and 128 per process.
 Handles already being closed by eviction still count toward the directory limit.
 
+Read caches admit stable working sets, bypass active writes, and invalidate when a write transaction
+ends. A working set larger than the cache bound disables its cache until the next write generation.
+Hydrated-record reuse excludes scoped
+reads, media, and semantic contexts. Its retained UTF-8 content and metadata total at most 8 MiB
+per directory, plus object overhead; the smaller candidate cache retains IDs and occurrence times.
+
 These bounds cover MindBridge-owned submissions, workers, stores, and SQLite handles. The byte
 budget charges UTF-8 text and media sizes before materialization and releases them on operation
 exit. Inputs whose own cumulative size exceeds 512 MiB raise `ValidationError`; contention for
@@ -98,6 +106,8 @@ decoded media, native model/Zvec allocations, backend request sizes, and provide
 need host sizing. A full capture backlog refuses new queued records atomically; settle existing
 captures before retrying. Duplicate captures remain idempotent at the limit.
 The limits are conservative safety bounds, not measured optimal throughput settings.
+Use the [local SDK load test](benchmarking.md#measure-local-sdk-concurrency) to measure throughput,
+tail latency, and overload rejections for a physical store before tuning its producers.
 Use backend timeouts and bound the host's own producers. At the HTTP server boundary,
 Uvicorn's [concurrency limit](https://uvicorn.dev/server-behavior/#resource-limits) can
 also reject excess requests based on open connections and in-flight tasks. A worker count alone

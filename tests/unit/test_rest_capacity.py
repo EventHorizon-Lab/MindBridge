@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Generator, Sequence
+from collections.abc import Sequence
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -14,7 +14,6 @@ from fastapi.testclient import TestClient
 from starlette.types import Message, Scope
 
 from mindbridge import (
-    AnswerChunk,
     AnswerPolicy,
     AnswerResult,
     AsyncMemory,
@@ -157,14 +156,10 @@ def test_real_operation_overload_has_the_retryable_error_envelope(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_rest_and_async_sdk_share_stream_capacity(tmp_path: Path) -> None:
-    def chunks() -> Generator[AnswerChunk, None, AnswerResult]:
-        yield AnswerChunk(text="answer")
-        return AnswerResult(answer="answer")
-
     with Memory(tmp_path, embedder=TinyEmbedder(), answerer=_Answerer()) as memory:
         memory.add("reference evidence")
         facade = AsyncMemory(memory)
-        streams = [facade._pump(chunks()) for _ in range(8)]
+        streams = [facade.ask_stream("reference evidence") for _ in range(8)]
         with TestClient(create_app(memory=memory)) as client:
             try:
                 for stream in streams:

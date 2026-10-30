@@ -14,13 +14,11 @@ from collections.abc import (
 from dataclasses import fields
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import yaml
 from pydantic import SecretStr
 
-if TYPE_CHECKING:
-    pass
 from mindbridge import MindBridgeConfig
 from mindbridge.benchmarks.eval_adapters import MediaManifest
 from mindbridge.benchmarks.eval_config import (

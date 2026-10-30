@@ -114,6 +114,7 @@ class Connections:
         # keeps the cache where writes are observable: one data directory has one live owner, so
         # a commit this process did not make cannot exist.
         self._write_generation = 0
+        self._read_state = (0, 0)
         self._directory_lock = DataDirectoryLock(self.data_dir)
         if not _PROCESS_INSTANCES.acquire():
             self._directory_lock.close()
@@ -134,6 +135,14 @@ class Connections:
     def write_generation(self) -> int:
         """How many transactions have committed; a reader's cache key over the whole store."""
         return self._write_generation
+
+    @property
+    def read_generation(self) -> int | None:
+        """A reusable read version, or none while a writer can change committed state."""
+        # Capture one immutable pair so readers never combine a new version with an old writer
+        # count, and need not contend on the process-wide connection-pool condition.
+        generation, writers = self._read_state
+        return None if writers else generation
 
     def close(self) -> None:
         """Release the pooled connections and the directory; repeated calls are harmless."""
@@ -318,6 +327,9 @@ class Connections:
     def transaction(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:
         with self.connection(secure_delete=secure_delete) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            with self._pool_lock:
+                generation, writers = self._read_state
+                self._read_state = (generation, writers + 1)
             try:
                 yield connection
             except BaseException:
@@ -326,6 +338,13 @@ class Connections:
             else:
                 connection.commit()
                 self._write_generation += 1
+            finally:
+                # Keep caches unavailable through commit/rollback, including the gap between
+                # SQLite returning and Python updating its counters. A failed transaction also
+                # invalidates read reuse: a commit error must never leave an assumed old view.
+                with self._pool_lock:
+                    generation, writers = self._read_state
+                    self._read_state = (generation + 1, writers - 1)
 
     @contextmanager
     def read_transaction(self) -> Iterator[sqlite3.Connection]:

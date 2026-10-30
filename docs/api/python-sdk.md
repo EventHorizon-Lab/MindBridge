@@ -1711,8 +1711,6 @@ The added map context has a separate whole-candidate character budget; the exist
 byte bound remains in force. Enabling this resource changes the available external knowledge,
 requires task-specific quality evaluation and must be declared in comparisons.
 
-The [multimodal recall guide](../grounded-multimodal-recall.md) documents media fitting and limits.
-
 The default `generation_response_format="json_schema"` sends strict schemas for structural model
 operations: formation, consolidation, visual descriptions, media diagnosis, and recall planning.
 Explicit `"json_object"` supports compatible endpoints that implement only JSON mode. Both retain local

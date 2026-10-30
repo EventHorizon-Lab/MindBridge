@@ -19,7 +19,7 @@ import re
 from collections.abc import Sequence
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
@@ -157,7 +157,7 @@ def logic_structure(group_structure: str) -> VideoMMEV2LogicStructure | None:
 def load_video_mme_v2(annotation_path: Path) -> tuple[VideoMMEV2Group, ...]:
     """Load the official Hugging Face Parquet release without materializing media."""
     try:
-        parquet = cast(Any, import_module("pyarrow.parquet"))
+        parquet = import_module("pyarrow.parquet")
     except ModuleNotFoundError as error:
         if error.name is not None and not error.name.startswith("pyarrow"):
             raise

@@ -1,10 +1,4 @@
-"""The kernel says out loud where it degrades instead of raising.
-
-Observability rode entirely on OpenTelemetry spans, which are no-ops when the SDK is not
-installed, and the kernel held no logger at all. Silent degradation is how a capability dies
-unnoticed here: video captioning never worked for months, and media encoding silently fell back
-to text. One logger, at the points where a reason string already existed and was thrown away.
-"""
+"""Kernel policy refusals report safe diagnostic reasons through ordinary logging."""
 
 from __future__ import annotations
 

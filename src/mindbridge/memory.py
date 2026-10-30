@@ -10,7 +10,6 @@ settings travel as explicit constructor arguments.
 
 from __future__ import annotations
 
-import asyncio
 import builtins
 import errno
 import logging
@@ -24,14 +23,11 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextvars import copy_context
 from dataclasses import fields
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 from threading import RLock
-from time import perf_counter
-from typing import cast
 
 from opentelemetry import trace
 from opentelemetry.trace import Tracer
@@ -46,7 +42,7 @@ from mindbridge.exceptions import (
 )
 from mindbridge.infrastructure.local.assets import AssetStore
 from mindbridge.infrastructure.local.zvec_index import ZvecIndex, validate_index_configuration
-from mindbridge.kernel.answering import ASYNC_QUEUE_TIME_MS, Answering
+from mindbridge.kernel.answering import Answering
 from mindbridge.kernel.compilation import Compilation
 from mindbridge.kernel.contracts import (
     close_quietly,
@@ -74,7 +70,6 @@ from mindbridge.kernel.runtime import (
 )
 from mindbridge.kernel.settings import resolve_settings
 from mindbridge.kernel.speech import Speech
-from mindbridge.kernel.validation import strict_bool
 from mindbridge.kernel.vision import Vision
 from mindbridge.models.base import (
     ConsolidationBackend,
@@ -126,7 +121,6 @@ from mindbridge.types import (
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_CONFIG = MemoryConfig()
-_STREAM_EXHAUSTED = object()
 
 
 class Memory:
@@ -371,6 +365,7 @@ class Memory:
             backends=self._backends,
             settings=self._settings,
             lifecycle=self._lifecycle,
+            execution=self._execution,
             hydrator=self._hydrator,
             materializer=materializer,
             speech=speech,
@@ -1270,37 +1265,8 @@ class AsyncMemory:
 
         With `capture=True` each item commits through `capture()` and owes a later `settle()`.
         """
-        if not isinstance(contents, AsyncIterable):
-            raise ValidationError("contents must be an async iterable of memory inputs")
-        capture = strict_bool(capture, "capture")
-        iterator = aiter(contents)
-        index = 0
-        while True:
-            try:
-                content = await anext(iterator)
-            except StopAsyncIteration:
-                return
-            except MindBridgeError as error:
-                if error.subject is None:
-                    error.subject = f"contents[{index}]"
-                raise
-            try:
-                if isinstance(content, StreamInput):
-                    record = (
-                        await self._capture_stream_input(content)
-                        if capture
-                        else await self._add_stream_input(content)
-                    )
-                elif capture:
-                    record = await self.capture(content)
-                else:
-                    record = await self.add(content)
-            except MindBridgeError as error:
-                if error.subject is None:
-                    error.subject = f"contents[{index}]"
-                raise
+        async for record in self._memory._ingestion.add_async_stream(contents, capture=capture):
             yield record
-            index += 1
 
     async def search(
         self,
@@ -1357,24 +1323,16 @@ class AsyncMemory:
         link_identities: bool = True,
         answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
-        queued_at = perf_counter()
-
-        def answer() -> AnswerResult:
-            token = ASYNC_QUEUE_TIME_MS.set((perf_counter() - queued_at) * 1_000.0)
-            try:
-                return self._memory.ask(
-                    question,
-                    limit=limit,
-                    memory_type=memory_type,
-                    reference_at=reference_at,
-                    scope=scope,
-                    link_identities=link_identities,
-                    answer_policy=answer_policy,
-                )
-            finally:
-                ASYNC_QUEUE_TIME_MS.reset(token)
-
-        return await self._memory._execution.run(answer)
+        return await self._memory._execution.run(
+            self._memory.ask,
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+            link_identities=link_identities,
+            answer_policy=answer_policy,
+        )
 
     def ask_stream(
         self,
@@ -1407,77 +1365,7 @@ class AsyncMemory:
             link_identities=link_identities,
             answer_policy=answer_policy,
         )
-        return self._pump(stream)
-
-    async def _pump(
-        self,
-        stream: Generator[AnswerChunk, None, AnswerResult],
-    ) -> AsyncGenerator[AnswerChunk, None]:
-        loop = asyncio.get_running_loop()
-        context = copy_context()
-        # One worker, not `asyncio.to_thread`: every step has to run on the same thread so the
-        # span and operation contextvars the generator attaches on its first step are the ones
-        # it detaches on its last. `to_thread` runs each call in a fresh context copy, which
-        # would strand both. `next` is given a sentinel because a `StopIteration` crossing a
-        # future becomes `RuntimeError` rather than ending the loop.
-        #
-        # Admission happens before a worker is created, and every wrapper and transport borrows
-        # from this instance's same bounded pool.
-        worker = self._memory._execution.streams.borrow()
-        first_advance = True
-        closed = False
-
-        def advance(queued_at: float, record_queue: bool) -> object:
-            token = None
-            if record_queue:
-                token = ASYNC_QUEUE_TIME_MS.set((perf_counter() - queued_at) * 1_000.0)
-            try:
-                return next(stream, _STREAM_EXHAUSTED)
-            finally:
-                if token is not None:
-                    ASYNC_QUEUE_TIME_MS.reset(token)
-
-        async def close_stream() -> None:
-            nonlocal closed
-            if closed:
-                return
-            closed = True
-            try:
-                closing = loop.run_in_executor(worker, context.run, stream.close)
-                closing.add_done_callback(
-                    lambda done: None if done.cancelled() else done.exception()
-                )
-                await asyncio.shield(closing)
-            finally:
-                released = asyncio.wrap_future(worker.release())
-                await asyncio.shield(released)
-
-        try:
-            while True:
-                queued_at = perf_counter()
-                record_queue = first_advance
-                first_advance = False
-                chunk = await loop.run_in_executor(
-                    worker,
-                    context.run,
-                    advance,
-                    queued_at,
-                    record_queue,
-                )
-                if chunk is _STREAM_EXHAUSTED:
-                    return
-                answer_chunk = cast(AnswerChunk, chunk)
-                if answer_chunk.result is not None:
-                    # Reading the terminal result is a complete consumption: callers need not
-                    # advance once more or explicitly close it to return worker capacity.
-                    await close_stream()
-                    yield answer_chunk
-                    return
-                yield answer_chunk
-        finally:
-            # A running executor call cannot be cancelled, so the close always completes even
-            # when the awaiting task is gone; `wait=False` keeps that off the event loop.
-            await close_stream()
+        return self._memory._execution.pump(stream)
 
     async def compile(
         self,

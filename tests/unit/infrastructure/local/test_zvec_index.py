@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Barrier, Event, Lock
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, NoReturn, cast
 
 import numpy as np
@@ -60,7 +60,7 @@ def test_every_batch_status_is_checked() -> None:
     index = object.__new__(ZvecIndex)
     index._gate = _CollectionGate()
     index.dimension = 2
-    index._zvec = _FakeZvec
+    index._zvec = cast(ModuleType, _FakeZvec)
     index._collection = _FailingCollection()
 
     with pytest.raises(ZvecWriteError, match="embedding_bad: INTERNAL_ERROR: disk full"):
@@ -71,7 +71,7 @@ def test_native_fd_status_becomes_safe_emfile() -> None:
     index = object.__new__(ZvecIndex)
     index._gate = _CollectionGate()
     index.dimension = 2
-    index._zvec = _FakeZvec
+    index._zvec = cast(ModuleType, _FakeZvec)
     index._collection = _FileDescriptorFailingCollection()
 
     with pytest.raises(OSError) as failure:
@@ -109,7 +109,7 @@ def test_native_writes_are_serialized_across_collections() -> None:
         index = object.__new__(ZvecIndex)
         index._gate = _CollectionGate()
         index.dimension = 2
-        index._zvec = _FakeZvec
+        index._zvec = cast(ModuleType, _FakeZvec)
         index._collection = BlockingCollection()
         indexes.append(index)
 
@@ -137,7 +137,7 @@ def test_only_aggregate_vector_carries_full_text() -> None:
     index = object.__new__(ZvecIndex)
     index._gate = _CollectionGate()
     index.dimension = 2
-    index._zvec = _FakeZvec
+    index._zvec = cast(ModuleType, _FakeZvec)
     collection = _CapturingCollection()
     index._collection = collection
 
@@ -163,7 +163,7 @@ def test_only_aggregate_vector_carries_full_text() -> None:
 def test_delete_accepts_only_not_found_failures() -> None:
     index = object.__new__(ZvecIndex)
     index._gate = _CollectionGate()
-    index._zvec = _FakeZvec
+    index._zvec = cast(ModuleType, _FakeZvec)
     index._collection = _DeletingCollection()
 
     index.delete(["already_deleted"])
@@ -205,7 +205,7 @@ def test_lexical_search_preserves_relative_bm25_score_and_all_filters() -> None:
         ]
     )
     index = object.__new__(ZvecIndex)
-    index._zvec = _QueryZvec
+    index._zvec = cast(ModuleType, _QueryZvec)
     index._collection = collection
     index._gate = _CollectionGate()
 
@@ -256,7 +256,7 @@ def test_group_by_falls_back_until_it_has_distinct_parent_memories() -> None:
     index.dimension = 2
     index.ef_search = 300
     index.quantization = IndexQuantization.NONE
-    index._zvec = _DenseZvec
+    index._zvec = cast(ModuleType, _DenseZvec)
     index._collection = collection
 
     docs = index._dense_query(
@@ -291,7 +291,7 @@ def test_quantized_candidate_pool_does_not_repeat_native_group_oversampling() ->
     index.dimension = 2
     index.ef_search = 2048
     index.quantization = IndexQuantization.INT8
-    index._zvec = _DenseZvec
+    index._zvec = cast(ModuleType, _DenseZvec)
     index._collection = collection
     hits = index.search((1.0, 0.0), limit=2)
     assert [hit.id for hit in hits] == ["first", "second"]
@@ -316,7 +316,7 @@ def test_dense_search_asks_for_the_largest_candidate_list_zvec_accepts() -> None
     index.dimension = 2
     index.ef_search = zvec_index_module._DEFAULT_EF_SEARCH
     index.quantization = IndexQuantization.NONE
-    index._zvec = _DenseZvec
+    index._zvec = cast(ModuleType, _DenseZvec)
     index._collection = collection
 
     # Zvec's own bound, spelled out: the module constant must not be able to drift away from it.
@@ -403,7 +403,7 @@ def test_create_search_flush_close_and_reopen(tmp_path: Path) -> None:
 def test_a_query_only_fuses_the_routes_that_can_answer_it() -> None:
     collection = _LexicalCollection([_QueryDocument("first", 0.8)])
     index = object.__new__(ZvecIndex)
-    index._zvec = _QueryZvec
+    index._zvec = cast(ModuleType, _QueryZvec)
     index._collection = collection
     index._gate = _CollectionGate()
 
@@ -426,7 +426,7 @@ def test_punctuation_left_over_from_latin_words_does_not_open_a_second_route() -
     """
     collection = _LexicalCollection([_QueryDocument("first", 0.8)])
     index = object.__new__(ZvecIndex)
-    index._zvec = _QueryZvec
+    index._zvec = cast(ModuleType, _QueryZvec)
     index._collection = collection
     index._gate = _CollectionGate()
 
@@ -683,7 +683,7 @@ def test_write_refuses_to_consume_the_fd_safety_reserve(
     index = object.__new__(ZvecIndex)
     index._gate = _CollectionGate()
     index.dimension = 2
-    index._zvec = _FakeZvec
+    index._zvec = cast(ModuleType, _FakeZvec)
     collection = _CapturingCollection()
     index._collection = collection
     monkeypatch.setattr(zvec_index_module, "_file_descriptor_usage", lambda: (900, 1_024))
@@ -1276,7 +1276,7 @@ def test_native_writes_overlap_queries(operation: str) -> None:
 
     index = object.__new__(ZvecIndex)
     index._gate = _CollectionGate()
-    index._zvec = _FakeZvec
+    index._zvec = cast(ModuleType, _FakeZvec)
     index._collection = FlushingCollection()
     index.dimension = 2
     index._flushes_since_optimization = 0

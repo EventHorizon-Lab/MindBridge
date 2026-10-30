@@ -7,6 +7,7 @@ from collections.abc import Generator, Sequence
 from contextlib import closing
 from datetime import datetime, timezone
 
+from mindbridge.infrastructure.local.store._cache import ReadCache
 from mindbridge.infrastructure.local.store._codec import (
     SQLITE_PARAMETER_BATCH,
     datetime_text,
@@ -40,6 +41,7 @@ class IndexOutbox:
         connections: Connections,
     ) -> None:
         self._connections = connections
+        self._candidate_cache: ReadCache[IndexCandidate] = ReadCache(1_024)
 
     def write_embedding(self, embedding: StoredEmbedding) -> bool:
         """Create or update one authoritative vector and enqueue its index mutation."""
@@ -185,6 +187,12 @@ class IndexOutbox:
             return ()
         for embedding_id in embedding_ids:
             require_identifier(embedding_id, "embedding_id")
+        self._connections.require_open()
+        generation = self._connections.read_generation
+        if generation is not None:
+            cached = self._candidate_cache.get(embedding_ids, generation=generation)
+            if cached is not None:
+                return cached
         rows: list[sqlite3.Row] = []
         with self._connections.connection() as connection:
             for offset in range(0, len(embedding_ids), SQLITE_PARAMETER_BATCH):
@@ -211,7 +219,15 @@ class IndexOutbox:
                 occurred_end=optional_datetime_from_row(row, "occurred_end"),
             )
             by_id[candidate.embedding_id] = candidate
-        return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
+        candidates = tuple(
+            by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id
+        )
+        if generation is not None and generation == self._connections.read_generation:
+            self._candidate_cache.put(
+                ((candidate.embedding_id, candidate) for candidate in candidates),
+                generation=generation,
+            )
+        return candidates
 
     def read_memory_index_documents(
         self,

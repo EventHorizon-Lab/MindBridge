@@ -13,13 +13,11 @@ from collections.abc import (
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar, cast, get_args, overload
+from typing import TypeVar, cast, get_args, overload
 
 import yaml
 from pydantic import SecretStr
 
-if TYPE_CHECKING:
-    pass
 from mindbridge import (
     AnswerPolicy,
     ContextBudget,

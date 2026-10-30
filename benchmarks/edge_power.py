@@ -27,10 +27,8 @@ from pathlib import Path
 from corpora import atm_units, gallery_units, source_id, write_unit
 from support_coverage import _embedder, _env
 
-from mindbridge import Memory
+from mindbridge import Memory, OpenAIModels, OpenCVFaceAnalyzer
 from mindbridge.kernel.answering import expansion_ceiling
-from mindbridge.models.openai_sdk import OpenAIModels
-from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 
 LIMIT = 12
 EDGES = ("capture", "identity", "place", "lineage", "evidence")

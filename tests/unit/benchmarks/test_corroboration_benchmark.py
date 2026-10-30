@@ -2,11 +2,18 @@
 
 from pathlib import Path
 
-from mindbridge.benchmarks.corroboration import Scenario, Step, _ablation, run_case, summarize
+from mindbridge.benchmarks.corroboration import (
+    Scenario,
+    Step,
+    VisibilityResult,
+    _ablation,
+    run_case,
+    summarize,
+)
 
 
 def test_learning_and_false_corroboration_have_separate_denominators() -> None:
-    rows = [
+    rows: list[VisibilityResult] = [
         {"expected_visible": True, "visible": True, "compiled": True},
         {"expected_visible": True, "visible": False, "compiled": False},
         {"expected_visible": False, "visible": True, "compiled": True},

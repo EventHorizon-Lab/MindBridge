@@ -12,10 +12,8 @@ from collections.abc import (
     Sequence,
 )
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-if TYPE_CHECKING:
-    pass
 from mindbridge import AnswerPolicy, MemoryConfig, MindBridgeConfig
 from mindbridge.benchmarks.eval_adapters import LoadedTask
 from mindbridge.benchmarks.eval_arms import (
