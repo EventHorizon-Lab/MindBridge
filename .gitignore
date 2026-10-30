@@ -25,8 +25,9 @@ dist/
 # this rule covering the whole directory. The committed template lives at
 # docs/examples/eval.example.yaml instead.
 .benchmarks/
-# Default output of the credentialed model-quality CLI.
+# Default outputs of the credentialed model-quality CLIs.
 /model-quality.json
+/workflow-quality.json
 
 # Autoresearch workspaces and generated artifacts are local-only.
 /autoresearch/
