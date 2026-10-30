@@ -29,7 +29,7 @@ from mindbridge import (
 )
 from mindbridge.exceptions import ValidationError
 from mindbridge.infrastructure.local.store import RECALL_MAX_ROWS
-from mindbridge.kernel.answering import _packed_grounding
+from mindbridge.kernel.grounding import pack_grounding
 
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -395,7 +395,7 @@ def test_a_linked_row_the_ranking_also_ranked_is_still_offered(tmp_path: Path) -
     Discarding a linked row that appears anywhere in the candidate pool was tried and measured
     harmful: with no character budget the pool is `min(100, limit * 3)` and the window is `limit`,
     so a gold row at rank 20 is in the pool and will never be in the window. What removes the rows
-    a wider window would have held anyway is `_packed_grounding`'s dedup, which is the only place
+    a wider window would have held anyway is `pack_grounding`'s dedup, which is the only place
     that knows what the window holds.
     """
     answerer = _RecordingAnswerer()
@@ -469,7 +469,7 @@ def test_expansion_media_rows_stop_at_the_cap_a_plan_s_media_rows_stop_at() -> N
     window = (_hit("w1"),)
     expansion = (_hit("m1", media=True), _hit("m2", media=True), _hit("t1"))
 
-    packed, added = _packed_grounding(window, expansion, (), None, media_limit=1)
+    packed, added = pack_grounding(window, expansion, (), None, media_limit=1)
 
     assert [hit.id for hit in packed] == ["w1", "m1", "t1"]
     assert added == 2, "the clip over the cap is refused; the text row behind it is not"
@@ -480,7 +480,7 @@ def test_the_media_cap_never_trims_the_window_or_the_budget_s_own_tail() -> None
     window = (_hit("w1", media=True),)
     tail = (_hit("r1", media=True), _hit("r2", media=True))
 
-    packed, added = _packed_grounding(window, (), tail, 100_000, media_limit=0)
+    packed, added = pack_grounding(window, (), tail, 100_000, media_limit=0)
 
     assert [hit.id for hit in packed] == ["w1", "r1", "r2"]
     assert added == 0

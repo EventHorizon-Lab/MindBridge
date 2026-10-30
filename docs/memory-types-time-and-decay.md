@@ -546,8 +546,8 @@ the formation path leaves behind. `CONTRADICTION` rows are functional lineages w
 visible `STATE` claims or user-stated `TRAIT` claims have different values over overlapping
 validity intervals. Accumulating `RELATION` and
 model-inferred `TRAIT` lineages are not contradiction work. `FEEDBACK` rows are records confirmed
-through `reinforce()`, or cited by an `ask()`
-answer under the default `reinforce_on_answer`. `QUERY_FAILURE` rows are near-equal recalls that
+through `reinforce()`, or reported in a non-abstained `ask()` result under the default
+`reinforce_on_answer`. `QUERY_FAILURE` rows are near-equal recalls that
 came back empty at least twice inside the configured window, named against the nearest records
 the store does hold. `PRESSURE` rows appear only over a declared `memory_budget_records`, because
 growth alone is not evidence that forgetting is useful. `IDLE` rows appear only when the operator
@@ -593,11 +593,16 @@ event end, event start, or last update time. The configured half-life applies ex
 with a nonzero floor, and repeated confirmations slow that decay. Public scores remain bounded to
 `[0, 1]`. Eligible confirmations also provide a small ranking boost when decay is disabled.
 
-Search never reinforces a hit. `ask()` does reinforce the hits its answerer actually cited,
-because a citation is observed utility rather than retrieval: something read the evidence and
-used it. That is a default, not a rule — set `reinforce_on_answer=False` when one question must
-not change later rankings, which is what an evaluation needs. Record positive application
-feedback explicitly:
+Search never reinforces a hit. By default, a non-abstained `ask()` reinforces the canonical
+records its answerer lists in `AnswerResult.hits`. These are backend-declared usage, not verified
+factual support or user feedback: an adapter that returns its entire input reinforces every
+delivered hit. An abstained answer preserves its returned hits for diagnosis and records a query
+failure, without changing access counts, access timestamps, or reinforcement ranking signals.
+This applies to buffered and streamed answers.
+
+Set `reinforce_on_answer=False` when one question must not change later rankings, as in an
+evaluation, or when only confirmed application feedback should count. Record that feedback
+explicitly:
 
 ```python
 used = memory.search("How should I recover the deployment?", limit=1)

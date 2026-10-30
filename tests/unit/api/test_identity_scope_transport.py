@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
@@ -17,6 +18,8 @@ from mcp import Client
 from mcp.types import CallToolResult, TextContent
 
 from mindbridge import (
+    AnswerPolicy,
+    AnswerResult,
     AssetRef,
     Blob,
     EmbedTask,
@@ -25,6 +28,7 @@ from mindbridge import (
     Memory,
     Modality,
     ModelInput,
+    SearchHit,
 )
 from mindbridge.api.app import create_app
 from mindbridge.api.mcp import build_mcp_server
@@ -64,16 +68,48 @@ class _Face:
         pass
 
 
-def _library(tmp_path: Path) -> tuple[Memory, str, str]:
+class _EntityAnswerer:
+    generation_capabilities = frozenset({Modality.TEXT, Modality.IMAGE})
+
+    def plan_recall(
+        self,
+        question: str,
+        *,
+        reference_at: datetime,
+        corpus_digest: str,
+        attempted: str = "",
+    ) -> str:
+        return json.dumps({"shape": "entity", "steps": [{"op": "entity", "name": "Alice"}]})
+
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
+    ) -> AnswerResult:
+        return AnswerResult(answer="Read the supplied evidence.", hits=tuple(hits))
+
+    def close(self) -> None:
+        pass
+
+
+def _library(tmp_path: Path, *, planning: bool = False) -> tuple[Memory, str, str]:
     memory = Memory(
         tmp_path,
         embedder=_Embedder(),
         face_analyzer=_Face(),
+        answerer=_EntityAnswerer() if planning else None,
+        recall_planning=planning,
         minimum_relevance=0,
     )
     seen = memory.add(Blob(b"one", "image/png", "alice.png"))
     memory.add("a kettle nobody was photographed beside")
-    return memory, seen.id, memory.faces(seen.id)[0].identity_id
+    alice = memory.faces(seen.id)[0].identity_id
+    if planning:
+        memory.register_identity(alice, "Alice")
+    return memory, seen.id, alice
 
 
 def test_rest_search_accepts_and_applies_an_identity_scope(tmp_path: Path) -> None:
@@ -126,6 +162,30 @@ async def test_mcp_search_accepts_and_applies_an_identity_scope(tmp_path: Path) 
 
     assert [hit["id"] for hit in _hits(scoped)] == [seen_id]
     assert len(_hits(unscoped)) == 2
+
+
+def test_rest_entity_recall_cannot_replace_the_requested_identity(tmp_path: Path) -> None:
+    memory, _seen_id, _alice = _library(tmp_path, planning=True)
+    with memory, TestClient(create_app(memory=memory)) as client:
+        response = client.post(
+            "/v1/answers",
+            json={"question": "What about Alice?", "scope": {"identity_id": "missing"}},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["hits"] == []
+
+
+async def test_mcp_entity_recall_cannot_replace_the_requested_identity(tmp_path: Path) -> None:
+    memory, _seen_id, _alice = _library(tmp_path, planning=True)
+    with memory:
+        async with Client(build_mcp_server(memory)) as client:
+            result = await client.call_tool(
+                "ask_memory",
+                {"question": "What about Alice?", "scope": {"identity_id": "missing"}},
+            )
+
+    assert _hits(result) == []
 
 
 def _hits(result: CallToolResult) -> list[dict[str, str]]:

@@ -48,9 +48,8 @@ class RecallRead(tuple["StoredMemory", ...]):
     """The rows one recall primitive returned, carrying how many IDs its predicate selected.
 
     A tuple of memories, so every caller reads it as the row sequence it always was. `selected`
-    is the count `max_rows` was applied to in SQL, and it exceeds the rows themselves whenever a
-    bitemporal, spatial or metric scope drops one during hydration -- a scope that has exactly
-    one implementation, in `read_memories`, and so cannot be pushed into the selecting statement.
+    is the count `max_rows` was applied to in SQL. Match/window reads apply temporal eligibility
+    before that bound; metric scope is still applied during hydration and can reduce the rows.
 
     That difference is the only thing that can say whether rows beyond the bound exist. Deciding
     it from the row count instead reports a read the bound truncated as a read that returned

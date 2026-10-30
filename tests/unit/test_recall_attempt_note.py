@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 
 from mindbridge import AbstentionReason, AnswerResult, SearchHit
-from mindbridge.kernel.answering import _attempt_note
+from mindbridge.kernel.grounding import attempt_note
 
 
 def test_semantic_attempts_bound_and_deduplicate_untrusted_evidence() -> None:
@@ -25,7 +25,7 @@ def test_semantic_attempts_bound_and_deduplicate_untrusted_evidence() -> None:
         abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
     )
 
-    note = _attempt_note((hits[0], *hits), result, include_evidence=True)
+    note = attempt_note((hits[0], *hits), result, include_evidence=True)
     payload = json.loads(note)
 
     assert len(note) <= 6_000

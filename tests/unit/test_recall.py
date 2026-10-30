@@ -617,7 +617,10 @@ def test_a_term_the_store_accepts_at_its_limit_still_plans() -> None:
     assert plan.steps[0].terms == ("x" * RECALL_MAX_TERM_CHARS,)
 
 
-def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen() -> None:
+@pytest.mark.parametrize("active_records", [1, 1_000])
+def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen(
+    active_records: int,
+) -> None:
     """A store `ValueError` must not leave `ask()` raising on model-authored plan text.
 
     The step reads nothing and is reported as bounded: the rows its predicate matched were never
@@ -644,10 +647,12 @@ def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen() 
     )
 
     assert plan is not None
-    result = execute(plan, reader, limit=12, active_records=1_000)
+    result = execute(plan, reader, limit=12, active_records=active_records)
 
     assert result.executed[0] == RecallStepResult(op="match", rows=0, bounded=True)
     assert result.complete is False
+    assert "some matching records were not read" in recall_note(result)
+    assert "matched too many" not in recall_note(result)
     assert [hit.id for hit in result.hits] == ["s-1"]
 
 

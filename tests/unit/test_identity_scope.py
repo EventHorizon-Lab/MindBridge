@@ -9,13 +9,17 @@ hold, and that both network transports accept the axis.
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from mindbridge import (
+    AnswerPolicy,
+    AnswerResult,
     AssetRef,
     Blob,
     EmbedTask,
@@ -25,6 +29,7 @@ from mindbridge import (
     Modality,
     ModelInput,
     RetrievalScope,
+    SearchHit,
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechTurn,
@@ -220,6 +225,137 @@ def test_an_unknown_identity_scopes_to_nothing(tmp_path: Path) -> None:
         memory.add("a kettle on a worktop")
 
         assert memory.search("kettle", scope=RetrievalScope(identity_id="nobody")) == ()
+
+
+class _EntityAnswerer:
+    generation_capabilities = frozenset({Modality.TEXT, Modality.IMAGE})
+
+    def __init__(self) -> None:
+        self.questions: list[ModelInput] = []
+
+    def plan_recall(
+        self,
+        question: str,
+        *,
+        reference_at: datetime,
+        corpus_digest: str,
+        attempted: str = "",
+    ) -> str:
+        return json.dumps({"shape": "entity", "steps": [{"op": "entity", "name": "Alice"}]})
+
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
+    ) -> AnswerResult:
+        self.questions.append(question)
+        return AnswerResult(answer="Read the supplied evidence.", hits=tuple(hits))
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize("person", ["Alice", "Bob", "missing"])
+def test_entity_plan_intersects_the_callers_identity_scope(tmp_path: Path, person: str) -> None:
+    alice_image = Blob(b"alice", "image/png", "alice.png")
+    bob_image = Blob(b"bob", "image/png", "bob.png")
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        face_analyzer=_PerAssetFace(),
+        answerer=_EntityAnswerer(),
+        recall_planning=True,
+        minimum_relevance=0,
+        reinforce_on_answer=False,
+    ) as memory:
+        alice_record = memory.add(("Alice's red kettle", alice_image))
+        bob_record = memory.add(("Bob's blue kettle", bob_image))
+        shared = memory.add(("A kettle shared by Alice and Bob", alice_image, bob_image))
+        alice = memory.faces(alice_record.id)[0].identity_id
+        bob = memory.faces(bob_record.id)[0].identity_id
+        memory.faces(shared.id)
+        memory.register_identity(alice, "Alice")
+        memory.register_identity(bob, "Bob")
+        scope = RetrievalScope(identity_id={"Alice": alice, "Bob": bob}.get(person, "missing"))
+        allowed = {hit.id for hit in memory.search("kettle", limit=100, scope=scope)}
+
+        result = memory.ask("What do we know about Alice's kettle?", limit=2, scope=scope)
+
+        assert {hit.id for hit in result.hits} <= allowed
+        if person != "missing":
+            assert shared.id in {hit.id for hit in result.hits}
+        if person == "Bob":
+            assert alice_record.id not in {hit.id for hit in result.hits}
+            overlap = memory._store.recall.match_memories(
+                identity_id=bob, entity_id=alice, max_rows=1
+            )
+            assert tuple(row.memory_id for row in overlap) == (shared.id,)
+            assert overlap.selected == 1
+
+
+def test_entity_name_requires_disambiguation_instead_of_choosing_an_id(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path, embedder=_Embedder(), face_analyzer=_PerAssetFace(), minimum_relevance=0
+    ) as memory:
+        first = memory.add(Blob(b"one", "image/png", "alice.png"))
+        second = memory.add(Blob(b"two", "image/png", "bob.png"))
+        alice = memory.faces(first.id)[0].identity_id
+        other = memory.faces(second.id)[0].identity_id
+        assert alice != other
+        memory.register_identity(alice, "Alice")
+        memory.register_identity(other, "Alice")
+
+        with pytest.raises(ValueError, match="ambiguous"):
+            memory._store.recall.identity_id_for_name("ALICE")
+        assert memory._store.recall.identity_id_for_name("ALICE", identity_id=alice) == alice
+        assert memory._store.recall.identity_id_for_name("ALICE", identity_id=other) == other
+
+
+class _TextFirstEmbedder(_Embedder):
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        return tuple((0.0, 1.0) if item.assets else (1.0, 0.0) for item in inputs)
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_ambiguous_entity_plan_preserves_ranking_until_the_caller_disambiguates(
+    tmp_path: Path, scoped: bool
+) -> None:
+    answerer = _EntityAnswerer()
+    with Memory(
+        tmp_path,
+        embedder=_TextFirstEmbedder(),
+        face_analyzer=_PerAssetFace(),
+        answerer=answerer,
+        recall_planning=True,
+        minimum_relevance=0,
+        evidence_budget_chars=None,
+        reinforce_on_answer=False,
+    ) as memory:
+        memory.add_many(tuple(f"A kettle note {index}" for index in range(8)))
+        first = memory.add(Blob(b"one", "image/png", "alice.png"))
+        second = memory.add(Blob(b"two", "image/png", "bob.png"))
+        alice = memory.faces(first.id)[0].identity_id
+        other = memory.faces(second.id)[0].identity_id
+        memory.register_identity(alice, "Alice")
+        memory.register_identity(other, "Alice")
+        scope = RetrievalScope(identity_id=alice) if scoped else None
+        ranked = memory.search("kettle", limit=2, scope=scope)
+
+        result = memory.ask("kettle", limit=2, scope=scope)
+
+        if scoped:
+            assert first.id in {hit.id for hit in result.hits}
+            assert second.id not in {hit.id for hit in result.hits}
+        else:
+            assert result.hits == ranked
+            assert "some matching records were not read" in answerer.questions[-1].text
 
 
 def test_identity_membership_sql_agrees_in_both_directions(tmp_path: Path) -> None:

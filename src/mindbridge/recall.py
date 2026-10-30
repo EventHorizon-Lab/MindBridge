@@ -200,10 +200,9 @@ class RecallResult:
 class RecallReader(Protocol):
     """The reads a recall program may make. `Memory` implements it over its own store.
 
-    Every read answers with its rows and the number of records its predicate selected. The two
-    differ when the caller's own bitemporal, spatial or metric scope drops a selected row while
-    it is hydrated, which happens after the row bound was applied -- so only the selection count
-    can say whether rows beyond the bound exist, and only it may decide completeness.
+    Every read answers with its rows and the number of records its predicate selected. Metric
+    scope can drop selected rows during hydration, after the bound was applied; only the
+    selection count can decide completeness. Match/window temporal eligibility precedes the bound.
     """
 
     def similar(self, query: str, *, k: int) -> RecallRows: ...
@@ -341,11 +340,12 @@ def execute(
         except (ValueError, OverflowError):
             # A primitive rejecting its own arguments is a read that did not happen. Every field
             # reaching one came from a model's plan text, and `ask()` raising a bare `ValueError`
-            # from that would make model output an exception; reporting the step as having filled
-            # its bound says the truth instead, which is that records this predicate matches were
-            # never read. A derived span is data from stored records the same way, so a date the
+            # from that would make model output an exception. Mark the step unread without
+            # inventing a match count: a failed predicate did not enumerate anything.
+            # A derived span is data from stored records the same way, so a date the
             # calendar cannot hold is the same non-read rather than an exception out of `ask()`.
-            rows, selected = (), bound
+            rows, selected = (), 0
+            unread = True
         non_selective = selected if step.op in _EXHAUSTIVE_OPS and selected > ceiling else 0
         if non_selective:
             rows = ()

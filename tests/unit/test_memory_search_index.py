@@ -1236,7 +1236,7 @@ def test_the_candidate_trace_order_does_not_depend_on_the_process_hash_seed(
 
 def test_the_modality_floor_never_evicts_the_top_hit(tmp_path: Path) -> None:
     """A floor promotes into spare slots; it does not rebuild the window out of last places."""
-    from mindbridge.kernel.answering import grounding_hits
+    from mindbridge.kernel.grounding import grounding_hits
     from mindbridge.types import SearchHit
 
     created = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
@@ -1305,7 +1305,7 @@ def test_the_modality_floor_never_evicts_the_top_hit(tmp_path: Path) -> None:
 def test_evidence_budget_skips_an_oversized_extra_and_keeps_a_later_fit() -> None:
     """The optional budget extension is not closed by one expensive lower-ranked record."""
     from mindbridge.context import evidence_cost
-    from mindbridge.kernel.answering import grounding_hits
+    from mindbridge.kernel.grounding import grounding_hits
     from mindbridge.types import SearchHit
 
     created = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)

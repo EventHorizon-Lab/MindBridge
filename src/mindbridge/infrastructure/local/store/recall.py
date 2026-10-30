@@ -26,7 +26,11 @@ from mindbridge.infrastructure.local.store._recall import (
     require_recall_window,
     require_related_edges,
 )
-from mindbridge.infrastructure.local.store._selection import identity_scope
+from mindbridge.infrastructure.local.store._selection import (
+    identity_scope,
+    memory_time_clause,
+    require_scope_axes,
+)
 from mindbridge.infrastructure.local.store.records import MemoryRecords
 from mindbridge.infrastructure.local.store.rows import (
     RecallDigest,
@@ -67,6 +71,7 @@ class RecallReads:
         radius_m: float | None = None,
         place_id: str | None = None,
         identity_id: str | None = None,
+        entity_id: str | None = None,
     ) -> RecallRead:
         """Return every active memory whose content contains the terms, oldest first.
 
@@ -76,14 +81,18 @@ class RecallReads:
         transcripts, visual descriptions and speech prose, so a media memory is reachable by the
         words its own record holds. No terms means the predicate is the time window alone.
 
-        The scope arguments are `read_memories`'s, and hydration goes through it, so bitemporal,
-        place, identity and metric scope have exactly one implementation. Because that read runs
-        after `max_rows` has already been applied, the returned `RecallRead` carries how many IDs
-        were selected: a caller can only tell a truncated set from a complete one from that count.
+        Valid time, known time, visibility, place and identity are applied before `max_rows`.
+        The temporal predicate is shared with authoritative hydration. Metric scope remains a
+        hydration filter, so `RecallRead.selected` still distinguishes truncation from an empty
+        result when that filter drops selected rows.
+
+        `entity_id` is an additional named-person predicate. It intersects the caller's
+        `identity_id` scope before the row bound; a record can belong to both people.
         """
         folded = recall_terms(terms)
         require_recall_window(occurred_from, occurred_until, require_both=False)
         require_recall_filters(modality, memory_type, max_rows)
+        require_scope_axes(valid_at=valid_at, known_at=known_at, near=near, radius_m=radius_m)
         selected = self._recall_memory_ids(
             folded,
             any_of=any_of,
@@ -94,6 +103,9 @@ class RecallReads:
             max_rows=max_rows,
             place_id=place_id,
             identity_id=identity_id,
+            entity_id=entity_id,
+            valid_at=valid_at,
+            known_at=known_at,
         )
         return RecallRead(
             self._hydrate_recall(
@@ -372,13 +384,11 @@ class RecallReads:
             )
         return tuple(memory_id for _event_time, _row_position, memory_id in sorted(found))
 
-    def identity_id_for_name(self, name: str) -> str | None:
-        """Resolve a display name to the canonical identity ID that carries it.
+    def identity_id_for_name(self, name: str, *, identity_id: str | None = None) -> str | None:
+        """Resolve an unambiguous display name, with an optional explicit disambiguator.
 
-        The comparison is the NFKC casefold the rest of the kernel uses, and the lowest matching
-        ID wins so two identities registered under one name resolve deterministically. A name no
-        identity was registered under returns None, which leaves the caller to fall back on
-        matching the name as text.
+        Unknown names return None for literal text fallback. Distinct people sharing a name
+        require a matching caller identity; otherwise the optional recall step cannot run.
         """
         wanted = canonical_subject(name)
         if wanted is None:
@@ -392,10 +402,20 @@ class RecallReads:
                 ORDER BY identity_id
                 """
             ).fetchall()
-            for row in rows:
-                if canonical_subject(row_text(row, "name")) == wanted:
-                    return resolve_identity_id(connection, row_text(row, "identity_id"))
-        return None
+            # Registry rows are canonical; merged IDs live only in identity_aliases.
+            matches = {
+                row_text(row, "identity_id")
+                for row in rows
+                if canonical_subject(row_text(row, "name")) == wanted
+            }
+            preferred = (
+                None if identity_id is None else resolve_identity_id(connection, identity_id)
+            )
+        if preferred in matches:
+            return preferred
+        if len(matches) > 1:
+            raise ValueError("identity name is ambiguous; supply an identity scope")
+        return next(iter(matches), None)
 
     def recall_digest(self) -> RecallDigest:
         """Summarize the active corpus, recomputed only after a commit.
@@ -450,6 +470,9 @@ class RecallReads:
         max_rows: int,
         place_id: str | None,
         identity_id: str | None,
+        entity_id: str | None,
+        valid_at: datetime | None,
+        known_at: datetime | None,
     ) -> tuple[str, ...]:
         """Select the bounded, chronologically ordered ID set one recall predicate defines."""
         clauses: list[str] = []
@@ -467,9 +490,17 @@ class RecallReads:
         term_clause, term_parameters = recall_term_clause(terms, any_of=any_of)
         clauses.append(term_clause)
         parameters.extend(term_parameters)
+        eligibility_clause, eligibility_parameters = memory_time_clause(
+            valid_at=valid_at, known_at=known_at
+        )
+        clauses.append(eligibility_clause)
+        parameters.extend(eligibility_parameters)
         with self._connections.read_transaction() as connection:
             identity_clause, identity_parameters = identity_scope(connection, identity_id)
             if identity_clause is None:
+                return ()
+            entity_clause, entity_parameters = identity_scope(connection, entity_id)
+            if entity_clause is None:
                 return ()
             rows = connection.execute(
                 f"""
@@ -478,10 +509,11 @@ class RecallReads:
                 WHERE forgotten_at IS NULL
                 {" ".join(clauses)}
                 {identity_clause}
+                {entity_clause}
                 ORDER BY {RECALL_EVENT_TIME}, rowid
                 LIMIT ?
                 """,
-                (*parameters, *identity_parameters, max_rows),
+                (*parameters, *identity_parameters, *entity_parameters, max_rows),
             ).fetchall()
         return tuple(row_text(row, "memory_id") for row in rows)
 

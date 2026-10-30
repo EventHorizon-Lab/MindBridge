@@ -88,6 +88,49 @@ def memory_in_scope(
     )
 
 
+def version_time_clause(
+    *,
+    valid_at: datetime | None,
+    known_at: datetime | None,
+    active_only: bool,
+    alias: str = "v",
+) -> tuple[str, tuple[object, ...]]:
+    """Temporal eligibility of an internal version alias, shared by selection and recall."""
+    if not active_only:
+        return (
+            ("", ())
+            if known_at is None
+            else (f"AND {alias}.recorded_at <= ?", (datetime_text(known_at),))
+        )
+    known = datetime_text(known_at or datetime.now(timezone.utc))
+    valid = datetime_text(valid_at or datetime.now(timezone.utc))
+    return (
+        f"AND {alias}.recorded_at <= ? AND ({alias}.retired_at IS NULL OR {alias}.retired_at > ?) "
+        f"AND ({alias}.valid_from IS NULL OR {alias}.valid_from <= ?) "
+        f"AND ({alias}.valid_until IS NULL OR {alias}.valid_until > ?) AND {alias}.visible = 1",
+        (known, known, valid, valid),
+    )
+
+
+def memory_time_clause(
+    *, valid_at: datetime | None, known_at: datetime | None
+) -> tuple[str, tuple[object, ...]]:
+    """Select active records before LIMIT, including untyped records known at the cutoff."""
+    version_clause, parameters = version_time_clause(
+        valid_at=valid_at, known_at=known_at, active_only=True
+    )
+    raw_clause = "" if known_at is None else "AND memory_records.created_at <= ?"
+    raw_parameters: tuple[object, ...] = () if known_at is None else (datetime_text(known_at),)
+    return (
+        "AND ((NOT EXISTS (SELECT 1 FROM memory_semantics AS s "
+        f"WHERE s.memory_id = memory_records.memory_id) {raw_clause}) "
+        "OR EXISTS (SELECT 1 FROM memory_versions AS v "
+        "WHERE v.memory_id = memory_records.memory_id "
+        f"{version_clause}))",
+        (*raw_parameters, *parameters),
+    )
+
+
 def select_memory_contexts(  # noqa: C901 - one authoritative bitemporal selection pass
     connection: sqlite3.Connection,
     memory_ids: Sequence[str],
@@ -106,8 +149,9 @@ def select_memory_contexts(  # noqa: C901 - one authoritative bitemporal selecti
     if not memory_ids:
         return {}, frozenset()
     require_scope_axes(valid_at=valid_at, known_at=known_at, near=near, radius_m=radius_m)
-    query_valid_at = valid_at or datetime.now(timezone.utc)
-    query_known_at = known_at or datetime.now(timezone.utc)
+    version_clause, version_parameters = version_time_clause(
+        valid_at=valid_at, known_at=known_at, active_only=active_only, alias="candidate"
+    )
 
     rows: list[sqlite3.Row] = []
     for offset in range(0, len(memory_ids), SQLITE_PARAMETER_BATCH):
@@ -128,11 +172,17 @@ def select_memory_contexts(  # noqa: C901 - one authoritative bitemporal selecti
                     v.version, v.confidence, v.valid_from, v.valid_until,
                     v.recorded_at, v.retired_at, v.visible, v.supersedes_id
                 FROM memory_semantics AS s
-                JOIN memory_versions AS v ON v.memory_id = s.memory_id
+                LEFT JOIN memory_versions AS v
+                  ON v.memory_id = s.memory_id AND v.version = (
+                      SELECT candidate.version FROM memory_versions AS candidate
+                      WHERE candidate.memory_id = s.memory_id {version_clause}
+                      ORDER BY candidate.recorded_at DESC, candidate.version DESC
+                      LIMIT 1
+                  )
                 WHERE s.memory_id IN ({placeholders})
-                ORDER BY s.memory_id, v.recorded_at DESC, v.version DESC
+                ORDER BY s.memory_id
                 """,
-                tuple(batch),
+                (*version_parameters, *batch),
             ).fetchall()
         )
 
@@ -140,23 +190,7 @@ def select_memory_contexts(  # noqa: C901 - one authoritative bitemporal selecti
     selected: dict[str, sqlite3.Row] = {}
     for row in rows:
         memory_id = row_text(row, "semantic_memory_id")
-        if memory_id in selected:
-            continue
-        recorded_at = parse_datetime(row_text(row, "recorded_at"))
-        # Historical background also needs the version known then, even when retired or hidden
-        # claims are intentionally included. Activity controls eligibility, not transaction time.
-        if known_at is not None and recorded_at > known_at:
-            continue
-        retired_at = optional_datetime_from_row(row, "retired_at")
-        row_valid_from = optional_datetime_from_row(row, "valid_from")
-        row_valid_until = optional_datetime_from_row(row, "valid_until")
-        if active_only and (
-            recorded_at > query_known_at
-            or (retired_at is not None and retired_at <= query_known_at)
-            or (row_valid_from is not None and row_valid_from > query_valid_at)
-            or (row_valid_until is not None and row_valid_until <= query_valid_at)
-            or not bool(int(row["visible"]))
-        ):
+        if row["version"] is None:
             continue
         selected[memory_id] = row
 

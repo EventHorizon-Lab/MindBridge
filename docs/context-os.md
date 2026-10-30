@@ -166,7 +166,7 @@ The reasoning backend may change, but the proposal vocabulary and kernel validat
 
 | Intent | Kernel semantics |
 | --- | --- |
-| Reinforce | Record independent supporting evidence or observed utility; retrieval alone is not reinforcement, though a hit an answerer cited is observed utility. |
+| Reinforce | Record independent supporting evidence or explicit utility feedback. Automatic answer reinforcement counts backend-declared hits only on non-abstained results; this does not verify factual support. |
 | Consolidate | Create a higher-level derived memory with explicit evidence links; preserve source observations. |
 | Merge | Unify compatible derived identity or meaning while retaining reversible lineage. Kernel-initiated from corroborated cross-modal evidence, not backend vocabulary: a proposed merge is refused. |
 | Update | Add a new valid and transaction-time version that supersedes prior state; do not overwrite history. Realized as consolidate into an existing lineage. |
