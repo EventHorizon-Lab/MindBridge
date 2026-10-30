@@ -2529,8 +2529,8 @@ def test_memory_from_config_uses_the_same_kernel_and_closes_resolved_backends(
         "data_dir": tmp_path,
         "embedding": {
             "provider": "sentence-transformers",
-            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            "model": "google/embeddinggemma-2",
+            "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
         },
         "generation": {"provider": "openai", "model": "gpt-5-mini"},
         "speech": {"provider": "funasr"},
@@ -2591,8 +2591,8 @@ def test_memory_from_config_validates_settings_before_building_backends(
             {
                 "embedding": {
                     "provider": "sentence-transformers",
-                    "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-                    "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                    "model": "google/embeddinggemma-2",
+                    "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
                 },
                 "settings": {"minimum_relevance": 2},
             }
@@ -2615,8 +2615,8 @@ def test_config_resolution_closes_an_earlier_backend_when_a_later_one_fails(
             {
                 "embedding": {
                     "provider": "sentence-transformers",
-                    "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-                    "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                    "model": "google/embeddinggemma-2",
+                    "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
                 },
                 "generation": {"provider": "openai"},
             }
@@ -6508,8 +6508,8 @@ async def test_async_memory_from_config_uses_the_same_composition(
             "data_dir": tmp_path,
             "embedding": {
                 "provider": "sentence-transformers",
-                "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-                "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                "model": "google/embeddinggemma-2",
+                "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
             },
             "settings": {"minimum_relevance": 0},
         }

@@ -15,7 +15,7 @@ from typing import Any, cast, get_type_hints
 
 import pytest
 from fastapi import status
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, iter_route_contexts
 from pydantic import BaseModel
 
 import mindbridge
@@ -154,7 +154,7 @@ PROTOCOL_OPERATIONS = (
 # built from a real value rather than a stub.
 CAPABILITIES = MemoryCapabilities(
     embedding=frozenset({Modality.TEXT, Modality.IMAGE}),
-    embedding_model="jina-v5-omni",
+    embedding_model="test-omni",
     embedding_space="space_1",
     embedding_dimension=1024,
     generation=frozenset({Modality.TEXT}),
@@ -202,9 +202,9 @@ def _rest_route(operation_id: str) -> APIRoute:
         embodied_operations=True,
     )
     routes = [
-        route
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.operation_id == operation_id
+        route.original_route
+        for route in iter_route_contexts(app.routes)
+        if isinstance(route.original_route, APIRoute) and route.operation_id == operation_id
     ]
     assert len(routes) == 1, operation_id
     return routes[0]
@@ -290,8 +290,8 @@ def test_every_transport_operation_is_covered() -> None:
     )
     routes = {
         route.operation_id
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.path.startswith("/v1")
+        for route in iter_route_contexts(app.routes)
+        if isinstance(route.original_route, APIRoute) and (route.path or "").startswith("/v1")
     }
     server = mcp_adapter.build_mcp_server(_UnusedMemory())  # type: ignore[arg-type]
     tools = {published.name for published in server._tool_manager.list_tools()}
@@ -582,7 +582,7 @@ class _TinyEmbedder:
     """The smallest thing `declared_capabilities` accepts, so the CLI path needs no store."""
 
     embedding_capabilities = frozenset({Modality.TEXT, Modality.IMAGE})
-    embedding_model = "jina-v5-omni"
+    embedding_model = "test-omni"
     embedding_space = "space_1"
     embedding_dimension = 1024
 

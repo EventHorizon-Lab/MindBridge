@@ -1582,10 +1582,6 @@ def test_a_prompt_change_at_one_model_does_not_replay_the_old_captions(
         monkeypatch.setattr(eval_module, "resolve_memory_config", lambda _config: resolved)
         return eval_module._BackendPool(
             ModelConfig(),
-            device=None,
-            batch_size=1,
-            needs_speech=False,
-            seed=0,
             memory_config=MindBridgeConfig.model_validate({"embedding": {"provider": "openai"}}),
             description_cache=cache_path,
         )

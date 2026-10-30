@@ -79,8 +79,8 @@ with Memory.from_config(
         "data_dir": "./data/assistant",
         "embedding": {
             "provider": "sentence-transformers",
-            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            "model": "google/embeddinggemma-2",
+            "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
         },
     }
 ) as memory:
@@ -194,7 +194,8 @@ an answer abstains, or a bundle carries no evidence -- the bounded recall-failur
 control plane's `QUERY_FAILURE` trigger reads; they are also not advertised as idempotent. Every
 tool has `open_world_hint=false`. `ask_memory` requires an answerer in the
 injected memory; without one it returns `model_error/backend_not_configured`. With the default
-`reinforce_on_answer=True`, it also reinforces the hits the answerer cites. Its `answer_policy`
+`reinforce_on_answer=True`, a non-abstained result also reinforces backend-declared hits; an
+abstained result records the query failure without reinforcement. Its `answer_policy`
 is `strict` or `best_effort`: the default refuses when the evidence is thin, while `best_effort`
 commits to the most likely answer -- for a multiple-choice question, always one of the options --
 and still reports `abstained`, so an agent that must produce an answer keeps the confidence

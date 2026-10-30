@@ -137,19 +137,11 @@ def _local() -> None:
     ``torchaudio.functional.forced_align``, which Fun-ASR-Nano -- the default recipe -- calls for
     its native timestamps, so assert that symbol instead.
     """
-    import cairosvg
     import torchaudio.functional
-
-    from mindbridge.models._jina import _require_local_extra
 
     for name in ("funasr", "librosa", "sentence_transformers", "soundfile", "torch"):
         importlib.import_module(name)
-    _require_local_extra()
     assert hasattr(torchaudio.functional, "forced_align")
-    # The pinned Jina revision converts image/svg+xml through cairosvg, and memory.py maps .svg.
-    assert cairosvg.svg2png(
-        bytestring=b'<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>'
-    )
 
 
 def _server() -> None:
@@ -240,7 +232,6 @@ MODULES: dict[str, tuple[str, ...]] = {
     "face": ("mindbridge", "mindbridge.models.opencv_face"),
     "local": (
         "mindbridge.models.funasr",
-        "mindbridge.models._jina",
         "mindbridge.models.sentence_transformers",
     ),
     "server": ("mindbridge.api", "mindbridge.api.app"),

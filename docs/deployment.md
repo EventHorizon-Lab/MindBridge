@@ -23,7 +23,7 @@ adapters around one constructed `Memory`, or have other processes call the exist
 
 Before starting the owner, verify:
 
-- Python 3.10 through 3.14 and compatible 64-bit wheels exist for Zvec 0.8 and every selected
+- Python 3.11 through 3.14 and compatible 64-bit wheels exist for Zvec 0.8 and every selected
   backend. Zvec's additional Intel Mac and Windows ARM64 builds do not establish support for
   every optional model dependency; verify the complete environment on the target platform.
 - The data directory is on one local, durable filesystem with working SQLite WAL, file locking,
@@ -63,8 +63,8 @@ try:
     with Memory(
         "/var/lib/mindbridge/assistant",
         embedder=SentenceTransformersEmbedder(
-            model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-            revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            model_id="google/embeddinggemma-2",
+            revision="f9972ac22e696a105c482202646979e33e4b5a1e",
         ),
         answerer=OpenAIModels(generation_client=client),
     ) as memory:
@@ -77,8 +77,8 @@ Keep one `Memory` open for a long-running process. `Memory.close()` closes suppl
 `OpenAIModels.close()` deliberately leaves caller-owned OpenAI clients open. Construct `Memory`
 after any process fork, never before it.
 
-The Jina adapter executes pinned upstream model code and uses non-commercial weights. Review
-[embedding choices](configuration.md#embedding-choices) before deploying it.
+Pin the selected model revision and review its license before deployment; see
+[embedding choices](configuration.md#embedding-choices).
 
 For OpenAI generation slots, configure only parameters supported by the selected model and choose
 `response_format="json_schema"` when the endpoint supports strict structured output. A compatible
@@ -138,8 +138,8 @@ def main() -> None:
         with Memory(
             "/var/lib/mindbridge/assistant",
             embedder=SentenceTransformersEmbedder(
-                model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-                revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                model_id="google/embeddinggemma-2",
+                revision="f9972ac22e696a105c482202646979e33e4b5a1e",
             ),
             answerer=OpenAIModels(generation_client=client),
         ) as memory:
@@ -186,8 +186,8 @@ with Memory.from_config(
         "data_dir": "/var/lib/mindbridge/assistant",
         "embedding": {
             "provider": "sentence-transformers",
-            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            "model": "google/embeddinggemma-2",
+            "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
         },
     }
 ) as memory:

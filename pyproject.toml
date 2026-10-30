@@ -7,12 +7,12 @@ name = "mindbridge"
 version = "0.2.0"
 description = "Agentic native embodied omni-modal memory system"
 readme = "README.md"
-requires-python = ">=3.10,<3.15"
+requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 dependencies = [
     "numpy>=2,<3",
-    "opentelemetry-api>=1.34,<2",
-    "pydantic>=2.10,<3",
+    "opentelemetry-api>=1.45.2,<2",
+    "pydantic>=2.14.2,<3",
     "zvec>=0.8,<0.9",
 ]
 
@@ -26,41 +26,39 @@ mindbridge-bench = "mindbridge.benchmarks.cli:main"
 # union.
 all = [
     "av>=14,<19",
-    "cairosvg>=2.7,<3",
-    "fastapi>=0.116,<1",
+    "fastapi>=0.162,<1",
     "funasr @ git+https://github.com/modelscope/FunASR.git@940b0d2463141a2e9ace8a9fd965b4aea93f2db5",
     "httpx>=0.28,<1",
-    "httpx2>=2.7,<3",
+    "httpx2>=2.16,<3",
     "huggingface-hub>=0.30,<2",
     "librosa>=0.11,<2",
-    "mcp>=2,<3",
+    "mcp>=2.3,<3",
     "nltk>=3.9,<4",
     "openai>=3,<4",
     "opencv-python-headless>=4.10,<6",
-    "opentelemetry-sdk>=1.34,<2",
-    "pillow>=10,<13",
-    "pyproj>=3.6.1,<3.7; python_version < '3.11'",
-    "pyproj>=3.7.2,<4; python_version >= '3.11'",
+    "opentelemetry-sdk>=1.45.2,<2",
+    "pillow>=13,<14",
+    "pyproj>=3.7.2,<4",
     "pyarrow>=18,<26",
     "pyyaml>=6,<7",
     "regex>=2024.11.6",
     "sentence-transformers[image,video]>=6.1,<7",
     "shapely>=2.1.2,<3",
     "soundfile>=0.13,<1",
-    "starlette>=0.46,<2",
+    "starlette>=1.10,<2",
     "torch>=2.6,<3",
     "torchaudio>=2.11,<3",
     "torchvision>=0.26,<0.27",
     "tqdm>=4.66,<5",
     "transformers>=5.18,<6",
-    "uvicorn>=0.35,<1",
+    "uvicorn>=0.54,<1",
 ]
 benchmarks = [
     # download.py imports httpx at module scope; huggingface-hub happens to require it today.
     "httpx>=0.28,<1",
     "huggingface-hub>=0.30,<2",
     "nltk>=3.9,<4",
-    "opentelemetry-sdk>=1.34,<2",
+    "opentelemetry-sdk>=1.45.2,<2",
     "pyarrow>=18,<26",
     # eval.py reads its harness configuration file as YAML or JSON.
     "pyyaml>=6,<7",
@@ -71,28 +69,25 @@ benchmarks = [
     "tqdm>=4.66,<5",
 ]
 observability = [
-    "opentelemetry-sdk>=1.34,<2",
+    "opentelemetry-sdk>=1.45.2,<2",
 ]
 openai = [
     "av>=14,<19",
-    "httpx2>=2.7,<3",
+    "httpx2>=2.16,<3",
     "openai>=3,<4",
-    "pillow>=10,<13",
+    "pillow>=13,<14",
 ]
 face = [
     "opencv-python-headless>=4.10,<6",
 ]
 gazetteer = [
-    "pyproj>=3.6.1,<3.7; python_version < '3.11'",
-    "pyproj>=3.7.2,<4; python_version >= '3.11'",
+    "pyproj>=3.7.2,<4",
     "shapely>=2.1.2,<3",
 ]
 local = [
-    # The pinned Jina revision converts image/svg+xml through cairosvg, and memory.py maps .svg
-    # to it, so a documented input needs it. LGPL-3.0, installed separately, never linked.
-    "cairosvg>=2.7,<3",
-    # Avoid transformers[audio]: pyctcdecode pins NumPy 1.x, which has no Python 3.13/3.14
-    # wheels. Jina only needs librosa and soundfile for its native audio path.
+    "pillow>=13,<14",
+    # Audio processors use librosa and soundfile; the broader transformers[audio] extra
+    # includes unrelated decoders with incompatible NumPy requirements.
     "librosa>=0.11,<2",
     "funasr @ git+https://github.com/modelscope/FunASR.git@940b0d2463141a2e9ace8a9fd965b4aea93f2db5",
     # EmbeddingGemma 2 requires ordered multimodal inputs introduced in ST 6.1.
@@ -109,12 +104,12 @@ local = [
     "transformers>=5.18,<6",
 ]
 server = [
-    "fastapi>=0.116,<1",
-    "starlette>=0.46,<2",
-    "uvicorn>=0.35,<1",
+    "fastapi>=0.162,<1",
+    "starlette>=1.10,<2",
+    "uvicorn>=0.54,<1",
 ]
 mcp = [
-    "mcp>=2,<3",
+    "mcp>=2.3,<3",
 ]
 
 [tool.uv]
@@ -144,7 +139,7 @@ default = true
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.10,<3",
+    "httpx2>=2.16,<3",
     "mypy>=1.15,<3",
     "packaging>=24,<27",
     # `faulthandler_exit_on_timeout` is read under `--strict-config`, which errors on an ini
@@ -152,8 +147,6 @@ dev = [
     "pytest>=9.1,<10",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.11,<1",
-    # Packaging tests read pyproject.toml on Python 3.10, which has no tomllib.
-    "tomli>=2,<3; python_version < '3.11'",
     # eval.py imports yaml and tqdm; neither ships inline types, so the strict gate needs stubs.
     "types-PyYAML>=6,<7",
     "types-tqdm>=4.66,<5",
@@ -169,6 +162,7 @@ allow-direct-references = true
 packages = ["src/mindbridge"]
 
 [tool.ruff]
+# Keep the existing modernization rules stable during the runtime support upgrade.
 target-version = "py310"
 line-length = 100
 
@@ -179,14 +173,12 @@ select = ["ANN", "ASYNC", "B", "C4", "C90", "DTZ", "E4", "E7", "E9", "F", "I", "
 max-complexity = 10
 
 [tool.mypy]
-# Every CI interpreter checks itself; Ruff enforces the Python 3.10 syntax floor.
+# Every CI interpreter checks itself.
 strict = true
 files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
 module = [
-    # Installed and imported only on Python 3.10.
-    "tomli",
     # Optional benchmark download client, imported lazily.
     "huggingface_hub",
     "huggingface_hub.*",

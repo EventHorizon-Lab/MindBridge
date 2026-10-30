@@ -24,9 +24,7 @@ from mindbridge.benchmarks.eval_config import (
 from mindbridge.benchmarks.model_config import ModelConfig
 
 
-@pytest.mark.parametrize(
-    "configured_style", [None, "default", "concise"], ids=["raw", "configured", "concise"]
-)
+@pytest.mark.parametrize("configured_style", ["default", "concise"], ids=["configured", "concise"])
 @pytest.mark.parametrize("temperature", [0.0, 0.7], ids=["default", "sampled"])
 def test_every_generation_arm_emits_the_resolved_temperature(  # noqa: C901 - sync and async clients
     monkeypatch: pytest.MonkeyPatch, configured_style: str | None, temperature: float
@@ -84,7 +82,6 @@ def test_every_generation_arm_emits_the_resolved_temperature(  # noqa: C901 - sy
 
     monkeypatch.setattr(openai, "OpenAI", Client)
     monkeypatch.setattr(openai, "AsyncOpenAI", AsyncClient)
-    monkeypatch.setattr(eval_module, "SentenceTransformersEmbedder", Embedder)
     monkeypatch.setattr(configuration_module, "SentenceTransformersEmbedder", Embedder)
     options = _generation_kwargs(f"temperature={temperature}", 7)
     arguments = cast(_Arguments, SimpleNamespace(gen_kwargs=options, seed=7, device=None))
@@ -103,16 +100,14 @@ def test_every_generation_arm_emits_the_resolved_temperature(  # noqa: C901 - sy
         if configured_style is not None
         else None
     )
-    effective = _evaluation_memory_config(declared, model, arguments)
-    pool = eval_module._BackendPool(
+    effective = _evaluation_memory_config(
+        declared,
         model,
-        device=None,
-        batch_size=1,
-        needs_speech=False,
-        seed=7,
-        gen_kwargs=options,
-        memory_config=effective,
+        gen_kwargs=arguments.gen_kwargs,
+        seed=arguments.seed,
+        device=arguments.device,
     )
+    pool = eval_module._BackendPool(model, memory_config=effective)
     baseline = _BaselineGenerator(model, seed=7, gen_kwargs=options, generation=effective)
     try:
         assert pool._answerer is not None

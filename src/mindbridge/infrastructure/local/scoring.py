@@ -22,7 +22,7 @@ def _fallback_dot_product(left: Sequence[float], right: Sequence[float]) -> floa
     return cast(float, sum(map(mul, left, right)))
 
 
-# Python 3.10 and 3.11 lack the standard-library native dot product.
+# Python 3.11 lacks the standard-library native dot product.
 _dot_product: Callable[[Sequence[float], Sequence[float]], float] = getattr(
     math, "sumprod", _fallback_dot_product
 )

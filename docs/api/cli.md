@@ -24,7 +24,7 @@ Choose exactly one composition on every invocation:
 
 ```bash
 mindbridge --app my_application:build_memory search "where is the spare key"
-mindbridge --embedder jina-omni add "The spare key is in the blue toolbox."
+mindbridge --embedder openai add "The spare key is in the blue toolbox."
 mindbridge --url http://127.0.0.1:8000 list
 ```
 
@@ -80,7 +80,6 @@ server's owner.
 
 | Recipe | Allowed slot | Default identity |
 | --- | --- | --- |
-| `jina-omni` | `--embedder` | pinned Jina Omni model, revision, and 1024 dimensions |
 | `funasr` | `--transcriber` | pinned FunASR model and component revisions |
 | `openai` | `--embedder`, `--answerer`, `--former`, `--consolidator`, `--transcriber`, `--vision` | `text-embedding-3-small`, `gpt-5-mini`, `gpt-5-mini`, `gpt-5-mini`, `whisper-1`, `gpt-5-mini` |
 
@@ -233,8 +232,8 @@ retyped on each invocation.
 values use the CLI's `validation_error` exit status without sending a remote request.
 
 `forget` is cognitive forgetting, reversible with `rollback`; `delete` is erasure. With the
-default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer cites; use
-`--app` to construct a memory with that policy disabled.
+default `reinforce_on_answer=True`, a non-abstained `ask` also reinforces backend-declared hits;
+abstention adds no reinforcement. Use `--app` to construct a memory with that policy disabled.
 
 `ask` may run face recognition on a retrieved photo or video before answering. With the default
 `--link-identities` (true), a voice-and-face pair corroborated across enough assets is fused into
@@ -278,10 +277,10 @@ and `spatial`; its scope decoder accepts `valid_at`, `known_at`, `near`, `radius
 and `identity_id`, which is the whole of [`RetrievalScope`](python-sdk.md#public-values).
 
 ```bash
-mindbridge --embedder jina-omni add "The mug is on the table" \
+mindbridge --app my_application:build_memory add "The mug is on the table" \
   --context '{"basis":"observation","source_id":"camera-1:42","confidence":0.94}'
 
-mindbridge --embedder jina-omni search "Where is the mug?" \
+mindbridge --app my_application:build_memory search "Where is the mug?" \
   --scope '{"near":{"frame_id":"home/map","anchor":"subject","x":2,"y":1},"radius_m":0.75}'
 ```
 

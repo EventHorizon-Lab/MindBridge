@@ -22,7 +22,7 @@ from mindbridge.types import MemoryCapabilities, Modality
 # surface is the only thing that can be the reason one is missing.
 EVERYTHING = MemoryCapabilities(
     embedding=frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO}),
-    embedding_model="jina-v5-omni",
+    embedding_model="test-omni",
     embedding_space="space_1",
     embedding_dimension=8,
     generation=frozenset({Modality.TEXT}),
@@ -53,7 +53,7 @@ class _Embedder:
     """The smallest thing `declared_capabilities` accepts, so doctor needs no store."""
 
     embedding_capabilities = frozenset({Modality.TEXT})
-    embedding_model = "jina-v5-omni"
+    embedding_model = "test-omni"
     embedding_space = "space_1"
     embedding_dimension = 8
 

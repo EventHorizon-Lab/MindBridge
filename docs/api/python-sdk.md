@@ -20,7 +20,7 @@ from mindbridge import SentenceTransformersEmbedder, Memory
 with Memory(
     "./data/assistant",
     embedder=SentenceTransformersEmbedder(
-        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        model_id="google/embeddinggemma-2",
     ),
 ) as memory:
     record = memory.add("The spare key is in the blue toolbox.")
@@ -37,7 +37,7 @@ with Memory.from_config(
         "data_dir": "./data/assistant",
         "embedding": {
             "provider": "sentence-transformers",
-            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+            "model": "google/embeddinggemma-2",
         },
     }
 ) as memory:
@@ -199,8 +199,10 @@ separate lineage relations and never increase that count unless their ID is also
 If a grounding media cap omits an asset from a retained hit, the generator receives an omitted-media
 count by modality while any retained transcript or text remains available.
 
-`reinforce_on_answer=True` records positive feedback for the hits an answerer actually cites.
-Set it to `False` for evaluations that require one question not to change later rankings.
+`reinforce_on_answer=True` reinforces the canonical hits the backend reports in a non-abstained
+`AnswerResult`. Returned hits are backend-declared usage, not verified factual support. Abstention
+still records a query failure but adds no reinforcement. Set this option to `False` for evaluations
+that require one question not to change later rankings.
 
 The two other construction boundaries are:
 
@@ -786,7 +788,7 @@ so a host that polls this in a tight loop should say so with `memory_budget_reco
 | --- | --- | --- |
 | `EVIDENCE` | A derived record gained independent evidence nothing has weighed yet. `memory_ids` is that record followed by the new sources. | New evidence links |
 | `CONTRADICTION` | One lineage carries two or more current visible claims with different values, the same disagreement `compile()` reports as a `ContextConflict`. | Distinct conflicting values |
-| `FEEDBACK` | A record was confirmed through `reinforce()`, or cited by an `ask()` answer under the default `reinforce_on_answer`, since anything last weighed it. | Recorded confirmations |
+| `FEEDBACK` | A record was confirmed through `reinforce()`, or reported in a non-abstained `ask()` result under the default `reinforce_on_answer`, since anything last weighed it. | Recorded confirmations |
 | `QUERY_FAILURE` | Two or more near-equal recalls returned nothing inside `query_failure_window_seconds`. A failed query cites no evidence of its own, so `memory_ids` is the nearest active records to it, resolved through the ordinary retrieval kernel. | Recorded failures |
 | `PRESSURE` | The store holds more active records than `memory_budget_records`, so the least recently useful of them are offered for `CONSOLIDATE` or `FORGET`. Without a configured budget this derives nothing: growth alone is not evidence that forgetting is useful. | Records over budget |
 | `IDLE` | Only with `idle=True`: a derived lineage nothing has ever weighed, oldest first. The operator declares the window; the kernel never infers idleness from a clock, because whether now is a good time to spend the device's battery is the host's knowledge. | Always `1` |
@@ -1512,15 +1514,12 @@ OpenCVFaceAnalyzer(
 
 The direct `SentenceTransformersEmbedder` constructor accepts a caller-owned encoder implementing
 `supports`, `get_embedding_dimension`, `encode_query`, and `encode_document`. With no encoder,
-the constructor loads the selected model, deferring the pinned Jina checkpoint until the first
-non-empty embedding call; `load` eagerly loads every model. An explicit
+the constructor and `load` both load the selected model immediately. An explicit
 `revision` must be a 40-character immutable commit hash. When omitted, a Hub model's current
 revision is resolved before loading and included in its vector-space identity. This resolution
 requires Hub access; specify a commit hash for reproducible or cached offline loading. An injected
 encoder must expose an immutable `_commit_hash` in its model configuration or receive an explicit
-`revision`. The bundled Jina model defaults to its supported pinned revision. Jina loading sets
-`trust_remote_code=True` while pinning both model and code revisions. Its weights are CC BY-NC 4.0;
-that license covers the weights, not MindBridge. `DEFAULT_FUNASR_MODEL_ID` and
+`revision`. Loading uses `trust_remote_code=False`. `DEFAULT_FUNASR_MODEL_ID` and
 `DEFAULT_FUNASR_RECIPE` publish the default speech recipe.
 `FunASRRecipe.auto_model_arguments() -> dict[str, object]` returns its standard FunASR composition.
 The transcriber uses an immutable FunASR main revision; its transcription space includes that

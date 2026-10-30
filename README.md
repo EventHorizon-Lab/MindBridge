@@ -1,7 +1,7 @@
 # MindBridge
 
 [![CI](https://github.com/EventHorizon-Lab/MindBridge/actions/workflows/ci.yml/badge.svg)](https://github.com/EventHorizon-Lab/MindBridge/actions/workflows/ci.yml)
-[![Python 3.10–3.14](https://img.shields.io/badge/Python-3.10%E2%80%933.14-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.11–3.14](https://img.shields.io/badge/Python-3.11%E2%80%933.14-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-3DA639.svg)](LICENSE)
 
 **Agentic Native Embodied Omni-Modal Memory System.**
@@ -116,12 +116,12 @@ See [Design principles](docs/design-principles.md) and
 
 ## Installation
 
-MindBridge supports Python 3.10 through 3.14. Install only the surfaces you use:
+MindBridge supports Python 3.11 through 3.14. Install only the surfaces you use:
 
 | Extra | Choose it when | Adds |
 | --- | --- | --- |
 | none | You provide an `EmbeddingBackend` | Core storage, retrieval, public types, and Zvec |
-| `local` | You want bundled local embedding or speech | Jina, Sentence Transformers, and FunASR |
+| `local` | You want bundled local embedding or speech | Sentence Transformers and FunASR |
 | `openai` | You use OpenAI or an OpenAI-compatible endpoint | Official SDK adapter and media request handling |
 | `face` | You need local face analysis | OpenCV detection and recognition |
 | `server` | You expose REST | FastAPI and Starlette; install an ASGI server separately |
@@ -155,10 +155,9 @@ providers, download benchmark datasets, or supply the YuNet and SFace model file
 Transport extras do not choose a model backend. The base package always requires an application
 supplied embedder.
 
-The first Jina embedding call through `SentenceTransformersEmbedder` downloads the pinned
-`jinaai/jina-embeddings-v5-omni-small-retrieval` model and executes its pinned remote code with
-`trust_remote_code=True`. Its weights are CC BY-NC 4.0. Review that code and license before
-sensitive or commercial use; choose another backend when those terms do not fit.
+`SentenceTransformersEmbedder` loads the selected model at construction with
+`trust_remote_code=False`. The example below selects EmbeddingGemma 2 with Apache-2.0 weights.
+Review the selected model's license and pin its revision for reproducible deployments.
 
 See [Configuration](docs/configuration.md) for provider fields, custom backends, credentials, and
 durable embedding-space rules.
@@ -175,8 +174,8 @@ config = {
     "data_dir": "./data/mindbridge-demo",
     "embedding": {
         "provider": "sentence-transformers",
-        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        "model": "google/embeddinggemma-2",
+        "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
     },
     "settings": {
         "minimum_relevance": 0.0,
@@ -245,11 +244,13 @@ The [documentation index](docs/README.md) is the complete task-oriented map.
 Its executable catalog covers seventeen benchmark families across long-horizon conversation,
 personalization, multimodal video and lifelog QA, embodied scene memory, and grounded retrieval.
 Separate utilities produce raw LoCoMo-Refined predictions and measure the local SQLite-to-Zvec
-index path.
+index path. Copy the [evaluation example](docs/examples/eval.example.yaml) to `eval.yaml` and
+select an embedding model before executing a MindBridge run.
 
 ```bash
 mindbridge-bench eval --list-tasks
 mindbridge-bench eval \
+  --config eval.yaml \
   --tasks locomo-refined \
   --model-args generation_model=gpt-5-mini-2025-08-07 \
   --limit 1 \
@@ -294,7 +295,7 @@ If you use MindBridge in academic or technical work, cite the version or commit 
 ## Acknowledgements
 
 MindBridge builds on SQLite, Zvec, Pydantic, and OpenTelemetry. Optional surfaces integrate
-Sentence Transformers and Jina, FunASR, OpenCV, the official OpenAI SDK, FastAPI/Starlette, and MCP.
+Sentence Transformers, FunASR, OpenCV, the official OpenAI SDK, FastAPI/Starlette, and MCP.
 We thank their maintainers and research communities. Benchmark sources, revisions, protocol notes,
 and retained licenses are listed in [Benchmarking](docs/benchmarking.md) and the bundled
 [scorer notices](src/mindbridge/benchmarks/_official/NOTICE.md).
@@ -302,7 +303,7 @@ and retained licenses are listed in [Benchmarking](docs/benchmarking.md) and the
 ## Contributing
 
 Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the locked `uv` environment,
-Python 3.10–3.14 quality gates, documentation checks, architecture constraints, and pull-request
+Python 3.11–3.14 quality gates, documentation checks, architecture constraints, and pull-request
 expectations. Participation follows the [Code of Conduct](CODE_OF_CONDUCT.md); report security
 issues privately through [SECURITY.md](SECURITY.md).
 

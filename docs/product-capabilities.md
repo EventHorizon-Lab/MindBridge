@@ -68,7 +68,7 @@ MindBridge adds the following product properties beyond a raw vector-search comp
 | Context | Evidence-closed `ContextBundle` with typed sections, conflicts, unknowns, and optional exact raw excerpts | No generation backend required | [Context compilation](context-compilation.md) |
 | Memory management | Explicit consolidation, correction, reinforcement, cognitive forgetting, operation history, and rollback | Proposal generation needs a `ConsolidationBackend`; the host schedules the loop | [Memory management](api/python-sdk.md#memory-management-operations) |
 | Answer | Grounded `ask` with explicit abstention and the canonical hits actually used | A `GenerationBackend` | [Core concepts](concepts.md#retrieval-can-return-no-evidence) |
-| Reinforcement | Explicit positive feedback plus automatic reinforcement of evidence cited by `ask`; optional recency decay | Core policy; automatic answer reinforcement is configurable | [Decay and reinforcement](memory-types-time-and-decay.md#decay-and-reinforcement) |
+| Reinforcement | Explicit positive feedback plus automatic reinforcement of backend-declared hits from non-abstained answers; optional recency decay | Core policy; automatic answer reinforcement is configurable | [Decay and reinforcement](memory-types-time-and-decay.md#decay-and-reinforcement) |
 | Omni-modal analysis | Native modality routing, transcription fallback, speech analysis, visual-description hook, and face analysis | Route-specific embedding, speech, vision, or face backends | [Configuration](configuration.md) |
 | Identity | Durable voice and face exemplars, local identity resolution, names and relationships, corroborated face/voice linking, unlinking, and person erasure | A `SpeechBackend` and/or `FaceBackend` for observations | [Cross-modal identity binding](api/python-sdk.md#cross-modal-identity-binding) |
 | Data-subject operations | Host-recorded consent, subject export, biometric erasure, and explicit retention passes | Host authority; network routes require opt-in; consent is not an access-control filter | [Data-subject rights](api/python-sdk.md#data-subject-rights) |
@@ -92,7 +92,7 @@ flowchart LR
     retrieval --> hydrate["SQLite hydrate, filter, and rank"]
     hydrate --> evidence["Bounded canonical evidence"]
     evidence --> answer["Optional grounded answer"]
-    answer --> reinforce["Reinforce cited memories"]
+    answer -- "non-abstained result" --> reinforce["Reinforce declared hits"]
     reinforce --> retrieval
     interaction -. "speculative snapshots" .-> retrieval
     source -. "analyze stored media" .-> identity["Speech / face identity evidence"]
@@ -191,13 +191,14 @@ returned hits or `get` to inspect evidence.
 
 `ask` runs the same retrieval plane, applies the configured grounding policy, and passes canonical
 hits to a generation backend. The returned `AnswerResult` contains only the retrieved hits the
-backend cited, not every candidate and never a provider-fabricated record. A backend can abstain
+backend reported, not every candidate and never a provider-fabricated record. A backend can abstain
 with `no_evidence` or `insufficient_evidence`; callers should treat abstention as a normal outcome.
 
 `reinforce` records explicit positive feedback for existing IDs. By default, a successful `ask`
-also reinforces only its cited hits. Reinforcement affects later ranking but does not alter content,
-metadata, or timestamps. Recency decay is optional and demotes old records without using age alone
-as a reason to hide otherwise relevant evidence. Evaluation runs can disable automatic answer
+also reinforces its backend-declared hits. Abstention adds no reinforcement; reported hits do not
+prove factual support or user approval. Reinforcement changes access counts and access time,
+affecting later ranking without altering content or metadata. Recency decay is optional and demotes
+old records without using age alone as a reason to hide otherwise relevant evidence. Evaluation runs can disable automatic answer
 reinforcement for reproducibility.
 
 ### 7. Speech, faces, and identity
@@ -347,7 +348,7 @@ and lifecycle.
 
 Applications can compose those objects directly, group them in `MemoryPlugins`, or use
 `Memory.from_config` for the bundled provider catalog. Current bundled adapters cover
-Sentence Transformers embedding, including the pinned Jina Omni checkpoint, OpenAI-compatible
+Sentence Transformers embedding with an application-selected model, OpenAI-compatible
 embedding/generation/transcription/formation/vision/consolidation, FunASR speech, and OpenCV face
 analysis. Exact extras, provider fields, model revisions, and license constraints are maintained in
 [configuration](configuration.md).

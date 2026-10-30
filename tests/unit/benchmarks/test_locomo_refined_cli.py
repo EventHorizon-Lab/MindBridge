@@ -8,11 +8,11 @@ import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import pytest
 
-from mindbridge import AnswerResult, AsyncMemory, MemoryRecord, SearchHit
+from mindbridge import AnswerResult, AsyncMemory, MemoryRecord, MindBridgeConfig, SearchHit
 from mindbridge.benchmarks import locomo_refined_cli
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.locomo_refined import (
@@ -101,6 +101,7 @@ class _FakePool:
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         self.closed = False
+        self.config = cast(MindBridgeConfig, _kwargs["memory_config"])
         self.instances.append(self)
 
     def memory(self, data_dir: Path) -> _FakeAsyncMemory:
@@ -108,6 +109,26 @@ class _FakePool:
 
     def close(self) -> None:
         self.closed = True
+
+
+async def test_environment_generation_controls_reach_the_configured_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _FakeAsyncMemory.reset()
+    _FakePool.instances = []
+    monkeypatch.setattr(locomo_refined_cli, "_BackendPool", _FakePool)
+    monkeypatch.setenv("MINDBRIDGE_GENERATION_MODEL", "configured-model")
+    monkeypatch.setenv("MINDBRIDGE_GENERATION_API_KEY", "fixture-environment-key")
+    arguments = _arguments(tmp_path)
+    run = BenchmarkRun(arguments.data_root, "locomo-refined", arguments.run_id)
+
+    await locomo_refined_cli._run_conversations(arguments, (_conversation("sample"),), run)
+
+    generation = _FakePool.instances[0].config.generation
+    assert generation is not None and generation.api_key is not None
+    assert generation.model == "configured-model"
+    assert generation.api_key.get_secret_value() == "fixture-environment-key"
+    assert generation.seed == 0 and generation.temperature == 0.0
 
 
 async def test_parallel_conversations_use_distinct_closed_physical_memories(
@@ -237,7 +258,13 @@ def _arguments(
     dataset: Path | None = None,
     unit_concurrency: int = 2,
 ) -> _Arguments:
+    root.mkdir(parents=True, exist_ok=True)
+    config = root / "models.json"
+    config.write_text(
+        json.dumps({"embedding": {"provider": "openai", "model": "test-embedding", "dimension": 2}})
+    )
     return _Arguments(
+        config=config,
         dataset=dataset or root / "dataset.json",
         output=root / "artifacts" / "predictions.jsonl",
         data_root=root / "data",

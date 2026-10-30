@@ -30,6 +30,7 @@ from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.task_catalog import TaskSpec
 
 _CONFIG = """
+embedding: {provider: openai}
 generation:
   provider: openai
   api_key: unused

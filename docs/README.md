@@ -3,7 +3,7 @@
 Use the shortest path that matches your task. Each page owns one subject so contracts and examples
 have one place to stay current.
 
-The guides and API references describe this checkout's `0.2.0` package and Python 3.10–3.14
+The guides and API references describe this checkout's `0.2.0` package and Python 3.11–3.14
 contract.
 
 ## Choose a path

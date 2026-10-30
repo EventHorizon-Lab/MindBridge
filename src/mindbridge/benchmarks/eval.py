@@ -31,17 +31,13 @@ from importlib import metadata
 from pathlib import Path
 from tempfile import gettempdir
 from threading import Lock
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast
 
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode, Tracer
 
-if TYPE_CHECKING:
-    pass
-
 from mindbridge import (
     DEFAULT_FUNASR_MODEL_ID,
-    DEFAULT_FUNASR_RECIPE,
     AbstentionReason,
     AnswerPolicy,
     AnswerResult,
@@ -51,16 +47,13 @@ from mindbridge import (
     ContextBundle,
     ContextExcerpt,
     FaceAnalysis,
-    FunASRTranscriber,
     IndexUnavailableError,
     Memory,
     MemoryConfig,
     MemoryType,
     MindBridgeConfig,
     Modality,
-    OpenAIModels,
     SearchHit,
-    SentenceTransformersEmbedder,
     resolve_memory_config,
 )
 from mindbridge._telemetry import (
@@ -224,11 +217,6 @@ from mindbridge.benchmarks.task_catalog import (
     listing,
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
-from mindbridge.models._jina import (
-    DEFAULT_JINA_DIMENSION,
-    DEFAULT_JINA_MODEL_ID,
-    DEFAULT_JINA_REVISION,
-)
 from mindbridge.models._openai_protocol import reasoning_model
 from mindbridge.models.base import (
     ConsolidationBackend,
@@ -539,175 +527,92 @@ class _BackendPool:
         self,
         config: ModelConfig,
         *,
-        device: str | None,
-        batch_size: int,
-        needs_speech: bool,
-        seed: int,
-        gen_kwargs: str = "",
         memory_config: MindBridgeConfig | None = None,
         tracer: Tracer | None = None,
         description_cache: Path | None = None,
     ) -> None:
-        self.config = config
-        self._resolved_config = None
         self._description_cache: DescriptionCache | None = None
         self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
         self.embedding_warmup_count = 0
-        if memory_config is not None:
-            if memory_config.generation is not None:
-                # The harness owns both of these for a run: `--model-args` and the environment
-                # name the modalities, and the video floor belongs to the corpus rather than to
-                # the endpoint. Injecting them here is what makes the configured path honour
-                # them -- the resolved backends are built from this document, so a floor left
-                # only on `ModelConfig` would be reported in the result artifact while short
-                # videos still went to the endpoint whole.
-                update: dict[str, object] = {"modalities": config.generation_capabilities}
-                if config.generation_min_video_seconds is not None:
-                    update["min_video_seconds"] = config.generation_min_video_seconds
-                memory_config = memory_config.model_copy(
-                    update={"generation": memory_config.generation.model_copy(update=update)}
-                )
-            resolved = resolve_memory_config(memory_config)
-            self._resolved_config = resolved
-            plugins = resolved.plugins
-            self._embedder = cast(EmbeddingBackend, _BorrowedBackend(plugins.embedder))
-            self._answerer = (
-                None
-                if plugins.answerer is None
-                else cast(GenerationBackend, _BorrowedGenerationBackend(plugins.answerer))
+        if memory_config is None:
+            raise ValueError(
+                "benchmark execution requires --config with an explicit embedding section"
             )
-            self._transcriber = (
-                None
-                if plugins.transcriber is None
-                else cast(
-                    SpeechBackend | TranscriptionBackend,
-                    (
-                        _BorrowedSpeechBackend(plugins.transcriber)
-                        if isinstance(plugins.transcriber, SpeechBackend)
-                        else _BorrowedBackend(plugins.transcriber)
-                    ),
-                )
+        if memory_config.generation is not None:
+            # The harness owns both of these for a run: `--model-args` and the environment
+            # name the modalities, and the video floor belongs to the corpus rather than to
+            # the endpoint. Injecting them here is what makes the configured path honour
+            # them -- the resolved backends are built from this document, so a floor left
+            # only on `ModelConfig` would be reported in the result artifact while short
+            # videos still went to the endpoint whole.
+            update: dict[str, object] = {"modalities": config.generation_capabilities}
+            if config.generation_min_video_seconds is not None:
+                update["min_video_seconds"] = config.generation_min_video_seconds
+            memory_config = memory_config.model_copy(
+                update={"generation": memory_config.generation.model_copy(update=update)}
             )
-            self._face_analyzer = (
-                None
-                if plugins.face_analyzer is None
-                else cast(FaceBackend, _BorrowedFaceBackend(plugins.face_analyzer))
-            )
-            self._former = (
-                None
-                if plugins.former is None
-                else cast(FormationBackend, _BorrowedBackend(plugins.former))
-            )
-            self._consolidator = (
-                None
-                if plugins.consolidator is None
-                else cast(ConsolidationBackend, _BorrowedBackend(plugins.consolidator))
-            )
-            if plugins.vision_describer is None:
-                self._vision_describer = None
-            else:
-                borrowed = cast(
-                    VisionDescriptionBackend, _BorrowedBackend(plugins.vision_describer)
-                )
-                # Opened only when `vision:` is configured, so a run without the slot touches no
-                # cache file at all and behaves exactly as it does today.
-                if description_cache is not None:
-                    self._description_cache = DescriptionCache(
-                        description_cache, plugins.vision_describer.vision_space
-                    )
-                    borrowed = cast(
-                        VisionDescriptionBackend,
-                        _CachedVisionDescriber(borrowed, self._description_cache),
-                    )
-                self._vision_describer = borrowed
-            # Answer-time reinforcement is a product behaviour, not a measured one: it makes a
-            # question's retrieval depend on which earlier questions ran, and under concurrency on
-            # the order their updates committed, so a run stops being reproducible from its seed.
-            self._settings = replace(resolved.settings, reinforce_on_answer=False)
-            configured_embed = getattr(self._embedder, "embed", None)
-            if callable(configured_embed):
-                configured_embed(
-                    (ModelInput(text="MindBridge benchmark warmup"),),
-                    task=EmbedTask.QUERY,
-                )
-                self.embedding_warmup_count = 1
-            return
-        try:
-            from openai import OpenAI
-        except ImportError:
-            raise RuntimeError("benchmark execution requires mindbridge[openai]") from None
-        generation_options = dict(
-            item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item
-        )
-        enable_thinking = generation_options.get("enable_thinking")
-        extra_body = (
+        resolved = resolve_memory_config(memory_config)
+        self._resolved_config = resolved
+        plugins = resolved.plugins
+        self._embedder = cast(EmbeddingBackend, _BorrowedBackend(plugins.embedder))
+        self._answerer = (
             None
-            if enable_thinking is None
-            else {"chat_template_kwargs": {"enable_thinking": enable_thinking == "true"}}
+            if plugins.answerer is None
+            else cast(GenerationBackend, _BorrowedGenerationBackend(plugins.answerer))
         )
-        temperature = _generation_temperature(
-            config.generation_model, generation_options, extra_body
-        )
-        self.client = OpenAI(
-            api_key=config.generation_api_key,
-            base_url=config.generation_base_url,
-            timeout=config.timeout_seconds,
-        )
-        self.models = OpenAIModels(
-            generation_client=self.client,
-            generation_model=config.generation_model,
-            generation_capabilities=config.generation_capabilities,
-            generation_seed=None if reasoning_model(config.generation_model) else seed,
-            generation_temperature=temperature,
-            generation_max_tokens=(
-                None
-                if "max_tokens" not in generation_options
-                else int(generation_options["max_tokens"])
-            ),
-            generation_min_video_seconds=config.generation_min_video_seconds,
-            generation_extra_body=extra_body,
-        )
-        self.embedder = SentenceTransformersEmbedder(
-            model_id=DEFAULT_JINA_MODEL_ID,
-            revision=DEFAULT_JINA_REVISION,
-            device=device,
-            batch_size=batch_size,
-        )
-        self.embedder.embed((ModelInput(text="MindBridge benchmark warmup"),), task=EmbedTask.QUERY)
-        self.embedding_warmup_count = 1
-        self.transcriber = (
-            FunASRTranscriber(
-                recipe=replace(
-                    DEFAULT_FUNASR_RECIPE,
-                    speaker_model=None,
-                    speaker_revision=None,
-                ),
-                device=device or "auto",
-            )
-            if needs_speech
-            else None
-        )
-        self._answerer = cast(
-            GenerationBackend,
-            _BorrowedGenerationBackend(self.models),
-        )
-        self._embedder = cast(EmbeddingBackend, _BorrowedBackend(self.embedder))
         self._transcriber = (
-            cast(SpeechBackend, _BorrowedSpeechBackend(self.transcriber))
-            if self.transcriber is not None
-            else None
+            None
+            if plugins.transcriber is None
+            else cast(
+                SpeechBackend | TranscriptionBackend,
+                (
+                    _BorrowedSpeechBackend(plugins.transcriber)
+                    if isinstance(plugins.transcriber, SpeechBackend)
+                    else _BorrowedBackend(plugins.transcriber)
+                ),
+            )
         )
-        self._face_analyzer = None
-        self._former = None
-        self._consolidator = None
-        self._vision_describer = None
-        self._settings = MemoryConfig(
-            index_speech=self._transcriber is not None,
-            # Answer-time reinforcement is a product behaviour, not a measured one: it makes a
-            # question's retrieval depend on which earlier questions ran, and under concurrency on
-            # the order their updates committed, so a run stops being reproducible from its seed.
-            reinforce_on_answer=False,
+        self._face_analyzer = (
+            None
+            if plugins.face_analyzer is None
+            else cast(FaceBackend, _BorrowedFaceBackend(plugins.face_analyzer))
         )
+        self._former = (
+            None
+            if plugins.former is None
+            else cast(FormationBackend, _BorrowedBackend(plugins.former))
+        )
+        self._consolidator = (
+            None
+            if plugins.consolidator is None
+            else cast(ConsolidationBackend, _BorrowedBackend(plugins.consolidator))
+        )
+        if plugins.vision_describer is None:
+            self._vision_describer = None
+        else:
+            borrowed = cast(VisionDescriptionBackend, _BorrowedBackend(plugins.vision_describer))
+            # Opened only when `vision:` is configured, so a run without the slot touches no
+            # cache file at all and behaves exactly as it does today.
+            if description_cache is not None:
+                self._description_cache = DescriptionCache(
+                    description_cache, plugins.vision_describer.vision_space
+                )
+                borrowed = cast(
+                    VisionDescriptionBackend,
+                    _CachedVisionDescriber(borrowed, self._description_cache),
+                )
+            self._vision_describer = borrowed
+        # Answer-time reinforcement is a product behaviour, not a measured one: it makes a
+        # question's retrieval depend on which earlier questions ran, and under concurrency on
+        # the order their updates committed, so a run stops being reproducible from its seed.
+        self._settings = replace(resolved.settings, reinforce_on_answer=False)
+        configured_embed = getattr(self._embedder, "embed", None)
+        if callable(configured_embed):
+            configured_embed(
+                (ModelInput(text="MindBridge benchmark warmup"),),
+                task=EmbedTask.QUERY,
+            )
+            self.embedding_warmup_count = 1
 
     def prefetch_speech(self, items: Sequence[MemoryItem]) -> None:
         """Analyse the next chunk's speech while a store embeds and writes the current one."""
@@ -745,14 +650,7 @@ class _BackendPool:
             with suppress(Exception):
                 self._description_cache.close()
             self._description_cache = None
-        if self._resolved_config is not None:
-            self._resolved_config.close()
-            return
-        resources = (self.transcriber, self.embedder, self.client)
-        for resource in resources:
-            if resource is not None:
-                with suppress(Exception):
-                    resource.close()
+        self._resolved_config.close()
 
 
 def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
@@ -827,6 +725,8 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
             end="",
         )
         return 0
+    if memory_config is None and DEFAULT_ARM in arguments.arms:
+        parser.error("the mindbridge arm requires --config with an explicit embedding section")
     try:
         base_config = _model_config(
             arguments.model_args,
@@ -877,7 +777,13 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     if arguments.ingest_concurrency > 1 and _has_question_cutoffs(loaded):
         parser.error("--ingest-concurrency above 1 requires static units without question cutoffs")
     config = _evaluation_config(base_config, loaded)
-    memory_config = _evaluation_memory_config(memory_config, config, arguments)
+    memory_config = _evaluation_memory_config(
+        memory_config,
+        config,
+        gen_kwargs=arguments.gen_kwargs,
+        seed=arguments.seed,
+        device=arguments.device,
+    )
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
     samples, duration, performance, resources, embedding_warmup_count = _execute(
         loaded,
@@ -1265,11 +1171,6 @@ def _execute(
                 else:
                     pool = _BackendPool(
                         config,
-                        device=arguments.device,
-                        batch_size=max(batch_sizes.values()),
-                        needs_speech=needs_speech,
-                        seed=arguments.seed,
-                        gen_kwargs=arguments.gen_kwargs,
                         memory_config=memory_config,
                         tracer=telemetry.tracer,
                         description_cache=_description_cache_path(arguments, memory_config),
@@ -4022,9 +3923,9 @@ def _model_result(
         generation_temperature = _generation_temperature(config.generation_model, options)
     result: dict[str, object] = {
         "adapter": DEFAULT_ARM,
-        "embedding_model": DEFAULT_JINA_MODEL_ID,
-        "embedding_revision": DEFAULT_JINA_REVISION,
-        "embedding_dimension": DEFAULT_JINA_DIMENSION,
+        "embedding_model": None,
+        "embedding_revision": None,
+        "embedding_dimension": None,
         "embedding_warmup": {
             "count": embedding_warmup_count,
             "task": EmbedTask.QUERY.value,
@@ -4045,7 +3946,7 @@ def _model_result(
         ),
         "generation_kwargs": arguments.gen_kwargs,
         "generation_min_video_seconds": config.generation_min_video_seconds,
-        "transcription_model": DEFAULT_FUNASR_MODEL_ID,
+        "transcription_model": None,
         "timeout_seconds": config.timeout_seconds,
         "memory_config": None,
     }
@@ -4255,9 +4156,6 @@ def _ingest_digest(
         "runner": EVAL_RUNNER_VERSION,
         "implementation": _implementation_identity(),
         "task": _cache_task(task),
-        "embedding_model": DEFAULT_JINA_MODEL_ID,
-        "embedding_revision": DEFAULT_JINA_REVISION,
-        "transcription_model": DEFAULT_FUNASR_MODEL_ID,
         "device": arguments.device or "auto",
         "ingest": arguments.ingest,
         "ingest_concurrency": arguments.ingest_concurrency,
@@ -4299,9 +4197,6 @@ def _cache_namespace(
         "implementation": _implementation_identity(),
         "model": config.generation_model,
         "base_url": config.generation_base_url,
-        "embedding_model": DEFAULT_JINA_MODEL_ID,
-        "embedding_revision": DEFAULT_JINA_REVISION,
-        "transcription_model": DEFAULT_FUNASR_MODEL_ID,
         "device": arguments.device or "auto",
         "seed": arguments.seed,
         "gen_kwargs": arguments.gen_kwargs,

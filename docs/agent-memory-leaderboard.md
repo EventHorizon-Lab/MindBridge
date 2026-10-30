@@ -23,9 +23,9 @@ is:
 ```yaml
 embedding:
   provider: sentence-transformers
-  model: jinaai/jina-embeddings-v5-omni-small-retrieval
-  revision: e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4
-  dimension: 1024
+  model: google/embeddinggemma-2
+  revision: f9972ac22e696a105c482202646979e33e4b5a1e
+  dimension: 768
 ```
 
 Set the participant's Memory System Key in the environment and start the adapter. The `server`

@@ -38,7 +38,7 @@ def test_console_does_not_create_multiprocessing_resources(exit_mode: str) -> No
             # First output after multiprocessing's exit callback has already run.
             atexit.register(report)
 
-        # Exercise named semaphore tracking on Python 3.10-3.13 as well as 3.14.
+        # Exercise named semaphore tracking on Python 3.11-3.13 as well as 3.14.
         multiprocessing.set_start_method("spawn", force=True)
         from multiprocessing import resource_tracker
 

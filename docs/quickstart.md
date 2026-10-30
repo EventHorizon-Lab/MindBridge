@@ -7,7 +7,7 @@ time.
 
 ## 1. Install MindBridge
 
-The SDK supports Python 3.10 through 3.14. In an existing Python project, install the local surface
+The SDK supports Python 3.11 through 3.14. In an existing Python project, install the local surface
 used by the first example:
 
 ```bash
@@ -51,10 +51,10 @@ from mindbridge import Memory
 # Everything stored by this example lives under this directory.
 config = {
     "data_dir": "./data/mindbridge-quickstart",
-    # The bundled Jina adapter embeds text, images, video, and audio locally.
+    # EmbeddingGemma 2 embeds text, images, video, and audio locally.
     "embedding": {
         "provider": "sentence-transformers",
-        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        "model": "google/embeddinggemma-2",
     },
     # These two zeroes make this one-record tutorial deterministic.
     # Remove the settings block to use the production defaults.
@@ -171,7 +171,7 @@ Event intervals, bitemporal validity, spatial scope, decay, and reinforcement ar
 
 ### Omni-modal observations
 
-With the local Jina embedder, one record can preserve ordered text and media:
+With a local multimodal embedder, one record can preserve ordered text and media:
 
 ```python
 from pathlib import Path
@@ -195,8 +195,8 @@ fails explicitly instead of silently discarding evidence.
   boundary.
 - An embedding model, revision, dimension, and request recipe define a durable vector space. Start a
   new directory when intentionally changing that space.
-- The bundled Jina recipe downloads pinned model code and loads it with `trust_remote_code=True`.
-  Its weights are CC BY-NC 4.0; review both boundaries before sensitive or commercial use.
+- Local Sentence Transformers models load with `trust_remote_code=False`. Review the selected
+  model's license and use an immutable revision for reproducible deployments.
 - Remote URLs are not fetched. Download and validate remote media in the host application before
   passing a `Blob` to MindBridge.
 

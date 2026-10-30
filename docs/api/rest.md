@@ -54,8 +54,8 @@ memory = Memory.from_config(
         "data_dir": "./data/assistant",
         "embedding": {
             "provider": "sentence-transformers",
-            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            "model": "google/embeddinggemma-2",
+            "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
         },
     }
 )
@@ -276,7 +276,9 @@ Context-request budget:
 
 Creation is content-addressed and idempotent. Batch results preserve input order. Deletion is also
 idempotent: `deleted` reports whether a record existed. `ask` requires an answerer configured in
-the injected memory and, with the default `reinforce_on_answer=True`, reinforces the hits it cites.
+the injected memory and, with the default `reinforce_on_answer=True`, reinforces backend-declared
+hits only when the answer does not abstain. Returned evidence alone does not establish utility;
+see [reinforcement semantics](../memory-types-time-and-decay.md#decay-and-reinforcement).
 Explicit reinforcement is not idempotent: every call raises `access_count` for the named memories
 and moves the ranker's reinforcement factor, so a lost response must not be retried blindly.
 Unknown IDs are skipped, and `reinforced` counts the ones that existed.
@@ -431,8 +433,8 @@ to send a probe write to learn what the deployment can do:
   "status": "ok",
   "capabilities": {
     "embedding": ["audio", "image", "text", "video"],
-    "embedding_model": "jina-v5-omni",
-    "embedding_space": "jina-v5-omni:1024",
+    "embedding_model": "test-omni",
+    "embedding_space": "test-omni:1024",
     "embedding_dimension": 1024,
     "generation": ["text"],
     "transcription": ["audio"],

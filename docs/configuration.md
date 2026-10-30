@@ -20,7 +20,7 @@ model runtimes and transports:
 
 | Extra | Adds |
 | --- | --- |
-| `local` | Jina and Sentence Transformers embedding, plus FunASR speech |
+| `local` | Sentence Transformers embedding, plus FunASR speech |
 | `openai` | Official OpenAI SDK 3.x adapter, its `httpx2` transport, and media handling |
 | `face` | Local OpenCV face analysis |
 | `server` | FastAPI and Starlette REST adapter; bring your own ASGI server |
@@ -47,7 +47,7 @@ config = {
     "data_dir": "./data/assistant",
     "embedding": {
         "provider": "sentence-transformers",
-        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        "model": "google/embeddinggemma-2",
         "device": "cuda",
         "batch_size": 16,
     },
@@ -240,8 +240,7 @@ override the model, messages, response format, streaming controls, or storage po
 their named options.
 
 Atomic capability declarations contain only `text`, `image`, `video`, and `audio`. OpenAI
-embedding requires at least one modality. Jina dimensions are `32`, `64`, `128`, `256`, `512`, or
-`1024`. Positive fields must be greater than zero; retry counts are non-negative; temperature is
+embedding requires at least one modality. Positive fields must be greater than zero; retry counts are non-negative; temperature is
 from 0 through 2; seed is from 0 through `2**63 - 1`; face thresholds are from 0 through 1.
 
 `generation.video_limit` caps retrieved evidence videos in one answer request; question media has
@@ -287,12 +286,10 @@ The embedding model defines durable vector identity, so every memory requires on
 
 - `sentence-transformers` loads an application-selected model. An optional `revision` pins a
   40-character immutable commit hash. When omitted, MindBridge resolves the current Hub revision
-  before loading and retains that commit in the vector-space identity; Jina uses its bundled pin.
+  before loading and retains that commit in the vector-space identity.
   Resolution requires Hub access. Specify a commit for reproducible or cached offline loading.
-  The model declares its supported modalities. The pinned Jina Omni checkpoint used in project
-  examples supports text, images, audio, and video, with 1024 dimensions by default. Its weights
-  are CC BY-NC 4.0 and loading executes pinned upstream code with `trust_remote_code=True`;
-  review that code and license as part of the application's trust boundary.
+  Models load immediately with `trust_remote_code=False` and declare their supported modalities.
+  The EmbeddingGemma 2 example supports text, images, audio, and video with 768 dimensions.
 - `openai` defaults to text embedding. For an OpenAI-compatible multimodal server, declare its
   `modalities` and use `request_format=input` for the embeddings array or
   `request_format=messages` for chat-style media parts. The request format is part of the embedding
@@ -306,20 +303,6 @@ MindBridge refuses store metadata mismatches instead of mixing spaces.
 
 **Guidance:** Start a new data directory when intentionally changing embedding space; see
 [store metadata mismatch](troubleshooting.md#store-metadata-mismatch).
-
-### Pinned Jina checkpoint
-
-Use `SentenceTransformersEmbedder` or `provider: sentence-transformers` with
-`model: jinaai/jina-embeddings-v5-omni-small-retrieval`, as in the example above. The bundled pin is
-`e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4`. Only this Jina revision is supported; another revision
-fails validation before loading remote code.
-
-Without a caller-supplied encoder, the constructor and declarative configuration keep this pinned
-Jina checkpoint lazy. `SentenceTransformersEmbedder.load(...)` loads it immediately. Other models
-load immediately and continue to use `trust_remote_code=False`. The Jina input recipe, embedding
-space ID are fixed by the checkpoint and adapter recipe. A current-recipe Jina directory
-reopens without re-embedding. The CLI `--embedder jina-omni` selects a model recipe that constructs
-the same Sentence Transformers backend.
 
 ### EmbeddingGemma 2
 
@@ -444,8 +427,8 @@ with Memory.from_config(
         "data_dir": "./data/assistant",
         "embedding": {
             "provider": "sentence-transformers",
-            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            "model": "google/embeddinggemma-2",
+            "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
         },
         "formation": {
             "provider": "openai",
@@ -544,8 +527,8 @@ retrieval reach a visual memory at all.
 config = {
     "embedding": {
         "provider": "sentence-transformers",
-        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        "model": "google/embeddinggemma-2",
+        "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
     },
     "vision": {
         "provider": "openai",
@@ -658,8 +641,8 @@ with Memory.from_config(
         "data_dir": "./data/assistant",
         "embedding": {
             "provider": "sentence-transformers",
-            "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-            "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            "model": "google/embeddinggemma-2",
+            "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
         },
         "consolidation": {
             "provider": "openai",
@@ -744,7 +727,7 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `evidence_expansion` | `False` | Widen `ask` grounding with exact query-media source context and existing structural links. An exact source in the scoped ranking can add its immediate corpus neighbors before semantic additions and the ranked tail; capture, person, place, lineage and evidence links spend the remaining budget. Adds no model call |
 | `evidence_expansion_max_rows` | `24` | Joint cap on added exact-source context and structural rows, within the remaining character and supplemental media budgets. Read only when `evidence_expansion` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
-| `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
+| `reinforce_on_answer` | `True` | Reinforce backend-declared hits from non-abstained answers, so retrieval favours them later |
 | `independent_evidence` | `False` | Experimental capture-grounded AND/OR corroboration for formation and consolidation; fixed when a store is created. See [independent evidence](memory-types-time-and-decay.md#experimental-independent-evidence) |
 | `formation_history_max_rows` | `0` | Read-only text history records per formation target; `0` disables, maximum `128` |
 | `formation_history_budget_chars` | `6000` | Combined history content characters per target; positive, whole records only, excludes protocol overhead |
@@ -871,6 +854,19 @@ For a `sequence` plan, the final selected evidence is presented in corpus time o
 SQLite insertion order when event times tie, across matched, ranked and supplemental records;
 this presentation order does not establish a complete event history or answer set.
 
+An `entity(name)` step intersects its named person with the caller's `scope.identity_id` before
+applying its row limit. A record mentioning both people can match; a record about only the named
+person cannot replace the requested scope. An unknown scoped identity still selects no records.
+Distinct identities may share a display name. Supply a matching `scope.identity_id` to disambiguate;
+without it, the optional entity step is unread and the original ranked evidence remains available.
+An unknown name still falls back to literal text matching within the caller's scope.
+
+Match and time-window reads apply visibility, valid time and known time before their row limit,
+using the same version predicate as authoritative hydration. Expired or not-yet-known records
+cannot occupy that window. Metric distance remains a hydration filter; its selection count still
+reports truncation when fewer rows survive. A failed read is incomplete and supplies no match
+count; it cannot be reported as a predicate that matched too much of the corpus.
+
 `evidence_expansion` widens the window without another model call. If an original query attachment
 has exactly the same asset ID and SHA as a source in the already scoped ranking, the kernel can
 include that source and the immediately preceding and following corpus records. At most `limit`
@@ -911,7 +907,7 @@ supplemental media caps.
 Evaluate expansion on your own corpus before enabling it. Compare complete support, answer
 quality and evidence cost against both the narrow window and a budget of ranked rows. Existing
 links can reach records below the window without establishing a complete answer set or improving
-quality. `benchmarks/edge_power.py` measures potential support coverage without running a reader.
+quality.
 
 What expansion adds is reported to the reader as records linked to the evidence rather than records
 a predicate matched, so nothing it adds licenses a count, and the count is the number of rows
@@ -977,8 +973,8 @@ setting shapes what recall returns and can be changed back, and this one deletes
 config = {
     "embedding": {
         "provider": "sentence-transformers",
-        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        "model": "google/embeddinggemma-2",
+        "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
     },
     "retention": {
         "media_days": 30,
@@ -1027,8 +1023,8 @@ with OpenAI(timeout=30.0, max_retries=3) as client:
     with Memory(
         "./data/assistant",
         embedder=SentenceTransformersEmbedder(
-            model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-            revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+            model_id="google/embeddinggemma-2",
+            revision="f9972ac22e696a105c482202646979e33e4b5a1e",
         ),
         answerer=models,
     ) as memory:
@@ -1055,8 +1051,8 @@ models = OpenAIModels(generation_model="gpt-5-mini-2025-08-07")
 memory = Memory(
     "./data/assistant",
     embedder=SentenceTransformersEmbedder(
-        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-        revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        model_id="google/embeddinggemma-2",
+        revision="f9972ac22e696a105c482202646979e33e4b5a1e",
     ),
     answerer=models,
     former=models,

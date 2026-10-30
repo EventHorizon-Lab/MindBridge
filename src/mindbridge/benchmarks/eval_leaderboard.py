@@ -23,7 +23,7 @@ from mindbridge import AsyncMemory, Blob, MemoryRecord, MindBridgeConfig, Search
 from mindbridge.api.content import StrictModel
 from mindbridge.api.errors import register_error_handlers
 from mindbridge.benchmarks.eval_artifacts import _atomic_replace, _json_bytes
-from mindbridge.benchmarks.eval_config import DEFAULT_CONFIG_SECTIONS, _read_config_document
+from mindbridge.benchmarks.eval_config import _read_config_document
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.types import ContentInput
 
@@ -336,7 +336,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     try:
         values = dict(_read_config_document(arguments.config.expanduser().resolve()))
         values.pop("benchmark", None)
-        values.setdefault("embedding", dict(DEFAULT_CONFIG_SECTIONS["embedding"]))
+        if values.get("embedding") is None:
+            raise ValueError("benchmark config requires an explicit embedding section")
         config = MindBridgeConfig.model_validate(values).model_copy(update={"generation": None})
     except ValueError as error:
         parser.error(str(error))
@@ -351,14 +352,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
         root = arguments.data_root.expanduser().resolve()
         owner = DataDirectoryLock(root)
         cleanup.callback(owner.close)
-        pool = _BackendPool(
-            ModelConfig(),
-            device=None,
-            batch_size=64,
-            needs_speech=False,
-            seed=0,
-            memory_config=config,
-        )
+        pool = _BackendPool(ModelConfig(), memory_config=config)
         cleanup.callback(pool.close)
         uvicorn.run(
             create_app(

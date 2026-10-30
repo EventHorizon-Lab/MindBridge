@@ -158,6 +158,9 @@ Do not treat a copied `.mindbridge.lock` file as evidence that a snapshot is bus
 `state.sqlite3` from a running owner; use a proper SQLite-aware snapshot mechanism if downtime is
 not acceptable.
 
+Do not delete files inside `zvec/` by a filename glob: RocksDB `.log` files are database journals,
+not disposable application logs. Use the index rebuild procedure to replace derived index state.
+
 ## Restore
 
 Restore into a new, empty path while the target service is stopped:
@@ -341,8 +344,8 @@ trace.set_tracer_provider(provider)
 with Memory(
     "./data",
     embedder=SentenceTransformersEmbedder(
-        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-        revision="e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        model_id="google/embeddinggemma-2",
+        revision="f9972ac22e696a105c482202646979e33e4b5a1e",
     ),
 ) as memory:
     memory.add("Remember this")

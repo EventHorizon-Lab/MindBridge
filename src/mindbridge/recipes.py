@@ -18,11 +18,6 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from mindbridge.exceptions import ValidationError
-from mindbridge.models._jina import (
-    DEFAULT_JINA_DIMENSION,
-    DEFAULT_JINA_MODEL_ID,
-    DEFAULT_JINA_REVISION,
-)
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -44,7 +39,6 @@ from mindbridge.models.openai_sdk import (
     DEFAULT_TRANSCRIPTION_MODEL,
     OpenAIModels,
 )
-from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 from mindbridge.types import Modality
 
 if TYPE_CHECKING:
@@ -52,7 +46,6 @@ if TYPE_CHECKING:
 
 Slot = Literal["embedder", "answerer", "former", "consolidator", "transcriber", "vision"]
 
-JINA_OMNI = "jina-omni"
 FUNASR = "funasr"
 OPENAI = "openai"
 
@@ -60,11 +53,10 @@ OPENAI = "openai"
 # is the only bundled backend whose model is an argument rather than a pinned local revision.
 _SLOTS: Mapping[str, frozenset[str]] = {
     FUNASR: frozenset({"transcriber"}),
-    JINA_OMNI: frozenset({"embedder"}),
     OPENAI: frozenset({"embedder", "answerer", "former", "consolidator", "transcriber", "vision"}),
 }
 _PARAMETERIZED = frozenset({OPENAI})
-_PROBES: Mapping[str, str] = {JINA_OMNI: "weights", FUNASR: "import", OPENAI: "client"}
+_PROBES: Mapping[str, str] = {FUNASR: "import", OPENAI: "client"}
 _OPENAI_MODELS: Mapping[str, str] = {
     "embedder": DEFAULT_EMBEDDING_MODEL,
     "answerer": DEFAULT_GENERATION_MODEL,
@@ -101,7 +93,7 @@ def require_slot(name: str, slot: str) -> None:
 
 
 def probe(name: str) -> str:
-    """What ``load=True`` exercises: pinned ``weights``, a runtime ``import``, or a ``client``."""
+    """What ``load=True`` exercises: a runtime ``import`` or a ``client``."""
     family, _model = _split(name)
     return _PROBES[family]
 
@@ -109,19 +101,6 @@ def probe(name: str) -> str:
 def describe(name: str) -> dict[str, object]:
     """Static identity of one recipe. Resolves nothing and constructs nothing."""
     family, model = _split(name)
-    if family == JINA_OMNI:
-        return {
-            "recipe": name,
-            "class": _qualified(SentenceTransformersEmbedder),
-            "slots": list(slots(name)),
-            "models": {"embedder": DEFAULT_JINA_MODEL_ID},
-            "revision": DEFAULT_JINA_REVISION,
-            "embedding_dimension": DEFAULT_JINA_DIMENSION,
-            # Disclosed where the recipe is chosen, not only in a README footer. The licence
-            # covers the pinned weights, not MindBridge.
-            "license": "CC BY-NC 4.0",
-            "extra": "local",
-        }
     if family == FUNASR:
         return {
             "recipe": name,
@@ -230,9 +209,6 @@ def _owned_openai_models(**controls: object) -> OpenAIModels:
 def _build(name: str, *, slot: Slot, load: bool) -> object:
     family, model = _split(name)
     require_slot(name, slot)
-    if family == JINA_OMNI:
-        factory = SentenceTransformersEmbedder.load if load else SentenceTransformersEmbedder
-        return factory(model_id=DEFAULT_JINA_MODEL_ID, revision=DEFAULT_JINA_REVISION)
     if family == FUNASR:
         if load:
             # FunASR publishes no loader, so the deepest honest probe is the deferred import an

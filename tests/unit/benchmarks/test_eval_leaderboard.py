@@ -335,7 +335,7 @@ def test_cli_loads_config_runs_server_and_closes_backends(
     closed: list[bool] = []
     configuration = tmp_path / "config.yaml"
     configuration.write_text(
-        "generation:\n  provider: openai\nbenchmark:\n  run:\n    tasks: ignored\n",
+        "embedding: {provider: openai}\ngeneration:\n  provider: openai\nbenchmark:\n  run:\n    tasks: ignored\n",
         encoding="utf-8",
     )
 
@@ -382,7 +382,7 @@ def test_cli_loads_config_runs_server_and_closes_backends(
         == 0
     )
     assert configs[0].generation is None
-    assert configs[0].embedding.provider == "sentence-transformers"
+    assert configs[0].embedding.provider == "openai"
     assert closed == [True]
     with closing(DataDirectoryLock(tmp_path / "data")):
         pass
@@ -392,7 +392,7 @@ def test_cli_refuses_an_owned_root_before_loading_models(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configuration = tmp_path / "config.yaml"
-    configuration.write_text("{}\n", encoding="utf-8")
+    configuration.write_text("embedding: {provider: openai}\n", encoding="utf-8")
 
     def load(*args: object, **kwargs: object) -> None:
         raise AssertionError("an owned root must fail before any backend is loaded")
@@ -417,7 +417,7 @@ def test_cli_releases_root_after_startup_failure(
     import uvicorn
 
     configuration = tmp_path / "config.yaml"
-    configuration.write_text("{}\n", encoding="utf-8")
+    configuration.write_text("embedding: {provider: openai}\n", encoding="utf-8")
     closed: list[bool] = []
 
     class Pool:

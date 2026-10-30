@@ -307,7 +307,7 @@ def test_cli_rejects_implicit_or_history_dependent_backends(
     arguments = ["--tasks", "mem-gallery", "--ingest-concurrency", "2"]
     if section is not None:
         config = tmp_path / "config.yaml"
-        config.write_text(section + "\n")
+        config.write_text("embedding: {provider: openai}\n" + section + "\n")
         arguments += ["--config", str(config)]
     with pytest.raises(SystemExit) as caught:
         runner.main(arguments)

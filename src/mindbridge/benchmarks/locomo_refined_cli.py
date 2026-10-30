@@ -15,6 +15,11 @@ from tempfile import NamedTemporaryFile
 
 from mindbridge.benchmarks.eval import _BackendPool
 from mindbridge.benchmarks.eval_artifacts import _jsonl_bytes
+from mindbridge.benchmarks.eval_config import (
+    _evaluation_memory_config,
+    _load_memory_config,
+    _model_config,
+)
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.locomo_refined import (
     LOCOMO_REFINED_ADAPTER_VERSION,
@@ -25,14 +30,13 @@ from mindbridge.benchmarks.locomo_refined_runner import (
     LoCoMoRefinedPrediction,
     run_locomo_refined_conversation,
 )
-from mindbridge.benchmarks.model_config import ModelConfig
-from mindbridge.models._jina import DEFAULT_JINA_DIMENSION, DEFAULT_JINA_MODEL_ID
 
 LOCOMO_REFINED_RUNNER_VERSION = "locomo_refined_local_v2"
 
 
 @dataclass(frozen=True, slots=True)
 class _Arguments:
+    config: Path
     dataset: Path
     output: Path
     data_root: Path
@@ -73,13 +77,12 @@ async def _run_conversations(
 ) -> tuple[tuple[LoCoMoRefinedPrediction, ...], tuple[Path, ...]]:
     unit_dirs = tuple(run.unit_dir(conversation.sample_id) for conversation in conversations)
     semaphore = asyncio.Semaphore(arguments.unit_concurrency)
-    pool = _BackendPool(
-        ModelConfig.from_environment(),
-        device=None,
-        batch_size=32,
-        needs_speech=False,
-        seed=0,
+    memory_config, _overrides = _load_memory_config(arguments.config)
+    model = _model_config("", memory_config=memory_config)
+    memory_config = _evaluation_memory_config(
+        memory_config, model, gen_kwargs="", seed=0, device=None
     )
+    pool = _BackendPool(model, memory_config=memory_config)
 
     async def run_one(
         conversation: LoCoMoRefinedConversation,
@@ -123,14 +126,18 @@ def _write_artifacts(
     _require_writable(arguments.output, overwrite=arguments.overwrite)
 
     rows = _jsonl_bytes(prediction.model_dump(mode="json") for prediction in predictions)
-    config = ModelConfig.from_environment()
+    memory_config, _overrides = _load_memory_config(arguments.config)
+    assert memory_config is not None
+    embedding = memory_config.embedding.model_dump(mode="json")
+    config = _model_config("", memory_config=memory_config)
     manifest = {
         "adapter_version": LOCOMO_REFINED_ADAPTER_VERSION,
         "benchmark": "locomo-refined",
         "conversation_count": len(conversations),
         "dataset_sha256": _sha256_file(arguments.dataset),
-        "embedding_dimension": DEFAULT_JINA_DIMENSION,
-        "embedding_model": DEFAULT_JINA_MODEL_ID,
+        "embedding_dimension": embedding.get("dimension"),
+        "embedding_model": embedding["model"],
+        "embedding_revision": embedding.get("revision"),
         "generation_model": config.generation_model,
         "limit": arguments.limit,
         "mindbridge_version": metadata.version("mindbridge"),
@@ -165,6 +172,7 @@ def _write_artifacts(
 
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = argparse.ArgumentParser(prog=prog, description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
@@ -177,6 +185,7 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
     parser.add_argument("--resume", action="store_true")
     parsed = parser.parse_args(argv)
     return _Arguments(
+        config=parsed.config,
         dataset=parsed.dataset,
         output=parsed.output,
         data_root=parsed.data_root,

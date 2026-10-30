@@ -120,8 +120,6 @@ from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
 from mindbridge.configuration import OpenAIEmbeddingConfig, OpenAIGenerationConfig
 from mindbridge.models.base import (
-    EmbedTask,
-    ModelInput,
     SpeechAnalysis,
     SpeechBackend,
     SpeechTurn,
@@ -967,67 +965,24 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     assert _cache_namespace(clocked_arguments, ModelConfig(), {"text": 1}) != before
 
 
-@pytest.mark.parametrize(
-    ("model", "temperature", "seed"),
-    (("compatible-model", 0.0, 7), ("gpt-5-mini", None, None), ("gpt-5.1", 0.0, None)),
-)
-def test_backend_pool_warms_query_embedding_before_evaluation(
-    monkeypatch: pytest.MonkeyPatch,
-    model: str,
-    temperature: float | None,
-    seed: int | None,
+def test_backend_pool_requires_an_explicit_embedding_configuration() -> None:
+    with pytest.raises(ValueError, match="explicit embedding"):
+        eval_module._BackendPool(ModelConfig())
+
+
+def test_execution_requires_embedding_configuration_before_downloading_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import openai
+    def unexpected_download(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("missing configuration must fail before downloading benchmark inputs")
 
-    calls: list[tuple[tuple[ModelInput, ...], EmbedTask]] = []
-    model_options: list[dict[str, object]] = []
-
-    class Client:
-        def __init__(self, **_kwargs: object) -> None: ...
-
-        def close(self) -> None: ...
-
-    class Models(Client):
-        def __init__(self, **kwargs: object) -> None:
-            model_options.append(kwargs)
-
-    class Embedder:
-        def __init__(self, **_kwargs: object) -> None: ...
-
-        def embed(
-            self, inputs: Sequence[ModelInput], task: EmbedTask
-        ) -> tuple[tuple[float, ...], ...]:
-            calls.append((tuple(inputs), task))
-            return ((1.0,),)
-
-        def close(self) -> None: ...
-
-    monkeypatch.setattr(openai, "OpenAI", Client)
-    monkeypatch.setattr(eval_module, "OpenAIModels", Models)
-    monkeypatch.setattr(eval_module, "SentenceTransformersEmbedder", Embedder)
-
-    pool = eval_module._BackendPool(
-        ModelConfig(generation_model=model),
-        device="cuda",
-        batch_size=8,
-        needs_speech=False,
-        seed=7,
-    )
-    pool.close()
-
-    assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
-    assert model_options[0]["generation_temperature"] == temperature
-    assert model_options[0]["generation_seed"] == seed
-    recorded = eval_module._model_result(
-        cast(
-            eval_config_module._Arguments,
-            SimpleNamespace(device="cuda", seed=7, gen_kwargs=""),
-        ),
-        ModelConfig(generation_model=model),
-        None,
-    )
-    assert recorded["generation_temperature"] == temperature
-    assert recorded["generation_seed"] == seed
+    monkeypatch.setattr(eval_module, "acquire_inputs", unexpected_download)
+    output = tmp_path / "results"
+    with pytest.raises(SystemExit) as failure:
+        main(["--tasks", "locomo-refined", "--output-path", str(output)])
+    assert failure.value.code == 2
+    assert "explicit embedding" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_backend_pool_forwards_every_memory_setting_and_plugin(
@@ -1153,8 +1108,8 @@ def test_configured_devices_are_locked_in_physical_order(
         {
             "embedding": {
                 "provider": "sentence-transformers",
-                "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-                "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                "model": "google/embeddinggemma-2",
+                "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
                 "device": "cuda:0",
             },
             "speech": {"provider": "funasr", "device": "cuda:1"},
@@ -1239,8 +1194,8 @@ def test_eval_config_reuses_the_declarative_memory_schema(
                 "data_dir": "ignored-by-benchmark",
                 "embedding": {
                     "provider": "sentence-transformers",
-                    "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-                    "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+                    "model": "google/embeddinggemma-2",
+                    "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
                     "device": "cpu",
                     "batch_size": 4,
                 },
@@ -1289,7 +1244,9 @@ def test_eval_config_reuses_the_declarative_memory_schema(
             fallback_reference_at=None,
         ),
     )
-    effective = eval_config_module._evaluation_memory_config(loaded, model, arguments)
+    effective = eval_config_module._evaluation_memory_config(
+        loaded, model, gen_kwargs=arguments.gen_kwargs, seed=arguments.seed, device=arguments.device
+    )
 
     assert effective is not None and effective.generation is not None
     assert effective.data_dir == Path("ignored-by-benchmark")
@@ -1367,10 +1324,6 @@ def test_configured_backend_pool_lends_plugins_and_closes_the_owner(
 
     pool = eval_module._BackendPool(
         ModelConfig(generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})),
-        device=None,
-        batch_size=1,
-        needs_speech=False,
-        seed=0,
         memory_config=memory_config,
     )
 
@@ -1418,10 +1371,6 @@ def test_backend_pool_borrows_every_configured_plugin_slot(
     monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = eval_module._BackendPool(
         ModelConfig(),
-        device=None,
-        batch_size=1,
-        needs_speech=False,
-        seed=0,
         memory_config=MindBridgeConfig.model_validate({"embedding": {"provider": "openai"}}),
     )
 
@@ -4617,30 +4566,29 @@ def test_eval_config_still_reads_the_json_it_used_to_take(tmp_path: Path) -> Non
     "document",
     (
         "generation:\n  provider: openai\n",
-        "embedding:\n  provider: openai\n",
         "benchmark:\n  judge:\n    model: only-a-judge\n",
         "{}\n",
         "",
     ),
 )
-def test_eval_config_defaults_absent_sections_instead_of_failing(
+def test_eval_config_requires_an_explicit_embedding_section(
     document: str,
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(document, encoding="utf-8")
 
-    config, _ = eval_config_module._load_memory_config(path)
-
-    assert config is not None
-    assert config.generation is not None
-    assert config.embedding.provider in {"openai", "sentence-transformers"}
+    with pytest.raises(ValueError, match="explicit embedding"):
+        eval_config_module._load_memory_config(path)
 
 
 @pytest.mark.parametrize("section", ("judge", "run"))
 def test_eval_config_rejects_an_unknown_harness_key(tmp_path: Path, section: str) -> None:
     path = tmp_path / "eval.yaml"
-    path.write_text(f"benchmark:\n  {section}:\n    unknown: typo\n", encoding="utf-8")
+    path.write_text(
+        "embedding: {provider: openai}\n" + f"benchmark:\n  {section}:\n    unknown: typo\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValidationError):
         eval_config_module._load_memory_config(path)
@@ -4657,7 +4605,8 @@ def test_eval_config_reports_the_yaml_error_position(tmp_path: Path) -> None:
 def test_eval_config_artifact_records_effective_values_without_credentials(tmp_path: Path) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(
-        """
+        "embedding: {provider: openai}\n"
+        + """
 generation:
   provider: openai
   model: configured-model
@@ -4699,7 +4648,13 @@ benchmark:
         memory_config=memory_config,
     )
     judge = eval_config_module._judge_config(model, arguments, overrides=overrides)
-    effective_memory = eval_config_module._evaluation_memory_config(memory_config, model, arguments)
+    effective_memory = eval_config_module._evaluation_memory_config(
+        memory_config,
+        model,
+        gen_kwargs=arguments.gen_kwargs,
+        seed=arguments.seed,
+        device=arguments.device,
+    )
 
     artifact = eval_artifacts_module._config_artifact(
         arguments,
@@ -4841,11 +4796,14 @@ def test_eval_generation_credential_prefers_the_file_over_the_environment(
     monkeypatch.setenv("MINDBRIDGE_GENERATION_API_KEY", "environment-key")
     declared = tmp_path / "declared.yaml"
     declared.write_text(
-        "generation:\n  provider: openai\n  api_key: file-key\n",
+        "embedding: {provider: openai}\n"
+        + "generation:\n  provider: openai\n  api_key: file-key\n",
         encoding="utf-8",
     )
     silent = tmp_path / "silent.yaml"
-    silent.write_text("generation:\n  provider: openai\n", encoding="utf-8")
+    silent.write_text(
+        "embedding: {provider: openai}\n" + "generation:\n  provider: openai\n", encoding="utf-8"
+    )
 
     config, _ = _load_memory_config(declared)
     assert config is not None and config.generation is not None
@@ -4866,7 +4824,8 @@ def test_eval_video_floor_has_exactly_one_home(tmp_path: Path) -> None:
     """
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "generation:\n  provider: openai\n  min_video_seconds: 4\n",
+        "embedding: {provider: openai}\n"
+        + "generation:\n  provider: openai\n  min_video_seconds: 4\n",
         encoding="utf-8",
     )
 
@@ -4878,7 +4837,7 @@ def test_eval_video_floor_has_exactly_one_home(tmp_path: Path) -> None:
     assert resolved.generation_min_video_seconds == 4.0
 
     path.write_text(
-        "benchmark:\n  generation:\n    min_video_seconds: 4\n",
+        "embedding: {provider: openai}\n" + "benchmark:\n  generation:\n    min_video_seconds: 4\n",
         encoding="utf-8",
     )
     with pytest.raises(ValidationError):
@@ -4970,7 +4929,9 @@ def test_eval_judge_prefers_the_file_then_the_environment_then_generation(
 
 def test_eval_memory_config_survives_an_empty_gen_kwargs(tmp_path: Path) -> None:
     path = tmp_path / "eval.yaml"
-    path.write_text("generation:\n  provider: openai\n", encoding="utf-8")
+    path.write_text(
+        "embedding: {provider: openai}\n" + "generation:\n  provider: openai\n", encoding="utf-8"
+    )
     config, _ = eval_config_module._load_memory_config(path)
     arguments = cast(
         eval_config_module._Arguments,
@@ -4981,7 +4942,13 @@ def test_eval_memory_config_survives_an_empty_gen_kwargs(tmp_path: Path) -> None
         ),
     )
 
-    resolved = eval_config_module._evaluation_memory_config(config, ModelConfig(), arguments)
+    resolved = eval_config_module._evaluation_memory_config(
+        config,
+        ModelConfig(),
+        gen_kwargs=arguments.gen_kwargs,
+        seed=arguments.seed,
+        device=arguments.device,
+    )
 
     assert resolved is not None
     assert resolved.generation is not None
@@ -5009,7 +4976,13 @@ def test_eval_memory_config_pins_reinforcement_off_without_a_generation_section(
         SimpleNamespace(gen_kwargs="", seed=0, device=None),
     )
 
-    resolved = eval_config_module._evaluation_memory_config(config, ModelConfig(), arguments)
+    resolved = eval_config_module._evaluation_memory_config(
+        config,
+        ModelConfig(),
+        gen_kwargs=arguments.gen_kwargs,
+        seed=arguments.seed,
+        device=arguments.device,
+    )
 
     assert config.settings.reinforce_on_answer is True
     assert resolved is not None and resolved.generation is None
@@ -5098,7 +5071,8 @@ def test_eval_model_config_keeps_env_model_when_file_omits_it(
     monkeypatch.setenv("MINDBRIDGE_GENERATION_MODALITIES", "text,image,video")
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "generation:\n  provider: openai\n  base_url: https://example.com/v1\n",
+        "embedding: {provider: openai}\n"
+        + "generation:\n  provider: openai\n  base_url: https://example.com/v1\n",
         encoding="utf-8",
     )
 
@@ -5120,7 +5094,8 @@ def test_eval_model_config_still_prefers_a_declared_model_and_modalities(
     monkeypatch.setenv("MINDBRIDGE_GENERATION_MODALITIES", "text,image,video")
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "generation:\n  provider: openai\n  model: file-model\n  modalities: [text]\n",
+        "embedding: {provider: openai}\n"
+        + "generation:\n  provider: openai\n  model: file-model\n  modalities: [text]\n",
         encoding="utf-8",
     )
 
@@ -5143,7 +5118,9 @@ def test_eval_resolved_generation_keeps_an_env_only_credential(
     """
     monkeypatch.setenv("MINDBRIDGE_GENERATION_API_KEY", "environment-key")
     path = tmp_path / "eval.yaml"
-    path.write_text("generation:\n  provider: openai\n", encoding="utf-8")
+    path.write_text(
+        "embedding: {provider: openai}\n" + "generation:\n  provider: openai\n", encoding="utf-8"
+    )
 
     config, _ = _load_memory_config(path)
     model = _model_config("", memory_config=config)
@@ -5152,7 +5129,9 @@ def test_eval_resolved_generation_keeps_an_env_only_credential(
         SimpleNamespace(gen_kwargs="", seed=0, device=None),
     )
 
-    resolved = eval_config_module._evaluation_memory_config(config, model, arguments)
+    resolved = eval_config_module._evaluation_memory_config(
+        config, model, gen_kwargs=arguments.gen_kwargs, seed=arguments.seed, device=arguments.device
+    )
 
     assert resolved is not None and resolved.generation is not None
     assert resolved.generation.api_key is not None
@@ -5161,7 +5140,11 @@ def test_eval_resolved_generation_keeps_an_env_only_credential(
 
 def test_eval_resolved_generation_still_prefers_a_declared_credential(tmp_path: Path) -> None:
     path = tmp_path / "eval.yaml"
-    path.write_text("generation:\n  provider: openai\n  api_key: file-key\n", encoding="utf-8")
+    path.write_text(
+        "embedding: {provider: openai}\n"
+        + "generation:\n  provider: openai\n  api_key: file-key\n",
+        encoding="utf-8",
+    )
 
     config, _ = _load_memory_config(path)
     model = _model_config("", memory_config=config)
@@ -5170,7 +5153,9 @@ def test_eval_resolved_generation_still_prefers_a_declared_credential(tmp_path: 
         SimpleNamespace(gen_kwargs="", seed=0, device=None),
     )
 
-    resolved = eval_config_module._evaluation_memory_config(config, model, arguments)
+    resolved = eval_config_module._evaluation_memory_config(
+        config, model, gen_kwargs=arguments.gen_kwargs, seed=arguments.seed, device=arguments.device
+    )
 
     assert resolved is not None and resolved.generation is not None
     assert resolved.generation.api_key is not None
@@ -5186,7 +5171,7 @@ def test_eval_config_rejects_sampling_controls_the_harness_pins(field: str, tmp_
     """
     path = tmp_path / "eval.yaml"
     path.write_text(
-        f"generation:\n  provider: openai\n  {field}: 1\n",
+        "embedding: {provider: openai}\n" + f"generation:\n  provider: openai\n  {field}: 1\n",
         encoding="utf-8",
     )
 
@@ -5198,7 +5183,8 @@ def test_eval_run_section_supplies_every_tunable_the_flags_carry(tmp_path: Path)
     """A file alone must be able to describe a whole sweep, with no flags but `--config`."""
     path = tmp_path / "eval.yaml"
     path.write_text(
-        """
+        "embedding: {provider: openai}\n"
+        + """
 benchmark:
   run:
     tasks: clbench
@@ -5259,7 +5245,8 @@ benchmark:
 def test_performance_budget_flags_override_named_config_values(tmp_path: Path) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(
-        """
+        "embedding: {provider: openai}\n"
+        + """
 benchmark:
   performance_budgets:
     answer_e2e_ttft_p95: 0.10
@@ -5331,12 +5318,7 @@ def test_backend_pool_hands_the_configured_video_floor_to_the_resolved_models(
 
     with pytest.raises(_StopResolving):
         eval_module._BackendPool(
-            ModelConfig(generation_min_video_seconds=2.5),
-            device=None,
-            batch_size=1,
-            needs_speech=False,
-            seed=0,
-            memory_config=memory_config,
+            ModelConfig(generation_min_video_seconds=2.5), memory_config=memory_config
         )
 
     assert configured[0].generation is not None
@@ -5362,14 +5344,7 @@ def test_backend_pool_leaves_an_unset_video_floor_alone(
     )
 
     with pytest.raises(_StopResolving):
-        eval_module._BackendPool(
-            ModelConfig(),
-            device=None,
-            batch_size=1,
-            needs_speech=False,
-            seed=0,
-            memory_config=memory_config,
-        )
+        eval_module._BackendPool(ModelConfig(), memory_config=memory_config)
 
     assert configured[0].generation is not None
     assert configured[0].generation.min_video_seconds == 4.0
@@ -5379,7 +5354,8 @@ def test_eval_run_section_selects_the_baseline_arms(tmp_path: Path) -> None:
     """A baseline sweep is what a file describes; the flag alone cannot be reused across runs."""
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "benchmark:\n  run:\n    tasks: clbench\n    arms: mindbridge,full-context\n"
+        "embedding: {provider: openai}\n"
+        + "benchmark:\n  run:\n    tasks: clbench\n    arms: mindbridge,full-context\n"
         "    full_context_chars: 4096\n",
         encoding="utf-8",
     )
@@ -5396,7 +5372,8 @@ def test_eval_run_section_selects_the_baseline_arms(tmp_path: Path) -> None:
 def test_eval_arm_flags_still_beat_the_run_section(tmp_path: Path) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "benchmark:\n  run:\n    tasks: clbench\n    arms: full-context\n"
+        "embedding: {provider: openai}\n"
+        + "benchmark:\n  run:\n    tasks: clbench\n    arms: full-context\n"
         "    full_context_chars: 4096\n",
         encoding="utf-8",
     )
@@ -5416,7 +5393,8 @@ def test_eval_blind_rejects_a_configured_arm_selection(tmp_path: Path) -> None:
     """`--blind` labels the whole run as the control, so a file naming another arm is a conflict."""
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "benchmark:\n  run:\n    tasks: clbench\n    arms: mindbridge,full-context\n",
+        "embedding: {provider: openai}\n"
+        + "benchmark:\n  run:\n    tasks: clbench\n    arms: mindbridge,full-context\n",
         encoding="utf-8",
     )
     _, overrides = _load_memory_config(path)
@@ -5430,7 +5408,8 @@ def test_eval_blind_rejects_a_configured_arm_selection(tmp_path: Path) -> None:
 def test_eval_flags_still_beat_the_run_section(tmp_path: Path) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "benchmark:\n  run:\n    tasks: clbench\n    unit_concurrency: 6\n    seed: 7\n",
+        "embedding: {provider: openai}\n"
+        + "benchmark:\n  run:\n    tasks: clbench\n    unit_concurrency: 6\n    seed: 7\n",
         encoding="utf-8",
     )
     _, overrides = _load_memory_config(path)
@@ -5449,7 +5428,9 @@ def test_eval_flags_still_beat_the_run_section(tmp_path: Path) -> None:
 def test_eval_defaults_survive_an_empty_run_section(tmp_path: Path) -> None:
     """Every constant moved out of argparse must still be the value an unset flag produces."""
     path = tmp_path / "eval.yaml"
-    path.write_text("generation:\n  provider: openai\n", encoding="utf-8")
+    path.write_text(
+        "embedding: {provider: openai}\n" + "generation:\n  provider: openai\n", encoding="utf-8"
+    )
     _, overrides = _load_memory_config(path)
     parser = eval_config_module._build_parser("eval")
     parsed = parser.parse_args(["--config", str(path), "--tasks", "clbench"])
@@ -5483,7 +5464,8 @@ def test_eval_run_section_carries_per_task_path_overrides(tmp_path: Path) -> Non
     dataset.write_text("{}", encoding="utf-8")
     path = tmp_path / "eval.yaml"
     path.write_text(
-        f"benchmark:\n  run:\n    tasks: clbench\n    task_data:\n      clbench: {dataset}\n",
+        "embedding: {provider: openai}\n"
+        + f"benchmark:\n  run:\n    tasks: clbench\n    task_data:\n      clbench: {dataset}\n",
         encoding="utf-8",
     )
     _, overrides = _load_memory_config(path)
@@ -5503,7 +5485,8 @@ def test_eval_run_section_run_id_is_validated_like_the_flag(tmp_path: Path) -> N
     """
     path = tmp_path / "eval.yaml"
     path.write_text(
-        'benchmark:\n  run:\n    tasks: clbench\n    run_id: "../../../escaped"\n',
+        "embedding: {provider: openai}\n"
+        + 'benchmark:\n  run:\n    tasks: clbench\n    run_id: "../../../escaped"\n',
         encoding="utf-8",
     )
     _, overrides = _load_memory_config(path)
@@ -5517,7 +5500,8 @@ def test_eval_run_section_run_id_is_validated_like_the_flag(tmp_path: Path) -> N
 def test_eval_run_section_accepts_a_well_formed_run_id(tmp_path: Path) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "benchmark:\n  run:\n    tasks: clbench\n    run_id: sweep-2026.09\n",
+        "embedding: {provider: openai}\n"
+        + "benchmark:\n  run:\n    tasks: clbench\n    run_id: sweep-2026.09\n",
         encoding="utf-8",
     )
     _, overrides = _load_memory_config(path)
@@ -5545,7 +5529,7 @@ def test_eval_run_section_reports_bad_values_as_usage_errors(body: str, tmp_path
     unhandled exception instead of the usage message a bad flag produces.
     """
     path = tmp_path / "eval.yaml"
-    path.write_text(body, encoding="utf-8")
+    path.write_text("embedding: {provider: openai}\n" + body, encoding="utf-8")
     _, overrides = _load_memory_config(path)
     parser = eval_config_module._build_parser("eval")
     parsed = parser.parse_args(["--config", str(path)])

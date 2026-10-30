@@ -31,7 +31,7 @@ from _api_support import (
     _record,
     _trace,
 )
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, iter_route_contexts
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -90,7 +90,7 @@ from mindbridge.types import (
 # with five values an unsorted serializer produces the documented order once in 120 runs.
 CAPABILITIES = MemoryCapabilities(
     embedding=frozenset(Modality),
-    embedding_model="jina-v5-omni",
+    embedding_model="test-omni",
     embedding_space="space_1",
     embedding_dimension=1024,
     generation=frozenset({Modality.TEXT}),
@@ -687,9 +687,9 @@ async def test_answer_stream_closes_after_the_transport_send_fails(
 
     app = create_app(memory=CloseTrackedMemory())
     endpoint = next(
-        route.endpoint
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.path == "/v1/answers/stream"
+        route.original_route.endpoint
+        for route in iter_route_contexts(app.routes)
+        if isinstance(route.original_route, APIRoute) and route.path == "/v1/answers/stream"
     )
     never_disconnect = asyncio.Event()
 
@@ -959,9 +959,9 @@ def test_content_parts_reject_ambiguous_or_untrusted_sources_before_memory(
 def test_memory_routes_are_sync_for_fastapi_threadpool_execution() -> None:
     app = create_app(memory=FakeMemory())
     routes = [
-        route
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.path.startswith("/v1/")
+        route.original_route
+        for route in iter_route_contexts(app.routes)
+        if isinstance(route.original_route, APIRoute) and (route.path or "").startswith("/v1/")
     ]
 
     assert routes
@@ -991,8 +991,8 @@ def test_the_documented_v1_route_counts_are_the_real_ones() -> None:
         )
         return sum(
             1
-            for route in app.routes
-            if isinstance(route, APIRoute) and route.path.startswith("/v1/")
+            for route in iter_route_contexts(app.routes)
+            if isinstance(route.original_route, APIRoute) and (route.path or "").startswith("/v1/")
         )
 
     always_on = v1_route_count()
@@ -1168,7 +1168,7 @@ def test_health_reports_the_live_composition() -> None:
     assert body["status"] == "ok"
     assert body["capabilities"] == {
         "embedding": ["audio", "image", "omni", "text", "video"],
-        "embedding_model": "jina-v5-omni",
+        "embedding_model": "test-omni",
         "embedding_space": "space_1",
         "embedding_dimension": 1024,
         "generation": ["text"],

@@ -12,13 +12,9 @@ from importlib.metadata import distributions
 from pathlib import Path
 from typing import cast
 
+import tomllib
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
 
 ROOT = Path(__file__).parents[2]
 SOURCE = ROOT / "src" / "mindbridge"
@@ -140,7 +136,7 @@ def _installed_roots() -> dict[str, frozenset[str]]:
     """Map each importable root to the installed distributions that provide it.
 
     ``importlib.metadata.packages_distributions`` reads only ``top_level.txt`` before Python
-    3.12, and modern wheels omit that file, so on 3.10 and 3.11 it reports almost nothing and
+    3.12, and modern wheels omit that file, so on 3.11 it reports almost nothing and
     the declaration check above would call every third-party import undeclared. Reading the
     recorded files instead is what 3.12 does internally and behaves the same on every
     supported interpreter.
@@ -303,7 +299,7 @@ def test_dependency_surface_is_exact() -> None:
         "face": {"opencv-python-headless"},
         "gazetteer": {"pyproj", "shapely"},
         "local": {
-            "cairosvg",
+            "pillow",
             "funasr",
             "librosa",
             "sentence-transformers",

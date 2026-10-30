@@ -271,8 +271,8 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         dest="memory_config",
         type=Path,
         help=(
-            "YAML MindBridgeConfig plus an optional benchmark section; absent sections take "
-            "defaults and data_dir is replaced by isolated benchmark directories"
+            "YAML MindBridgeConfig with an explicit embedding section, plus optional benchmark "
+            "settings; data_dir is replaced by isolated benchmark directories"
         ),
     )
     parser.add_argument(
@@ -605,20 +605,6 @@ def _arguments(
     )
 
 
-# What a configuration file that names no provider gets. These mirror the backends the harness
-# builds when `--config` is omitted entirely, so adding a file to set one unrelated knob does not
-# silently change which models run. Naming a section overrides the default for that section only.
-DEFAULT_CONFIG_SECTIONS: Mapping[str, Mapping[str, object]] = {
-    "embedding": {
-        "provider": "sentence-transformers",
-        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
-        "dimension": 1024,
-    },
-    "generation": {"provider": "openai"},
-}
-
-
 def _read_config_document(path: Path) -> Mapping[str, object]:
     """Parse one harness configuration file, reporting where invalid YAML went wrong."""
     try:
@@ -734,9 +720,10 @@ def _load_memory_config(
     if not isinstance(section, Mapping):
         raise ValueError(f"benchmark config {path} benchmark section must be a mapping")
     overrides = HarnessOverrides.model_validate(section)
-    for name, default in DEFAULT_CONFIG_SECTIONS.items():
-        if values.get(name) is None:
-            values[name] = dict(default)
+    if values.get("generation") is None:
+        values["generation"] = {"provider": "openai"}
+    if values.get("embedding") is None:
+        raise ValueError("benchmark config requires an explicit embedding section")
     config = MindBridgeConfig.model_validate(values)
     generation = config.generation
     if generation is None:
@@ -884,7 +871,10 @@ def _evaluation_config(config: ModelConfig, tasks: Sequence[LoadedTask]) -> Mode
 def _evaluation_memory_config(
     config: MindBridgeConfig | None,
     model: ModelConfig,
-    arguments: _Arguments,
+    *,
+    gen_kwargs: str,
+    seed: int,
+    device: str | None,
 ) -> MindBridgeConfig | None:
     if config is None:
         return None
@@ -899,7 +889,7 @@ def _evaluation_memory_config(
     generation = config.generation
     if generation is None:
         return config
-    options = dict(item.split("=", 1) for item in arguments.gen_kwargs.split(",") if "=" in item)
+    options = dict(item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item)
     extra_body = None if generation.extra_body is None else dict(generation.extra_body)
     if "enable_thinking" in options:
         extra_body = {} if extra_body is None else extra_body
@@ -920,7 +910,7 @@ def _evaluation_memory_config(
             "model": model.generation_model,
             "timeout": model.timeout_seconds,
             "temperature": _generation_temperature(model.generation_model, options, extra_body),
-            "seed": None if reasoning_model(model.generation_model) else arguments.seed,
+            "seed": None if reasoning_model(model.generation_model) else seed,
             "modalities": model.generation_capabilities,
             "max_tokens": (
                 generation.max_tokens if "max_tokens" not in options else int(options["max_tokens"])
@@ -930,11 +920,11 @@ def _evaluation_memory_config(
     )
     embedding = config.embedding
     speech = config.speech
-    if arguments.device is not None:
+    if device is not None:
         if embedding.provider == "sentence-transformers":
-            embedding = embedding.model_copy(update={"device": arguments.device})
+            embedding = embedding.model_copy(update={"device": device})
         if speech is not None and speech.provider == "funasr":
-            speech = speech.model_copy(update={"device": arguments.device})
+            speech = speech.model_copy(update={"device": device})
     return config.model_copy(
         update={
             "embedding": embedding,

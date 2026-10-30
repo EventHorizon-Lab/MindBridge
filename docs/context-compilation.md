@@ -485,8 +485,8 @@ config = {
     "data_dir": "./data/compile-example",
     "embedding": {
         "provider": "sentence-transformers",
-        "model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-        "revision": "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4",
+        "model": "google/embeddinggemma-2",
+        "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
     },
     "settings": {"minimum_relevance": 0, "ambiguity_margin": 0},
 }

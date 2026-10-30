@@ -6,7 +6,7 @@ invariants, and review expectations. Automated contributors must also follow
 
 ## Setup
 
-MindBridge supports Python 3.10 through 3.14. The project uses
+MindBridge supports Python 3.11 through 3.14. The project uses
 [uv](https://docs.astral.sh/uv/) and the checked-in `uv.lock`.
 
 Local development accepts uv 0.12.5 or newer; there is no need to downgrade a newer installation.
@@ -53,8 +53,8 @@ uv run --frozen mypy
 git diff --check
 ```
 
-Mypy runs in strict mode over `src` and `tests`. Ruff holds the project to Python 3.10 syntax and
-formats Python code blocks inside Markdown. Pytest treats warnings as errors.
+Mypy runs in strict mode over `src` and `tests`. Ruff checks project style and formats Python code
+blocks inside Markdown. Pytest treats warnings as errors.
 
 Select the smallest tests covering the changed behavior and its direct callers. Include contract
 tests when a public surface changes. Once the relevant checks pass, do not expand or repeat them

@@ -44,13 +44,14 @@ not handed.
 | `kernel/formation.py` | `Formation` | Running the formation backend over committed sources and committing accepted proposals. |
 | `kernel/identity.py` | `Identities` | Naming, consent, linking, unlinking, and erasing people. |
 | `kernel/ingestion.py` | `Ingestion` | `add`, `add_many`, `capture`, `settle`, and streamed observations. |
-| `kernel/answering.py` | `Answering` | Grounding, recall programs, generation routing, and streamed answer validation. |
+| `kernel/answering.py` | `Answering` | Executing recall programs, generation routing, and streamed answer validation; deterministic evidence packing lives in `kernel/grounding.py`. |
 | `kernel/compilation.py` | `Compilation` | Evidence closure over lineage, consent, and actors; the pure selection stays in `context.py`. |
 | `kernel/control_plane.py` | `ControlPlane` | Proposing, applying, auditing, and reversing operations. |
 | `kernel/records.py` | `Records` | `get`, `list`, `delete`, `export`, retention, and reinforcement. |
 
 The pure modules beside them -- `content.py` for what the caller gave, `derived.py` for what a
-model derived, `temporal.py`, `ranking.py`, `contracts.py`, `metadata.py`, `validation.py`,
+model derived, `grounding.py` for answer evidence packing and request annotations,
+`temporal.py`, `ranking.py`, `contracts.py`, `metadata.py`, `validation.py`,
 `settings.py` --
 read no storage and call no model; they are the functions the planes agree on, and they are
 where a rule about identity, ranking, or derived text lives exactly once. Two small shared
@@ -72,6 +73,11 @@ private modules (`_connections.py`, `_lineage.py`, `_selection.py`, `_identity.p
 `_schema.py`) are the pool and those connection-level functions, grouped by the invariant they
 keep; product code outside the package imports only `LocalStore` and the row values, while
 white-box tests may reach the private modules directly.
+
+`store/_selection.py` owns version eligibility for both predicate selection and authoritative
+hydration. It selects the latest eligible version in SQLite before transferring a context row,
+so history length does not multiply decoded context rows. Match and window recall reuse its
+temporal predicate before applying their row bound. Metric distance remains a hydration check.
 
 ## Durable state
 
@@ -461,10 +467,9 @@ backend swap during a `Memory` lifetime. SQLite, the asset store, and Zvec are i
 rather than public storage plugins: a model backend may perform inference but cannot bypass
 validation, stable identity, durability, or final SQLite hydration.
 
-Model code is part of the application's trust boundary. The bundled Jina adapter, for example,
-executes pinned upstream model code; [configuration](configuration.md) owns its exact recipe and
-license constraints. No backend can bypass validation, stable identity, durability, or final
-SQLite hydration.
+Model code is part of the application's trust boundary. Sentence Transformers loads with remote
+code disabled; [configuration](configuration.md) owns the model selection and revision rules.
+No backend can bypass validation, stable identity, durability, or final SQLite hydration.
 
 Typed lineage and evidence are a SQLite projection, not a graph database or traversal service. A
 future entity/relation search projection must remain derived and rebuildable and pass the evidence

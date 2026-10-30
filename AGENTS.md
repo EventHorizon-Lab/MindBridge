@@ -27,7 +27,7 @@ to measure SQLite or Zvec directly; do not let that exception become an alternat
 
 ## Build and test
 
-MindBridge supports Python 3.10 through 3.14 and uses `uv` with `pyproject.toml` and `uv.lock`.
+MindBridge supports Python 3.11 through 3.14 and uses `uv` with `pyproject.toml` and `uv.lock`.
 Install every development group and optional surface with:
 
 ```bash

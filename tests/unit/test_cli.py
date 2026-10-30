@@ -37,9 +37,9 @@ from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, _parser, main
 from mindbridge.control import dump_operation, load_operation
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.kernel.contracts import declared_capabilities
-from mindbridge.models._jina import DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.models.funasr import DEFAULT_FUNASR_MODEL_ID
+from mindbridge.models.openai_sdk import DEFAULT_EMBEDDING_MODEL
 from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
@@ -680,14 +680,13 @@ def test_explain_reports_the_composition_and_executes_nothing(
 ) -> None:
     store = tmp_path / "store"
     status, document, _ = _run(
-        capsys, "--embedder", "jina-omni", "--data-dir", str(store), "--explain", "-q", "reindex"
+        capsys, "--embedder", "openai", "--data-dir", str(store), "--explain", "-q", "reindex"
     )
     assert status == 0
     composition = cast(dict[str, object], document)
-    assert composition["source"] == "--embedder jina-omni"
-    assert cast(dict[str, object], composition["embedder"])["models"] == {
-        "embedder": DEFAULT_JINA_MODEL_ID
-    }
+    assert composition["source"] == "--embedder openai"
+    models = cast(dict[str, object], cast(dict[str, object], composition["embedder"])["models"])
+    assert models["embedder"] == DEFAULT_EMBEDDING_MODEL
     assert not store.exists()
 
 
@@ -696,11 +695,7 @@ def test_explain_reports_the_composition_and_executes_nothing(
 
 
 def test_recipes_pin_identity_to_the_constants_in_the_source() -> None:
-    assert recipes.names() == ("funasr", "jina-omni", "openai")
-    jina = recipes.describe("jina-omni")
-    assert jina["models"] == {"embedder": DEFAULT_JINA_MODEL_ID}
-    assert jina["revision"] == DEFAULT_JINA_REVISION
-    assert jina["license"] == "CC BY-NC 4.0"
+    assert recipes.names() == ("funasr", "openai")
     assert recipes.describe("funasr")["models"] == {"transcriber": DEFAULT_FUNASR_MODEL_ID}
     assert recipes.describe("openai:gpt-5-mini")["models"] == {
         "embedder": "gpt-5-mini",
@@ -759,11 +754,12 @@ def test_every_recipe_slot_has_a_command_line_flag() -> None:
     assert set(cli._SLOTS) <= flags
 
 
-def test_recipes_return_an_object_the_caller_owns() -> None:
-    embedder = recipes.embedder("jina-omni")
+def test_recipes_return_an_object_the_caller_owns(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(recipes, "_openai_client", _SdkClient)
+    embedder = recipes.embedder("openai")
     try:
-        assert embedder.embedding_model == DEFAULT_JINA_MODEL_ID
-        assert embedder.embedding_dimension == 1024
+        assert embedder.embedding_model == DEFAULT_EMBEDDING_MODEL
+        assert embedder.embedding_dimension == 1536
     finally:
         embedder.close()
 
@@ -805,7 +801,7 @@ def test_a_recipe_closes_the_sdk_client_it_constructed(
 
 @pytest.mark.parametrize(
     "name",
-    ("unknown", "jina-omni:something", "openai:", "funasr:x"),
+    ("unknown", "jina-omni", "openai:", "funasr:x"),
 )
 def test_unknown_or_misused_recipe_names_are_rejected(name: str) -> None:
     with pytest.raises(ValidationError):
@@ -814,7 +810,7 @@ def test_unknown_or_misused_recipe_names_are_rejected(name: str) -> None:
 
 def test_a_recipe_cannot_fill_a_slot_it_does_not_serve() -> None:
     with pytest.raises(ValidationError):
-        recipes.answerer("jina-omni")
+        recipes.answerer("funasr")
     with pytest.raises(ValidationError):
         recipes.embedder("funasr")
 
@@ -857,7 +853,7 @@ def test_doctor_publishes_the_capability_document_without_opening_a_store(
     monkeypatch.setattr(recipes, "embedder", lambda name, *, load=False: _Embedder())
     store = tmp_path / "store"
     _status, document, _ = _run(
-        capsys, "--embedder", "jina-omni", "--data-dir", str(store), "-q", "doctor"
+        capsys, "--embedder", "openai", "--data-dir", str(store), "-q", "doctor"
     )
     report = cast(dict[str, object], document)
 
@@ -873,7 +869,7 @@ def test_doctor_publishes_the_capability_document_without_opening_a_store(
     _status, seeing, _ = _run(
         capsys,
         "--embedder",
-        "jina-omni",
+        "openai",
         "--vision",
         "openai",
         "--data-dir",
@@ -903,9 +899,9 @@ def test_doctor_sees_a_directory_another_process_owns(
     store = tmp_path / "store"
     with Memory(store, embedder=_Embedder()):
         _status, document, _ = _run(
-            capsys, "--embedder", "jina-omni", "--data-dir", str(store), "-q", "--explain", "doctor"
+            capsys, "--embedder", "openai", "--data-dir", str(store), "-q", "--explain", "doctor"
         )
-        assert cast(dict[str, object], document)["source"] == "--embedder jina-omni"
+        assert cast(dict[str, object], document)["source"] == "--embedder openai"
         _status, report, _ = _run(
             capsys, "--url", "http://127.0.0.1:0", "-q", "--explain", "doctor"
         )

@@ -46,9 +46,16 @@ The [documentation index](docs/README.md) describes the current contracts.
   physically isolated stores, response caches, resume support, per-task artifacts, diagnostics,
   rejudging, and local storage measurements. See [benchmarking](docs/benchmarking.md).
 - A real-model quality gate over fixed answering fixtures, isolated optional-dependency checks,
-  and wheel/sdist validation across the supported Python 3.10–3.14 range.
+  and wheel/sdist validation across the supported Python 3.11–3.14 range.
 
 ### Changed
+
+- Require Python 3.11–3.14 and Pillow 13; update HTTPX2, Pydantic, MCP and the server/telemetry
+  dependency chains. Remove CairoSVG and the CI system-library installation it needed.
+- Remove the Jina-specific Sentence Transformers adaptation and `jina-omni` recipe. Local models
+  use the standard Sentence Transformers loader with remote code disabled. MindBridge evaluation
+  and serving require an explicit embedding configuration; existing stores keep their original vector-space
+  identity and need a fresh directory when changing models.
 
 - Operation-log decoding requires the complete current payload. Removed missing-field defaults,
   outdated benchmark object-shape fallbacks and non-protocol MCP error-field handling; older

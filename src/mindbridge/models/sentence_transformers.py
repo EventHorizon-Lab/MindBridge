@@ -14,7 +14,6 @@ from typing import Protocol, cast
 
 from mindbridge._telemetry import mark_model_requests, record_unmetered_model_usage
 from mindbridge.exceptions import ModelError, ValidationError
-from mindbridge.models import _jina
 from mindbridge.models._media import fetch_videos
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import Modality
@@ -25,8 +24,6 @@ _EMBEDDINGGEMMA2_MODEL = "google/embeddinggemma-2"
 _EMBEDDINGGEMMA2_DIMENSIONS = (128, 256, 512, 768)
 _EMBEDDINGGEMMA2_RECIPE = "embeddinggemma2-text-prompts-pyav-v1"
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
-# Some trust-remote-code models mutate shared Sentence Transformers state while importing.
-_ST_LOCK = threading.RLock()
 
 
 class _EmbeddingMatrix(Protocol):
@@ -81,58 +78,23 @@ class SentenceTransformersEmbedder:
         self._batch_size = _positive_integer(batch_size, "batch_size")
         if dimension is not None:
             _positive_integer(dimension, "dimension")
-        self._jina = self._model_id == _jina.DEFAULT_JINA_MODEL_ID
         self._revision = _resolve_revision(self._model_id, revision, encoder)
-        self._encoder: _SentenceEncoder | None = None
         self._lock = threading.RLock()
         self._closed = False
         recipe = _STANDARD_RECIPE
-        if self._jina:
-            if self._revision != _jina.DEFAULT_JINA_REVISION:
-                raise ValidationError("Jina Omni requires the supported pinned revision")
-            if dimension is not None:
-                _jina._jina_dimension(dimension)
-            if encoder is None:
-                dimension = _jina._jina_dimension(
-                    _jina.DEFAULT_JINA_DIMENSION if dimension is None else dimension
-                )
-                _jina._require_local_extra()
-            self._dimension = _jina.DEFAULT_JINA_DIMENSION if dimension is None else dimension
-            self._truncate_dim: int | None = None
-            self._capabilities = _jina._JINA_CAPABILITIES
-            recipe = _jina._JINA_RECIPE
-        if encoder is not None or not self._jina:
-            with _ST_LOCK:
-                if encoder is None:
-                    encoder = _load_encoder(
-                        self._model_id, revision=self._revision, device=self._device
-                    )
-                self._bind_encoder(encoder, dimension)
+        if encoder is None:
+            encoder = _load_encoder(self._model_id, revision=self._revision, device=self._device)
+        self._encoder = encoder
+        self._dimension, self._truncate_dim = _dimensions(encoder, dimension, self._model_id)
+        encode = getattr(encoder, "encode", None)
+        if callable(encode):
+            object.__setattr__(encoder, "encode", encode)
+        self._encode_query = encoder.encode_query
+        self._encode_document = encoder.encode_document
+        self._capabilities = self._discover_capabilities()
         if self._model_id == _EMBEDDINGGEMMA2_MODEL:
             recipe = _EMBEDDINGGEMMA2_RECIPE
         self._space_id = _recipe_space(recipe, self._model_id, self._revision, self._dimension)
-
-    def _bind_encoder(self, encoder: _SentenceEncoder, dimension: int | None) -> None:
-        with _ST_LOCK:
-            if self._jina:
-                if _jina._media_processor_missing(encoder):
-                    raise ModelError(
-                        "Jina Omni's media processor is unavailable; install MindBridge "
-                        "with the local extra"
-                    )
-                _jina._configure_jina_video(encoder[0])  # type: ignore[index]
-            dimension, truncate_dim = _dimensions(encoder, dimension, self._model_id)
-            if self._jina:
-                _jina._jina_dimension(dimension)
-            self._encoder = encoder
-            encode = getattr(encoder, "encode", None)
-            if callable(encode):
-                object.__setattr__(encoder, "encode", encode)
-            self._encode_query = encoder.encode_query
-            self._encode_document = encoder.encode_document
-            self._dimension, self._truncate_dim = dimension, truncate_dim
-            if not self._jina:
-                self._capabilities = self._discover_capabilities()
 
     @classmethod
     def load(
@@ -144,23 +106,14 @@ class SentenceTransformersEmbedder:
         device: str | None = None,
         batch_size: int = 32,
     ) -> SentenceTransformersEmbedder:
-        """Resolve and load an immutable model revision, including pinned Jina."""
-        backend = cls(
+        """Resolve and load an immutable model revision."""
+        return cls(
             model_id=model_id,
             revision=revision,
             dimension=dimension,
             device=device,
             batch_size=batch_size,
         )
-        with backend._lock:
-            backend._ensure_loaded()
-        return backend
-
-    def _ensure_loaded(self) -> None:
-        if self._encoder is None:
-            with _ST_LOCK:
-                encoder = _jina._load_jina(device=self._device)
-                self._bind_encoder(encoder, self._dimension)
 
     @property
     def embedding_capabilities(self) -> frozenset[Modality]:
@@ -216,7 +169,6 @@ class SentenceTransformersEmbedder:
                 raise ModelError("embedding backend is closed")
             if not batch:
                 return ()
-            self._ensure_loaded()
             encode = cast(
                 Callable[..., _EmbeddingMatrix],
                 self._encode_query if selected_task is EmbedTask.QUERY else self._encode_document,
@@ -265,12 +217,6 @@ class SentenceTransformersEmbedder:
         parts.extend(
             (cast(Modality, asset.modality).value, str(asset.path)) for asset in value.assets
         )
-        if self._jina:
-            values = tuple(
-                _jina._Text(part) if modality == Modality.TEXT.value else part
-                for modality, part in parts
-            )
-            return values[0] if len(values) == 1 else values
         modalities = tuple(modality for modality, _ in parts)
         for modality in set(modalities):
             if Modality(modality) not in self._capabilities:
@@ -298,8 +244,6 @@ class SentenceTransformersEmbedder:
         ]
 
     def _supports(self, modality: str | tuple[str, ...]) -> bool:
-        if self._encoder is None:
-            return False
         try:
             supported = self._encoder.supports(modality)
         except Exception:
@@ -310,8 +254,6 @@ class SentenceTransformersEmbedder:
 def _resolve_revision(model_id: str, revision: str | None, encoder: _SentenceEncoder | None) -> str:
     if revision is not None:
         return _revision(revision)
-    if model_id == _jina.DEFAULT_JINA_MODEL_ID:
-        return _jina.DEFAULT_JINA_REVISION
     if encoder is not None:
         return _revision(_config_value(encoder, "_commit_hash"))
     try:

@@ -125,6 +125,7 @@ Set credentials for the OpenAI-compatible generation endpoint, then select a tas
 export OPENAI_API_KEY="..."
 
 uv run --frozen mindbridge-bench eval \
+  --config eval.yaml \
   --tasks locomo-refined \
   --output-path .benchmarks/results/locomo
 ```
@@ -143,6 +144,7 @@ dataset or corpus date:
 
 ```bash
 uv run --frozen mindbridge-bench eval \
+  --config eval.yaml \
   --tasks m3-bench-robot \
   --fallback-reference-at 2026-09-08T00:00:00Z \
   --output-path .benchmarks/results/m3-fixed-clock
@@ -222,6 +224,7 @@ that seeker's questions:
 
 ```bash
 uv run --frozen mindbridge-bench eval \
+  --config eval.yaml \
   --tasks es-memeval \
   --limit 1 \
   --output-path .benchmarks/results/es-memeval-qa-smoke
@@ -235,6 +238,7 @@ Configure an OpenAI-compatible generation endpoint, then start with one task and
 export MINDBRIDGE_GENERATION_API_KEY="..."
 
 uv run --frozen mindbridge-bench eval \
+  --config eval.yaml \
   --tasks locomo-refined \
   --model-args generation_model=gpt-5-mini-2025-08-07 \
   --limit 1 \
@@ -281,6 +285,7 @@ export MINDBRIDGE_JUDGE_BASE_URL="https://judge.example/v1"
 export MINDBRIDGE_JUDGE_API_KEY="..."
 
 uv run --frozen mindbridge-bench eval \
+  --config eval.yaml \
   --tasks locomo-refined \
   --limit 10 \
   --seed 42 \
@@ -418,10 +423,10 @@ failure preserves deterministic metrics such as Gallery F1 and is still recorded
 metrics that require the missing verdict receive their documented failure score. Saved
 `JudgeError` predictions can restore local metrics and be rejudged without generating new answers.
 
-Omitted sections use the same defaults as a run without `--config`: the pinned Jina Omni model
-through the `sentence-transformers` provider and an
-`openai` generation endpoint. The runner always replaces `data_dir` with isolated per-unit
-directories.
+Executing the MindBridge arm requires `--config` with an explicit `embedding` section. There is no
+implicit local embedding model. Task listing, integrity checks, and baseline-only runs can work
+without it. An omitted generation section uses the `openai` provider and the configured environment
+endpoint. The runner always replaces `data_dir` with isolated per-unit directories.
 
 ```bash
 uv run --frozen mindbridge-bench eval \
@@ -548,6 +553,7 @@ the product, sharing one ingest per unit:
 
 ```bash
 mindbridge-bench eval \
+  --config eval.yaml \
   --tasks atm-bench-easy \
   --arms mindbridge,blind,full-context,random,compile \
   --full-context-chars 24000 \
@@ -875,6 +881,7 @@ Use `--no-download` for an offline run. Override operator-managed inputs explici
 
 ```bash
 mindbridge-bench eval \
+  --config eval.yaml \
   --tasks video-mme-v2 \
   --task-data video-mme-v2=/datasets/video-mme-v2/test.parquet \
   --media-root video-mme-v2=/datasets/video-mme-v2/videos \
@@ -903,6 +910,7 @@ otherwise point at them:
 
 ```bash
 mindbridge-bench eval \
+  --config eval.yaml \
   --tasks openeqa-hm3d \
   --media-root openeqa-hm3d=/datasets/open-eqa/data/frames/hm3d-v0 \
   --limit 1
@@ -1253,6 +1261,7 @@ mindbridge-bench eval --tasks locomo-refined --blind \
   --output-path .benchmarks/results/blind
 
 mindbridge-bench eval --tasks locomo-refined \
+  --config eval.yaml \
   --blind-baseline .benchmarks/results/blind \
   --output-path .benchmarks/results/memory
 ```
@@ -1556,6 +1565,7 @@ Compare a candidate with an equivalent baseline using stable sample IDs:
 
 ```bash
 mindbridge-bench eval \
+  --config eval.yaml \
   --tasks locomo-refined \
   --compare .benchmarks/results/baseline \
   --fail-on-regression \
@@ -1607,6 +1617,7 @@ halves of its work when it is started with a fixed `--run-id` and a response cac
 
 ```bash
 mindbridge-bench eval \
+  --config eval.yaml \
   --tasks locomo-refined \
   --run-id locomo-sweep-01 \
   --use-cache .benchmarks/response-cache \
@@ -1648,6 +1659,7 @@ than integrated scores:
 
 ```bash
 uv run --frozen mindbridge-bench locomo-refined \
+  --config eval.yaml \
   --dataset .benchmarks/locomo-refined/data/raw/locomo_refined.json \
   --output .benchmarks/results/locomo-raw/predictions.jsonl \
   --data-root .benchmarks/data \

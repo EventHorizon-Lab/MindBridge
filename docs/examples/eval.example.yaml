@@ -39,9 +39,8 @@
 # Command-line flag  >  this file  >  environment variable  >  built-in default
 #
 # A flag wins because it is typed for one run; this file beats the environment because it is the
-# reviewable artifact. Every section is optional: an omitted section takes the same default the
-# harness uses with no `--config` at all, so adding this file to set one knob does not silently
-# change which models run.
+# reviewable artifact. The embedding section is required; other sections use their documented
+# defaults. The harness never chooses a local embedding model implicitly.
 #
 # See docs/benchmarking.md for the flags and docs/configuration.md for the full product schema.
 
@@ -56,8 +55,7 @@
 embedding:
   # `openai` reaches any OpenAI-compatible server, including a local vLLM.
   # Alternative: `sentence-transformers` (requires `model`; `revision` is optional).
-  # The default Jina model is jinaai/jina-embeddings-v5-omni-small-retrieval through it,
-  # pinned to revision e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4.
+  # Select an immutable model revision explicitly for reproducible local evaluation.
   provider: openai
   base_url: http://127.0.0.1:8000/v1
   # Local servers usually accept any non-empty string; omit the field to let the SDK read

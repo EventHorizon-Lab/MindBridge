@@ -69,7 +69,7 @@ from mindbridge.types import (
 
 CAPABILITIES = MemoryCapabilities(
     embedding=frozenset({Modality.TEXT, Modality.IMAGE}),
-    embedding_model="jina-v5-omni",
+    embedding_model="test-omni",
     embedding_space="space_1",
     embedding_dimension=1024,
     generation=frozenset({Modality.TEXT}),
